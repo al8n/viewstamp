@@ -1750,7 +1750,7 @@ async fn inbound_feed_rekeys_before_a_following_close_suppresses_stale_redial() 
 
   // Feed an inbound frame through the production inbound entry point. The bytes target a conn id the
   // router does not hold, so the feed is a coordinator no-op (it does not perturb the slot-1 conn) —
-  // what matters is that `handle_inbound` now runs `rekey_if_needed` after the feed.
+  // what matters is that `handle_inbound` runs `rekey_if_needed` after the feed.
   driver.handle_inbound(
     viewstamp_proto::Instant::ZERO,
     BridgeInbound::Bytes {

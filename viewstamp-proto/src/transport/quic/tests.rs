@@ -417,7 +417,7 @@ fn the_connection_cap_keeps_a_floor_for_a_tiny_cluster() {
 /// (attested-but-unresolvable) member occupies a bridge-table slot at the pre-identity capacity gate —
 /// BEFORE its id is resolved and the post-identity quarantine eviction can run — so without a reserve a
 /// burst of up to [`QuicCoordinator::QUARANTINE_CONN_LIMIT`] quarantined members would consume mesh
-/// slots and starve the authoritative mesh (Codex R1 finding). The quarantine population itself is
+/// slots and starve the authoritative mesh. The quarantine population itself is
 /// bounded at that ceiling, so reserving it above the floor keeps the full mesh capacity available.
 ///
 /// NEUTER CHECK: drop the `+ QUARANTINE_CONN_LIMIT` reserve in `build` and the cap falls back to the

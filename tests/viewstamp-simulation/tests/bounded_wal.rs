@@ -3,7 +3,7 @@
 //!
 //! With an OPT-IN bounded ring WAL ([`Cluster::set_wal_capacity`]) of `N` slots, op `K` occupies ring
 //! slot `K mod N`, so an append at `K + N` would PHYSICALLY overwrite op `K`'s slot. The safety
-//! invariant Phase A enforces: a slot for op `K` is reused by `K + N` ONLY AFTER `K` is below the prune
+//! invariant: a slot for op `K` is reused by `K + N` ONLY AFTER `K` is below the prune
 //! floor `min(checkpoint_op, quorum_checkpoint_op)` (checkpoint-subsumed on a quorum). The primary
 //! enforces it by STALLING op-assignment so the un-pruned window `(floor, op]` never exceeds `N` slots —
 //! it refuses to mint op `K + 1` when `(K + 1) - floor > N`, dropping the request (back-pressure) until
@@ -12,10 +12,9 @@
 //! These gates assert (1) ops KEEP FLOWING under a bounded ring (the stall self-releases as the cluster
 //! checkpoints — proven via the proto's `wal_stalls` counter going `> 0` then every client finishing),
 //! and (2) NO op above the durable checkpoint is ever physically wrapped away — so no committed op is
-//! lost to a ring-wrap before it is snapshot-subsumed. A laggard below the prune floor whose ops HAVE
-//! been wrapped away would recover them via state-sync, verified separately in Phase B.
+//! lost to a ring-wrap before it is snapshot-subsumed.
 //!
-//! ## Phase B (this milestone): crash-recovery + the wrapped-away laggard
+//! ## Crash-recovery and the wrapped-away laggard
 //!
 //! [`bounded_wal_recover_reconstructs_a_wrapped_ring`] proves a bounded-WAL replica that has wrapped its
 //! ring MANY times recovers correctly on crash + restart: `recover` reads exactly the RESIDENT tail

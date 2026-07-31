@@ -703,12 +703,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     storage: &mut Storage<W, B, S>,
     m: crate::DoViewChange,
   ) {
-    // NOTE (deferred to a later milestone): we do not yet validate incoming DVC well-formedness
-    // (commit <= op; the log is the OFFSET tail `(checkpoint .. op]`, dense WITHIN that range — it is
-    // NOT required to be dense from op 1, since a recover-from-checkpoint / state-synced sender
-    // legitimately omits the prefix that lives in its SM snapshot). Safe under honest crash-stop
-    // peers; matters once untrusted/real-driver inputs land. The cross-DVC commit* <= op_head
-    // invariant is enforced (fail-stop) in `select_canonical_log`.
+    // Incoming DVC well-formedness is NOT validated here (commit <= op; the log is the OFFSET tail
+    // `(checkpoint .. op]`, dense WITHIN that range — it is NOT required to be dense from op 1, since
+    // a recover-from-checkpoint / state-synced sender legitimately omits the prefix that lives in its
+    // SM snapshot). That holds under the crash-stop threat model this crate targets, where a peer
+    // never emits a malformed DVC; admitting untrusted senders would require validating it. The
+    // cross-DVC commit* <= op_head invariant IS enforced (fail-stop) in `select_canonical_log`.
     // `!is_view_change()` short-circuits BEFORE `dvc_quorum()` reads the (then-`None`) collection, so
     // the collection is `Some` on every non-returning path below (ViewChange ⟹ `view_change.is_some()`).
     if m.view() != self.view

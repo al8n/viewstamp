@@ -830,7 +830,7 @@ fn read_live_checkpoint(sb: &mut InMemorySuperblock) -> (u64, Vec<u8>) {
 #[test]
 fn checkpoint_unreadable_until_a_root_names_it() {
   use viewstamp_proto::SuperblockDone;
-  // A written-but-unrooted snapshot is NOT yet the live checkpoint (redundant-copy model, finding B):
+  // A written-but-unrooted snapshot is NOT yet the live checkpoint under the redundant-copy model:
   // the durable root is the authority for which generation is readable.
   let mut sb = InMemorySuperblock::new();
   // No checkpoint at all → read faults (the no-checkpoint case).
@@ -877,7 +877,7 @@ fn orphaned_checkpoint_restores_the_last_rooted_snapshot() {
 #[test]
 fn crash_discards_a_staged_but_unrooted_snapshot_keeping_the_rooted_one() {
   // A crash (`discard_inflight`) drops a staged-but-unrooted snapshot, keeping the last-rooted one
-  // readable — the redundant-copy crash semantics (finding B).
+  // readable — the redundant-copy crash semantics.
   let mut sb = InMemorySuperblock::new();
   write_rooted_checkpoint(&mut sb, 4, b"snap4");
   // A newer snapshot lands (root not yet written).
@@ -908,10 +908,10 @@ fn a_staged_root_defers_the_live_checkpoint_handoff_until_it_lands() {
   // The retention window the serialized root writer still opens: a checkpoint's step-2 root is
   // STAGED (in flight, not yet durable), and until it lands the OLD checkpoint is the live one —
   // its snapshot must stay readable, and the newer written-but-unrooted generation must be
-  // retained without being served. (The historical supersession arm — a LATER root naming an
-  // OLDER checkpoint completing behind a newer-op root — can no longer be submitted at all: the
-  // proto session refuses a checkpoint-pointer rewind at its submission choke and hands the
-  // backend one root write at a time, which the submit_write assert above enforces.)
+  // retained without being served. (The supersession arm — a LATER root naming an OLDER
+  // checkpoint completing behind a newer-op root — is unreachable and so untested: the proto
+  // session refuses a checkpoint-pointer rewind at its submission choke and hands the backend one
+  // root write at a time, which the submit_write assert above enforces.)
   let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
   // Establish a rooted checkpoint at op 4 first (drain fully).
   sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"snap4"));

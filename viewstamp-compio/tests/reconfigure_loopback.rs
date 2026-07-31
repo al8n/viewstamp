@@ -407,9 +407,9 @@ async fn single_node_reconfigure_converges_ok() {
 /// answer a health-probe round and can never be proven live.
 ///
 /// The genesis MUST be three voters, not two: shrinking a two-voter genesis down to a SELF-ONLY
-/// successor ({0}) is exactly the idle-but-live case the probe fixes — `proven_live_voters` unions the
+/// successor ({0}) is exactly the idle-but-live case the probe covers — `proven_live_voters` unions the
 /// local member into a live round unconditionally, so a lone running node can always prove ITSELF alive and
-/// that shrink now correctly COMPLETES (see the idle multi-voter completion test below). Here the
+/// that shrink COMPLETES (see the idle multi-voter completion test below). Here the
 /// target is still `{0}` alone, so the first step's successor (dropping either peer) is a TWO-voter
 /// config that needs the OTHER never-running peer proven too — evidence no probe round can ever
 /// produce — so the picker genuinely has nothing to confirm and stalls on every iteration. With
@@ -467,9 +467,9 @@ async fn single_node_shrink_with_an_unreachable_successor_voter_stalls_to_insuff
 /// THE HEALTH PROBE ALONE PROVES AN IDLE SHRINK'S SUCCESSOR QUORUM: a real 3-voter cluster with
 /// ZERO client traffic EVER submitted still converges a shrink to 2 voters, because the primary's
 /// active `solicit_health_proofs` round — not any inflight acked op — proves the successor voter
-/// alive. This is the direct end-to-end regression for the idle-shrink-stall defect the probe fixes:
-/// the deleted `recently_acked_voters` oracle read only in-flight uncommitted prepares and was empty on an idle
-/// cluster, so this exact scenario used to stall to `Timeout` before the probe replaced it. All three
+/// alive. An in-flight-traffic oracle cannot stand in for that round: an idle cluster has no
+/// uncommitted prepares to read, so the shrink would gather no successor-liveness proof at all and
+/// this exact scenario would fail closed to `Timeout`. All three
 /// nodes run as separate driver processes over real mTLS QUIC, and the shrink is driven with the
 /// stock default `DriverConfig` (no shortened deadline, no operator `HealthHint`).
 #[compio::test]
@@ -720,8 +720,8 @@ async fn a_demoted_voter_becomes_a_learner_then_is_gced_and_the_smaller_cluster_
 /// because member 1 is ALREADY in the live membership, the driver must rebuild its dial list against
 /// the CURRENT config immediately (not wait for some later, unrelated membership change) so it dials
 /// member 1 now. node 1 accepts that dial, the mutual mesh edge forms, quorum-2 is reached, and the
-/// commit lands. Before the fix, `add_peer` only populated the address book and node 0 never dialed,
-/// so this commit would time out.
+/// commit lands. An `add_peer` that only populated the address book would leave node 0 never
+/// dialing, and the commit would time out.
 #[compio::test]
 async fn late_add_peer_dials_an_already_present_member() {
   let ca = TestCa::new();
@@ -1219,12 +1219,12 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
 /// emits NO `MembershipChanged` (`install_membership` is passed `None` for the reconfigure op — the laggard
 /// synced PAST it), so `StateSyncCompleted` is the terminal witness; in this topology the learner's ONLY
 /// possible sync is the E0->E1 crossing (it boots at E0 checkpoint 0 with a single peer that is a settled-E1
-/// donor), so a completed sync IS the crossing. Without the timer fix neither event arrives and the wait
-/// times out.
+/// donor), so a completed sync IS the crossing. Without the unconditional consensus-timer service
+/// neither event arrives and the wait times out.
 ///
 /// NON-PRIMARY IS LOAD-BEARING: any successor-PRIMARY `Prepare`/`Commit` reaching the learner would trigger
 /// the crossing via `maybe_request_cross_epoch_catchup` (inbound-driven, INDEPENDENT of the cadence) and the
-/// test would pass even WITHOUT the fix. So the learner's sole link is member 0 — the E0 primary DEMOTED to
+/// test would pass without the cadence under test running at all. So the learner's sole link is member 0 — the E0 primary DEMOTED to
 /// an E1 learner-seat — which answers `EpochAhead` and serves the crossing checkpoint (its `RequestSync`
 /// `Backups` fan-out reaches every bound replica conn) but NEVER broadcasts to a learner. The E1 primary
 /// (member 1) is never wired to the learner (asymmetric peer lists), so no successor-primary traffic ever

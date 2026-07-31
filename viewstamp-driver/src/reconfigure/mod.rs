@@ -272,7 +272,7 @@ pub trait ReconfigureBackend {
 /// `voters(live) \ {X}` holds `>= quorum` voters PROVEN LIVE — a voter counts ALIVE iff it is NOT in
 /// `known_down` AND it is in `fresh` (the set the active voter-liveness probe proved answered THIS
 /// round). `fresh` is the SOLE positive source: there is no operator "known up" vouch, because such a
-/// vouch cannot be retracted by the voter's later crash (the very defect this probe replaces). The
+/// vouch cannot be retracted by the voter's later crash. The
 /// NEGATIVE-only `known_down` can never CONFIRM the quorum (absence is not a positive witness). Prefer
 /// demoting an `X` that is apparently down (in `known_down`, or absent from `fresh`). Self
 /// (`local_member`) is ranked LAST unconditionally — not merely as a tie-break within the same liveness

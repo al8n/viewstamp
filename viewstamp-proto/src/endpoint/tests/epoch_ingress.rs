@@ -451,7 +451,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
     "a foreign-epoch head-advancing Prepare is dropped by the strict normal arm: head unchanged",
   );
   // No PrepareOk — the strict normal arm cast no vote. The lower-epoch Prepare DOES elicit a single
-  // pre-binding `EpochAhead` hint (the Change #3 egress: this replica is ahead of the sender), so the
+  // pre-binding `EpochAhead` hint (the egress half: this replica is ahead of the sender), so the
   // assertion is precisely "no vote", not "no message".
   let mut saw_prepare_ok = false;
   while let Some(out) = e.poll_message() {
@@ -713,7 +713,7 @@ fn settled_voter_at(epoch: u64) -> Endpoint<NoopSm> {
 
 #[test]
 fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint() {
-  // Change #3 — the egress half. A settled Normal voter at E+1 receives a strictly-LOWER-epoch
+  // The EpochAhead egress half. A settled Normal voter at E+1 receives a strictly-LOWER-epoch
   // StartViewChange (a stranded laggard's old-epoch view-change traffic) from an ACTIVE member. It
   // answers — BEFORE the sender binding — with EXACTLY ONE minimal `EpochAhead{epoch: E+1,
   // checkpoint_op}` back to that `from`, acting on NONE of the stale message's content (the SVC is then
@@ -796,7 +796,7 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
 
 #[test]
 fn a_stranded_laggard_triggers_the_cross_epoch_peer_fetch_on_an_epoch_ahead_hint() {
-  // Change #3 — the ingress half. A stranded laggard at epoch 0 (Normal) receives a minimal
+  // The EpochAhead ingress half. A stranded laggard at epoch 0 (Normal) receives a minimal
   // `EpochAhead{epoch: 1, checkpoint_op: 9}` pulled back from a bindable retained voter. It must arm the
   // SAME forced, crossing-required cross-epoch sync a higher-epoch Commit would — needing NO new-primary
   // binding (`from` is a retained voter in our own config). A NORMAL laggard STAYS Normal (it is

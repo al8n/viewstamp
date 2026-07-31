@@ -818,12 +818,12 @@ fn a_since_recovered_peer_drops_out_of_the_two_window_intersection() {
 
 #[test]
 fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
-  // PRIMARY committed-op-loss fix, exercised in the re-formation escalation path. A RecoveringHead voter holds a
+  // Committed-op loss on the PRIMARY, through the re-formation escalation path. A RecoveringHead voter holds a
   // COMMITTED op whose recovery read FAULTED but whose durable header survives — kept header-only as
   // `Body::Repairing`, NOT dropped to a bare hole. When it escalates the wedge into a view change, that op
   // must be CARRIED: its existence + identity flow into the DoViewChange / StartView log_slice so a new
   // primary peer-repairs it and never re-mints its op number. Dropping it would lose it if this voter then
-  // solo/minimal-forms the next view (the seed-774 intersection class).
+  // solo/minimal-forms the next view.
   //
   // Setup: a SEALED offline-restart successor (commit 2, dense band [h1, h2]); WAL head 3. op 1 reads clean
   // (Present); op 2 (committed, durable band header) read FAULTS → kept as `Body::Repairing`; op 3 (the
@@ -1257,7 +1257,7 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
     }
   }
   assert_eq!(r.status(), Status::Normal, "recover reaches Normal");
-  // #31: the capacity-bounded window reads the FULL held tail — K is NOT stranded, even off an unsealed root.
+  // The capacity-bounded window reads the FULL held tail — K is NOT stranded, even off an unsealed root.
   assert_eq!(
     r.op(),
     OpNumber::with(k),

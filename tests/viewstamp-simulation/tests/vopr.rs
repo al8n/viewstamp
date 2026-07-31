@@ -10,7 +10,7 @@
 //! exercising the recovery/repair placement-integrity checks); small AND large `checkpoint_ops` (the
 //! latter holds a non-trivial recover tail above the checkpoint — the large-checkpoint recover
 //! read-window path); a redundant-copy
-//! Superblock that retains the last-rooted checkpoint until a new one is durably rooted (finding B); and
+//! Superblock that retains the last-rooted checkpoint until a new one is durably rooted; and
 //! a seed-derived PHYSICAL BOUNDED-WAL RING on ~1/3 of seeds (the rest unbounded), where
 //! each WAL is a fixed `N`-slot ring so the primary STALLS op-assignment before it would wrap an
 //! un-pruned slot — folding wrap (stall-before-wrap + recover off a wrapped ring + a below-ring-window
@@ -59,11 +59,11 @@
 //! deliberately violates the `Wal` header-durability contract to measure its blast radius — it is a
 //! contract-violation measurement, never a CI gate. A
 //! wide catch-panic scan `0..512` at [`DEFAULT_TICKS`] with the async-superblock mode ON is verified
-//! clean end to end (including the final-quiesce fix — see below). The
+//! clean end to end. The
 //! bounded-WAL axis (a fixed-`N` ring on the ~1/3 of seeds it seed-derives) is verified clean over the
 //! committed `0..SEEDS` + regression range; it is drawn from a SEPARATE per-seed PRNG, so the ~2/3
 //! UNBOUNDED seeds (and every pinned regression seed that lands unbounded) keep
-//! their EXACT pre-bounded-axis schedule, leaving that historical `0..512` unbounded-schedule scan valid. The
+//! the EXACT schedule they run with the axis off, which is what keeps that wider scan valid. The
 //! committed `SEEDS` is kept smaller only to bound the gate's wall-clock (each seed runs a few thousand
 //! ticks of
 //! rich adversarial schedule).
@@ -77,7 +77,7 @@
 //! WAL, and when the cluster committed the op (whose canonical value differs) `advance_commit` applied
 //! the stale local body → a single committed op number carried two values (op 227 = `…76` on r0 vs
 //! `…77` elsewhere, for an adversarial schedule). At-most-once held throughout (no second op minted, no request
-//! committed twice). FIXED in two places: (1) `adopt_canonical_head` / `start_view_as_new_primary` now
+//! committed twice). Two places hold the line: (1) `adopt_canonical_head` / `start_view_as_new_primary`
 //! `wal.truncate` above the adopted canonical head, dropping the uncommitted divergent suffix from the
 //! WAL at the source (no durability dip — only uncommitted ops are removed); (2) `recover` extends the
 //! `vsr_headers` cross-check — a self-verifying tail slot ABOVE the durable committed frontier whose
@@ -85,8 +85,8 @@
 //! is dropped + peer-repaired instead of trusted (this catches the INTERIOR committed-band variant
 //! that the head truncation cannot, where the stale slot sits below the adopted offset-log's floor).
 //!
-//! Seed **313** was a FINAL-INSTANT durability-CHECKER artifact (verified real-vs-checker), now FIXED
-//! in the driver — NOT a proto loss. The end-of-run assertion fired `no operational replica retains the
+//! Seed **313** pins a FINAL-INSTANT durability-CHECKER artifact, a harness limit rather than a proto
+//! loss. The end-of-run assertion fired `no operational replica retains the
 //! committed history of 1141 ops` (masked by `VOPR_NO_DUP` but NOT `VOPR_NO_ASYNC_SB`). The dump at tick
 //! 4000 proved op 1141 was held DURABLY by a QUORUM — replicas 0, 1 (operational) and 3 (crashed) all
 //! had it in their WAL (head op 1143), so the per-tick structural quorum-durability check correctly
@@ -96,8 +96,8 @@
 //! the history to be APPLIED by an OPERATIONAL replica at that arbitrary instant — strictly stronger
 //! than VSR's guarantee (a committed op survives on a quorum's DURABLE storage; application is local
 //! catch-up). Proof it was no loss: from that instant a healed, fault-free cluster converged all five
-//! replicas to applied=1141 in ~74 ticks. The fix mirrors TigerBeetle's VOPR `transition_to_liveness_mode`:
-//! `run_vopr` now runs a final bounded QUIESCE phase (heal everything, restart all, no faults, tick to
+//! replicas to applied=1141 in ~74 ticks. Mirroring TigerBeetle's VOPR `transition_to_liveness_mode`,
+//! `run_vopr` runs a final bounded QUIESCE phase (heal everything, restart all, no faults, tick to
 //! convergence, full per-tick checks still live) BEFORE the end-of-run durability + applied assertions,
 //! so the survivors apply the durably-held committed tail first. It stays STRICT — a committed op held by
 //! NO quorum cannot be repaired from a non-existent source, so the drain never converges it and the phase
@@ -109,11 +109,11 @@
 //! while the ahead sub-quorum had checkpointed + GC-pruned past the gap. The primary could then neither
 //! re-commit the gap (no quorum can re-ack a pruned op), state-sync (it already held the bodies in its
 //! offset tail), nor forfeit (its checkpoint sat AT the quorum floor, so the forfeit lag was zero) — a
-//! stable wedge through a fault-free window. FIXED in `on_prepare_ok`: a primary whose commit lags the
+//! stable wedge through a fault-free window. `on_prepare_ok` closes it: a primary whose commit lags the
 //! highest peer-reported checkpoint adopts it (a peer checkpoints only a committed op) and applies the
 //! held ops — the commit-side complement of the above-head state-sync trigger.
 //!
-//! Every bug this sweep found has been fixed:
+//! The defect classes this sweep pins, and where each is guarded:
 //! - **append-before-ack re-ack hole** — the `appending` set is not a durability oracle; the
 //!   re-ack now consults the WAL's durable status directly;
 //! - **stale-unapplied-held-copy divergence** (multiple adversarial schedules) — adoption preserved a
@@ -154,26 +154,27 @@
 //!   emptying that WAL slot. Re-checking the now-STALE `PrepareOk(view = V)` against the replica's
 //!   post-truncation WAL is stricter than VSR requires: the message carries `view = V`, and the proto's
 //!   `on_prepare_ok` DROPS any ack whose `view != self.view`, so a `view < current` ack can never count
-//!   toward a commit quorum — it is inert. FIXED in the CHECKER (`Cluster::tick`): the
-//!   append-before-ack proxy exempts a `msg_view < cur_view` stale ack (same class of checker fix —
-//!   fix the checker, never the proto); a `msg_view >= cur_view` non-durable ack still trips.
+//!   toward a commit quorum — it is inert. Guarded in the CHECKER (`Cluster::tick`): the
+//!   append-before-ack proxy exempts a `msg_view < cur_view` stale ack (the checker is what gives
+//!   here, never the proto); a `msg_view >= cur_view` non-durable ack still trips.
 //! - **liveness wedge: forfeit StartViewChange STORM** — a Normal primary stuck `pending_forfeit` (it
 //!   forfeited while the cluster ran on in a higher view) RE-BROADCAST a `StartViewChange` on EVERY
 //!   `handle_timeout` tick, because `primary_timeouts` called `forfeit()` → `propose_next_view()`
 //!   unconditionally. In the nanosecond-clock simulator that storm pins the virtual clock to
 //!   sub-millisecond steps, starving the LIVE view's primary's 50ms Commit heartbeat → the stale-view
-//!   holdout never hears the new view to catch up, livelocking the cluster. FIXED in the proto: the
-//!   forfeit re-propose is now gated on the `svc_message` retransmit timer (one SVC per
+//!   holdout never hears the new view to catch up, livelocking the cluster. Guarded in the proto: the
+//!   forfeit re-propose is gated on the `svc_message` retransmit timer (one SVC per
 //!   `VC_MESSAGE_RETRANSMIT` window, like `view_change_timeouts`) — the persistent step-down + heartbeat
 //!   suppression are preserved, only the per-tick storm is removed.
-//! - **storage-fault committed-op loss + op-number reuse** (found by a release-mode `0..2048` wide
-//!   sweep) — a committed op (on a durable quorum) was LOST and its op number RE-MINTED
+//! - **storage-fault committed-op loss + op-number reuse** — a committed op (on a durable quorum)
+//!   was LOST and its op number RE-MINTED
 //!   across a view change when a recover-time disk fault (torn/bit-rot) dropped that op's WAL slot on the
 //!   SOLE commit/view quorum-intersection replica, which then neither held the op nor knew it was
-//!   committed. FIXED structurally (TigerBeetle's body-independent header durability): an op's HEADER now
+//!   committed. Guarded structurally (TigerBeetle's body-independent header durability): an op's HEADER
 //!   survives a body-only fault, so `recover` keeps the op header-only as a `Body::Repairing` hole rather
 //!   than dropping it; that hole flows through the DoViewChange so `select_canonical_log` counts the op as
-//!   TAKEN (never re-minted) and the new primary peer-repairs the canonical body. `0..2048` is now clean.
+//!   TAKEN (never re-minted) and the new primary peer-repairs the canonical body. `0..2048` is verified
+//!   clean.
 
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
@@ -377,7 +378,7 @@ fn vopr_sweep_no_violations() {
     //   above the small interval's ~12 ceiling, not always a tiny one;
     // - the misdirected-read axis fired, exercising the recovery/repair placement-integrity checks
     //   (`header.op() == op`) that the DST otherwise never reaches;
-    // - the two-slot/redundant-copy superblock (finding B) still drives GENUINE peer-fetch escalations
+    // - the two-slot/redundant-copy superblock still drives GENUINE peer-fetch escalations
     //   (only the SPURIOUS orphaned-checkpoint ones were removed) — `forced_syncs > 0` proves a replica
     //   really had to fetch a checkpoint/op from a peer because its own disk could not serve it.
     assert!(
@@ -504,15 +505,15 @@ fn vopr_sweep_no_violations() {
 /// schedule, and this lane is ADDITIVE to the default sweep, so its budget is kept modest.
 const HOLD_SEEDS: u64 = 16;
 
-/// Hold-axis regression seeds: each caught a real bug under a held-message schedule (the nightly wide
-/// hold sweep, `VOPR_HOLD=1` over `0..1024`), pinned here with the axis FORCED ON — a default-axis run
-/// of the same seed consumes different PRNG draws and never reaches the failing schedule.
+/// Hold-axis regression seeds: schedules that expose a real defect only under a held-message
+/// schedule, pinned here with the axis FORCED ON — a default-axis run of the same seed consumes
+/// different PRNG draws and never reaches the failing schedule.
 ///
 /// - **903** — ring-residency committed-op loss on a BOUNDED ring: a deep laggard (own checkpoint a
-///   full ring behind the cluster) was handed a peer-repair body for a committed op ABOVE its ring
-///   window, and `fill_repair` appended it, physically evicting a committed, un-pruned op (the
-///   adoption re-append had the same unguarded shape). Fixed by extending the below-ring-window
-///   discipline (`ring_append_would_wrap`) to BOTH non-head-extend append paths.
+///   full ring behind the cluster) is handed a peer-repair body for a committed op ABOVE its ring
+///   window, and an unguarded `fill_repair` appends it, physically evicting a committed, un-pruned op
+///   (the adoption re-append has the same shape). Guarded by the below-ring-window discipline
+///   (`ring_append_would_wrap`) on BOTH non-head-extend append paths.
 const HOLD_REGRESSION_SEEDS: [u64; 1] = [903];
 
 /// The committed HOLD sweep: [`run_vopr_with_hold`] over `0..HOLD_SEEDS` — the unbounded-hold network
@@ -1851,7 +1852,7 @@ fn vopr_collect_failures() {
   }
 }
 
-/// Regression for the final-quiesce fix: a FINAL-INSTANT durability-checker artifact, NOT a proto loss.
+/// Seed 313, the FINAL-INSTANT durability-checker artifact: a harness limit, NOT a proto loss.
 ///
 /// Under an adversarial schedule the committed-history high-water op was APPLIED only by a replica
 /// that happened to be CRASHED at that instant, while two OPERATIONAL survivors held that op DURABLY
@@ -1860,11 +1861,11 @@ fn vopr_collect_failures() {
 /// their `commit_max` had not yet learned the op was committed). The end-of-run durability assertion
 /// asked for the committed history to be APPLIED by an operational replica AT THAT ARBITRARY INSTANT —
 /// strictly stronger than VSR's true guarantee (a committed op survives on a quorum's DURABLE storage;
-/// application is local catch-up that completes eventually). The fix gives [`run_vopr`] a final
+/// application is local catch-up that completes eventually). [`run_vopr`] therefore runs a final
 /// bounded QUIESCE phase (heal everything, restart all, no faults, tick to convergence) BEFORE the
 /// end-of-run assertions — exactly TigerBeetle's VOPR `transition_to_liveness_mode` discipline — so the
 /// survivors apply the durably-held committed tail before the check. This run is a pure function of
-/// the seed, so the artifact reproduces exactly and the drained run must now pass.
+/// the seed, so the artifact reproduces exactly and the drained run must pass.
 #[test]
 fn seed_313_final_quiesce_converges_the_durably_held_committed_tail() {
   // Must NOT panic: the final quiesce phase drains the committed tail the (operational) survivors
@@ -1892,8 +1893,7 @@ fn seed_313_final_quiesce_converges_the_durably_held_committed_tail() {
 /// `VOPR_SEED` to the seed of interest and run with `--ignored --nocapture`. (Ignored so it does not
 /// run in the normal sweep; it is a debugging aid, not a gate.) Pair with the `VOPR_DUMP` /
 /// `VOPR_TRACE` / `VOPR_NO_*` env switches in `src/vopr.rs` to dump divergence state, trace actions, or
-/// shrink the fault set while staying on the exact same seeded schedule. (Set `VOPR_SEED` to any seed
-/// you want to inspect — e.g. a historical bug-finder like 24, 36, or 164.)
+/// shrink the fault set while staying on the exact same seeded schedule.
 #[test]
 #[ignore = "single-seed replay: set VOPR_SEED and run with --ignored --nocapture to debug a sweep failure"]
 fn replay_single_seed() {
@@ -1961,41 +1961,43 @@ fn replay_single_restart_in_place_seed() {
 /// [`HOLD_SEEDS`]).
 const RESTART_IN_PLACE_SEEDS: u64 = 16;
 
-/// Restart-in-place regression seeds: the applied-history safety violations the crossed axis used
-/// to produce — a replica's state machine applying an op number BELOW the position it sits at
-/// (e.g. seed 33: `applied op 1580 at position 1583`), the applied-stream shape of a committed op
-/// re-served with the wrong sequencing. All of them were consequences of a rebuilt endpoint losing
-/// the medium's slot-quiescence witnesses; they are pinned here so the session that carries those
-/// witnesses cannot regress without a failing seed.
+/// Restart-in-place regression seeds: schedules whose crossed axis exposes an applied-history
+/// safety violation when a rebuilt endpoint loses the medium's slot-quiescence witnesses — a
+/// replica's state machine applying an op number BELOW the position it sits at (seed 33 reaches
+/// `applied op 1580 at position 1583`), the applied-stream shape of a committed op re-served with
+/// the wrong sequencing. Pinned here so the session that carries those witnesses across a rebuild
+/// cannot regress without a failing seed.
 ///
-/// Seed 162 sat in this list too, with a different shape, and is pinned on its own in
+/// Seed 162 pins a different shape and has its own gate,
 /// [`restart_in_place_seed_162_stays_within_the_durability_model`].
 const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 7] = [33, 59, 64, 78, 134, 179, 186];
 
 /// Seed 162 of the restart-in-place axis, pinning two properties at once.
 ///
-/// **The durability bound.** At its original two voters this seed wedged because the fault injector
-/// put the run outside the durability model. At tick 1697 both voters were `Normal` in view 40 with
-/// `op = 209`, `commit_max = 208`, `commit_min = 96`: the blocked op 97's durable copies had BOTH
-/// been permanently destroyed at append time (replica 0's by bit-rot, replica 1's by a torn write
-/// whose stored body fails `Header::verify`), and with a unanimous two-voter quorum `f` is 0, so op
-/// 97's bytes existed nowhere — holding the commit at the hole and soliciting forever was the only
-/// safe response. That was a harness fault-model gap, not a protocol defect; the cross-replica
-/// permanent-fault bound closed it, and the third assertion below keeps the bound observed FIRING
-/// on this seed rather than inferred from the pass.
+/// **The durability bound.** At the two voters the size draw gives it without the
+/// permanent-corruption fold, this seed wedges: the fault injector puts the run outside the
+/// durability model. At tick 1697 both voters are `Normal` in view 40 with `op = 209`,
+/// `commit_max = 208`, `commit_min = 96`: the blocked op 97's durable copies have BOTH been
+/// permanently destroyed at append time (replica 0's by bit-rot, replica 1's by a torn write whose
+/// stored body fails `Header::verify`), and with a unanimous two-voter quorum `f` is 0, so op 97's
+/// bytes exist nowhere — holding the commit at the hole and soliciting forever is the only safe
+/// response. That is a harness fault-model gap, not a protocol defect, and the cross-replica
+/// permanent-fault bound is what keeps the schedule out of it; the third assertion below keeps the
+/// bound observed FIRING on this seed rather than inferred from the pass.
 ///
-/// **The rebuild over a staged root.** The permanent-corruption voting-set fold reshaped this seed
-/// to three voters, and the reshaped schedule fires `restart_in_place` while a durable-view root
+/// **The rebuild over a staged root.** The permanent-corruption voting-set fold puts this seed at
+/// three voters, and that schedule fires `restart_in_place` while a durable-view root
 /// write is still STAGED: the dead incarnation adopted a view and submitted its root, the endpoint
 /// is rebuilt before it lands, and the staged root then lands underneath the successor. Running
 /// clean here requires the storage session's root timeline: the successor recovers at the
 /// EFFECTIVE root (never below a state the medium is already guaranteed to reach), parks its own
 /// root write behind the inherited one, and lifts its durable-view witness only as the landings
-/// settle. Before the timeline carried recovery, this schedule tripped the view-monotonic oracle —
-/// `durable view regressed to 8 (was 9)` at tick 3792 — the successor recovered at the last LANDED
-/// root, the staged higher-view root landed underneath it, and the successor's own lower root
-/// followed. `VOPR_NO_ASYNC_SB=1` isolates the mechanism: masking the staged-write window makes
-/// the regression unreachable, so a future failure here that survives the mask is NOT this shape.
+/// settle. Without recovery baselining on that timeline this schedule trips the view-monotonic
+/// oracle — `durable view regressed to 8 (was 9)` at tick 3792 — the successor recovering at the
+/// last LANDED root, the staged higher-view root landing underneath it, and the successor's own
+/// lower root following. `VOPR_NO_ASYNC_SB=1` isolates the mechanism: masking the staged-write
+/// window makes the regression unreachable, so a future failure here that survives the mask is NOT
+/// this shape.
 #[test]
 fn restart_in_place_seed_162_stays_within_the_durability_model() {
   let r = run_vopr_with_restart_in_place(162, DEFAULT_TICKS);
@@ -2007,10 +2009,10 @@ fn restart_in_place_seed_162_stays_within_the_durability_model() {
     r.max_committed() > 0,
     "the seed must do real work, not merely survive by making no progress"
   );
-  // The bound is what turned this seed from a wedge into a clean run, so it must be observed firing
-  // here rather than inferred from the pass. Both voters ran a unanimous quorum, where `f` is 0, and
-  // the old run destroyed two durable copies of op 97 — so both of those rolls are refusals now, and
-  // this count can only be zero if the budget stopped being consulted.
+  // The bound is what keeps this seed inside the durability model, so it must be observed FIRING
+  // here rather than inferred from the pass: the seed's fault schedule rolls permanent body faults
+  // on the same op across replicas, so a zero here means the run no longer reaches the durability
+  // boundary at all and the pass rests on something else entirely.
   assert!(
     r.permanent_faults_refused() > 0,
     "the durability bound never fired on the seed it exists to keep inside the model \

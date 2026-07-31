@@ -1802,11 +1802,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // self-verifying) authenticates the STATE, but the trigger still gates the SENDER to a current member.
     // The trigger sender is authenticated as either a RESOLVED current member (its slot is in our
     // membership) or a QUARANTINED attested member (a `Peer::Member` our membership does not resolve —
-    // the #65 shape: a laggard partitioned across a rolling replacement, whose higher-epoch heartbeats
+    // a laggard partitioned across a rolling replacement, whose higher-epoch heartbeats
     // arrive on quarantined conns from the new members it cannot yet resolve). A client / out-of-config
     // slot elicits nothing. Provenance matters for the bounded probe below: a RESOLVED-member hint is
     // authoritative (unbounded); a quarantine-sourced one arms a BOUNDED probe and records the donor to
-    // solicit directly (our `RequestSync` fan-out reaches only bound members — for #65's laggard those
+    // solicit directly (our `RequestSync` fan-out reaches only bound members — for such a laggard those
     // are its dead old peers).
     let quarantined_source = match from {
       Peer::Replica(slot) if self.membership.member_at(slot).is_some() => false,
@@ -1850,8 +1850,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // APPENDED op `N` but missed its commit (`op == N`, `commit_min < N`) sees a checkpoint at `M == N == op`
     // and would NOT sync, stranding at the old epoch. Instead arm directly through the `arm_sync` chokepoint:
     //
-    // - `target = checkpoint` (the advertised cluster crossing point, `>= N` via #1) — the cross-epoch
-    //   crossing checkpoint a donor serves at `M >= N`.
+    // - `target = checkpoint` (the advertised cluster crossing point, `>= N` because the epoch swap
+    //   forces a checkpoint at `M >= N`) — the cross-epoch crossing checkpoint a donor serves at `M >= N`.
     // - `forced = true` — so `apply_sync`'s discard-direction assert uses the relaxed `checkpoint_op >=
     //   commit_min` invariant (needed for the `op == N` case, where the synced checkpoint sits at/below the
     //   head); the arm is NOT `> op`-gated, so `op == N` still crosses.
@@ -1863,7 +1863,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // until `apply_sync` INSTALLS the verified crossing checkpoint (which then advances `commit_min` to
     // `M >= N`, installs the successor membership, and discards the stale tail). So a higher-epoch message
     // moves no accumulator; the speculative sync just keeps re-soliciting until a donor's `M >= N` crossing
-    // checkpoint lands (#1 guarantees one exists). UPGRADE an outstanding sync to a forced pinned crossing
+    // checkpoint lands (the epoch swap's forced checkpoint guarantees one exists). UPGRADE an
+    // outstanding sync to a forced pinned crossing
     // (keeping the higher target, anti-thrash on the nonce); otherwise fresh-arm a crossing sync.
     match self.sync {
       Some(s) => {

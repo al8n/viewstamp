@@ -558,7 +558,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       Message::RequestSync(request),
     ));
     // ALSO solicit a remembered QUARANTINED donor directly: the `Backups` fan-out reaches only
-    // bound members, but a crossing armed by a quarantined member (#65) must reach the donor whose
+    // bound members, but a crossing armed by a quarantined member must reach the donor whose
     // slot this laggard cannot yet resolve — its old bound peers are gone.
     if let Some(donor) = self.quarantined_donor {
       self.emit(Outgoing::new(
@@ -603,8 +603,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Service the bounded QUARANTINE probe against its wall-clock deadline and report whether it DISARMED.
-  /// The probe bounds a crossing armed SOLELY by a quarantined member's higher-epoch evidence (the #65
-  /// C-side / a possibly bit-flipped epoch scalar no donor can answer): left unbounded it would keep a
+  /// The probe bounds a crossing armed SOLELY by a quarantined member's higher-epoch evidence (a
+  /// genuinely stranded laggard, or a bit-flipped epoch scalar no donor can answer): left unbounded it would keep a
   /// speculative cross-epoch `sync` armed forever, wedging op-mint at the stale epoch. It is the
   /// epoch-plane twin of the view-plane catch-up revert.
   ///
@@ -1970,7 +1970,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // empty-membership reply (a donor in the transient force-checkpoint window serving its `M < N` checkpoint)
     // is REJECTED: stage NOTHING and return, leaving `sync`/`pending_install` consistent (identical to the
     // corrupt-membership `None => return` drop above) so the solicit timer re-fetches until a donor's E+1
-    // crossing checkpoint lands (#1 guarantees one exists, restart-survivably).
+    // crossing checkpoint lands (the epoch swap's forced checkpoint guarantees one exists,
+    // restart-survivably).
     //
     // The hinted `target` (an EpochAhead / higher-epoch `checkpoint_op`) is NOT a hard crossing bound here —
     // only the SOLICIT floor (which donor checkpoint to request). A buggy/misrouted higher-epoch message

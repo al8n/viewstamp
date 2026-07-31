@@ -593,8 +593,8 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     "op 2 is NOT applied to the SM before its append is durable \
      (FAIL-BEFORE: op 2 applied immediately on the staged append)"
   );
-  // op 2's HEADER stays exposed in the log_slice as a `Repairing` hole — seed-774 keeps a committed op's
-  // existence in the DVC (header-only) so a new primary peer-repairs it; that header has been durable in
+  // op 2's HEADER stays exposed in the log_slice as a `Repairing` hole — keeping a committed op's
+  // existence in the DVC (header-only) is what lets a new primary peer-repair it; that header has been durable in
   // the committed band since recovery, independent of this staged fill. The consensus-critical barrier is
   // that the STAGED RepairFill body is NOT folded into a `Present` entry before it is durable: op 2 stays
   // `Repairing` (the body rides in `Pending::RepairFill`, not `self.log`), so this replica never sources

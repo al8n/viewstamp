@@ -2851,7 +2851,7 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   assert_eq!(ep.op(), OpNumber::with(10));
   // A backup's PrepareOk reports checkpoint_op = 8 — ABOVE the hole at 2, so the hole is snapshot-only
   // on that peer (pruned: RequestPrepare is futile). This drives the production `on_prepare_ok` →
-  // `maybe_force_sync` path on the PRIMARY (the exact strand the finding flagged as reachable).
+  // `maybe_force_sync` path on the PRIMARY, rather than reaching it through a test-only shortcut.
   let mut storage = Storage::new(wal, sb);
   ep.handle_message(
     Instant::ZERO,
@@ -2937,13 +2937,13 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
 
 #[test]
 fn a_primary_in_the_force_sync_strand_never_reuses_an_op_number() {
-  // SAFETY (the heart of the finding): the op-reuse divergence happens ONLY if the primary's `op` is
+  // SAFETY (the heart of the hazard): the op-reuse divergence happens ONLY if the primary's `op` is
   // REWOUND below its head (force-sync resets it to the checkpoint, then new requests land at the
-  // vacated op numbers that backups still hold under old bodies). The forfeit fix guarantees `op` is
-  // NEVER rewound. We drive the full strand→forfeit→serve sequence and assert `op` is monotone
+  // vacated op numbers that backups still hold under old bodies). The deferred forfeit guarantees `op`
+  // is NEVER rewound. We drive the full strand→forfeit→serve sequence and assert `op` is monotone
   // non-decreasing throughout: a request the (still-Normal, lone-SVC) primary serves lands at a FRESH
-  // op ABOVE the old head (11), never at a reused number. Under the OLD force-sync behaviour `op`
-  // would have collapsed to the checkpoint floor, and the next request would have reused op 9/10.
+  // op ABOVE the old head (11), never at a reused number. Were `op` instead allowed to collapse to the
+  // checkpoint floor, the next request would reuse op 9/10.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (wal, sb) = (TestWal::default(), TestSb::default());
@@ -4011,8 +4011,8 @@ fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
   // `hash(E3_membership, E2) == E3_config_id`), and that content verification is what self-certifies the
   // installed configuration: it never depended on the laggard's own lineage, so a distance-3 skip is as
   // sound to install as a single step. There is NO distance bound — the laggard crosses directly to E3
-  // rather than stranding forever on a "closer donor" the protocol does not preserve (the finding: a
-  // retained member offline across three changes could never re-sync). The post-crossing ring stamps
+  // rather than stranding forever on a "closer donor" the protocol does not preserve (with a distance
+  // bound, a retained member offline across three changes could never re-sync). The post-crossing ring stamps
   // `[E2, E0]` — the VERIFIED immediate predecessor E2 over the laggard's own prior E0 — which SKIPS the
   // intermediate E1: a bounded liveness nicety (an agnostic solicitation carrying E1 is not admitted;
   // state-sync is admitted on member identity regardless), never a safety gap, since the immediate
@@ -4159,7 +4159,7 @@ fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
 
 #[test]
 fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
-  // Change #2 — the `op == N` crossing. A Normal laggard APPENDED the reconfigure op N but missed its
+  // The `op == N` crossing. A Normal laggard APPENDED the reconfigure op N but missed its
   // commit (`op == N`, `commit_min < N`), so the ordinary `maybe_request_sync` trigger (gated
   // `incoming_checkpoint > self.op`) would do NOTHING for a checkpoint at `M == N == op` and the laggard
   // would strand at the OLD epoch. The unified forced peer-fetch is NOT `> op`-gated: a higher-epoch
@@ -4504,7 +4504,7 @@ fn a_slot_shifted_donor_whole_sync_checkpoint_reply_is_admitted_and_crosses() {
 
 #[test]
 fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits() {
-  // Change #2 — the CROSSING REQUIREMENT. A forced cross-epoch fetch (`require_cross_epoch`) must NOT
+  // The CROSSING REQUIREMENT. A forced cross-epoch fetch (`require_cross_epoch`) must NOT
   // settle for a below-target / empty-membership reply (a donor in the transient force-checkpoint window
   // serving its `M < N` checkpoint): installing it with `successor = None` would EXIT Recovering STILL at
   // the old epoch — a fetch that does not cross. The fetch REJECTS such a reply (sync stays armed, no
@@ -4657,7 +4657,7 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
 
 #[test]
 fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_successor() {
-  // Change #2 — the VERIFICATION IS THE AUTHORITY, not the unverified hint. The cross-epoch trigger
+  // VERIFICATION IS THE AUTHORITY, not the unverified hint. The cross-epoch trigger
   // treats the hint's `checkpoint_op` only as a STICKY SOLICIT FLOOR (`target` raises). A buggy/misrouted
   // higher-epoch message (an `EpochAhead` hint here) carrying an UNREACHABLE-HIGH `checkpoint_op` must NOT
   // become a hard crossing bound: the real crossing requirement is installing a VERIFIED successor
@@ -9723,7 +9723,7 @@ fn a_quarantined_member_reaches_no_authority_path() {
 
 #[test]
 fn a_quarantined_member_is_served_the_state_sync_checkpoint() {
-  // The #63/#65/#70 donor side: a quarantined attested member soliciting state-sync IS served the
+  // The donor side of the quarantined-member lane: a quarantined attested member soliciting state-sync IS served the
   // checkpoint (routed back to its `Peer::Member` address) — the no-authority read that lets a
   // stranded member learn the current configuration to rejoin or discover its own retirement.
   let now = Instant::ZERO;
@@ -9761,7 +9761,7 @@ fn a_quarantined_member_is_served_the_state_sync_checkpoint() {
 
 #[test]
 fn a_quarantined_higher_epoch_hint_arms_a_bounded_probe_that_disarms() {
-  // The #65 laggard-trigger side + the bounded probe. A quarantined member's higher-epoch heartbeat
+  // The laggard-trigger side of that lane, plus the bounded probe. A quarantined member's higher-epoch heartbeat
   // arms a crossing sync (which blocks op-mint) AND records the quarantined donor to solicit
   // directly (the fan-out reaches only bound members — for a partitioned laggard those are its dead
   // old peers). If no crossing-presenting answer arrives, the probe DISARMS after the bounded window
@@ -10452,7 +10452,7 @@ fn quarantined_serves_are_capped_independently_of_the_transport() {
   // reserving the map's replica capacity independently of transport connection lifetime.
   //
   // NEUTER CHECK: drop the QUARANTINE_SERVE_LIMIT gate and the member-serve count grows to the number of
-  // distinct ids that solicited (here 32) — the unbounded growth R4-F2 flags.
+  // distinct ids that solicited (here 32) — unbounded in the number of distinct requesters.
   let (mut e, mut storage) = donor_primary_at_checkpoint(2);
   let now = Instant::ZERO;
   while e.poll_message().is_some() {} // drain warm-up

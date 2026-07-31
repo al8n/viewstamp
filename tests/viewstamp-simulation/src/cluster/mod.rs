@@ -792,8 +792,8 @@ impl Cluster {
 
   /// Enables (or, with `None`, disables) **async-append mode** on every replica's WAL, with per-append
   /// delay `delay` polls. In this mode an append stays not-yet-durable (`SlotStatus::Dirty`, reads
-  /// `Absent`) for `delay` polls — the in-flight window the append-before-ack invariant must survive
-  /// (Phase A). Composes with the current storage-fault plan. Call before running; the mode persists
+  /// `Absent`) for `delay` polls — the in-flight window the append-before-ack invariant must
+  /// survive. Composes with the current storage-fault plan. Call before running; the mode persists
   /// across `crash`/`restart` because the WAL struct does. Rebuilds the (empty) WALs, like
   /// [`set_storage_faults`](Self::set_storage_faults).
   pub fn set_async_wal_delay(&mut self, delay: Option<u32>) {

@@ -27,15 +27,15 @@ use viewstamp_simulation::{
 #[test]
 fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
   // The durable-root timeline's CONSTANT bound, driven through the checker at exactly the shape
-  // that used to grow the queue: a superblock so slow the front root write never lands, a
-  // view-change escalation that keeps a durable-view root submitted behind it, and an endpoint
-  // rebuilt in place over the live session faster than the backend services roots. Each dead
-  // incarnation used to leave its parked durable-view root on the timeline — no correlation-ending
-  // path runs at a rebuild, so nothing forfeited it — growing the queue by one header-bearing
-  // state per rebuild cycle, while the checker's then-affine allowance (three plus two per
-  // incarnation) grew right along with it and could never fail. The endpoint-construction
-  // collapse now removes the dead incarnations' parked roots, and the checker holds the queue to
-  // the constant three: the held front plus the live endpoint's awaited roots.
+  // that grows the queue without the endpoint-construction collapse: a superblock so slow the
+  // front root write never lands, a view-change escalation that keeps a durable-view root
+  // submitted behind it, and an endpoint rebuilt in place over the live session faster than the
+  // backend services roots. No correlation-ending path runs at a rebuild, so nothing else
+  // forfeits a dead incarnation's parked durable-view root — leaving it on the timeline would add
+  // one header-bearing state per rebuild cycle, and an affine allowance (three plus two per
+  // incarnation) would grow right along with it and could never fail. The collapse drops those
+  // parked roots at endpoint construction, so the checker holds the queue to the constant three:
+  // the held front plus the live endpoint's awaited roots.
   for seed in 0..4u64 {
     let mut c = Cluster::new(3, 1, 1, seed);
     // Every superblock write stays staged for the whole run: the first root any survivor submits

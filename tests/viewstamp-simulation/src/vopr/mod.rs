@@ -163,10 +163,10 @@ pub struct VoprReport {
   /// cannot recover a committed checkpoint/op from its OWN disk and must FETCH it from a peer — both
   /// the pruned-committed-hole escalation path AND the recover-checkpoint peer-fetch (a replica whose
   /// own durable checkpoint snapshot reads back unusable). It is the observability proxy for
-  /// "peer-fetch escalation": the two-slot-superblock fix (finding B) removes the SPURIOUS escalations
-  /// (an orphaned checkpoint a redundant-copy backend would still hold locally) while a GENUINELY
-  /// far-behind replica (its own checkpoint truly subsumed/gone) still escalates — so this count must
-  /// stay `> 0` after the fix, proving the path is still exercised.
+  /// "peer-fetch escalation": the two-slot superblock removes the SPURIOUS escalations (an orphaned
+  /// checkpoint a redundant-copy backend would still hold locally) while a GENUINELY far-behind
+  /// replica (its own checkpoint truly subsumed/gone) still escalates — so this count must stay
+  /// `> 0`, proving the path is still exercised rather than merely quiet.
   forced_syncs: u64,
   /// The bounded WAL ring size `N` this run was seeded with, or `None` if this seed runs
   /// the UNBOUNDED default (≈2/3 of seeds). When `Some(n)`, every replica's WAL is a fixed `n`-slot ring
@@ -1911,7 +1911,7 @@ impl Vopr {
     // rates, and injects nothing for the whole run. Those seeds would spend their entire tick budget
     // exercising the transient axes alone while appearing to carry permanent corruption. n=3 is the
     // smallest size that can host it (quorum 2, `f` 1), so the 2-slot folds onto 3; the other four
-    // sizes keep their draw, which is why only the seeds that drew two voters change schedule at all.
+    // sizes keep their draw, so only a seed that draws two voters is remapped.
     // This is the size-side counterpart of the argument the TRANSIENT misdirect rate carries in
     // `chaos_storage_faults`: a misdirected read never removes a correct copy, so it is quorum-safe at
     // any size and needs no such constraint.

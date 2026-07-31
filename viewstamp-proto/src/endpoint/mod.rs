@@ -302,8 +302,9 @@ struct SyncState {
   /// membership — it can NOT settle for a below-`target`, same-config, or empty-membership reply (which
   /// `apply_sync` would otherwise install with `successor = None`, exiting STILL at the old epoch). When
   /// set, `apply_sync` REJECTS any non-crossing reply (leaving `sync` armed so the solicit timer
-  /// re-fetches), completing only on the `M >= N` successor-membership checkpoint that #1 guarantees
-  /// exists; and the crossing install forces `held_tail = false` (the old-epoch tail above `M` is not in
+  /// re-fetches), completing only on the `M >= N` successor-membership checkpoint the epoch swap's
+  /// forced checkpoint guarantees exists (`on_sb_done`'s `SwapEpoch` arm checkpoints at `M >= N`);
+  /// and the crossing install forces `held_tail = false` (the old-epoch tail above `M` is not in
   /// E+1's lineage). An ordinary / non-cross-epoch sync (`false`) keeps the existing empty-membership
   /// `successor = None` behavior byte-identical.
   require_cross_epoch: bool,
@@ -1000,7 +1001,7 @@ struct RecoverState {
 /// [`crate::message`]; re-used here as the in-memory `LogEntry`'s body.
 pub(crate) use crate::message::Body;
 
-/// One entry in the in-memory log (persistence arrives in a later milestone). Its [`Body`] is either
+/// One entry in the in-memory log. Its [`Body`] is either
 /// `Present` (the bytes) or `Repairing` (only the durable `body_checksum`, awaiting peer-repair).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogEntry {
@@ -1378,9 +1379,9 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// commit machinery and `sm_at` by the content machinery, so `assert_invariants` can cross-check
   /// the two independently-written frontiers: at every handler exit `sm_at == commit_min` unless a
   /// flagged behind-window is open (`sm_reconstruct` owed, or recovery rebuilding). This reifies
-  /// "the SM's content is where the pointers say it is" — previously only the emergent negation of
-  /// a three-flag disjunction spread across five modules — as one first-class witness, making any
-  /// future path that applies over a stale SM or advances a pointer past un-restored content trip
+  /// "the SM's content is where the pointers say it is" as one first-class witness rather than the
+  /// emergent negation of a flag disjunction spread across modules, so any
+  /// path that applies over a stale SM or advances a pointer past un-restored content trips
   /// deterministically across the suite and the VOPR debug gate.
   sm_at: OpNumber,
   /// Highest op known committed cluster-wide (may exceed locally-held + applied ops).
@@ -1647,8 +1648,8 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// from the live signal rather than a stale persisted goal.
   cross_epoch_intent: Option<OpNumber>,
   /// The QUARANTINED donor to solicit a crossing checkpoint from directly, when the crossing was armed
-  /// by a QUARANTINED attested member (a `Peer::Member` the active membership does not resolve — the
-  /// #65 shape: a laggard partitioned across a rolling replacement whose donors are the new members it
+  /// by a QUARANTINED attested member (a `Peer::Member` the active membership does not resolve — a
+  /// laggard partitioned across a rolling replacement whose donors are the new members it
   /// cannot yet resolve, so its `RequestSync` fan-out reaches only its dead old peers). `Some(peer)`
   /// both records the address to also solicit (beside the `Backups` broadcast) AND marks the crossing
   /// as quarantine-sourced, which bounds it (below). Cleared when a RESOLVED-member higher-epoch hint
@@ -3186,9 +3187,10 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   }
 
   /// The aggregate `(Status × sub-state-flag)` coupling check — TigerBeetle's `assert_main`, run at the
-  /// END of every public entry point (`handle_message` / `handle_timeout` / `handle_storage`). The flag
-  /// rules previously lived only as scattered prose at each set/clear site; encoding them as ONE
-  /// handler-exit invariant makes any future drift (a transition that forgets to clear a flag, a new
+  /// END of every public entry point (`handle_message` / `handle_timeout` / `handle_storage`). Encoding
+  /// the flag rules as ONE
+  /// handler-exit invariant, rather than as prose at each set/clear site, makes any drift (a transition
+  /// that forgets to clear a flag, a new
   /// sub-state that violates the coupling) trip DETERMINISTICALLY across the whole suite + VOPR, exactly
   /// like the `serviceable_now` no-orphan-due assert does for timers. Each clause is verified to hold at
   /// every handler exit (the `new`/transition handlers re-establish the coupling before returning); this
@@ -5506,7 +5508,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       // A CURRENT member answering under a slot that shifted across the reconfiguration.
       Peer::Replica(slot) => self.membership.member_at(slot).is_some(),
       // A QUARANTINED attested member (our active membership does not resolve it) answering OUR
-      // outstanding crossing sync — the #65 shape: a partitioned laggard's donors are the new members
+      // outstanding crossing sync — a partitioned laggard's donors are the new members
       // it cannot yet resolve, so their `SyncCheckpoint` arrives on a quarantined conn. The reply
       // carries NO authority; the in-flight sync's NONCE is the authenticator (`on_sync_checkpoint`
       // drops any reply whose nonce does not match this incarnation's solicitation), so an unsolicited
@@ -5907,7 +5909,7 @@ where
       return;
     }
     // Authenticate `from` as either an ACTIVE replica member of OUR configuration (its slot resolves)
-    // or a QUARANTINED attested member (the #70 shape: a node REMOVED while offline still dials us
+    // or a QUARANTINED attested member (a node REMOVED while offline still dials us
     // from its stale peer map; the transport can no longer resolve its id, so it binds quarantined —
     // yet answering its stale traffic with the hint is exactly how it learns to walk itself to its
     // own retirement). A non-peer / out-of-config-slot sender elicits nothing. The hint carries no
