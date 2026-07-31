@@ -10532,7 +10532,7 @@ fn a_transfer_drained_under_the_superblock_fence_installs_from_the_local_arq() {
   e.stage_pending_checkpoint_for_test();
   e.block_step(now, &mut storage, &mut blocks);
   assert!(
-    !std::iter::from_fn(|| e.poll_message())
+    !core::iter::from_fn(|| e.poll_message())
       .any(|out| matches!(out.msg_ref(), Message::RequestBlock(_))),
     "ANTI-VACUITY: the DAG really is local — the walk DRAINED both frontiers rather than emitting a \
      pull, so the drain destination was reached under the fence"
@@ -10554,7 +10554,7 @@ fn a_transfer_drained_under_the_superblock_fence_installs_from_the_local_arq() {
   let later = now + SYNC_SOLICIT;
   e.sync_timeouts(later, &mut storage);
   assert!(
-    std::iter::from_fn(|| e.poll_message())
+    core::iter::from_fn(|| e.poll_message())
       .any(|out| matches!(out.msg_ref(), Message::RequestSync(_))),
     "ANTI-VACUITY: the solicit cadence really fired, so this ARQ round is a live one"
   );
