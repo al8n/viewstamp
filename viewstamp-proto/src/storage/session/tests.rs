@@ -438,14 +438,142 @@ fn a_successors_root_parks_behind_a_dead_predecessors_outstanding_one() {
 }
 
 #[test]
-fn same_incarnation_roots_stack_without_parking() {
+fn a_slow_backend_never_holds_more_than_one_outstanding_root() {
+  // A conforming backend may be arbitrarily slow, so the session must not hand it a second root
+  // while one is outstanding: the physical pipeline is one deep, and everything behind it parks.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
   s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
+  s.submit_root(WriteId::new(1, 3), root_at_view(4, 0, 0));
   assert_eq!(
     s.sb_mut().staged_roots.len(),
+    1,
+    "an outstanding root gates every later submission into the parked tail"
+  );
+  assert_eq!(
+    s.roots_in_flight(),
+    3,
+    "every submission is on the timeline"
+  );
+  assert_eq!(
+    s.effective_root(),
+    root_at_view(4, 0, 0),
+    "the back of the queue is still the effective root while parked"
+  );
+
+  // Each landing hands exactly the next queued root to the backend, in queue order — an
+  // endpoint's own stacking still lands last-submitted-wins, with the order enforced by the
+  // queue rather than trusted to the backend's serialization.
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("first landing").landed_root.is_some());
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    1,
+    "the landing released ONE parked root"
+  );
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("second landing").landed_root.is_some());
+  s.sb_mut().land_root();
+  let (id, state) = s
+    .poll_sb()
+    .expect("third landing")
+    .landed_root
+    .expect("reported");
+  assert_eq!(id, WriteId::new(1, 3));
+  assert_eq!(
+    state,
+    root_at_view(4, 0, 0),
+    "the latest submitted root became durable"
+  );
+  assert!(!s.has_inflight());
+}
+
+#[test]
+fn a_forfeited_parked_root_leaves_the_timeline() {
+  // The submitter superseded (or abandoned) its parked root: forfeiture removes the entry — the
+  // backend never saw the write, so nothing physical remains to wait for — while the submitted
+  // front stays owed to the medium.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let outstanding = WriteId::new(1, 1);
+  let superseded = WriteId::new(1, 2);
+  let newest = WriteId::new(1, 3);
+  s.submit_root(outstanding, root_at_view(2, 0, 0));
+  s.submit_root(superseded, root_at_view(3, 0, 0));
+  s.forfeit_root(superseded);
+  s.submit_root(newest, root_at_view(4, 0, 0));
+  assert_eq!(
+    s.roots_in_flight(),
     2,
-    "an endpoint's own checkpoint + view-change stacking reaches the backend unfenced"
+    "the superseded parked root left the queue; the front and its successor remain"
+  );
+  assert_eq!(
+    s.effective_root(),
+    root_at_view(4, 0, 0),
+    "the newest submission is the effective root"
+  );
+
+  // The forfeited root never lands: the drain goes front → newest, nothing in between.
+  s.sb_mut().land_root();
+  let (id, _) = s
+    .poll_sb()
+    .expect("the front lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!(id, outstanding);
+  s.sb_mut().land_root();
+  let (id, state) = s
+    .poll_sb()
+    .expect("the successor lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!(id, newest);
+  assert_eq!(state, root_at_view(4, 0, 0));
+  assert!(!s.has_inflight(), "no forfeited entry is left owed");
+}
+
+#[test]
+fn forfeiting_the_submitted_front_or_an_unknown_id_is_a_no_op() {
+  // An outstanding write is owed to the medium — forfeiture must not touch it — and an id the
+  // queue no longer holds (landed, or never submitted) has nothing to remove.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let outstanding = WriteId::new(1, 1);
+  s.submit_root(outstanding, root_at_view(2, 0, 0));
+  s.forfeit_root(outstanding);
+  assert_eq!(
+    s.roots_in_flight(),
+    1,
+    "the submitted front survives its submitter's abandonment"
+  );
+  s.forfeit_root(WriteId::new(9, 9));
+  assert_eq!(s.roots_in_flight(), 1, "an unknown id removes nothing");
+
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("the front lands").landed_root.is_some());
+  assert!(!s.has_inflight());
+}
+
+#[test]
+fn forfeiting_the_parked_back_steps_the_effective_root_to_the_previous_entry() {
+  // Abandonment without a successor (the catch-up shape): the parked back leaves, the effective
+  // root steps back to the previous timeline point, and the medium converges there.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let abandoned = WriteId::new(1, 2);
+  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
+  s.submit_root(abandoned, root_at_view(3, 0, 0));
+  s.forfeit_root(abandoned);
+  assert_eq!(
+    s.effective_root(),
+    root_at_view(2, 0, 0),
+    "the effective root stepped back to the state still owed to the medium"
+  );
+
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("the front lands").landed_root.is_some());
+  assert!(!s.has_inflight(), "the abandoned entry is not owed");
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    0,
+    "nothing was ever handed to the backend for the forfeited root"
   );
 }
 

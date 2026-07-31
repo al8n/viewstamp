@@ -984,7 +984,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     if p.view().get() > self.view.get() {
-      self.catch_up_to_view(now, p.view());
+      self.catch_up_to_view(now, storage, p.view());
       return;
     }
     if !self.status.is_normal() || p.view() != self.view || self.is_primary() {
@@ -1768,9 +1768,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// higher-epoch heartbeat cannot install unvouched state.
   ///
   /// The triggering message is still DROPPED by the caller (we acted on no E+1 content).
-  pub(crate) fn maybe_request_cross_epoch_catchup(
+  pub(crate) fn maybe_request_cross_epoch_catchup<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: &Message,
   ) {
@@ -1840,7 +1841,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // enters Recovering, FORCED-syncs the cluster checkpoint, and `complete_recovery` lands it Normal at
     // E+1. There is no Normal state to preserve, so the status transition is free.
     if !self.status.is_normal() {
-      self.enter_cross_epoch_peer_fetch(now, checkpoint);
+      self.enter_cross_epoch_peer_fetch(now, storage, checkpoint);
       return;
     }
     // A NORMAL laggard arms a NORMAL-STATUS crossing-required sync and STAYS Normal — it must keep
@@ -1949,7 +1950,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ok: PrepareOk,
   ) {
     if ok.view().get() > self.view.get() {
-      self.catch_up_to_view(now, ok.view());
+      self.catch_up_to_view(now, storage, ok.view());
       return;
     }
     if !self.status.is_normal() || !self.is_primary() || ok.view() != self.view {
@@ -2007,7 +2008,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     c: Commit,
   ) {
     if c.view().get() > self.view.get() {
-      self.catch_up_to_view(now, c.view());
+      self.catch_up_to_view(now, storage, c.view());
       return;
     }
     if !self.status.is_normal() || c.view() != self.view || self.is_primary() {

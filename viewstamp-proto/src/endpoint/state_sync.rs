@@ -2230,7 +2230,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // (the laggard never proposed one) this is a no-op, keeping that path byte-identical.
       self.pending_swap = None;
       if matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_)))) {
-        self.pending_sb = None;
+        // The stale swap's correlation ends here, so its root is forfeited with it: a parked one
+        // leaves the session queue (nothing awaits it), a submitted one lands and is ignored. The
+        // same belt-and-suspenders as the clear itself — the sync staged only over a free
+        // superblock, and the crossing's own re-persist root has already LANDED to reach this
+        // install, so a swap root still queued here is not an expected state; ending the
+        // correlation and the queue entry together keeps the belt airtight either way.
+        if let Some((abandoned, _)) = self.pending_sb.take() {
+          storage.forfeit_root(abandoned);
+        }
       }
     }
     // Advance the durable checkpoint pointer to the synced op — the durable root (already written) names

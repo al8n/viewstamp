@@ -1305,6 +1305,10 @@ impl MembershipMonotonicChecker {
 /// headroom. The bounds are generous constants chosen so a real leak (no GC) trips while normal
 /// fluctuation does not. The `clients` table is bounded separately by the active client set (one
 /// session per client), so it is checked against a client-count-derived bound, not the per-op bound.
+/// The session's durable-root queue is checked against its own bound — affine in the replica's
+/// incarnation (restart) count and independent of ops, views, and time — so a root backlog
+/// accumulating under a slow superblock (one superseded root per view-change window) trips within a
+/// few windows.
 #[derive(Debug)]
 pub struct BoundednessChecker {
   /// Max allowed entries in any per-op map (`log`, `inflight`) and any WAL.
@@ -1353,6 +1357,20 @@ impl BoundednessChecker {
         return CheckResult::violation(format!(
           "replica {i}: client sessions {clients} exceeds bound {}",
           self.max_clients
+        ));
+      }
+      // The durable-root queue: one submitted front + at most the live endpoint's two awaited
+      // roots (its durable-view write and its checkpoint root), plus at most that awaited pair per
+      // predecessor incarnation that died with correlations in flight (an in-place rebuild bumps
+      // the incarnation; a crash restart rebuilds the session, only shrinking the queue). Affine
+      // in the restart count, NOT in ops, views, or time — an unbounded backlog under a slow
+      // superblock blows past this within a few view-change windows.
+      let roots = cluster.replica_roots_in_flight(i);
+      let roots_bound = 3 + 2 * cluster.replica_incarnation(i) as usize;
+      if roots > roots_bound {
+        return CheckResult::violation(format!(
+          "replica {i}: durable-root queue {roots} exceeds bound {roots_bound} \
+           (the submission gate / forfeiture is not bounding the root timeline)"
         ));
       }
     }

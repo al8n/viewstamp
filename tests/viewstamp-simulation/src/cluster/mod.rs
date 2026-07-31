@@ -1267,6 +1267,14 @@ impl Cluster {
     self.wals[i].borrow().len()
   }
 
+  /// Replica `i`'s in-flight durable-root queue length — the submitted front plus every parked
+  /// entry (for the boundedness checker). The session's submission gate keeps the backend at one
+  /// outstanding root; forfeiture keeps the queue itself within the live endpoint's awaited roots
+  /// plus any dead incarnation's leftovers.
+  pub fn replica_roots_in_flight(&self, i: usize) -> usize {
+    self.storages[i].roots_in_flight()
+  }
+
   /// True iff replica `i`'s WAL PHYSICALLY holds op `op` right now — its slot is `Clean` or `Faulty`
   /// (durably written, possibly later corrupt). UNLIKE [`Self::replica_appended_op`] this does NOT fold
   /// in the `op <= checkpoint_op` snapshot-subsumption clause, so it distinguishes "still in the WAL

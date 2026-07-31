@@ -5802,7 +5802,7 @@ where
     // heartbeat would be dropped at the sender binding before it could signal us to catch up. Recognize a
     // strictly-higher-epoch `Prepare`/`Commit` from a configured member (`from`) here, re-arm the
     // committed-vouched catch-up, and act on NONE of the content. (A non-trigger message no-ops.)
-    self.maybe_request_cross_epoch_catchup(now, from, &msg);
+    self.maybe_request_cross_epoch_catchup(now, storage, from, &msg);
     // Epoch-mismatch RESPONSE — the SYMMETRIC pre-binding hook, also BEFORE the sender binding. A
     // reconfiguration that removes the old primary / shifts slots can make the honest E+1 primary a
     // DIFFERENT retained voter a stranded laggard cannot bind (its `MemberId` is absent from the

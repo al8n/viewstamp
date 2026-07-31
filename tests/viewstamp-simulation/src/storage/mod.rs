@@ -1141,11 +1141,11 @@ impl StagedSbWrite {
 /// whose op disagreed with the durable root → retry exhaustion → peer-fetch escalation.)
 ///
 /// Retention stays bounded: snapshots STRICTLY OLDER than the live root's `checkpoint_op` are GC'd —
-/// but only once the in-flight `staged` queue has drained, since a later-completing root can still
-/// reset `state` to an older `checkpoint_op` (the proto's serialized-root-ordering supersession: a
-/// checkpoint's step-2 root, left in flight when a view change issues a durable-view root naming the
-/// OLD checkpoint, completes FIRST but is superseded by that later durable-view root). So an older
-/// rooted snapshot is retained until no queued root could re-name it — at most a couple of generations.
+/// but only once the in-flight `staged` queue has drained, so an older rooted snapshot is retained
+/// until no queued root could re-name it — at most a couple of generations. (The proto session now
+/// refuses a checkpoint-pointer rewind at its submission choke and hands this backend one root
+/// write at a time, so no reachable schedule re-names an older generation; the drain-before-collect
+/// deferral stays as a general-backend belt.)
 ///
 /// # Async-write mode (opt-in, [`InMemorySuperblock::with_async_writes_and_faults`])
 ///
@@ -1363,13 +1363,13 @@ impl InMemorySuperblock {
   }
 
   /// GC checkpoint snapshot generations no longer reachable: drop every entry STRICTLY OLDER than the
-  /// live root's `checkpoint_op`. Deferred until the in-flight `staged` queue has drained, because a
-  /// later-completing root can still reset `state` to an OLDER `checkpoint_op` (the proto's serialized
-  /// root-ordering supersession — a stale in-flight checkpoint root completes before a durable-view
-  /// root naming the older checkpoint), and that older snapshot must stay readable until no queued root
-  /// could re-name it. Newer-than-live generations (a written snapshot whose root has not landed yet)
-  /// are RETAINED — a pending checkpoint root will promote one to live. Bounds the map to a couple of
-  /// generations in steady state.
+  /// live root's `checkpoint_op`. Deferred until the in-flight `staged` queue has drained, so an
+  /// older snapshot stays readable until no queued root could re-name it — a general-backend belt:
+  /// the proto session refuses a checkpoint-pointer rewind at its submission choke and submits one
+  /// root at a time, so no reachable schedule re-names an older generation. Newer-than-live
+  /// generations (a written snapshot whose root has not landed yet) are RETAINED — a pending
+  /// checkpoint root will promote one to live. Bounds the map to a couple of generations in steady
+  /// state.
   fn gc_snapshots(&mut self) {
     if !self.staged.is_empty() {
       return;
@@ -1388,9 +1388,22 @@ impl Superblock for InMemorySuperblock {
     match self.async_delay {
       // ASYNC steady-state: STAGE as not-yet-durable. `self.state` is left at the prior durable root
       // until `poll` releases this write after `delay` ticks — opening the pending durable-view window.
-      Some(delay) => self
-        .staged
-        .push_back((delay, StagedSbWrite::Root { id, state })),
+      Some(delay) => {
+        // The proto's storage session serializes physical root writes: at most one is ever with
+        // the backend, however slowly completions arrive, so a second staged root here means the
+        // session's submission gate regressed. A hard assert (the VOPR runs release) — this
+        // backend is the oracle for the one-deep root pipeline under arbitrary schedules.
+        assert!(
+          !self
+            .staged
+            .iter()
+            .any(|(_, w)| matches!(w, StagedSbWrite::Root { .. })),
+          "a second root write was submitted while one is outstanding"
+        );
+        self
+          .staged
+          .push_back((delay, StagedSbWrite::Root { id, state }))
+      }
       // SYNCHRONOUS: durable immediately, completion queued in this call. The new durable root may
       // NAME a just-written snapshot generation (a checkpoint's step-2 root) — which becomes the
       // live/readable checkpoint by virtue of `state.checkpoint_op()` now pointing at it; GC then drops
