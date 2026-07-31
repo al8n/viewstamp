@@ -3561,17 +3561,20 @@ fn a_laggard_keeps_its_membership_when_a_below_n_donor_withholds_then_swaps_once
     now,
     &mut storage2,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(4),
-      id2,
-      successor.epoch(),
-      successor.config_id(),
-      ReplicaId::new(0),
-      nonce2,
-      env2.clone(),
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id2,
+        successor.epoch(),
+        successor.config_id(),
+        ReplicaId::new(0),
+        nonce2,
+        env2.clone(),
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(4)),
+    ),
   );
   e2.storage_step(now, &mut storage2, &mut blocks2);
   assert_eq!(
@@ -3655,17 +3658,20 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(4),
-      id,
-      e2.epoch(),
-      e2.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      env.clone(),
-      e2_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        e2.epoch(),
+        e2.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        env.clone(),
+        e2_body,
+      )
+      .with_config_install_op(OpNumber::with(4)),
+    ),
   );
   e.storage_step(now, &mut storage, &mut blocks); // two-write persist → durable root → install
 
@@ -3788,6 +3794,216 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
 }
 
 #[test]
+fn a_synced_producing_op_survives_a_crash_and_re_serves_verbatim_to_the_next_laggard() {
+  // The TRANSITIVE chain a synced membership's producing op has to survive: a laggard that received
+  // its configuration by cross-epoch sync later becomes the DONOR for the next laggard, and the op it
+  // hands on must still be the op that PRODUCED the configuration — never the frontier of whichever
+  // checkpoint carried it.
+  //
+  // The two numbers are held DISTINCT throughout: the cluster reconfigured E0 -> E1 at op `N` == 2 and
+  // checkpointed on to `M` == 4, an ordinary client op past the swap. Every assertion below therefore
+  // DISTINGUISHES the producing op from the crossing frontier — a serve path that re-derived the value
+  // from its own `checkpoint_op` would answer 4 where 2 is owed, and each hop names the discrepancy.
+  //
+  // The chain is: first laggard receives `N` -> its crossing durable root records `N` -> CRASH -> recover
+  // restores `N` -> it re-serves, and the answer carries `N` through a full wire round trip -> a SECOND
+  // laggard installs off that answer, and both the `MembershipChanged` it reports and its own crossing
+  // durable root name `N`. Each hop re-reads the value from the previous hop's durable state, so nothing
+  // here can pass on a value that lives only in the first laggard's memory.
+  const N: u64 = 2; // the committed Reconfigure op that produced E1
+  const M: u64 = 4; // the checkpoint frontier the crossing rides — an ordinary client op above N
+  const _: () = assert!(
+    N != M,
+    "the whole point: the two values are never interchangeable"
+  );
+  let e0 = genesis(3); // [0,1,2]
+  let e1 = e0
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner(3) on the 3-voter genesis is valid"); // E1, chains from E0
+  let e1_body =
+    crate::message::ReconfigurePayload::from_membership(&e1, e0.config_id()).encode_body();
+
+  // ── HOP 1: the first laggard crosses E0 -> E1 off the donor's checkpoint at M, carrying N. ──
+  let (mut e, mut storage, env, id) = sync_apply_harness(M);
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, M);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(M),
+      OpNumber::with(M),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(M),
+        id,
+        e1.epoch(),
+        e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        env.clone(),
+        e1_body.clone(),
+      )
+      .with_config_install_op(OpNumber::with(N)),
+    ),
+  );
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(e.state_syncs_applied(), 1, "the E0->E1 crossing applied");
+  assert_eq!(e.membership, e1, "the first laggard installed E1");
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(M),
+    "its frontier is the crossing checkpoint M — the value a regressed serve path would hand on"
+  );
+  assert_eq!(
+    e.config_install_op,
+    OpNumber::with(N),
+    "but its install record is the DONOR-CARRIED producing op N, distinct from that frontier"
+  );
+  assert_eq!(
+    storage.sb().state().config_install_op(),
+    OpNumber::with(N),
+    "and the crossing durable root records N verbatim — what a crash restores"
+  );
+
+  // ── HOP 2: CRASH, then recover off that root. MemberId 1 is retained in E1, so it comes up Active. ──
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let mut donor = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  for _ in 0..8 {
+    donor.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(donor.membership, e1, "the recovered node comes up at E1");
+  assert_eq!(
+    donor.config_install_op,
+    OpNumber::with(N),
+    "recover restores the producing op N from the durable root — it outlived the process, not just \
+     the crossing's in-memory state"
+  );
+  assert!(
+    donor.checkpoint_op().get() >= donor.config_install_op.get(),
+    "its checkpoint covers the install, so the serve gate opens and it will attach the membership"
+  );
+
+  // ── HOP 3: the recovered node RE-SERVES as donor, and the answer survives a wire round trip. ──
+  let mut laggard2 = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(),
+    e0.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  laggard2.arm_cross_epoch_sync_for_test(M);
+  let nonce2 = laggard2.sync_nonce_for_test();
+  donor.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      donor.view(),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      nonce2,
+      true, // recovery peer-fetch — served at/above our checkpoint
+      0,
+    )),
+  );
+  donor.storage_step(now, &mut storage, &mut blocks); // the serve-read completes -> ship SyncCheckpoint
+  let mut served = None;
+  while let Some(out) = donor.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      served = Some(s.clone());
+    }
+  }
+  let served = served.expect("the recovered node re-serves a SyncCheckpoint");
+  // Round-trip the answer through the actual codec: the producing op and the membership are a PAIRED
+  // presence on the wire (either half without the other is refused), so this also pins that a re-serve
+  // emits a shape the wire accepts rather than one only direct delivery would tolerate.
+  let served = match crate::decode_message(crate::encode_message(&Message::SyncCheckpoint(served)))
+    .expect("the re-served answer round-trips through the wire codec")
+  {
+    Message::SyncCheckpoint(s) => s,
+    other => panic!("the round trip returned a different message: {other:?}"),
+  };
+  assert_eq!(
+    served.checkpoint_op(),
+    OpNumber::with(M),
+    "the re-serve advertises the frontier M — the value the producing op must NOT collapse into"
+  );
+  assert_eq!(
+    served.membership(),
+    &e1_body,
+    "it attaches E1, chained from the verified predecessor E0 so a fresh laggard can verify it"
+  );
+  // THE LOAD-BEARING ASSERTION. Exact, not merely present: the answer names the op that PRODUCED E1
+  // (N == 2), which this node never committed itself — it received it, stored it, and restored it. A
+  // serve path that reached for its own checkpoint frontier instead would answer Some(4) here.
+  assert_eq!(
+    served.config_install_op(),
+    Some(OpNumber::with(N)),
+    "the re-serve hands on the producing op N verbatim, not its own checkpoint frontier M"
+  );
+
+  // ── HOP 4: a SECOND laggard installs off that answer; its event and its durable root both name N. ──
+  let mut storage2 = Storage::new(TestWal::default(), TestSb::default());
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks2, M);
+  laggard2.handle_message(
+    now,
+    &mut storage2,
+    primary_peer(),
+    Message::SyncCheckpoint(served),
+  );
+  laggard2.block_step(now, &mut storage2, &mut blocks2);
+  for _ in 0..6 {
+    laggard2.storage_step(now, &mut storage2, &mut blocks2);
+    laggard2.block_step(now, &mut storage2, &mut blocks2);
+  }
+  assert_eq!(
+    laggard2.state_syncs_applied(),
+    1,
+    "the second laggard crossed off the RE-SERVED answer"
+  );
+  assert_eq!(laggard2.membership, e1, "it installed the same E1");
+  let mc = core::iter::from_fn(|| laggard2.poll_event())
+    .find_map(|ev| match ev {
+      Event::MembershipChanged(mc) => Some(mc),
+      _ => None,
+    })
+    .expect("the crossing install reports MembershipChanged");
+  assert_eq!(
+    mc.op(),
+    OpNumber::with(N),
+    "the event an embedder folds into consensus history names the real Reconfigure op N, two hops and \
+     a crash from where it was committed — not the frontier M this crossing rode"
+  );
+  assert_eq!(
+    laggard2.config_install_op,
+    OpNumber::with(N),
+    "the second laggard's own install record carries N, so IT would re-serve N in turn"
+  );
+  assert_eq!(
+    storage2.sb().state().config_install_op(),
+    OpNumber::with(N),
+    "and its crossing durable root records N — the chain is closed and survives another crash"
+  );
+}
+
+#[test]
 fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
   // WHOLESALE cross-epoch crossing past MORE than the two-prior `LINEAGE_RING` window. A retained E0
   // laggard offline across three legal changes is offered an E3 successor DIRECTLY from an E3 donor — an
@@ -3869,17 +4085,20 @@ fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(4),
-      id,
-      e3.epoch(),
-      e3.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      env.clone(),
-      e3_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        e3.epoch(),
+        e3.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        env.clone(),
+        e3_body,
+      )
+      .with_config_install_op(OpNumber::with(4)),
+    ),
   );
   e.storage_step(now, &mut storage, &mut blocks); // two-write persist → durable root → install
 
@@ -4045,17 +4264,20 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(n),
-      id,
-      successor.epoch(),
-      successor.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      env.clone(),
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(n),
+        id,
+        successor.epoch(),
+        successor.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        env.clone(),
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(n)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   // apply_sync staged the durable re-persist (two superblock writes) + STAYED Normal; drive them.
@@ -4211,17 +4433,20 @@ fn a_slot_shifted_donor_whole_sync_checkpoint_reply_is_admitted_and_crosses() {
     now,
     &mut storage,
     Peer::Replica(donor_old_slot), // bound under the laggard's OLD membership
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(SLOT_SHIFT_N),
-      id,
-      successor.epoch(),
-      successor.config_id(),
-      donor_current_slot, // the donor self-stamps its CURRENT (E+1) slot
-      nonce,
-      env.clone(),
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(SLOT_SHIFT_N),
+        id,
+        successor.epoch(),
+        successor.config_id(),
+        donor_current_slot, // the donor self-stamps its CURRENT (E+1) slot
+        nonce,
+        env.clone(),
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(SLOT_SHIFT_N)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   // apply_sync staged the durable re-persist (two superblock writes); drive them to install.
@@ -4395,17 +4620,20 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(n),
-      cross_id,
-      successor.epoch(),
-      successor.config_id(),
-      ReplicaId::new(0),
-      nonce2,
-      cross_env.clone(),
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(n),
+        cross_id,
+        successor.epoch(),
+        successor.config_id(),
+        ReplicaId::new(0),
+        nonce2,
+        cross_env.clone(),
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(n)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   for _ in 0..3 {
@@ -4541,17 +4769,20 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(n),
-      cross_id,
-      successor.epoch(),
-      successor.config_id(),
-      ReplicaId::new(0),
-      nonce2,
-      cross_env.clone(),
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(n),
+        cross_id,
+        successor.epoch(),
+        successor.config_id(),
+        ReplicaId::new(0),
+        nonce2,
+        cross_env.clone(),
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(n)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   for _ in 0..3 {
@@ -4709,17 +4940,20 @@ fn a_stranded_learner_crosses_an_epoch_via_the_pulled_epoch_ahead_hint() {
     t1,
     &mut lstorage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(n),
-      cross_id,
-      successor.epoch(),
-      successor.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env.clone(),
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(n),
+        cross_id,
+        successor.epoch(),
+        successor.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env.clone(),
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(n)),
+    ),
   );
   for _ in 0..3 {
     learner.storage_step(t1, &mut lstorage, &mut lblocks);
@@ -5257,17 +5491,20 @@ fn a_successful_cross_clears_the_intent_so_on_sb_done_never_re_arms_forever() {
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(m)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   assert!(e.pending_install.is_some(), "the crossing install staged");
@@ -5885,17 +6122,20 @@ fn a_verified_staged_crossing_keeps_its_intent_against_stale_same_epoch_authorit
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(m)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   assert!(
@@ -6018,17 +6258,20 @@ fn a_verified_crossing_retained_across_a_flush_fault_keeps_its_intent_against_st
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(m)),
+    ),
   );
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
@@ -6154,17 +6397,20 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(m)),
+    ),
   );
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
@@ -6319,17 +6565,20 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
     now,
     &mut storage,
     primary_peer(),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(m)),
+    ),
   );
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
@@ -9578,17 +9827,20 @@ fn crossing_checkpoint_at_4(env: &Bytes, id: u128, nonce: u64) -> Message {
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor, genesis(3).config_id())
       .encode_body();
-  Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-    View::new(),
-    OpNumber::with(4),
-    id,
-    successor.epoch(),
-    successor.config_id(),
-    ReplicaId::new(0),
-    nonce,
-    env.clone(),
-    membership_body,
-  ))
+  Message::SyncCheckpoint(
+    crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      membership_body,
+    )
+    .with_config_install_op(OpNumber::with(4)),
+  )
 }
 
 #[test]

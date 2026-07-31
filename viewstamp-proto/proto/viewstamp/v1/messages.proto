@@ -293,10 +293,16 @@ message SyncCheckpoint {
   bytes snapshot = 8;
   bytes membership = 9;
   // The op of the last reconfigure that produced the carried membership — the
-  // sender's config_install_op, meaningful only when membership is non-empty.
-  // A cross-epoch laggard records it verbatim (its crossing root and its own
-  // config_install_op), so the producing op survives any number of crossings.
-  uint64 config_install_op = 10;
+  // sender's config_install_op. EXPLICIT PRESENCE, present iff membership is
+  // non-empty: a sender that attaches a membership always writes this field
+  // (zero included — a genesis/offline-born configuration's producing point is
+  // genuinely 0 and encodes as an explicit 0, distinct from absence), and a
+  // membership-bearing answer with the field ABSENT rejects at conversion —
+  // implicit presence would make an omitted field indistinguishable from a
+  // legitimate producing op of 0. A cross-epoch laggard records the value
+  // verbatim (its crossing root and its own config_install_op), so the
+  // producing op survives any number of crossings.
+  optional uint64 config_install_op = 10;
 }
 
 message RequestBlock {

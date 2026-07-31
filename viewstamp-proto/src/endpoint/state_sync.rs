@@ -975,34 +975,35 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // cross-epoch requester records that op verbatim — in its crossing durable root, its own
     // install record, and the `MembershipChanged` it reports — so the producing op survives the
     // crossing instead of being re-approximated by this checkpoint's frontier (which for a donor
-    // checkpointed past the reconfigure op is an ordinary client op). Withheld alongside the
-    // membership (the field is meaningful only with one attached).
-    let attached_install_op = if membership.is_empty() {
-      OpNumber::new()
-    } else {
-      self.config_install_op
-    };
+    // checkpointed past the reconfigure op is an ordinary client op). STAMPED exactly when the
+    // membership is attached, ABSENT otherwise — presence itself is the claim (the wire codec
+    // refuses either half of the pair without the other), so a receiver can never mistake a
+    // withheld membership's answer for a producing-op assertion.
+    //
     // Ship the whole envelope as one `SyncCheckpoint`. It is always frame-sized now: the SM bytes
     // are no longer in the envelope (only a 16-byte SM root), and the carried membership is bounded by
     // the active member set — so the over-frame chunked announce/pull path is gone. The requester
     // verifies the envelope id, then walks the SM checkpoint DAG rooted at the decoded `sm_root`,
     // fetching the blocks it is missing via `RequestBlock`.
+    let answer = crate::SyncCheckpoint::new(
+      self.view,
+      cr.op(),
+      id,
+      self.membership.epoch(),
+      self.membership.config_id(),
+      self.local_slot(),
+      nonce,
+      snapshot,
+      membership,
+    );
+    let answer = if answer.membership().is_empty() {
+      answer
+    } else {
+      answer.with_config_install_op(self.config_install_op)
+    };
     self.emit(Outgoing::new(
       Recipient::To(to),
-      Message::SyncCheckpoint(
-        crate::SyncCheckpoint::new(
-          self.view,
-          cr.op(),
-          id,
-          self.membership.epoch(),
-          self.membership.config_id(),
-          self.local_slot(),
-          nonce,
-          snapshot,
-          membership,
-        )
-        .with_config_install_op(attached_install_op),
-      ),
+      Message::SyncCheckpoint(answer),
     ));
   }
 
@@ -1916,10 +1917,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           }
           // The op that PRODUCED the carried successor — the donor's `config_install_op`, recorded
           // verbatim by this install (the crossing durable root, the in-memory install record, and
-          // the `MembershipChanged` this node reports). Validated before anything stages, against
-          // the two facts the value must be consistent with, refusing the reply (stage nothing;
-          // the solicit timer re-fetches from another donor) rather than recording a value that
-          // trips a fail-stop later:
+          // the `MembershipChanged` this node reports). REQUIRED: a membership-bearing answer
+          // whose producing op is ABSENT is refused outright (stage nothing; the solicit timer
+          // re-fetches from another donor) — the wire codec already rejects that pairing, so this
+          // arm guards the direct-delivery path (tests, the simulation's in-memory network) and
+          // keeps the refusal a property of the receipt itself rather than of one codec. Absence
+          // is a sender that never asserted a producing op at all; defaulting it (to 0 or to
+          // anything else) would fabricate an install record no reconfigure ever committed.
+          // A PRESENT op is then validated before anything stages, against the two facts the
+          // value must be consistent with, refusing the reply the same way rather than recording
+          // a value that trips a fail-stop later:
           // - at/below the served frontier: the serve gate attaches a membership only when the
           //   donor's checkpoint covers its install (`checkpoint_op >= config_install_op`), so a
           //   claim above `M` contradicts the very gate that admitted it;
@@ -1929,7 +1936,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           //   scoped to a membership-bearing effective root, exactly like the assert: an
           //   equal-epoch re-persist of this node's own in-flight swap legitimately carries the
           //   SAME producing op the timeline already records.
-          let install_op = m.config_install_op();
+          let Some(install_op) = m.config_install_op() else {
+            return;
+          };
           if install_op > checkpoint_op
             || effective
               .membership_opt()

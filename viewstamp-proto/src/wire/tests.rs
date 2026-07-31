@@ -473,6 +473,8 @@ fn request_sync_round_trips() {
 
 #[test]
 fn sync_checkpoint_round_trips() {
+  // Membership-bearing, so the producing op is stamped (the codec refuses the pair split apart);
+  // presence survives the round trip verbatim.
   let m = SyncCheckpoint::new(
     View::with(1301),
     OpNumber::with(1302),
@@ -483,10 +485,37 @@ fn sync_checkpoint_round_trips() {
     1305,
     Bytes::from_static(b"snapshot-body"),
     Bytes::from_static(b"membership-body"),
-  );
+  )
+  .with_config_install_op(OpNumber::with(1300));
   let back =
     messages_b::sync_checkpoint_from(messages_b::pb_sync_checkpoint(&m)).expect("round-trip");
   assert_eq!(back, m);
+}
+
+#[test]
+fn sync_checkpoint_without_a_membership_round_trips_with_no_install_op() {
+  // The membership-less answer (a same-config sync, or a donor withholding inside the
+  // commit-first window): no producing op is stamped, none is encoded, and the round trip
+  // reconstructs the same absent state.
+  let m = SyncCheckpoint::new(
+    View::with(1311),
+    OpNumber::with(1312),
+    0x8282_1111_2222_3333_4444_5555_6666_7777,
+    Epoch::new(1313),
+    0x8383_1111_2222_3333_4444_5555_6666_7777,
+    ReplicaId::new(1314),
+    1315,
+    Bytes::from_static(b"snapshot-body"),
+    Bytes::new(),
+  );
+  let w = messages_b::pb_sync_checkpoint(&m);
+  assert_eq!(
+    w.config_install_op, None,
+    "an unstamped answer encodes NO producing-op field"
+  );
+  let back = messages_b::sync_checkpoint_from(w).expect("round-trip");
+  assert_eq!(back, m);
+  assert_eq!(back.config_install_op(), None);
 }
 
 #[test]
@@ -672,6 +701,88 @@ fn sync_checkpoint_with_undersized_checkpoint_id_rejects() {
   assert!(messages_b::sync_checkpoint_from(w).is_err());
 }
 
+/// A stamped membership-bearing wire shape for the producing-op pairing tests to mutate.
+fn membership_bearing_pb_sync_checkpoint() -> pb::SyncCheckpoint {
+  messages_b::pb_sync_checkpoint(
+    &SyncCheckpoint::new(
+      View::with(21),
+      OpNumber::with(22),
+      0x23,
+      Epoch::new(24),
+      0x25,
+      ReplicaId::new(26),
+      27,
+      Bytes::from_static(b"snapshot-body"),
+      Bytes::from_static(b"membership-body"),
+    )
+    .with_config_install_op(OpNumber::with(9)),
+  )
+}
+
+#[test]
+fn sync_checkpoint_with_a_membership_but_an_absent_install_op_rejects() {
+  // The producing-op field cleared under an attached membership — byte-for-byte what a sender
+  // whose encoder predates the field emits (proto3 encodes nothing for an unset optional field).
+  // Implicit presence would have decoded this as op 0 and let a genesis-lineage laggard install
+  // the membership under a producing op no reconfigure ever committed; the conversion refuses the
+  // envelope wholesale instead.
+  let mut w = membership_bearing_pb_sync_checkpoint();
+  w.config_install_op = None;
+  assert!(matches!(
+    messages_b::sync_checkpoint_from(w),
+    Err(CodecError::Malformed { .. })
+  ));
+}
+
+#[test]
+fn a_membership_bearing_envelope_without_the_install_op_field_rejects_at_decode_message() {
+  // The same refusal at the public choke point every transport decodes through, on the actual
+  // encoded bytes such a sender would put on the wire.
+  let mut w = membership_bearing_pb_sync_checkpoint();
+  w.config_install_op = None;
+  let envelope = pb::Message {
+    body: Some(pb::message::Body::SyncCheckpoint(Box::new(w))),
+    ..Default::default()
+  };
+  assert!(matches!(
+    decode_message(envelope.encode_to_bytes()),
+    Err(CodecError::Malformed { .. })
+  ));
+}
+
+#[test]
+fn sync_checkpoint_with_an_install_op_but_no_membership_rejects() {
+  // The other half of the pairing: a producing op asserted with NO membership attached is the
+  // same malformed split, refused symmetrically (no compliant sender produces it — the serve path
+  // stamps the op exactly when it attaches the membership).
+  let mut w = membership_bearing_pb_sync_checkpoint();
+  w.membership = Bytes::new();
+  assert!(matches!(
+    messages_b::sync_checkpoint_from(w),
+    Err(CodecError::Malformed { .. })
+  ));
+}
+
+#[test]
+fn sync_checkpoint_with_a_present_zero_install_op_is_distinct_from_absence() {
+  // A genesis/offline-born configuration's producing point is genuinely 0. Explicit presence
+  // keeps that claim on the wire — the stamped-zero encoding carries the field where the
+  // unstamped encoding carries nothing — and the round trip reconstructs `Some(0)`, never
+  // collapsing it into the refused absent state.
+  let stamped = membership_bearing_pb_sync_checkpoint();
+  let mut zeroed = stamped.clone();
+  zeroed.config_install_op = Some(0);
+  let mut absent = stamped;
+  absent.config_install_op = None;
+  assert_eq!(
+    zeroed.encode_to_bytes().len(),
+    absent.encode_to_bytes().len() + 2,
+    "the explicit zero occupies its own tag + varint byte on the wire"
+  );
+  let back = messages_b::sync_checkpoint_from(zeroed).expect("a stamped zero round-trips");
+  assert_eq!(back.config_install_op(), Some(OpNumber::new()));
+}
+
 #[test]
 fn block_response_with_oversized_addr_rejects() {
   let m = BlockResponse::new(BlockAddress::from_bytes([0u8; 16]), None);
@@ -802,17 +913,22 @@ fn one_of_each_message() -> std::vec::Vec<Message> {
       true,
       config_id,
     )),
-    Message::SyncCheckpoint(SyncCheckpoint::new(
-      View::with(10),
-      OpNumber::with(13),
-      checkpoint_id,
-      Epoch::new(14),
-      config_id,
-      ReplicaId::new(30),
-      16,
-      snapshot.clone(),
-      membership.clone(),
-    )),
+    Message::SyncCheckpoint(
+      SyncCheckpoint::new(
+        View::with(10),
+        OpNumber::with(13),
+        checkpoint_id,
+        Epoch::new(14),
+        config_id,
+        ReplicaId::new(30),
+        16,
+        snapshot.clone(),
+        membership.clone(),
+      )
+      // Membership-bearing, so the producing op is stamped (12 — at/below the checkpoint op 13,
+      // the shape the serve gate emits); the codec refuses the pair split apart.
+      .with_config_install_op(OpNumber::with(12)),
+    ),
     Message::RequestPrepareRange(RequestPrepareRange::new(
       View::with(10),
       OpNumber::with(17),
@@ -1073,7 +1189,7 @@ fn golden_byte_vectors() {
     "5a18081e1010180e221000000000000000000000000000000050",     // Recovery
     "62b701080a100b180c200d280e321000000000000000000000000000000050381e40104a19080112100000000000000000000000000000000118012201614a28080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff004a5008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // RecoveryResponse
     "6a1c080a100d181e20102801321000000000000000000000000000000050", // RequestSync
-    "7244080a100d1a1000000000000000000000000000000070200e2a1000000000000000000000000000000050301e38104208736e617073686f744a0a6d656d62657273686970", // SyncCheckpoint
+    "7246080a100d1a1000000000000000000000000000000070200e2a1000000000000000000000000000000050301e38104208736e617073686f744a0a6d656d62657273686970500c", // SyncCheckpoint
     "7a1a080a10111812201e2a1000000000000000000000000000000050", // RequestPrepareRange
     "8201af01080a100c180d2210000000000000000000000000000000502a19080112100000000000000000000000000000000118012201612a28080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff002a5008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // RepairBatch
     "8a01b101080a100c180d200e2a10000000000000000000000000000000503219080112100000000000000000000000000000000118012201613228080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff00325008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // PrepareBatch

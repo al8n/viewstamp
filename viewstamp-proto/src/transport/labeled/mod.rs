@@ -18,15 +18,22 @@ const HELLO_TAG: u8 = 0x0C;
 /// needs no bump — a `Message.body` oneof variant a newer peer adds is forward-compatible, decoded
 /// cleanly and then DROPPED by a peer that does not recognize it (on both transports, as
 /// [`CodecError::UnknownMessage`](crate::CodecError::UnknownMessage)), so a bump is reserved for a
-/// structural or semantic wire break, never for a new message. One superseded numbering collides: the
-/// original wire era also spoke `1`, so a peer from that era passes this version byte — and is
-/// fenced one layer later, structurally: its hand-rolled frames cannot decode under the protobuf
-/// envelope every current message rides, so no consensus traffic is ever accepted from it. Every
-/// other superseded numbering (`2`, `3`) is refused right here. The
+/// structural or semantic wire break, never for a new message.
+///
+/// Version `2` names the contract under which `SyncCheckpoint.config_install_op` is
+/// PRESENCE-BEARING: a compliant peer stamps the producing op on every membership-bearing sync
+/// answer (an explicit zero included) and refuses the pair split apart. The superseded numbering
+/// `1` — BOTH the original hand-rolled era and the immediately-prior protobuf era, whose encoders
+/// cannot express that presence (an omitted field was indistinguishable from a producing op of 0)
+/// — is refused right here at the version byte, as is the superseded protobuf-cutover numbering
+/// `3`. One superseded numbering collides: a hand-rolled-frame era also spoke `2`, so a peer from
+/// that era passes this version byte — and is fenced one layer later, structurally: its
+/// hand-rolled frames cannot decode under the protobuf envelope every current message rides, so no
+/// consensus traffic is ever accepted from it. The
 /// durable sibling is [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION): together they close both
 /// ways an unfenced writer's state could re-enter — through a recovered store, or through a live
 /// peer.
-const HELLO_VERSION: u8 = 1;
+const HELLO_VERSION: u8 = 2;
 
 /// Exposes [`HELLO_VERSION`] to sibling transport layers OUTSIDE this module — namely the QUIC
 /// transport's ALPN (`transport::quic::crypto::alpn_protocols`), which folds it into the negotiated

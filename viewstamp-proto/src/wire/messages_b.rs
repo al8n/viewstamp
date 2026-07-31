@@ -52,10 +52,12 @@ pub(crate) fn request_sync_from(w: pb::RequestSync) -> Result<RequestSync, Codec
   ))
 }
 
-/// Converts a borrowed [`SyncCheckpoint`] into its wire form: the view/checkpoint_op/epoch/nonce/
-/// config_install_op scalars carried as-is, the replica narrowed to its wire width, the checkpoint
-/// id and config id as 16 big-endian bytes each, and the snapshot and membership bodies carried
-/// as-is.
+/// Converts a borrowed [`SyncCheckpoint`] into its wire form: the view/checkpoint_op/epoch/nonce
+/// scalars carried as-is, the replica narrowed to its wire width, the checkpoint id and config id
+/// as 16 big-endian bytes each, the snapshot and membership bodies carried as-is, and the
+/// producing op mapped onto the proto3 explicit-presence field verbatim — `Some(0)` encodes an
+/// explicit zero on the wire, `None` encodes nothing, so absence and a genuinely-zero producing
+/// point never share a byte representation.
 pub(crate) fn pb_sync_checkpoint(m: &SyncCheckpoint) -> pb::SyncCheckpoint {
   pb::SyncCheckpoint {
     view: m.view().get(),
@@ -67,7 +69,7 @@ pub(crate) fn pb_sync_checkpoint(m: &SyncCheckpoint) -> pb::SyncCheckpoint {
     nonce: m.nonce(),
     snapshot: m.snapshot_bytes(),
     membership: m.membership_bytes(),
-    config_install_op: m.config_install_op().get(),
+    config_install_op: m.config_install_op().map(|op| op.get()),
     ..Default::default()
   }
 }
@@ -75,21 +77,44 @@ pub(crate) fn pb_sync_checkpoint(m: &SyncCheckpoint) -> pb::SyncCheckpoint {
 /// Converts a wire [`pb::SyncCheckpoint`] into the domain [`SyncCheckpoint`], moving the snapshot
 /// and membership `Bytes` out rather than copying them. Rejects a replica slot above
 /// [`u16::MAX`], or a wrong-length checkpoint id or config id.
+///
+/// The producing op and the membership MUST arrive together or not at all: a NON-EMPTY membership
+/// with `config_install_op` ABSENT is rejected — the field carries the op of the reconfigure that
+/// produced the attached membership, and a sender that cannot supply it (one whose encoder
+/// predates the field, or omits it) must not have its membership installed under a defaulted op —
+/// and an EMPTY membership with the field PRESENT is rejected as the same malformed pairing in the
+/// other direction. Presence therefore survives the wire round trip exactly, so a receiver never
+/// reconstructs a producing-op claim the sender did not make.
 pub(crate) fn sync_checkpoint_from(w: pb::SyncCheckpoint) -> Result<SyncCheckpoint, CodecError> {
-  Ok(
-    SyncCheckpoint::new(
-      View::with(w.view),
-      OpNumber::with(w.checkpoint_op),
-      u128_from(&w.checkpoint_id, "SyncCheckpoint.checkpoint_id")?,
-      Epoch::new(w.epoch),
-      u128_from(&w.config_id, "SyncCheckpoint.config_id")?,
-      replica_from(w.replica, "SyncCheckpoint.replica")?,
-      w.nonce,
-      w.snapshot,
-      w.membership,
-    )
-    .with_config_install_op(OpNumber::with(w.config_install_op)),
-  )
+  let config_install_op = match (w.membership.is_empty(), w.config_install_op) {
+    (false, Some(op)) => Some(OpNumber::with(op)),
+    (true, None) => None,
+    (false, None) => {
+      return Err(CodecError::Malformed {
+        what: "SyncCheckpoint.config_install_op absent with a membership attached",
+      });
+    }
+    (true, Some(_)) => {
+      return Err(CodecError::Malformed {
+        what: "SyncCheckpoint.config_install_op present without a membership",
+      });
+    }
+  };
+  let m = SyncCheckpoint::new(
+    View::with(w.view),
+    OpNumber::with(w.checkpoint_op),
+    u128_from(&w.checkpoint_id, "SyncCheckpoint.checkpoint_id")?,
+    Epoch::new(w.epoch),
+    u128_from(&w.config_id, "SyncCheckpoint.config_id")?,
+    replica_from(w.replica, "SyncCheckpoint.replica")?,
+    w.nonce,
+    w.snapshot,
+    w.membership,
+  );
+  Ok(match config_install_op {
+    Some(op) => m.with_config_install_op(op),
+    None => m,
+  })
 }
 
 /// Converts a borrowed [`RequestPrepareRange`] into its wire form: the view/lo/hi scalars carried

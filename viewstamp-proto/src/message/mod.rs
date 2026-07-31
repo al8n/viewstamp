@@ -2338,7 +2338,7 @@ pub struct SyncCheckpoint {
   nonce: u64,
   snapshot: Bytes,
   membership: Bytes,
-  config_install_op: OpNumber,
+  config_install_op: Option<OpNumber>,
 }
 
 impl SyncCheckpoint {
@@ -2349,8 +2349,9 @@ impl SyncCheckpoint {
   /// requester's `config_id` differs from the carried one) reconstructs and installs that successor
   /// configuration from `(epoch, config_id, membership)`; a same-config sync leaves `membership` unread.
   ///
-  /// The producing op of the carried membership defaults to `0` (unrecorded) here; a sender that
-  /// attaches a membership stamps it via [`Self::with_config_install_op`].
+  /// The producing op of the carried membership is ABSENT here; a sender that attaches a
+  /// membership MUST stamp it via [`Self::with_config_install_op`] (presence and the membership
+  /// travel together — the wire codec refuses a membership-bearing answer without it).
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[allow(clippy::too_many_arguments)]
   pub fn new(
@@ -2374,19 +2375,21 @@ impl SyncCheckpoint {
       nonce,
       snapshot,
       membership,
-      config_install_op: OpNumber::new(),
+      config_install_op: None,
     }
   }
 
   /// Stamps the op of the last reconfigure that produced the carried [`Self::membership`] — the
-  /// sender's own `config_install_op`. Meaningful only when the membership is attached (non-empty);
+  /// sender's own `config_install_op`. Stamped exactly when the membership is attached (non-empty);
   /// a cross-epoch requester validates it against the served frontier and records it VERBATIM (its
   /// crossing durable root and its own install record), so the producing op survives any number of
-  /// crossings instead of being re-approximated by each one's checkpoint frontier.
+  /// crossings instead of being re-approximated by each one's checkpoint frontier. `op` may be `0`
+  /// — a genesis/offline-born configuration's producing point — which stays DISTINCT from the
+  /// unstamped state: presence itself is the claim, so an absent op can never be mistaken for one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[must_use]
   pub const fn with_config_install_op(mut self, op: OpNumber) -> Self {
-    self.config_install_op = op;
+    self.config_install_op = Some(op);
     self
   }
 
@@ -2457,13 +2460,15 @@ impl SyncCheckpoint {
   }
 
   /// The op of the last reconfigure that produced the carried [`Self::membership`] — the sender's
-  /// `config_install_op`, stamped via [`Self::with_config_install_op`]. Meaningful only when the
-  /// membership is non-empty; `0` means unrecorded (or a genesis/offline-born configuration whose
-  /// producing point is genuinely `0`). A cross-epoch requester admits it only at or below
-  /// [`Self::checkpoint_op`] (the serve gate's own guarantee, reflected back) and at or above its
-  /// own effective install record, then records it verbatim.
+  /// `config_install_op`, stamped via [`Self::with_config_install_op`]. Present iff the membership
+  /// is attached (the wire codec enforces the pairing in both directions); `Some(0)` is a
+  /// genesis/offline-born configuration whose producing point is genuinely `0`, and `None` is a
+  /// membership-less answer — there is no unrecorded-but-attached state to misread. A cross-epoch
+  /// requester REFUSES a membership whose producing op is absent, admits a present one only at or
+  /// below [`Self::checkpoint_op`] (the serve gate's own guarantee, reflected back) and at or
+  /// above its own effective install record, then records it verbatim.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn config_install_op(&self) -> OpNumber {
+  pub const fn config_install_op(&self) -> Option<OpNumber> {
     self.config_install_op
   }
 
