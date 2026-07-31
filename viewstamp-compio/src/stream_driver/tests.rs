@@ -610,7 +610,6 @@ async fn validation_resets_the_redial_backoff_to_base() {
   // `Labeled` handshake.
   let peer_config = Config::try_new(CLUSTER, MemberId::new(1_u128)).unwrap();
   let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
-  let mut pblocks = MemBlocks::default();
   // Genesis: commit over the peer's own store (which it then pumps), so it is formatted exactly as a
   // real peer's store would be.
   let peer_endpoint = Endpoint::<_, SingleChange>::with_reconfig(
@@ -637,20 +636,14 @@ async fn validation_resets_the_redial_backoff_to_base() {
     }
     while let Some((cid, bytes)) = driver.coord.poll_conn_transmit() {
       if cid == id {
-        peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb, &mut pblocks);
+        peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb);
       }
     }
     while let Some((cid, bytes)) = peer.poll_conn_transmit() {
       if cid == pid {
-        driver.coord.handle_conn_data(
-          id,
-          &bytes,
-          false,
-          now,
-          &mut driver.wal,
-          &mut driver.sb,
-          &mut driver.blocks,
-        );
+        driver
+          .coord
+          .handle_conn_data(id, &bytes, false, now, &mut driver.wal, &mut driver.sb);
       }
     }
   }
@@ -2112,13 +2105,9 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
     viewstamp_proto::RequestNumber::with(1),
     Bytes::from_static(b"x"),
   );
-  driver.coord.submit_client_request(
-    now,
-    &mut driver.wal,
-    &mut driver.sb,
-    &mut driver.blocks,
-    request,
-  );
+  driver
+    .coord
+    .submit_client_request(now, &mut driver.wal, &mut driver.sb, request);
   driver
     .coord
     .handle_storage(now, &mut driver.wal, &mut driver.sb, &mut driver.blocks);

@@ -202,8 +202,8 @@ fn run_until_converged_faulty(
     now = now + Duration::from_millis(5);
     r0.handle_storage(now, wal0, sb0, blocks0);
     r1.handle_storage(now, wal1, sb1, blocks1);
-    r0.handle_timeout(now, wal0, sb0, blocks0);
-    r1.handle_timeout(now, wal1, sb1, blocks1);
+    r0.handle_timeout(now, wal0, sb0);
+    r1.handle_timeout(now, wal1, sb1);
 
     // Collect every outbound datagram from both sides through the seeded faults, routing by
     // destination: r0's traffic to r1 is faulted into the pipe toward r1 (from addr0), and vice
@@ -222,10 +222,10 @@ fn run_until_converged_faulty(
     // Deliver everything DUE this tick (in-order plus any reordered datagram whose hold elapsed) to
     // the OTHER coordinator under the same `now`.
     for (from, bytes) in to_r1.pop_due(tick) {
-      r1.handle_udp(now, from, None, &bytes, wal1, sb1, blocks1);
+      r1.handle_udp(now, from, None, &bytes, wal1, sb1);
     }
     for (from, bytes) in to_r0.pop_due(tick) {
-      r0.handle_udp(now, from, None, &bytes, wal0, sb0, blocks0);
+      r0.handle_udp(now, from, None, &bytes, wal0, sb0);
     }
 
     if r0.endpoint().state_machine_ref().applied().len() == 1

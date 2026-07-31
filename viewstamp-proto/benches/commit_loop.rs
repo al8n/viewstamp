@@ -281,6 +281,8 @@ struct Replica<S: StateMachine> {
   wal: BenchWal,
   sb: BenchSb,
   blocks: BenchBlocks,
+  /// The execution-order witness of this replica's inline storage lane.
+  block_lane: viewstamp_proto::BlockJobCursor,
 }
 
 /// One closed-loop client: at most one request in flight; the next is minted as
@@ -325,6 +327,7 @@ where
         wal,
         sb,
         blocks: BenchBlocks::default(),
+        block_lane: viewstamp_proto::BlockJobCursor::new(),
       }
     })
     .collect();
@@ -361,7 +364,6 @@ where
           now,
           &mut r.wal,
           &mut r.sb,
-          &mut r.blocks,
           Peer::Client(cl.id),
           Message::Request(req),
         );
@@ -415,12 +417,19 @@ where
       while let Some((to, from, msg)) = inbox.pop_front() {
         moved = true;
         let r = &mut reps[to];
-        r.ep
-          .handle_message(now, &mut r.wal, &mut r.sb, &mut r.blocks, from, msg);
+        r.ep.handle_message(now, &mut r.wal, &mut r.sb, from, msg);
       }
       for r in &mut reps {
-        r.ep
-          .handle_storage(now, &mut r.wal, &mut r.sb, &mut r.blocks);
+        // The bench's inline storage lane: drain the WAL/superblock completions, then execute one
+        // queued block job and feed its completion back, until neither side produces work.
+        loop {
+          r.ep.handle_storage(now, &mut r.wal, &mut r.sb);
+          let Some(job) = r.ep.poll_block_job() else {
+            break;
+          };
+          let done = viewstamp_proto::execute_block_job(&mut r.block_lane, job, &mut r.blocks);
+          r.ep.on_block_done(now, &mut r.wal, &mut r.sb, done);
+        }
         while r.ep.poll_event().is_some() {}
       }
       if !moved {
@@ -431,8 +440,7 @@ where
     // Fire timers at the advanced instant (heartbeat / retransmit cadence), as a
     // real driver would each tick.
     for r in &mut reps {
-      r.ep
-        .handle_timeout(now, &mut r.wal, &mut r.sb, &mut r.blocks);
+      r.ep.handle_timeout(now, &mut r.wal, &mut r.sb);
     }
   }
 

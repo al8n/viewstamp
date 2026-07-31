@@ -308,7 +308,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
-    mut blocks: L,
+    blocks: L,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -346,14 +346,7 @@ where
     let listener = TcpListener::bind(bind_addr)
       .await
       .map_err(DriverError::Bind)?;
-    let endpoint = build_endpoint(
-      config,
-      membership,
-      state_machine,
-      &mut wal,
-      &mut sb,
-      &mut blocks,
-    )?;
+    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
     let coord = StreamCoordinator::new(endpoint);
     // Seed the peer_book from the initial (slot -> addr) peers using the coordinator's membership
     // to resolve each slot to its stable MemberId.
@@ -771,15 +764,9 @@ where
   fn handle_inbound(&mut self, now: Instant, inb: BridgeInbound) {
     match inb {
       BridgeInbound::Bytes { id, bytes } => {
-        self.coord.handle_conn_data(
-          id,
-          &bytes,
-          false,
-          now,
-          &mut self.wal,
-          &mut self.sb,
-          &mut self.blocks,
-        );
+        self
+          .coord
+          .handle_conn_data(id, &bytes, false, now, &mut self.wal, &mut self.sb);
         // An inbound frame can install a new membership; refresh the dial-map immediately so a
         // close/redial that follows this feed (this iteration's `reconcile_closed_conns` /
         // `reconcile_auth_deadlines`, or a `close_conn`) reads the current projection, never a
@@ -891,13 +878,9 @@ where
             reservation,
           },
         );
-        self.coord.submit_client_request(
-          now,
-          &mut self.wal,
-          &mut self.sb,
-          &mut self.blocks,
-          request,
-        );
+        self
+          .coord
+          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
         false
       }
       Command::Shutdown { ack } => {
@@ -1069,15 +1052,9 @@ where
   /// `handle_conn_data(.., true, ..)` is a no-op.
   fn close_conn(&mut self, id: ConnId, now: Instant) {
     let removed = self.conns.remove(&id); // drop cancels the task(s) (connect or both halves) + out_tx
-    self.coord.handle_conn_data(
-      id,
-      &[],
-      true,
-      now,
-      &mut self.wal,
-      &mut self.sb,
-      &mut self.blocks,
-    ); // reap in coordinator
+    self
+      .coord
+      .handle_conn_data(id, &[], true, now, &mut self.wal, &mut self.sb); // reap in coordinator
     if let Some(Conn {
       redial: Some(redial),
       ..
@@ -1255,7 +1232,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, &mut self.blocks, request);
+        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
     }
   }
 
@@ -1383,9 +1360,7 @@ where
       .poll_timeout()
       .is_none_or(|deadline| deadline <= now)
     {
-      self
-        .coord
-        .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+      self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
       self.rekey_if_needed(now);
     }
   }

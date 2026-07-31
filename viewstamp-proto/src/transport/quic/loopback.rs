@@ -136,8 +136,8 @@ fn run_until_converged(
     now = now + Duration::from_millis(5);
     r0.handle_storage(now, wal0, sb0, blocks0);
     r1.handle_storage(now, wal1, sb1, blocks1);
-    r0.handle_timeout(now, wal0, sb0, blocks0);
-    r1.handle_timeout(now, wal1, sb1, blocks1);
+    r0.handle_timeout(now, wal0, sb0);
+    r1.handle_timeout(now, wal1, sb1);
 
     // Collect every outbound datagram from both sides, routing by destination: r0's traffic to r1
     // is queued toward r1 (from addr0), and vice versa. A self-addressed datagram cannot arise (a
@@ -155,10 +155,10 @@ fn run_until_converged(
 
     // Deliver everything queued this tick to the OTHER coordinator under the same `now`.
     while let Some((from, bytes)) = to_r1.pop() {
-      r1.handle_udp(now, from, None, &bytes, wal1, sb1, blocks1);
+      r1.handle_udp(now, from, None, &bytes, wal1, sb1);
     }
     while let Some((from, bytes)) = to_r0.pop() {
-      r0.handle_udp(now, from, None, &bytes, wal0, sb0, blocks0);
+      r0.handle_udp(now, from, None, &bytes, wal0, sb0);
     }
 
     if r0.endpoint().state_machine_ref().applied().len() == 1
@@ -188,8 +188,8 @@ fn converged_at(
     now = now + Duration::from_millis(5);
     r0.handle_storage(now, wal0, sb0, blocks0);
     r1.handle_storage(now, wal1, sb1, blocks1);
-    r0.handle_timeout(now, wal0, sb0, blocks0);
-    r1.handle_timeout(now, wal1, sb1, blocks1);
+    r0.handle_timeout(now, wal0, sb0);
+    r1.handle_timeout(now, wal1, sb1);
     while let Some((dst, bytes)) = r0.poll_transmit() {
       if dst == addr1 {
         to_r1.push(addr0, bytes);
@@ -201,10 +201,10 @@ fn converged_at(
       }
     }
     while let Some((from, bytes)) = to_r1.pop() {
-      r1.handle_udp(now, from, None, &bytes, wal1, sb1, blocks1);
+      r1.handle_udp(now, from, None, &bytes, wal1, sb1);
     }
     while let Some((from, bytes)) = to_r0.pop() {
-      r0.handle_udp(now, from, None, &bytes, wal0, sb0, blocks0);
+      r0.handle_udp(now, from, None, &bytes, wal0, sb0);
     }
     if r0.endpoint().state_machine_ref().applied().len() == 1
       && r1.endpoint().state_machine_ref().applied().len() == 1
@@ -242,12 +242,11 @@ pub(super) fn dial_and_seed(
     .connect(Instant::ZERO, addr0, Peer::Replica(ReplicaId::new(0)))
     .expect("a fresh coordinator dials under the connection cap");
 
-  let (coord0, wal0, sb0, blocks0) = r0;
+  let (coord0, wal0, sb0, _blocks0) = r0;
   coord0.inject_message_for_test(
     Instant::ZERO,
     wal0,
     sb0,
-    blocks0,
     Peer::Client(ClientId::new(1)),
     Message::Request(Request::new(ClientId::new(1), RequestNumber::with(1), body)),
   );
@@ -633,12 +632,11 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
     .connect(Instant::ZERO, addr0, Peer::Replica(ReplicaId::new(0)))
     .expect("a fresh coordinator dials under the connection cap");
   {
-    let (coord0, wal0, sb0, blocks0) = &mut r0;
+    let (coord0, wal0, sb0, _blocks0) = &mut r0;
     coord0.inject_message_for_test(
       Instant::ZERO,
       wal0,
       sb0,
-      blocks0,
       Peer::Client(ClientId::new(1)),
       Message::Request(Request::new(
         ClientId::new(1),
@@ -656,8 +654,8 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
     now = now + Duration::from_millis(5);
     r0.0.handle_storage(now, &mut r0.1, &mut r0.2, &mut r0.3);
     r1.0.handle_storage(now, &mut r1.1, &mut r1.2, &mut r1.3);
-    r0.0.handle_timeout(now, &mut r0.1, &mut r0.2, &mut r0.3);
-    r1.0.handle_timeout(now, &mut r1.1, &mut r1.2, &mut r1.3);
+    r0.0.handle_timeout(now, &mut r0.1, &mut r0.2);
+    r1.0.handle_timeout(now, &mut r1.1, &mut r1.2);
     while let Some((dst, bytes)) = r0.0.poll_transmit() {
       if dst == addr1 {
         to_r1.push(addr0, bytes);
@@ -670,11 +668,11 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
     }
     while let Some((from, bytes)) = to_r1.pop() {
       r1.0
-        .handle_udp(now, from, None, &bytes, &mut r1.1, &mut r1.2, &mut r1.3);
+        .handle_udp(now, from, None, &bytes, &mut r1.1, &mut r1.2);
     }
     while let Some((from, bytes)) = to_r0.pop() {
       r0.0
-        .handle_udp(now, from, None, &bytes, &mut r0.1, &mut r0.2, &mut r0.3);
+        .handle_udp(now, from, None, &bytes, &mut r0.1, &mut r0.2);
     }
     if r0.0.endpoint().state_machine_ref().applied().len() == 1
       && r1.0.endpoint().state_machine_ref().applied().len() == 1
@@ -796,12 +794,8 @@ fn small_node_admits_peer(scheme: Scheme, peer_id: u8) -> PeerOutcome {
   let mut to_peer = PacketPipe::default();
   for _ in 0..2_000 {
     now = now + Duration::from_millis(5);
-    small
-      .0
-      .handle_timeout(now, &mut small.1, &mut small.2, &mut small.3);
-    peer
-      .0
-      .handle_timeout(now, &mut peer.1, &mut peer.2, &mut peer.3);
+    small.0.handle_timeout(now, &mut small.1, &mut small.2);
+    peer.0.handle_timeout(now, &mut peer.1, &mut peer.2);
     while let Some((dst, bytes)) = small.0.poll_transmit() {
       if dst == peer_addr {
         to_peer.push(small_addr, bytes);
@@ -813,26 +807,14 @@ fn small_node_admits_peer(scheme: Scheme, peer_id: u8) -> PeerOutcome {
       }
     }
     while let Some((from, bytes)) = to_small.pop() {
-      small.0.handle_udp(
-        now,
-        from,
-        None,
-        &bytes,
-        &mut small.1,
-        &mut small.2,
-        &mut small.3,
-      );
+      small
+        .0
+        .handle_udp(now, from, None, &bytes, &mut small.1, &mut small.2);
     }
     while let Some((from, bytes)) = to_peer.pop() {
-      peer.0.handle_udp(
-        now,
-        from,
-        None,
-        &bytes,
-        &mut peer.1,
-        &mut peer.2,
-        &mut peer.3,
-      );
+      peer
+        .0
+        .handle_udp(now, from, None, &bytes, &mut peer.1, &mut peer.2);
     }
     // Stop early once the small node has settled the peer either way — bound as a replica, or
     // quarantined on the learn lane. Both positive outcomes settle fast.
@@ -1029,8 +1011,8 @@ fn a_buffered_tiny_frame_window_drains_one_budget_per_pump() {
   for _ in 0..4000u64 {
     now = now + Duration::from_millis(1);
     {
-      let (c0, w0, s0, b0) = &mut r0;
-      c0.handle_timeout(now, w0, s0, b0);
+      let (c0, w0, s0, _b0) = &mut r0;
+      c0.handle_timeout(now, w0, s0);
     }
     let mut moved = false;
     // r0's datagrams → buffered into r1 (no drain); r1's ACK datagrams → delivered to r0 normally.
@@ -1059,8 +1041,8 @@ fn a_buffered_tiny_frame_window_drains_one_budget_per_pump() {
     }
     for bytes in &to_r0 {
       moved = true;
-      let (c0, w0, s0, b0) = &mut r0;
-      c0.handle_udp(now, addr1, None, bytes, w0, s0, b0);
+      let (c0, w0, s0, _b0) = &mut r0;
+      c0.handle_udp(now, addr1, None, bytes, w0, s0);
     }
     // Stop once the link has quiesced (r0 flushed its whole staged burst and the ACK exchange settled).
     if moved {
@@ -1099,8 +1081,8 @@ fn a_buffered_tiny_frame_window_drains_one_budget_per_pump() {
       );
     }
     now = now + Duration::from_millis(1);
-    let (c1, w1, s1, b1) = &mut r1;
-    c1.receive_pump_for_test(now, w1, s1, b1);
+    let (c1, w1, s1, _b1) = &mut r1;
+    c1.receive_pump_for_test(now, w1, s1);
     let delivered = r1.0.consensus_frames_delivered() - before;
     if delivered > 0 {
       pumps += 1;
@@ -1222,7 +1204,6 @@ fn public_submit_client_request_converges() {
     Instant::ZERO,
     &mut r0.1,
     &mut r0.2,
-    &mut r0.3,
     Request::new(
       ClientId::new(1),
       RequestNumber::with(1),

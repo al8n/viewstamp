@@ -32,6 +32,9 @@ pub struct StreamCoordinator<S: StateMachine, R> {
   /// [`Self::reconcile_routing`] (a no-op unless the membership actually changed). Seeded from the
   /// endpoint's `config_id` at construction.
   last_reconciled_config_id: u128,
+  /// The execution-order witness of this coordinator's inline storage lane — one cursor per LANE, so
+  /// a job executed out of the order the endpoint issued it fail-stops before it touches the store.
+  block_lane: crate::BlockJobCursor,
 }
 
 impl<S: StateMachine, R> core::fmt::Debug for StreamCoordinator<S, R> {
@@ -54,6 +57,7 @@ impl<S: StateMachine, R> StreamCoordinator<S, R> {
       endpoint,
       router: PeerRouter::new(),
       last_reconciled_config_id,
+      block_lane: crate::BlockJobCursor::new(),
     }
   }
 
@@ -73,6 +77,7 @@ impl<S: StateMachine, R> StreamCoordinator<S, R> {
       endpoint,
       router: PeerRouter::with_outbound_cap(cap),
       last_reconciled_config_id,
+      block_lane: crate::BlockJobCursor::new(),
     }
   }
 
@@ -143,7 +148,6 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
   ) {
     // Feed the driver read in bounded chunks, decoding and draining between each, so the transport's
     // per-conn intake memory (record staging, the frame decoder's complete-frame queue) stays
@@ -167,7 +171,7 @@ where
         let _ = conn.poll_decoded(&mut decoded);
       }
       for (from, msg) in decoded {
-        self.deliver_inbound(now, wal, sb, blocks, from, msg);
+        self.deliver_inbound(now, wal, sb, from, msg);
       }
       // Finalize a peer-finished conn BEFORE pumping the output its final frames produced. A final
       // chunk can carry a complete request AND EOF; the endpoint's response to that request is now in
@@ -277,7 +281,6 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     request: Request,
   ) {
     if request.body().len() > super::frame::max_request_body_len() {
@@ -291,7 +294,6 @@ where
       now,
       wal,
       sb,
-      blocks,
       Peer::Client(request.client()),
       Message::Request(request.clone()),
     );
@@ -318,7 +320,6 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
@@ -327,27 +328,44 @@ where
     {
       return;
     }
-    self
-      .endpoint
-      .handle_message(now, wal, sb, blocks, from, msg);
+    self.endpoint.handle_message(now, wal, sb, from, msg);
   }
 
   /// Drives timers, then pumps.
-  pub fn handle_timeout<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
-    self.endpoint.handle_timeout(now, wal, sb, blocks);
+  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+    self.endpoint.handle_timeout(now, wal, sb);
     // A timeout-driven advance may have installed a new membership; reconcile routing against it
     // BEFORE the pump, so no current-config output rides a stale slot table.
     self.reconcile_routing();
     self.pump();
   }
 
-  /// Drives storage completions, then pumps.
+  /// Runs every block job the endpoint has queued against `blocks`, feeding each completion back,
+  /// and re-drains WAL/superblock completions between jobs — a completion can submit the superblock
+  /// write it gates (a materialized checkpoint publishing its snapshot), and a superblock completion
+  /// can queue the next job. The loop settles once neither side produces work.
+  ///
+  /// This is the coordinator's INLINE storage lane, and the ONLY place it holds a block store. It
+  /// satisfies the executor contract by construction: jobs execute strictly in poll order on ONE
+  /// cursor, and their completions are fed back in that same order.
+  fn drain_storage<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    loop {
+      self.endpoint.handle_storage(now, wal, sb);
+      let Some(job) = self.endpoint.poll_block_job() else {
+        break;
+      };
+      let done = crate::execute_block_job(&mut self.block_lane, job, blocks);
+      self.endpoint.on_block_done(now, wal, sb, done);
+    }
+  }
+
+  /// Drives storage completions — WAL, superblock, and the block-job lane — then pumps.
   pub fn handle_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -355,7 +373,7 @@ where
     sb: &mut B,
     blocks: &mut dyn BlockStore,
   ) {
-    self.endpoint.handle_storage(now, wal, sb, blocks);
+    self.drain_storage(now, wal, sb, blocks);
     // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
     // membership; reconcile routing against it BEFORE the pump.
     self.reconcile_routing();
@@ -557,11 +575,10 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
-    self.deliver_inbound(now, wal, sb, blocks, from, msg);
+    self.deliver_inbound(now, wal, sb, from, msg);
     self.pump();
   }
 }

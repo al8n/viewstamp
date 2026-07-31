@@ -35,7 +35,6 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -43,7 +42,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
       Bytes::from_static(b"a"),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote (bit 0)
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote (bit 0)
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(
     e.commit(),
@@ -62,7 +61,6 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -74,7 +72,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -86,7 +84,6 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -98,7 +95,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -116,15 +113,8 @@ fn foreign_config_id_commit_is_not_adopted() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold op 1 (so a commit=1 is appliable).
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(e.commit(), OpNumber::new());
 
@@ -133,7 +123,6 @@ fn foreign_config_id_commit_is_not_adopted() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -143,7 +132,7 @@ fn foreign_config_id_commit_is_not_adopted() {
       FOREIGN_CONFIG_ID,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -155,7 +144,6 @@ fn foreign_config_id_commit_is_not_adopted() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -165,7 +153,7 @@ fn foreign_config_id_commit_is_not_adopted() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -182,24 +170,10 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(2, 1),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {} // discard acks
 
   // Foreign-config_id RequestPrepare for op 1: rejected at the lineage gate — no serve.
@@ -207,7 +181,6 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -226,7 +199,6 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -263,7 +235,6 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -291,7 +262,6 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::RepairBatch(crate::RepairBatch::new(
       View::new(),
@@ -312,7 +282,6 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::RepairBatch(crate::RepairBatch::new(
       View::new(),
@@ -322,7 +291,7 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
       std::vec![entry],
     )),
   );
-  r.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(2),
     "an in-lineage RepairBatch is admitted → the op-2 hole is filled",
@@ -339,20 +308,13 @@ fn same_config_prepare_happy_path_still_appends_and_acks() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // `prepare(1, 0)` carries `Epoch::new(0)` + config_id 0 (the fixture lineage).
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
   assert_eq!(
     e.op(),
     OpNumber::with(1),
     "the same-config Prepare is appended"
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // pump WAL → PrepareOk
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // pump WAL → PrepareOk
   match e
     .poll_message()
     .expect("a PrepareOk is emitted for the admitted Prepare")
@@ -400,7 +362,6 @@ fn recovering_with_hole_at_epoch(
     CountSm::default(),
     &mut wal,
     &mut sb,
-    &mut blocks,
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -434,7 +395,6 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -452,7 +412,6 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -466,7 +425,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
       Bytes::copy_from_slice(&[2u8]),
     )),
   );
-  r.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(2),
     "a foreign-epoch repair-serve Prepare fills the hole — the repair arm is epoch-agnostic",
@@ -474,7 +433,6 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
 
   // Normal arm (strict): a backup at the head must NOT append a foreign-epoch head-advancing Prepare.
   let (mut e, mut wal2, mut sb2) = recovering_with_hole_at_epoch(3, 2, 1);
-  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   while e.poll_message().is_some() {}
   let head_before = e.op();
   let now = Instant::ZERO;
@@ -482,7 +440,6 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
     now,
     &mut wal2,
     &mut sb2,
-    &mut blocks2,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -533,14 +490,12 @@ fn a_non_normal_laggard_routes_a_higher_epoch_heartbeat_into_the_recovery_peer_f
   // (`awaiting_peer_checkpoint`): it solicits a cross-epoch `SyncCheckpoint` and ends Normal at E+1.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Drive the backup into a ViewChange at the OLD epoch via a higher-view (same-epoch) catch-up.
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -569,7 +524,6 @@ fn a_non_normal_laggard_routes_a_higher_epoch_heartbeat_into_the_recovery_peer_f
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -623,14 +577,7 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A view-0 Prepare stages the backup's append; its completion is HELD (the async in-flight window).
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
   assert_eq!(wal.staged_len(), 1, "the append is physically in flight");
   assert!(e.has_inflight_storage());
   while e.poll_message().is_some() {}
@@ -641,7 +588,6 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -659,7 +605,6 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -681,7 +626,7 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   // nothing else is owed (the action was abandoned at the transition), so storage is fully
   // quiescent — the drain signal settles instead of wedging forever.
   assert!(wal.release_latest_for(1), "the held append lands");
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_inflight_storage(),
     "the quiescence witness retired on delivery while Recovering — nothing leaks"
@@ -703,19 +648,17 @@ fn a_pending_durable_view_write_defers_the_cross_epoch_peer_fetch() {
   // higher-epoch heartbeat re-triggers it.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Self-driven view change via SVC quorum (own idle-timeout SVC + one peer SVC), which issues a
   // SendDoViewChange durable-view write. We do NOT pump `handle_storage`, so the write stays in flight
   // (the initial DoViewChange is deferred until the view is durable) and `pending_durable_view` holds.
-  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks); // bootstrap primary_idle
+  e.handle_timeout(now, &mut wal, &mut sb); // bootstrap primary_idle
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle due → own SVC(view 1)
+  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle due → own SVC(view 1)
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -736,7 +679,6 @@ fn a_pending_durable_view_write_defers_the_cross_epoch_peer_fetch() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -782,7 +724,6 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
   // dropped at the authority ingress, casting no vote / driving no view change).
   let mut e = settled_voter_at(1);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.status().is_normal() && e.membership.epoch() == Epoch::new(1));
   let from = Peer::Replica(ReplicaId::new(2)); // an active member of our 3-voter config
@@ -791,7 +732,6 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     from,
     // A stranded laggard's OLD-epoch (epoch 0) StartViewChange at some view, self-identifying replica 2.
     Message::StartViewChange(StartViewChange::new(
@@ -842,7 +782,6 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -870,7 +809,6 @@ fn a_stranded_laggard_triggers_the_cross_epoch_peer_fetch_on_an_epoch_ahead_hint
   // crosses only when the verified crossing checkpoint installs.
   let mut e = backup(); // Normal at epoch 0
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.status().is_normal() && e.membership.epoch() == Epoch::new(0));
 
@@ -878,7 +816,6 @@ fn a_stranded_laggard_triggers_the_cross_epoch_peer_fetch_on_an_epoch_ahead_hint
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(), // a retained voter (slot 0) the laggard already binds
     Message::EpochAhead(EpochAhead::new(Epoch::new(1), OpNumber::with(9))),
   );
@@ -914,7 +851,6 @@ fn a_higher_epoch_hint_from_a_non_member_slot_does_not_trigger_catch_up() {
   // pinned by the sibling tests above; a non-member hint is dropped here BEFORE it can poison.
   let mut e = backup(); // Normal at epoch 0, node_count 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(
     e.membership.node_count(),
@@ -926,7 +862,6 @@ fn a_higher_epoch_hint_from_a_non_member_slot_does_not_trigger_catch_up() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(5)), // a NON-member slot beyond our config — misrouted/forged
     Message::Commit(Commit::new(
       View::with(2),

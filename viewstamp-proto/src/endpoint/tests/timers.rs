@@ -37,7 +37,7 @@ fn new_primary_in_pending_view_window_does_not_spin_a_poll_timeout_driver() {
        deadline ({due:?} <= {last:?})"
     );
     last = due;
-    e.handle_timeout(due, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(due, &mut wal, &mut sb);
     while e.poll_message().is_some() {}
     steps += 1;
     assert!(
@@ -54,7 +54,7 @@ fn new_primary_in_pending_view_window_does_not_spin_a_poll_timeout_driver() {
   // PASS-AFTER: the durable-view completion (not a timer) is what begins participation. Deliver it and
   // confirm the new primary now broadcasts its StartView and arms its real Normal-primary timers.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (the superblock completion, not a timer, resolved the window)"
@@ -90,7 +90,6 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // A Normal backup holding a committed-op repair hole at op 2 (commit held at 1 below it).
   e.force_state_for_test(0, 10, 1, 0, &[2]);
   assert!(!e.is_primary());
@@ -104,13 +103,11 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
     Instant::ZERO + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
-    &mut blocks,
   );
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -141,7 +138,7 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
     );
     last = due;
     distinct_advances += 1;
-    e.handle_timeout(due, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(due, &mut wal, &mut sb);
     while e.poll_message().is_some() {}
     if distinct_advances >= 5 {
       break; // five strictly-advancing windows is ample proof the clock is not pinned
@@ -188,7 +185,6 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
       now,
       &mut wal,
       &mut sb,
-      &mut blocks,
       Peer::Client(ClientId::new(7)),
       Message::Request(Request::new(
         ClientId::new(7),
@@ -196,12 +192,11 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
         Bytes::from(std::vec![rn as u8]),
       )),
     );
-    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
-      &mut blocks,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -223,7 +218,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
   assert!(!e.has_repair_hole_for_test(3), "no repair hole");
   // Tick the primary ONCE so its `commit` heartbeat timer is armed (a real primary is heartbeating
   // before it forfeits — the bug needs `commit` already armed when `pending_forfeit` is set).
-  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_timeout(now, &mut wal, &mut sb);
   while e.poll_message().is_some() {}
   let commit_deadline = e
     .poll_timeout()
@@ -244,7 +239,6 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -286,7 +280,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
       "poll_timeout must strictly ADVANCE, not spin on a stale commit deadline ({due:?} <= {last:?})"
     );
     last = due;
-    e.handle_timeout(due, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(due, &mut wal, &mut sb);
     let mut proposed_this_step = false;
     while let Some(out) = e.poll_message() {
       if let Message::StartViewChange(svc) = out.into_msg()
@@ -342,16 +336,15 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(!e.is_primary());
   // Bootstrap the idle timer: the first Normal-backup tick only ARMS `primary_idle` (= now + 200ms), it
   // does not fire (the deadline is in the future). Tick at ZERO to arm it.
-  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
   while e.poll_message().is_some() {}
   // The primary went silent: fire the primary_idle timeout at 200ms. `on_primary_idle` proposes view 1
   // and `join_svc` arms `svc_message` at 200ms + 100ms = 300ms (and re-arms `primary_idle` to 400ms).
   let t_idle = Instant::ZERO + core::time::Duration::from_millis(200);
-  e.handle_timeout(t_idle, &mut wal, &mut sb, &mut blocks);
+  e.handle_timeout(t_idle, &mut wal, &mut sb);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -393,7 +386,7 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
        ({due:?} <= {last:?})"
     );
     last = due;
-    e.handle_timeout(due, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(due, &mut wal, &mut sb);
     let mut rebroadcast_this_step = false;
     while let Some(out) = e.poll_message() {
       if let Message::StartViewChange(svc) = out.msg_ref()
@@ -445,7 +438,6 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // A Normal PRIMARY (replica 0, view 0) holding a committed `repair` hole at op 2 (commit held at 1
   // below it, head 10). `force_state_for_test` arms `repair_retry` and leaves commit_max > commit_min.
   e.force_state_for_test(0, 10, 1, 0, &[2]);
@@ -457,7 +449,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   // Tick the primary so `maybe_forfeit` observes the outstanding hole and ARMS the grace timer
   // (FORFEIT_GRACE = 300ms). It is NOT yet forfeiting — the grace must elapse first.
   let now = Instant::ZERO;
-  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_timeout(now, &mut wal, &mut sb);
   while e.poll_message().is_some() {}
   assert!(
     e.forfeit_armed_for_test(),
@@ -479,7 +471,6 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -524,7 +515,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
        ({due:?} <= {last:?})"
     );
     last = due;
-    e.handle_timeout(due, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(due, &mut wal, &mut sb);
     let mut proposed_this_step = false;
     while let Some(out) = e.poll_message() {
       if let Message::StartViewChange(svc) = out.msg_ref()
@@ -573,13 +564,13 @@ fn poll_timeout_only_returns_serviceable_timers() {
     e: &mut Endpoint<S>,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
+    _blocks: &mut dyn BlockStore,
     label: &str,
   ) {
     let Some(due) = e.poll_timeout() else {
       return; // no armed timer — vacuously serviceable (nothing to spin on).
     };
-    e.handle_timeout(due, wal, sb, blocks);
+    e.handle_timeout(due, wal, sb);
     while e.poll_message().is_some() {}
     if let Some(next) = e.poll_timeout() {
       assert!(
@@ -608,7 +599,6 @@ fn poll_timeout_only_returns_serviceable_timers() {
         Instant::ZERO,
         &mut wal,
         &mut sb,
-        &mut blocks,
         Peer::Client(ClientId::new(7)),
         Message::Request(Request::new(
           ClientId::new(7),
@@ -616,12 +606,11 @@ fn poll_timeout_only_returns_serviceable_timers() {
           Bytes::from(std::vec![rn as u8]),
         )),
       );
-      e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+      e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
       e.handle_message(
         Instant::ZERO,
         &mut wal,
         &mut sb,
-        &mut blocks,
         Peer::Replica(ReplicaId::new(1)),
         Message::PrepareOk(PrepareOk::new(
           View::new(),
@@ -657,7 +646,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let mut blocks = crate::block_store::InMemoryBlockStore::new();
     e.force_state_for_test(0, 10, 1, 0, &[2]); // committed repair hole → grace arms on the next tick
-    e.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
     while e.poll_message().is_some() {}
     let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
     let (env, id) = donor_envelope(&dsb);
@@ -667,7 +656,6 @@ fn poll_timeout_only_returns_serviceable_timers() {
       Instant::ZERO,
       &mut wal,
       &mut sb,
-      &mut blocks,
       primary_peer(),
       Message::SyncCheckpoint(crate::SyncCheckpoint::new(
         View::new(),
@@ -704,7 +692,6 @@ fn poll_timeout_only_returns_serviceable_timers() {
       Instant::ZERO + core::time::Duration::from_millis(200),
       &mut wal,
       &mut sb,
-      &mut blocks,
     );
     assert!(e.status().is_normal() && !e.is_primary());
     while e.poll_message().is_some() {}
@@ -724,13 +711,11 @@ fn poll_timeout_only_returns_serviceable_timers() {
       Instant::ZERO + core::time::Duration::from_millis(200),
       &mut wal,
       &mut sb,
-      &mut blocks,
     );
     e.handle_message(
       Instant::ZERO,
       &mut wal,
       &mut sb,
-      &mut blocks,
       Peer::Replica(ReplicaId::new(0)),
       Message::StartViewChange(StartViewChange::new(
         View::with(1),
@@ -740,7 +725,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
       )),
     );
     assert_eq!(e.status(), Status::ViewChange);
-    e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the durable-view write so it participates
+    e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the durable-view write so it participates
     while e.poll_message().is_some() {}
     for _ in 0..8 {
       assert_strictly_advances(&mut e, &mut wal, &mut sb, &mut blocks, "view-change");
@@ -757,11 +742,11 @@ fn poll_timeout_only_returns_serviceable_timers() {
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(2), u8::MAX);
     let mut blocks = crate::block_store::InMemoryBlockStore::new();
-    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks)
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb)
       .expect("recover accepts this store")
       .expect_active();
     assert!(e.status().is_recovering() || e.status().is_recovering_head());
-    e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
     for _ in 0..8 {
       assert_strictly_advances(&mut e, &mut wal, &mut sb, &mut blocks, "recovering");
@@ -778,18 +763,18 @@ fn poll_timeout_only_returns_serviceable_timers() {
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(3), u8::MAX);
     let mut blocks = crate::block_store::InMemoryBlockStore::new();
-    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks)
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb)
       .expect("recover accepts this store")
       .expect_active();
     // Drain the recover loop to its terminal RecoveringHead (re-submit the faulty head read until the
     // budget exhausts), driving purely via the recover_retry timer.
     for _ in 0..64 {
-      e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+      e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
       if e.status().is_recovering_head() {
         break;
       }
       if let Some(due) = e.poll_timeout() {
-        e.handle_timeout(due, &mut wal, &mut sb, &mut blocks);
+        e.handle_timeout(due, &mut wal, &mut sb);
       }
     }
     assert_eq!(
@@ -831,11 +816,10 @@ fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
     t0,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     client_request(1),
   );
-  e.handle_storage(t0, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(t0, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   let deadline = t0 + PREPARE_RETRANSMIT;
   assert_eq!(
@@ -853,11 +837,10 @@ fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
       now,
       &mut wal,
       &mut sb,
-      &mut blocks,
       Peer::Client(ClientId::new(7)),
       client_request(2 + i as u64),
     );
-    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
     assert_eq!(
       e.timers.prepare,
@@ -874,7 +857,7 @@ fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
   // At T the retransmit FIRES: the whole uncommitted tail is re-broadcast (as the byte-bounded
   // `PrepareBatch`), so op 1 — whose accept-time Prepare may have been lost — reaches the backups
   // despite the continuous accepts.
-  e.handle_timeout(deadline, &mut wal, &mut sb, &mut blocks);
+  e.handle_timeout(deadline, &mut wal, &mut sb);
   let mut resent = std::collections::BTreeSet::new();
   while let Some(out) = e.poll_message() {
     if let Message::PrepareBatch(b) = out.msg_ref() {

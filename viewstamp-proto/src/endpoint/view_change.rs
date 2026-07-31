@@ -623,7 +623,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     m: crate::DoViewChange,
   ) {
     // NOTE (deferred to a later milestone): we do not yet validate incoming DVC well-formedness
@@ -683,7 +682,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.dvc_from_mut().insert(m.replica(), m);
     }
     if self.dvc_from().len() >= self.membership.quorum_view_change() {
-      self.start_view_as_new_primary(now, wal, sb, blocks);
+      self.start_view_as_new_primary(now, wal, sb);
     }
   }
 
@@ -912,7 +911,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
   ) {
     // No NEW checkpoint starts when forming a new primary's view (`maybe_checkpoint` is gated on Normal
     // status). An ORDINARY checkpoint kept in flight ACROSS the transition is permitted: it completes
@@ -964,7 +962,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (checkpoints only start in Normal) — no NEW checkpoint starts. An ordinary checkpoint kept in flight
     // across the transition is carried forward verbatim by the StartViewAsPrimary durable-view write below
     // (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
-    self.advance_commit(now, sb, blocks, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
+    self.advance_commit(now, sb, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
 
     // truncate the uncommitted suffix at the FIRST interior gap above commit*. The
     // adopted canonical log is the offset-union `(min_floor .. op_head]` and may still have an interior
@@ -1167,12 +1165,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
-  pub(crate) fn start_view_participate<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub(crate) fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
     // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
     // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised
@@ -1206,7 +1199,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ));
 
     self.arm_timers(now);
-    self.try_commit(now, sb, blocks);
+    self.try_commit(now, sb);
   }
 
   /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`, floored at
@@ -1351,7 +1344,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     m: crate::StartView,
   ) {
     // Adopt only a strictly newer view, or the current view while we have not yet returned to Normal
@@ -1376,7 +1368,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.adopt_canonical_head(
       now,
       sb,
-      blocks,
       m.view(),
       m.op(),
       m.commit(),
@@ -1440,7 +1431,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     &mut self,
     now: Instant,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     view: View,
     op: OpNumber,
     commit: OpNumber,
@@ -1485,7 +1475,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // tail is a no-op (checkpoints only start in Normal) — no NEW checkpoint starts; an ordinary
     // checkpoint kept in flight is carried forward verbatim by the AdoptedStartView durable-view write
     // below (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
-    self.advance_commit(now, sb, blocks, commit.get());
+    self.advance_commit(now, sb, commit.get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;
     self.set_status(Status::Normal);

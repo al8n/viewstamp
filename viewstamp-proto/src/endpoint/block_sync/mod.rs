@@ -281,3 +281,82 @@ impl<R: BlockRefs> BlockSync<R> {
     Ok(())
   }
 }
+
+/// The PAIR of frontiers one checkpoint transfer walks: the state machine's checkpoint DAG and the
+/// proto's client-session DAG, each with its own resolver.
+///
+/// Held as a unit because the two are only ever advanced and drained together: a transfer is complete
+/// when BOTH are present, and a fetched block belongs to exactly one of them (the other reports
+/// [`BlockOutcome::NonFrontier`], which is inert by construction). Walking is store-driven, so the
+/// pair is MOVED into a block job and moved back on its completion rather than pumped on the pump.
+pub(crate) struct BlockWalks<S> {
+  /// The frontier over the SM checkpoint DAG.
+  pub(crate) sm: BlockSync<SmRefs<S>>,
+  /// The frontier over the client-session-table DAG.
+  pub(crate) session: BlockSync<SessionRefs>,
+}
+
+impl<S> core::fmt::Debug for BlockWalks<S> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("BlockWalks")
+      .field("sm", &self.sm)
+      .field("session", &self.session)
+      .finish()
+  }
+}
+
+impl<S> BlockWalks<S> {
+  /// Seeds both frontiers at their respective DAG roots.
+  pub(crate) fn new(sm_root: BlockAddress, sessions_root: BlockAddress) -> Self {
+    Self {
+      sm: BlockSync::new(sm_root),
+      session: BlockSync::new(sessions_root),
+    }
+  }
+}
+
+impl<S: StateMachine> BlockWalks<S> {
+  /// Feeds one fetched block into BOTH frontiers and reports whether either ACCEPTED it.
+  ///
+  /// The block belongs to exactly one DAG — the owning frontier accepts it (verifying it against its
+  /// content address, writing it, and enqueueing its children); the other reports `NonFrontier`,
+  /// which is inert. A hash mismatch leaves the block re-requestable. Returns `Err(())` when either
+  /// walk breached its reachable-block bound (a malformed / foreign DAG).
+  pub(crate) fn accept(
+    &mut self,
+    addr: BlockAddress,
+    bytes: Bytes,
+    store: &mut dyn BlockStore,
+  ) -> Result<bool, ()> {
+    let sm_outcome = self.sm.on_block(addr, bytes.clone(), store);
+    let session_outcome = self.session.on_block(addr, bytes, store);
+    let mut accepted = false;
+    for outcome in [sm_outcome, session_outcome] {
+      match outcome {
+        Ok(BlockOutcome::Accepted) => accepted = true,
+        // Not this frontier's outstanding address (the OTHER DAG owns it, or it is a
+        // delayed/superseded response), or a corrupt/substituted block that was not written and
+        // stays re-requestable: inert either way — the caller re-drives the pull.
+        Ok(BlockOutcome::NonFrontier) | Err(BlockSyncError::AddressMismatch { .. }) => {}
+        Err(BlockSyncError::TooManyBlocks) => return Err(()),
+      }
+    }
+    Ok(accepted)
+  }
+
+  /// Drains both frontiers and returns the next MISSING block across the two DAGs, or `None` when
+  /// BOTH are fully present (the transfer is complete).
+  ///
+  /// The SM DAG is drained first and the session DAG second — a deterministic order, so the fetch
+  /// sequence is stable — but completion requires both. `Err(())` is a reachable-block-bound breach
+  /// in either walk.
+  pub(crate) fn next_missing(
+    &mut self,
+    store: &dyn BlockStore,
+  ) -> Result<Option<BlockAddress>, ()> {
+    if let Some(addr) = self.sm.next_request(store).map_err(|_| ())? {
+      return Ok(Some(addr));
+    }
+    self.session.next_request(store).map_err(|_| ())
+  }
+}

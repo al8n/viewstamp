@@ -5,6 +5,75 @@
 
 use super::*;
 
+/// The test harness's INLINE storage lane, standing in for a driver's.
+///
+/// The endpoint holds no block store, so a fixture that wants a queued block job to actually run
+/// drives it here: drain the WAL/superblock completions, execute one queued job against the store,
+/// feed its completion back, and repeat until neither side produces work (a job completion can
+/// submit the superblock write it gates, and a superblock completion can queue the next job).
+///
+/// The cursor is per CALL rather than per fixture: a lane that executes strictly in poll order is
+/// in-order by construction, and job ids only grow across calls, so a fresh cursor accepts exactly
+/// the same sequence a persistent one would. The order contract's falsifiers drive an explicit
+/// long-lived cursor instead, which is what makes a deliberate reordering observable.
+trait StorageStep {
+  fn storage_step<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  );
+
+  /// Runs ONLY the queued block jobs, without pumping WAL or superblock completions.
+  ///
+  /// The narrower step a fixture uses to observe the state a job's completion establishes — a staged
+  /// install, an emitted pull — WITHOUT also driving the superblock sequence that state gates, which
+  /// on a synchronously-completing fixture superblock would run the whole install to completion in
+  /// one call.
+  fn block_step<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  );
+}
+
+impl<S: StateMachine, R: Reconfig> StorageStep for Endpoint<S, R> {
+  fn storage_step<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    let mut cursor = crate::BlockJobCursor::new();
+    loop {
+      self.handle_storage(now, wal, sb);
+      let Some(job) = self.poll_block_job() else {
+        break;
+      };
+      let done = crate::execute_block_job(&mut cursor, job, blocks);
+      self.on_block_done(now, wal, sb, done);
+    }
+  }
+
+  fn block_step<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    let mut cursor = crate::BlockJobCursor::new();
+    while let Some(job) = self.poll_block_job() {
+      let done = crate::execute_block_job(&mut cursor, job, blocks);
+      self.on_block_done(now, wal, sb, done);
+    }
+  }
+}
+
 /// A deep-tail size the recovery fixtures share: comfortably larger than any real pipeline, so a test
 /// tail of this depth (or a corrupt `op_head` capped to it via a bounded `capacity`) exercises the
 /// window machinery well past ordinary operation.
@@ -975,13 +1044,11 @@ fn new_primary_with_op2_candidate(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
-    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -996,7 +1063,6 @@ fn new_primary_with_op2_candidate(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -1022,7 +1088,7 @@ fn new_primary_with_op2_candidate(
       ],
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   (e, wal, sb, blocks)
 }
@@ -1046,7 +1112,6 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
     CountSm::default(),
     &mut wal,
     &mut sb,
-    &mut blocks,
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1074,13 +1139,13 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
   // fire per step is enough to count a pending op's budget down to its exhaustion resolution.
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    r.handle_storage(t, wal, sb, blocks);
+    r.storage_step(t, wal, sb, blocks);
     if !r.status().is_recovering() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, wal, sb, blocks);
+      r.handle_timeout(t, wal, sb);
     }
   }
   // Re-baseline every timer to the caller's `now`, so the terminal state is observably identical to a
@@ -1107,7 +1172,6 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
     NoopSm,
     &mut wal,
     &mut sb,
-    &mut blocks,
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1229,13 +1293,11 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
-    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1274,14 +1336,13 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
   // Now Normal primary of view 1, op 2 — but the durable-view write is inflight (StepSb has not
   // flushed it). Pump the WAL (so the op-2 AdoptVote append completes) WITHOUT flushing the SB, so
   // the window stays open. Discard anything emitted by the transition itself.
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
@@ -1372,13 +1433,13 @@ fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
     sb.flush();
-    r.handle_storage(t, wal, sb, blocks);
+    r.storage_step(t, wal, sb, blocks);
     if !r.status().is_recovering() && !r.status().is_recovering_head() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, wal, sb, blocks);
+      r.handle_timeout(t, wal, sb);
     }
   }
 }
@@ -1405,16 +1466,14 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
       now,
       &mut wal,
       &mut sb,
-      &mut blocks,
       Peer::Client(ClientId::new(7)),
       req(rn),
     );
-    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable (own vote)
+    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable (own vote)
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
-      &mut blocks,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -1430,7 +1489,7 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
         0,
       )),
     );
-    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain checkpoint writes
+    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain checkpoint writes
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -1513,16 +1572,14 @@ fn seed_donor_blocks(blocks: &mut crate::block_store::InMemoryBlockStore, ckpt: 
       now,
       &mut wal,
       &mut sb,
-      blocks,
       Peer::Client(ClientId::new(7)),
       req(rn),
     );
-    e.handle_storage(now, &mut wal, &mut sb, blocks);
+    e.storage_step(now, &mut wal, &mut sb, blocks);
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
-      blocks,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -1538,7 +1595,7 @@ fn seed_donor_blocks(blocks: &mut crate::block_store::InMemoryBlockStore, ckpt: 
         0,
       )),
     );
-    e.handle_storage(now, &mut wal, &mut sb, blocks);
+    e.storage_step(now, &mut wal, &mut sb, blocks);
   }
 }
 

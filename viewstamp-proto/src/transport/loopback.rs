@@ -52,14 +52,14 @@ fn run_until_converged<R: StreamTransport>(
     now = now + Duration::from_millis(10);
     r0.handle_storage(now, wal0, sb0, blocks0);
     r1.handle_storage(now, wal1, sb1, blocks1);
-    r0.handle_timeout(now, wal0, sb0, blocks0);
-    r1.handle_timeout(now, wal1, sb1, blocks1);
+    r0.handle_timeout(now, wal0, sb0);
+    r1.handle_timeout(now, wal1, sb1);
     for _ in 0..2 {
       while let Some((_id, bytes)) = r0.poll_conn_transmit() {
-        r1.handle_conn_data(c1, &bytes, false, now, wal1, sb1, blocks1);
+        r1.handle_conn_data(c1, &bytes, false, now, wal1, sb1);
       }
       while let Some((_id, bytes)) = r1.poll_conn_transmit() {
-        r0.handle_conn_data(c0, &bytes, false, now, wal0, sb0, blocks0);
+        r0.handle_conn_data(c0, &bytes, false, now, wal0, sb0);
       }
     }
     if r0.endpoint().state_machine_ref().applied().len() == 1
@@ -114,7 +114,6 @@ fn two_replicas_commit_over_plain_tcp() {
     Instant::ZERO,
     &mut wal0,
     &mut sb0,
-    &mut blocks0,
     Peer::Client(ClientId::new(1)),
     sized_request(b"x"),
   );
@@ -157,7 +156,6 @@ fn public_submit_client_request_over_tcp_converges() {
     Instant::ZERO,
     &mut wal0,
     &mut sb0,
-    &mut blocks0,
     Request::new(
       ClientId::new(1),
       RequestNumber::with(1),
@@ -202,7 +200,6 @@ fn two_replicas_commit_over_raw_passthrough() {
     Instant::ZERO,
     &mut wal0,
     &mut sb0,
-    &mut blocks0,
     Peer::Client(ClientId::new(1)),
     sized_request(b"x"),
   );
@@ -267,7 +264,6 @@ mod tls {
       Instant::ZERO,
       &mut wal0,
       &mut sb0,
-      &mut blocks0,
       Peer::Client(ClientId::new(1)),
       sized_request(body),
     );

@@ -7,7 +7,7 @@ use crate::{
   Event, Header, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Prepare,
   PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status,
   Superblock, SuperblockDone, View, Wal, WalDone,
-  block_job::{BlockJobKind, BlockJobOutput},
+  block_job::{BlockJobKind, BlockJobOutput, RecoveredCheckpoint, RestorePurpose, WalkPurpose},
 };
 
 pub(crate) mod block_sync;
@@ -366,8 +366,8 @@ struct SyncServe {
 /// The receiver-side payload of an in-progress block-DAG state-sync transfer, held as
 /// `block_fetch: Option<BlockFetch>` on the [`Endpoint`]: the verified [`SyncCheckpoint`] the laggard is
 /// installing (carrying the inline `(checkpoint_op, sessions, sm_root)` header, replayed into
-/// [`Endpoint::apply_sync`] once the DAG drains), and the [`BlockSync`] frontier walking the SM
-/// checkpoint DAG rooted at `sm_root`. Held only while a block pull is in progress — always under an
+/// [`Endpoint::apply_sync`] once the DAG drains), and the [`WalkState`] holding (or lending out) the
+/// frontiers over its two DAGs. Held only while a block pull is in progress — always under an
 /// outstanding `sync` (the invariant `block_fetch ⟹ sync`, asserted beside `pending_install ⟹ sync`):
 /// every path that clears `sync` clears the fetch with it, and an abort (a malformed-DAG bound breach / a
 /// superseding checkpoint) drops ONLY the fetch, keeping `sync` armed so the solicit timer re-solicits.
@@ -378,6 +378,22 @@ struct SyncServe {
 /// `BlockStore` is the durable, content-addressed cache — there is no separate staging buffer to lose).
 /// A corrupt block is rejected on receipt by its hash and re-requested. Volatile: a crash clears it for
 /// free (the partially-written blocks survive in the store and are simply re-discovered on the next sync).
+/// Where a transfer's [`BlockWalks`](block_sync::BlockWalks) currently live: HELD by the fetch, or
+/// MOVED into a block job that is advancing them.
+///
+/// The two states are exclusive by construction, so the pump cannot pump a frontier while the
+/// storage lane is walking it, and a walk cannot be issued twice for one transfer. The in-flight
+/// state carries the job's id: a completion is grafted back ONLY onto the transfer still waiting on
+/// THAT job, so walks returned for a transfer that was replaced or torn down while they executed are
+/// dropped and counted rather than grafted onto its successor's frontier.
+#[derive(Debug)]
+enum WalkState<S> {
+  /// The frontiers are held here and may be moved into a fresh walk job.
+  Idle(block_sync::BlockWalks<S>),
+  /// A walk job is advancing them; the id is the token its completion must match.
+  InFlight(crate::JobId),
+}
+
 #[derive(Debug)]
 struct BlockFetch<S> {
   /// The verified checkpoint message being installed. Held verbatim so that, once the DAG rooted at its
@@ -394,14 +410,15 @@ struct BlockFetch<S> {
   /// The peer the next block pull is addressed to (re-pinned on each `BlockResponse` — the freshest
   /// live server).
   donor: Peer,
-  /// The missing-block frontier walking the SM DAG rooted at `sm_root`, fetching only the blocks the
-  /// store is missing (an unchanged subtree the laggard already holds is never re-pulled).
-  block_sync: block_sync::BlockSync<block_sync::SmRefs<S>>,
-  /// The missing-block frontier walking the SESSION-table DAG rooted at `sessions_root`. The fetch is
-  /// complete (the checkpoint replayed into `apply_sync`) only when BOTH this and `block_sync` have
-  /// drained — the install reconstructs the SM from `sm_root` AND the session table from `sessions_root`,
-  /// so both DAGs must be fully present first.
-  session_sync: block_sync::BlockSync<block_sync::SessionRefs>,
+  /// The missing-block frontiers over BOTH DAGs — the SM checkpoint DAG rooted at `sm_root` and the
+  /// session table rooted at `sessions_root` — fetching only the blocks the store is missing (an
+  /// unchanged subtree the laggard already holds is never re-pulled). The fetch is complete (the
+  /// checkpoint replayed into `apply_sync`) only when BOTH have drained: the install reconstructs the
+  /// SM from `sm_root` AND the session table from `sessions_root`, so both must be fully present.
+  ///
+  /// Advancing a frontier is intrinsically STORE-DRIVEN, so the walks live either HERE or inside an
+  /// executing [`BlockJob`](crate::BlockJob) — never both ([`WalkState`]).
+  walks: WalkState<S>,
   /// Whether this fetch's pinned `checkpoint` actually PRESENTS a cross-epoch crossing — `true` iff the
   /// envelope carries a STRICTLY-foreign configuration with a NON-EMPTY successor membership (the same
   /// crossing-presentation test `apply_sync` keys on: `config_id != current && !membership.is_empty()`).
@@ -530,6 +547,11 @@ pub(crate) struct SmReconstruct {
   checkpoint: crate::SyncCheckpoint,
   /// The AUTHENTICATED donor slot the re-armed block-fetch re-pulls the missing block from.
   donor: Peer,
+  /// The in-flight reconstruct job, or `None` while the obligation is waiting on a re-pull. The
+  /// completion is applied ONLY when its id matches this token: an obligation superseded (or torn
+  /// down and re-raised) while a reconstruct executed must never be answered by that stale job's
+  /// verdict, which would install content for a checkpoint this endpoint no longer names.
+  restore: Option<crate::JobId>,
 }
 
 /// The ViewChange-only collection state — reified as `Endpoint::view_change: Option<ViewChangeCollection>`
@@ -636,6 +658,16 @@ const CATCH_UP_VALIDATION_WINDOWS: u8 = 3;
 /// A NEW quarantined serve past this cap is refused (it re-solicits once an in-flight one frees a slot),
 /// reserving the map's replica capacity. Sized to match the transport's live quarantine population.
 const QUARANTINE_SERVE_LIMIT: usize = 8;
+/// The maximum `Serve` block jobs (peer `RequestBlock` answers) outstanding at once.
+///
+/// The donor's read runs OFF the pump, so requests can arrive faster than the storage lane drains
+/// them and the job queue would otherwise grow with the inbound rate. Every fetching peer runs ONE
+/// stop-and-wait pull at a time, so the honest concurrent demand is bounded by the member count;
+/// this sits comfortably above it, leaving the cap unreachable in normal operation and load-bearing
+/// only against a retransmit storm or a misbehaving peer. A request past the cap is DROPPED (not
+/// answered ABSENT — an absent reply for a block we hold would drive the requester's pruned-front
+/// re-solicit path) and re-sent by the requester's own ARQ.
+const MAX_OUTSTANDING_BLOCK_SERVES: usize = 128;
 /// Forfeit: how long the checkpoint-lag forfeit condition must
 /// hold CONTINUOUSLY before a stuck primary actually steps down (the anti-storm grace timer). Sits
 /// above `PRIMARY_IDLE` (200ms) — so a *silent* primary is failed over first by a backup's idle VC,
@@ -826,6 +858,12 @@ struct RecoverState {
   /// The in-flight checkpoint-read `OpId` (`Some` until the snapshot is restored), or `None` if no
   /// checkpoint exists / it is already restored.
   checkpoint: Option<u64>,
+  /// The in-flight block job of the two-step cold-start reconstruct — first the LOCAL presence probe
+  /// over the checkpoint read back above, then the reconstruct itself — or `None` when neither is
+  /// executing. While `Some`, a further (additively re-submitted) checkpoint read is ignored rather
+  /// than starting a second reconstruct, and each completion is applied only when its id matches — so
+  /// a superseded step can never install content.
+  reconstruct: Option<crate::JobId>,
   /// Whether the durable root this recovery started from was FORMATTED — written by [`format()`](crate::format) with a
   /// pinned nonzero `checkpoint_ops`, which an empty-consensus wipe cannot forge. Gates
   /// `complete_recovery`'s genesis-primary exemption: only a formatted store may resume Normal at
@@ -1363,11 +1401,13 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// drop is the safety property — a superseded materialize must never publish a root — and this is
   /// the non-vacuity witness that the supersession path is genuinely exercised.
   block_jobs_superseded: u64,
-  /// The execution-order witness of the endpoint's OWN inline storage lane — the lane the `handle_*`
-  /// entry points still run block jobs on while the remaining block-I/O paths are moved behind the
-  /// seam. It is the same [`BlockJobCursor`](crate::BlockJobCursor) a driver owns for its lane, held
-  /// here only because the endpoint is that lane for now.
-  block_job_cursor: crate::BlockJobCursor,
+  /// How many `Serve` jobs (peer `RequestBlock` answers) are outstanding, bounded by
+  /// [`MAX_OUTSTANDING_BLOCK_SERVES`] so an inbound request rate above the storage lane's drain rate
+  /// cannot grow the job queue without limit.
+  block_serves_outstanding: usize,
+  /// How many peer `RequestBlock`s were dropped at the outstanding-serve cap. Observability only —
+  /// the requester's ARQ re-sends — and the non-vacuity witness that the bound engaged.
+  block_serves_refused: u64,
   /// Outstanding storage submissions awaiting completion.
   pending: BTreeMap<u64, Pending>,
   /// EVERY in-flight physical WAL append (write-id sequence → op), entered at submit and removed ONLY
@@ -2052,7 +2092,8 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       block_jobs: VecDeque::new(),
       block_jobs_outstanding: VecDeque::new(),
       block_jobs_superseded: 0,
-      block_job_cursor: crate::BlockJobCursor::new(),
+      block_serves_outstanding: 0,
+      block_serves_refused: 0,
       pending: BTreeMap::new(),
       wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
@@ -4327,8 +4368,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       sm_root: sentinel_root,
       sessions_root: sentinel_root,
       donor: Peer::Replica(ReplicaId::new(0)),
-      block_sync: block_sync::BlockSync::new(sentinel_root),
-      session_sync: block_sync::BlockSync::new(sentinel_root),
+      walks: WalkState::Idle(block_sync::BlockWalks::new(sentinel_root, sentinel_root)),
       // Sentinel seam (an empty-membership, same-`config_id` checkpoint): not a crossing.
       crossing_answered: false,
       resolicited_front: None,
@@ -4473,9 +4513,16 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// queue — so no job can be issued without being ordered and accounted.
   fn issue_block_job(&mut self, kind: BlockJobKind<S>) -> crate::JobId {
     let id = self.mint_job_id();
+    self.enqueue_block_job(id, kind);
+    id
+  }
+
+  /// Records an already-minted job as owed and queues it. Split out of [`Self::issue_block_job`] for
+  /// the one caller that must know the id BEFORE it can build the payload — a walk job moves the
+  /// transfer's frontiers into itself and leaves the id behind as the token its completion matches.
+  fn enqueue_block_job(&mut self, id: crate::JobId, kind: BlockJobKind<S>) {
     self.block_jobs.push_back(BlockJob { id, kind });
     self.block_jobs_outstanding.push_back(id);
-    id
   }
 
   /// Takes the next block-storage job the endpoint has issued, or `None` when none is queued.
@@ -4501,6 +4548,17 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn block_jobs_superseded(&self) -> u64 {
     self.block_jobs_superseded
+  }
+
+  /// How many peer `RequestBlock`s this endpoint dropped at its outstanding-serve cap
+  /// ([`MAX_OUTSTANDING_BLOCK_SERVES`]): the requester's stop-and-wait ARQ re-sends, so the drop
+  /// costs a round trip and bounds the job queue against an inbound rate above the storage lane's
+  /// drain rate.
+  ///
+  /// Observability only; the bound is the property. A non-zero value witnesses that the cap engaged.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn block_serves_refused(&self) -> u64 {
+    self.block_serves_refused
   }
 
   /// This endpoint instance's incarnation — the value every id it mints carries.
@@ -5429,11 +5487,10 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
-    self.handle_message_inner(now, wal, sb, blocks, from, msg);
+    self.handle_message_inner(now, wal, sb, from, msg);
     #[cfg(debug_assertions)]
     self.assert_invariants();
   }
@@ -5508,7 +5565,6 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
@@ -5586,12 +5642,10 @@ where
     if self.status.is_recovering() {
       if self.awaiting_peer_checkpoint() {
         match msg {
-          Message::SyncCheckpoint(m) => {
-            self.on_recover_sync_checkpoint(now, wal, sb, blocks, from, m)
-          }
+          Message::SyncCheckpoint(m) => self.on_recover_sync_checkpoint(now, from, m),
           // While the recovery peer-fetch is pulling the SM checkpoint DAG, accept block responses
           // that feed the frontier (the over-frame chunked path is gone — the SM state IS the DAG).
-          Message::BlockResponse(m) => self.on_block_response(now, wal, sb, blocks, from, m),
+          Message::BlockResponse(m) => self.on_block_response(now, from, m),
           _ => {}
         }
       }
@@ -5614,8 +5668,8 @@ where
     // member is tallied; it is NOT on the `emit` egress path (zero emission → byte-identity safe).
     if self.status.is_recovering_head() {
       match msg {
-        Message::StartView(m) => self.on_start_view(now, wal, sb, blocks, m),
-        Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, blocks, m),
+        Message::StartView(m) => self.on_start_view(now, wal, sb, m),
+        Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
         Message::Recovery(m) => {
           // Tally a co-recovering OTHER VOTER (only another voter counts toward the voting-quorum
           // evidence G2), with ZERO emission. `sender_matches` already bound `from` to `m.replica()`
@@ -5643,23 +5697,23 @@ where
     }
     match msg {
       Message::Request(r) => self.on_request(now, wal, from, r),
-      Message::Prepare(p) => self.on_prepare(now, wal, sb, blocks, p),
-      Message::PrepareBatch(m) => self.on_prepare_batch(now, wal, sb, blocks, m),
-      Message::PrepareOk(ok) => self.on_prepare_ok(now, sb, blocks, ok),
-      Message::Commit(c) => self.on_commit(now, sb, blocks, c),
+      Message::Prepare(p) => self.on_prepare(now, wal, sb, p),
+      Message::PrepareBatch(m) => self.on_prepare_batch(now, wal, sb, m),
+      Message::PrepareOk(ok) => self.on_prepare_ok(now, sb, ok),
+      Message::Commit(c) => self.on_commit(now, sb, c),
       Message::StartViewChange(m) => self.on_start_view_change(now, sb, m),
-      Message::DoViewChange(m) => self.on_do_view_change(now, wal, sb, blocks, m),
-      Message::StartView(m) => self.on_start_view(now, wal, sb, blocks, m),
+      Message::DoViewChange(m) => self.on_do_view_change(now, wal, sb, m),
+      Message::StartView(m) => self.on_start_view(now, wal, sb, m),
       Message::GetView(m) => self.on_get_view(now, m),
       Message::RequestPrepare(m) => self.on_request_prepare(now, from, m),
       Message::RequestPrepareRange(m) => self.on_request_prepare_range(now, from, m),
       Message::Recovery(m) => self.on_recovery(now, m),
-      Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, blocks, m),
+      Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
       // State-sync: a peer's sync solicitation is answered from our durable checkpoint
       // (`on_request_sync`); a sync response is verified, its SM checkpoint DAG fetched, then applied
       // (`on_sync_checkpoint`).
       Message::RequestSync(m) => self.on_request_sync(now, sb, from, m),
-      Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, wal, sb, blocks, from, m),
+      Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, from, m),
       Message::RepairBatch(m) => self.on_repair_batch(now, wal, sb, m),
       // A learner's NON-VOTING progress report: record the durable frontier in `peer_progress` (touches
       // no quorum/vote state). It is a liveness HINT for a later `propose_membership(PromoteLearner)`.
@@ -5683,8 +5737,8 @@ where
       Message::EpochAhead(_) => {}
       // Block-DAG state-sync: serve a requested block from our store (stateless, content-addressed),
       // or feed a fetched block into the in-progress block-fetch frontier.
-      Message::RequestBlock(addr) => self.on_request_block(from, addr, blocks),
-      Message::BlockResponse(m) => self.on_block_response(now, wal, sb, blocks, from, m),
+      Message::RequestBlock(addr) => self.on_request_block(from, addr),
+      Message::BlockResponse(m) => self.on_block_response(now, from, m),
       // The negative repair answer: count the sender's durable LACK of a repair-or-truncate candidate op
       // toward the nack quorum that truncates the uncommitted tail (a new-primary-only tally).
       Message::Nack(m) => self.on_nack(wal, from, m),
@@ -5960,13 +6014,7 @@ where
   }
 
   /// Fires any timers due at `now`, dispatching by status/role.
-  pub fn handle_timeout<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     // BOUNDED QUARANTINE PROBE — checked FIRST, before the status dispatch, on a wall-clock deadline
     // INDEPENDENT of `sync_solicit` (which a quarantined higher-epoch heartbeat keeps re-soliciting, so a
     // solicit-gated probe would never expire under sustained heartbeats). On disarm the speculative
@@ -5987,7 +6035,7 @@ where
         // re-forces the owed checkpoint and the successor-serve gate opens, with no client commit or restart
         // needed. Self-gating (no debt owed / mid-transition / a write in flight) makes this a no-op
         // otherwise, so the steady-state heartbeat is unchanged.
-        self.maybe_pay_checkpoint_debt(now, sb, blocks);
+        self.maybe_pay_checkpoint_debt(now, sb);
         // Re-attempt a due ORDINARY checkpoint a prior commit-tail tried but whose block-store flush
         // faulted: a backup re-fires the cadence off the primary's Commit heartbeats, but a QUIESCENT
         // primary has no commit-advance tail to re-drive `maybe_checkpoint`, so without this a transient
@@ -6032,7 +6080,7 @@ where
       // Recovering re-submits any still-outstanding/faulty reads on its timer (termination under a
       // dropped completion / slow-clearing transient). RecoveringHead re-broadcasts its Recovery
       // solicitation until a peer hands it the canonical head.
-      Status::Recovering => self.recover_timeouts(now, wal, sb, blocks),
+      Status::Recovering => self.recover_timeouts(now, wal, sb),
       Status::RecoveringHead => self.recover_head_timeouts(now, sb),
       // A Retired (removed) replica fires NO timer — it is no longer a cluster member.
       Status::Retired => {}
@@ -6045,7 +6093,7 @@ where
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one), re-drive the one
       // outstanding block pull of an in-progress block-fetch transfer, AND self-heal an owed local
       // flush-retry install (re-flush + re-stage locally, no donor reply needed).
-      self.sync_timeouts(now, blocks);
+      self.sync_timeouts(now);
       // Learner progress report likewise runs only in Normal, and only for a non-voting learner — it
       // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
       self.learner_status_timeouts(now, wal);
@@ -6074,28 +6122,17 @@ where
     self.assert_invariants();
   }
 
-  /// Drain completed storage ops and react.
-  pub fn handle_storage<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
-    loop {
-      while let Some(done) = wal.poll() {
-        self.on_wal_done(now, wal, sb, blocks, done);
-      }
-      while let Some(done) = sb.poll() {
-        self.on_sb_done(now, wal, sb, blocks, done);
-      }
-      // A block job's completion can submit the superblock write it gates (a materialized checkpoint
-      // publishing its snapshot), so re-poll after running the lane; the loop settles once neither
-      // side produces work.
-      if self.block_jobs.is_empty() {
-        break;
-      }
-      self.run_block_lane(now, sb, blocks);
+  /// Drain completed WAL and superblock ops and react.
+  ///
+  /// Block work is NOT drained here: the endpoint holds no store, so the block jobs it issues are
+  /// taken by [`Self::poll_block_job`] and answered through [`Self::on_block_done`] on whatever
+  /// execution context the driver gives its storage lane.
+  pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+    while let Some(done) = wal.poll() {
+      self.on_wal_done(now, wal, sb, done);
+    }
+    while let Some(done) = sb.poll() {
+      self.on_sb_done(now, wal, sb, done);
     }
     // Re-check the (status × sub-state-flag) coupling at every storage-drain exit (see
     // `assert_invariants`) — the async superblock/WAL completions are where the flag transitions land.
@@ -6121,32 +6158,6 @@ where
     }
   }
 
-  /// Runs every queued block job to completion on the endpoint's OWN inline storage lane.
-  ///
-  /// [`Self::handle_storage`] — the endpoint's storage-progress step — calls this while the
-  /// remaining block-I/O paths are still executed on the pump: it drains [`Self::poll_block_job`],
-  /// executes each job with [`execute_block_job`](crate::execute_block_job) against the store it was
-  /// handed, and feeds each completion back through [`Self::on_block_done`] — the same sequence a
-  /// driver's storage lane performs, run inline. It executes strictly in poll order, so it satisfies
-  /// the lane's serial-in-issue-order obligation by construction.
-  ///
-  /// DELIBERATELY not called by [`Self::handle_message`] / [`Self::handle_timeout`]: the ingress and
-  /// timer paths must be able to make consensus progress — commit, ack, heartbeat, change view —
-  /// while a checkpoint's blocks are still being written, which is the whole point of moving the
-  /// write off the pump. A materialize issued from either therefore stays outstanding until the next
-  /// storage step.
-  fn run_block_lane<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
-    while let Some(job) = self.poll_block_job() {
-      let done = crate::execute_block_job(&mut self.block_job_cursor, job, blocks);
-      self.on_block_done(now, sb, done);
-    }
-  }
-
   /// Consumes the completion of a block-storage job the driver executed off the pump.
   ///
   /// The block-storage twin of [`Self::on_wal_done`] / [`Self::on_sb_done`], and gated the same two
@@ -6166,7 +6177,13 @@ where
   /// Only then does the outcome dispatch, and each arm re-validates its own correlation token: a
   /// completion whose state was superseded while it executed is dropped and counted
   /// ([`Self::block_jobs_superseded`]), never published.
-  pub fn on_block_done<B: Superblock>(&mut self, now: Instant, sb: &mut B, done: BlockJobDone<S>) {
+  pub fn on_block_done<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    done: BlockJobDone<S>,
+  ) {
     if self.is_foreign_completion(done.id.op_id()) {
       return;
     }
@@ -6187,6 +6204,31 @@ where
       // The sweep reports nothing: retention is the store's obligation, and the roots it was handed
       // were already durable when the job was issued.
       BlockJobOutput::Gced => {}
+      // The donor answer. No correlation token is needed or possible: the requester rides on the
+      // job, a served block carries no authority (it self-verifies by content address), and there
+      // is no endpoint state a stale serve could publish — so a serve is never superseded.
+      BlockJobOutput::Served { to, addr, block } => self.on_block_served(to, addr, block),
+      BlockJobOutput::Walked(walked) => self.on_walked(now, wal, done.id, walked),
+      BlockJobOutput::Restored { purpose, result } => match purpose {
+        // A synced checkpoint's content: the obligation carries the token, so a reconstruct whose
+        // obligation was superseded (or torn down and re-raised) while it executed answers nothing.
+        RestorePurpose::SyncedCheckpoint => {
+          if self.sm_reconstruct.as_ref().and_then(|r| r.restore) != Some(done.id) {
+            self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+            return;
+          }
+          self.on_sm_restored(now, wal, sb, result);
+        }
+        // This replica's OWN durable checkpoint, read back at cold start. The recovery bookkeeping
+        // carries the token the same way; a superseded reconstruct installs nothing.
+        RestorePurpose::RecoveredCheckpoint(checkpoint) => {
+          if self.recover.as_ref().and_then(|r| r.reconstruct) != Some(done.id) {
+            self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+            return;
+          }
+          self.on_recovered_checkpoint_restored(now, sb, checkpoint, result);
+        }
+      },
     }
     #[cfg(debug_assertions)]
     self.assert_invariants();

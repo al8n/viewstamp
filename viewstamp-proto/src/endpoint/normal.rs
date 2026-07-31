@@ -625,12 +625,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
-  pub(crate) fn try_commit<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub(crate) fn try_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Do NOT apply ops while the SM is mid-replacement or does not yet hold its checkpoint — the SAME gate
     // `advance_commit` takes. A node owing a post-root SM-reconstruct (`self.checkpoint_op == M`, SM still
     // at the OLD content) can become a Normal PRIMARY through a view change that PRESERVES the obligation;
@@ -699,7 +694,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint (the re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here). No-op when no debt is owed.
-    self.maybe_pay_checkpoint_debt(now, sb, blocks);
+    self.maybe_pay_checkpoint_debt(now, sb);
     // Re-submit a staged epoch swap that is waiting for a free superblock slot — chiefly a `pending_swap`
     // that SURVIVED a view change whose new generation issued no durable-view write (a `catch_up_to_view`):
     // there is no `on_sb_done` re-trigger on that path, so the commit tail is the re-submit point. No-op
@@ -908,7 +903,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     p: Prepare,
   ) {
     // Peer fault-repair: a `Prepare` answering our `RequestPrepare` for a committed-op hole is
@@ -980,7 +974,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     // Learn the primary's commit (apply anything we already have).
-    self.advance_commit(now, sb, blocks, p.commit().get());
+    self.advance_commit(now, sb, p.commit().get());
 
     let pop = p.op().get();
     if pop <= self.op.get() {
@@ -1103,7 +1097,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
       // After appending, apply any ops now available up to the learned commit.
       let target = self.commit_max.get();
-      self.advance_commit(now, sb, blocks, target);
+      self.advance_commit(now, sb, target);
     } else {
       // Future op: buffer it, and solicit the committed band between our head and it that the primary's
       // retransmit (only `commit_min+1..=op`) will never re-send (those ops are `<= commit_min`). This
@@ -1138,7 +1132,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     m: crate::PrepareBatch,
   ) {
     let (view, commit, checkpoint_op, epoch, config_id) = (
@@ -1162,7 +1155,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         now,
         wal,
         sb,
-        blocks,
         // Each reconstructed per-op `Prepare` carries the BATCH's epoch-policy pair (the envelope
         // every per-op `Prepare` would have carried), not this replica's — the un-batching preserves
         // the sender's `(epoch, config_id)` exactly as it preserves `view`/`commit`/`checkpoint_op`.
@@ -1438,13 +1430,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Applies committed ops we hold, up to `min(target, op)`, strictly in order. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
-  pub(crate) fn advance_commit<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    target: u64,
-  ) {
+  pub(crate) fn advance_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, target: u64) {
     // A PRE-ROOT staged install (`pending_install`) is about to wholesale-REPLACE the SM at the synced
     // point (`install_sync`), and keeps `commit_min`/`commit_max`/`self.op` FROZEN across the STAGE→install
     // window so the install is the single atomic mutation point (the captured held-tail decision + the
@@ -1532,7 +1518,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // advanced, so if it reached the reconfigure op force the owed checkpoint. The re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here (the loop above already drove commit). No-op when
     // no debt is owed (the common path).
-    self.maybe_pay_checkpoint_debt(now, sb, blocks);
+    self.maybe_pay_checkpoint_debt(now, sb);
     // Re-submit a staged epoch swap waiting for a free superblock slot (mirrors `try_commit`'s tail) —
     // chiefly a `pending_swap` that survived a `catch_up_to_view` view change (no durable-view write, so
     // no `on_sb_done` re-trigger). No-op unless a swap is staged and the superblock is free.
@@ -1883,13 +1869,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.send_prepare_ok(self.checkpoint_op);
   }
 
-  pub(crate) fn on_prepare_ok<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    ok: PrepareOk,
-  ) {
+  pub(crate) fn on_prepare_ok<B: Superblock>(&mut self, now: Instant, sb: &mut B, ok: PrepareOk) {
     if ok.view().get() > self.view.get() {
       self.catch_up_to_view(now, ok.view());
       return;
@@ -1919,7 +1899,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `maybe_request_sync` below, which covers the same evidence ABOVE our head (no bodies held → sync).
     let peer_checkpoint = self.max_peer_checkpoint_op();
     if peer_checkpoint.get() > self.commit_max.get() {
-      self.advance_commit(now, sb, blocks, peer_checkpoint.get());
+      self.advance_commit(now, sb, peer_checkpoint.get());
     }
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
@@ -1939,16 +1919,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     {
       inflight.oks |= 1u64 << ok.replica().get();
     }
-    self.try_commit(now, sb, blocks);
+    self.try_commit(now, sb);
   }
 
-  pub(crate) fn on_commit<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    c: Commit,
-  ) {
+  pub(crate) fn on_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, c: Commit) {
     if c.view().get() > self.view.get() {
       self.catch_up_to_view(now, c.view());
       return;
@@ -1970,7 +1944,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Force-sync escalation: the primary's just-recorded checkpoint may have crossed a `repair`
     // hole we hold below it (pruned everywhere on the quorum) → escalate to a forced `RequestSync`.
     self.maybe_force_sync(now);
-    self.advance_commit(now, sb, blocks, c.commit().get());
+    self.advance_commit(now, sb, c.commit().get());
     // Tail-gap repair: if the primary's commit is ABOVE our head (committed ops we are missing, above
     // the cluster checkpoint), solicit them via `RequestPrepare` — the primary's retransmit (only
     // `commit_min+1..=op`) never re-sends a committed op below its own commit_min, so a backup that fell

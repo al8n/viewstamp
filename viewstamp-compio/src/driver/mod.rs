@@ -259,7 +259,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
-    mut blocks: L,
+    blocks: L,
     client: ClientId,
     first_request: u64,
     opts: QuicOptions,
@@ -286,14 +286,7 @@ where
       .await
       .map_err(DriverError::Bind)?;
 
-    let endpoint = build_endpoint(
-      config,
-      membership,
-      state_machine,
-      &mut wal,
-      &mut sb,
-      &mut blocks,
-    )?;
+    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
     let mut coord = QuicCoordinator::with_identity(endpoint, opts, rng_seed, identity);
 
     let now = clock.now();
@@ -462,9 +455,7 @@ where
         .earliest_deadline()
         .is_some_and(|d| d <= std::time::Instant::now())
       {
-        self
-          .coord
-          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
         self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
@@ -534,9 +525,7 @@ where
         self.handle_inbound_datagram(now, &datagram, from);
       }
       if fire_timeout {
-        self
-          .coord
-          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
         self.rekey_if_needed(now);
       }
       if let Some(cmd) = command
@@ -665,13 +654,9 @@ where
             reservation,
           },
         );
-        self.coord.submit_client_request(
-          now,
-          &mut self.wal,
-          &mut self.sb,
-          &mut self.blocks,
-          request,
-        );
+        self
+          .coord
+          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
         false
       }
       Command::Shutdown { ack } => {
@@ -814,15 +799,9 @@ where
   /// stale map. `rekey_if_needed` is config_id-gated, so a datagram that does not change the
   /// membership costs only a scalar compare.
   fn handle_inbound_datagram(&mut self, now: Instant, datagram: &[u8], from: SocketAddr) {
-    self.coord.handle_udp(
-      now,
-      from,
-      None,
-      datagram,
-      &mut self.wal,
-      &mut self.sb,
-      &mut self.blocks,
-    );
+    self
+      .coord
+      .handle_udp(now, from, None, datagram, &mut self.wal, &mut self.sb);
     self.rekey_if_needed(now);
   }
 
@@ -880,7 +859,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, &mut self.blocks, request);
+        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
     }
   }
 
