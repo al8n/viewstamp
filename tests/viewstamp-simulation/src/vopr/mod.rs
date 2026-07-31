@@ -133,6 +133,20 @@ pub struct VoprReport {
   /// digest report hash (like the other off-axis-zero witnesses), so the default lane's hash schema
   /// is unchanged.
   wal_write_reorders: u64,
+  /// The high-water mark of CROSS-KIND superblock completion overtakes across the run, summed over
+  /// replicas — a lag-mode release that completed a ROOT while an earlier-submitted envelope write
+  /// was still staged. Always `0` off-axis (the envelope-lag axis is opt-in); on a reorder run a
+  /// nonzero value proves a view transition genuinely crossed an envelope window (a coincidence
+  /// the seeded schedules produce only occasionally — the deterministic falsifiers pin the
+  /// overtake semantics, so the sweep reports this as a diagnostic rather than asserting it).
+  /// Deliberately NOT folded into the digest report hash (like [`Self::wal_write_reorders`]).
+  sb_envelope_overtakes: u64,
+  /// The high-water mark of envelope writes that drew a nonzero extra lag across the run, summed
+  /// over replicas — one per checkpoint-envelope submission under the envelope-lag axis. Always
+  /// `0` off-axis; `> 0` on a reorder run proves the axis is plumbed through end to end (the
+  /// sweep's non-vacuity witness, independent of the view-transition coincidence the overtake
+  /// counter needs). Deliberately NOT folded into the digest report hash.
+  sb_envelope_lags: u64,
   /// The high-water mark of the recover read-window's HELD TAIL above the durable checkpoint
   /// (`op - checkpoint_op`), folded from [`Cluster::recovered_band_high_water`] — which samples it ONCE
   /// per recovery at recover construction (the held head is fixed there; the committed band above the
@@ -511,6 +525,20 @@ impl VoprReport {
   /// completions, so the slot-quiescence fence was exercised rather than merely armed.
   pub const fn wal_write_reorders(&self) -> u64 {
     self.wal_write_reorders
+  }
+
+  /// The high-water of CROSS-KIND superblock completion overtakes across the run (summed over
+  /// replicas): a root completed while an earlier-submitted envelope write was still staged.
+  /// Always `0` off-axis; on a reorder run a nonzero value means a view transition genuinely
+  /// crossed an envelope window (a schedule coincidence — reported as a diagnostic).
+  pub const fn sb_envelope_overtakes(&self) -> u64 {
+    self.sb_envelope_overtakes
+  }
+
+  /// The high-water of envelope writes that drew a nonzero extra lag (summed over replicas).
+  /// Always `0` off-axis; `> 0` on a reorder run ⇒ the axis is plumbed through end to end.
+  pub const fn sb_envelope_lags(&self) -> u64 {
+    self.sb_envelope_lags
   }
 
   /// The high-water of the recover read-window's HELD TAIL above the durable checkpoint
@@ -918,6 +946,14 @@ struct Vopr {
   /// deterministic baseline. No `VOPR_NO_*` shrink mask exists for it: masking would be identical to
   /// simply not enabling the axis (nothing else in the schedule depends on the chaos draws).
   write_chaos_axis: bool,
+  /// Whether the superblock ENVELOPE-LAG axis is enabled for this run: the `VOPR_SB_REORDER` env
+  /// var, or force-enabled via [`run_vopr_with_sb_reorder`] (the committed reorder sweep). Same
+  /// discipline as [`Self::write_chaos_axis`]: with the axis OFF no lag seed is installed and no
+  /// PRNG value is consumed (the lag base derives from `self.seed` behind a separate magic, never
+  /// from the action stream), so the default per-seed schedule stays byte-identical; a lag-enabled
+  /// run is its OWN deterministic baseline. No `VOPR_NO_*` shrink mask exists for it: masking would
+  /// be identical to simply not enabling the axis.
+  sb_reorder_axis: bool,
   /// Whether the RESTART-IN-PLACE axis is enabled for this run: the `VOPR_RESTART_IN_PLACE` env var,
   /// or force-enabled via [`run_vopr_with_restart_in_place`] (which forces the write-chaos axis on
   /// with it — see its docs for why the two only bite together). Same discipline as
@@ -1259,6 +1295,27 @@ pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
 pub fn run_vopr_with_write_chaos(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.write_chaos_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the superblock ENVELOPE-LAG axis FORCE-ENABLED, independent of the
+/// `VOPR_SB_REORDER` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]).
+/// Every replica's superblock then releases its async completions per KIND: root writes stay
+/// strictly ordered among themselves — the whole of the trait's ordering contract — while each
+/// checkpoint-envelope write draws an extra seeded delay, so later view/checkpoint roots complete
+/// AROUND a lagging envelope. That is the conforming schedule in which a re-persist orphaned at its
+/// envelope step (a view transition drops the correlation; the write stays with the medium) outlives
+/// the durable-view roots submitted after it, re-opening every endpoint-local staging gate while the
+/// orphan is still in flight — exactly what the session's one-outstanding envelope fence exists to
+/// bound, and a schedule the default globally-FIFO backend (stricter than the contract) can never
+/// produce. The sim superblock's hard assert (one staged envelope at submit) and the boundedness
+/// checker's constant envelope bound judge every tick, so a fence regression is a REAL finding
+/// reported with its seed, never masked. A lag-enabled run is a pure function of `(seed, ticks)` and
+/// its own deterministic baseline (the lag base derives from the run seed behind a separate magic,
+/// never from the action stream, so the default schedule stays byte-identical with the axis off).
+pub fn run_vopr_with_sb_reorder(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.sb_reorder_axis = true;
   run_seeded(v, ticks)
 }
 
@@ -1915,6 +1972,7 @@ impl Vopr {
       wipe_axis: env_flag("VOPR_WIPE"),
       torn_header_axis: env_flag("VOPR_TORN_HEADER"),
       write_chaos_axis: env_flag("VOPR_WRITE_CHAOS"),
+      sb_reorder_axis: env_flag("VOPR_SB_REORDER"),
       restart_in_place_axis: env_flag("VOPR_RESTART_IN_PLACE"),
       swap_rebuild_axis: env_flag("VOPR_SWAP_REBUILD"),
       swap_rebuild_actions: 0,
@@ -2079,6 +2137,18 @@ impl Vopr {
     if self.write_chaos_axis {
       const WRITE_CHAOS_SEED_MAGIC: u64 = 0x0F0F_C4A0_5EED_D1CE;
       c.set_wal_write_chaos(Some(self.seed ^ WRITE_CHAOS_SEED_MAGIC));
+    }
+    // SUPERBLOCK ENVELOPE-LAG axis: seeded per-kind completion release on every replica's
+    // superblock — checkpoint-envelope writes draw an extra delay and later roots complete around
+    // them, the completion order the trait contract actually permits (its ordering covers root
+    // writes only). This is the schedule under which the session's one-outstanding envelope fence
+    // (and its per-tick checker bound) must hold; the default FIFO backend is stricter than the
+    // contract and can never produce it. Same discipline as the write-chaos axis above: the lag
+    // base derives from the run seed behind its own magic, NOT the action stream, and the call is
+    // CONDITIONAL, so an off-axis run makes no cluster call and consumes no draw.
+    if self.sb_reorder_axis {
+      const SB_REORDER_SEED_MAGIC: u64 = 0xE57E_10FE_5EED_0D0D;
+      c.set_sb_envelope_lag(Some(self.seed ^ SB_REORDER_SEED_MAGIC));
     }
     // BLOCK-JOB DELAY axis: each polled block job waits a few storage steps on its replica's serial
     // lane before executing. Same discipline as the write-chaos axis above — the plan seed derives
@@ -3830,6 +3900,17 @@ impl Vopr {
       .map(|i| c.wal_write_reorders_fired(i))
       .sum();
     self.report.wal_write_reorders = self.report.wal_write_reorders.max(rw);
+    // ENVELOPE-LAG high-waters (same shape): roots completed around an earlier-staged envelope,
+    // and envelope submissions that drew a lag, summed over the persistent per-replica superblock
+    // counters. Identically 0 off-axis.
+    let eo: u64 = (0..self.node_count)
+      .map(|i| c.sb_envelope_overtakes_fired(i))
+      .sum();
+    self.report.sb_envelope_overtakes = self.report.sb_envelope_overtakes.max(eo);
+    let el: u64 = (0..self.node_count)
+      .map(|i| c.sb_envelope_lags_drawn(i))
+      .sum();
+    self.report.sb_envelope_lags = self.report.sb_envelope_lags.max(el);
     // FORCED-sync (peer-fetch escalation) cumulative accumulation. The proto's per-replica counter
     // resets to 0 on `recover` (each restart), so we fold each POSITIVE delta into the running total
     // and always re-baseline `forced_sync_seen` — a reset's downward step then contributes nothing and

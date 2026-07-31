@@ -152,6 +152,175 @@ fn stale_checkpoint_commit_triggers_request_sync() {
 }
 
 #[test]
+fn a_slow_envelope_write_bounds_the_checkpoint_lane_across_view_change_windows() {
+  // Replica 1 of 3, over a superblock that completes ROOT writes promptly but holds every
+  // checkpoint-ENVELOPE write until the test releases it (`KindSb`) — a CONFORMING backend: the
+  // trait's completion-order contract covers `submit_write` calls relative to each other only, so
+  // envelope writes may lag arbitrarily behind later roots. Each window completes a state-sync
+  // handshake to its envelope submission (`AwaitSnapshot`), then a StartView adoption drops the
+  // re-persist correlation — orphaning the envelope, which cannot be forfeited (it is with the
+  // medium) — and the durable-view root completes AROUND the held envelope, re-opening every
+  // endpoint-local staging gate. Without the session's envelope fence each window adds one more
+  // orphaned envelope to the medium and the session ledger, each retaining its full snapshot
+  // bytes: the unbounded backlog. The fence must hold the lane at ONE outstanding envelope
+  // through every window, and once the held writes are released a fresh sync must complete
+  // durably (the deferral is deferral, not a wedge).
+  const WINDOWS: u64 = 6;
+  let (_donor, donor_storage) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&donor_storage);
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4); // both DAGs local: every fetch drains without a RequestBlock
+  let mut e = sync_backup();
+  let (wal, sb) = (TestWal::default(), KindSb::default());
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+
+  let sync_to_staging = |e: &mut Endpoint<CountSm>,
+                         storage: &mut Storage<TestWal, KindSb, CountSm>,
+                         blocks: &mut InMemoryBlockStore,
+                         view: u64| {
+    e.handle_message(
+      now,
+      storage,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::with(view),
+        OpNumber::with(4),
+        OpNumber::with(4),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+    while e.poll_message().is_some() {}
+    // Window 1 arms the ordinary out-of-reach sync (checkpoint 4 > head 0); after an adoption at
+    // the checkpoint floor, later windows arm the FORCED escalation over the checkpoint-subsumed
+    // sub-floor gap instead. Either way one handshake is outstanding — read its live nonce.
+    let nonce = e.sync_nonce_for_test();
+    e.handle_message(
+      now,
+      storage,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::with(view),
+        OpNumber::with(4),
+        id,
+        crate::Epoch::new(0),
+        0,
+        ReplicaId::new(0),
+        nonce,
+        env.clone(),
+        Bytes::new(),
+      )),
+    );
+    e.storage_step(now, storage, blocks);
+    while e.poll_message().is_some() {}
+    while e.poll_event().is_some() {}
+  };
+
+  for k in 1..=WINDOWS {
+    let (view, next_view) = (3 * (k - 1), 3 * k);
+    sync_to_staging(&mut e, &mut storage, &mut blocks, view);
+    assert!(
+      storage.checkpoints_in_flight() <= 1,
+      "window {k}: the envelope lane grew past its bound ({} envelope writes outstanding)",
+      storage.checkpoints_in_flight(),
+    );
+    if k == 1 {
+      assert_eq!(
+        e.pending_checkpoint_is_sync_for_test(),
+        Some(true),
+        "window 1: the handshake staged the re-persist to its envelope step"
+      );
+    } else {
+      // Later windows: the handshake completes and the install is RETAINED, but its staging
+      // DEFERS behind the orphaned envelope still on the medium — nothing new is submitted.
+      assert_eq!(
+        e.pending_checkpoint_is_sync_for_test(),
+        None,
+        "window {k}: staging deferred while the orphaned envelope drains"
+      );
+      assert!(
+        e.sync_target_for_test().is_some(),
+        "window {k}: the deferred sync stays armed (the cadence re-drives it)"
+      );
+    }
+    // The adoption of the next view drops the re-persist correlation at its envelope step (only a
+    // staged ROOT defers view transitions), orphaning the in-flight envelope. The StartView is the
+    // truthful one a view-`next_view` primary at the durable checkpoint 4 sends: head 4, commit 4,
+    // an empty tail above the checkpoint floor 4.
+    e.handle_message(
+      now,
+      &mut storage,
+      primary_peer(),
+      Message::StartView(
+        crate::StartView::new(
+          View::with(next_view),
+          OpNumber::with(4),
+          OpNumber::with(4),
+          crate::Epoch::new(0),
+          0,
+          ReplicaId::new(0),
+          std::vec::Vec::new(),
+        )
+        .with_checkpoint_op(OpNumber::with(4)),
+      ),
+    );
+    // The durable-view root completes AROUND the held envelope (kind-scoped ordering — the
+    // contract's actual latitude), restoring Normal at the new view with every endpoint-local
+    // staging gate clear.
+    storage.sb_mut().flush_roots();
+    e.storage_step(now, &mut storage, &mut blocks);
+    while e.poll_message().is_some() {}
+    while e.poll_event().is_some() {}
+    assert_eq!(e.view(), View::with(next_view), "window {k}: adopted view");
+    assert_eq!(e.status(), Status::Normal, "window {k}: Normal again");
+    assert!(
+      storage.checkpoints_in_flight() <= 1,
+      "window {k}: the envelope lane grew past its bound after the adoption ({} outstanding)",
+      storage.checkpoints_in_flight(),
+    );
+    assert!(
+      storage.sb_mut().env_inflight.len() <= 1,
+      "window {k}: the backend holds more than one envelope write ({} held)",
+      storage.sb_mut().env_inflight.len(),
+    );
+  }
+
+  // Release the held envelope: the orphan completes (settling out of the session ledger with no
+  // live correlation — tolerated), the lane empties, and a fresh handshake now runs to a DURABLE
+  // synced checkpoint: envelope → root → install. The fence never wedged the lane.
+  storage.sb_mut().flush_envelopes();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(storage.checkpoints_in_flight(), 0, "the orphan drained");
+  sync_to_staging(&mut e, &mut storage, &mut blocks, 3 * WINDOWS);
+  assert_eq!(
+    e.pending_checkpoint_is_sync_for_test(),
+    Some(true),
+    "the drained lane admits the fresh re-persist"
+  );
+  for _ in 0..4 {
+    storage.sb_mut().flush_envelopes();
+    storage.sb_mut().flush_roots();
+    e.storage_step(now, &mut storage, &mut blocks);
+    while e.poll_message().is_some() {}
+    while e.poll_event().is_some() {}
+    if !storage.has_inflight() {
+      break;
+    }
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the released lane carried the synced checkpoint to durability"
+  );
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the completed sync tore down its handshake"
+  );
+  assert!(!storage.has_inflight(), "the medium quiesced");
+}
+
+#[test]
 fn stale_checkpoint_prepare_triggers_request_sync() {
   // A `Prepare` (not just a Commit) carrying checkpoint_op > our head also triggers the sync — the
   // this commit signal closes the last trigger gap for a backup that only ever hears Prepares.

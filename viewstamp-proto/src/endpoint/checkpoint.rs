@@ -874,6 +874,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if storage.materialize_owed() {
       return;
     }
+    // Defer while an ORPHANED envelope write drains. Every caller guarantees
+    // `pending_checkpoint.is_none()`, so an envelope the session still carries here belongs to a
+    // correlation that ended — a view transition dropped a re-persist at its envelope step, or a
+    // rebuild orphaned a predecessor's — and the session's envelope fence would refuse the write
+    // this capture leads to. Deferring BEFORE the capture spends nothing; the orphan's completion
+    // (owed by the backend) empties the lane, and every force site re-fires on its own sticky
+    // cadence, exactly as after the `materialize_owed` deferral above.
+    if storage.checkpoints_in_flight() > 0 {
+      return;
+    }
     // Never start a checkpoint BELOW the timeline's checkpoint frontier. A rebuilt endpoint
     // baselines `checkpoint_op` on the LANDED root, so while an inherited checkpoint root is still
     // in flight the cadence boundary can fall below the checkpoint that root carries — and a
@@ -971,7 +981,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       sessions_root,
     };
     let id = self.mint_write_id();
-    storage.submit_checkpoint(id, pc.target_op, envelope);
+    // An `EnvelopeFenced` refusal is handled exactly like the failed flush above: nothing durable
+    // was staged, no pointer moves, the checkpoint is dropped whole and the cadence re-forces it
+    // once the outstanding envelope drains. Unreachable in the current tree — `force_checkpoint`
+    // defers while the lane is occupied, and no other envelope can enter it between that gate and
+    // this completion (both submitters require the matching `pending_checkpoint`, which is ours) —
+    // so this arm is the structural backstop for a future caller, not a live path.
+    if storage.submit_checkpoint(id, pc.target_op, envelope)
+      == crate::storage::CheckpointSubmission::EnvelopeFenced
+    {
+      self.pending_checkpoint = None;
+      return;
+    }
     self.pending_checkpoint = Some(PendingCheckpoint {
       step: CheckpointStep::AwaitSnapshot(id, dag),
       ..pc
@@ -1011,36 +1032,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     if flush.is_err() {
       self.pending_checkpoint = None;
-      // Re-arm the cadence THIS status actually services. `sync_solicit` is serviced by the Normal-only
-      // `sync_timeouts`; while Recovering the barrier is re-attempted from `recover_timeouts`
-      // (→ `retry_install_flush`) on the `recover_retry` deadline, which that handler keeps armed across
-      // this fault. Arming `sync_solicit` there would leave a deadline nothing ever services. The
-      // recovery deadline may only move EARLIER outside its own servicer, so an already-armed one stands.
-      if self.status.is_recovering() {
-        let retry = now + RECOVER_READ_RETRANSMIT;
-        self.timers.recover_retry = Some(self.timers.recover_retry.map_or(retry, |d| d.min(retry)));
-      } else {
-        // `RecoveringHead` cannot reach this arm, which is why `sync_solicit` is the right cadence
-        // here. Reaching it needs a `Flush` barrier outstanding for a live `pending_install`, and
-        // NEITHER entry into that status can hold the pair:
-        //
-        // - `recover_progress` decides the faulty head BEHIND its `awaiting_peer_checkpoint` gate,
-        //   and every install this lane stages runs UNDER that flag — `on_fetch_drained` routes to
-        //   `complete_recover_peer_fetch` only while it is set, and the `recover_timeouts` re-flush
-        //   re-drives the install that same lane owed. Only a CLEAN barrier retires the flag
-        //   (`retire_recover_for_staged_sync`), so an outstanding one pins the node in `Recovering`.
-        // - `complete_state_sync` resumes the carried verdicts only once the re-persist ROOT landed:
-        //   `on_sb_done` has already taken `pending_install` and cleared `pending_checkpoint`, and the
-        //   flip clears `sync` + `block_fetch` ahead of itself. Nor can that node re-stage — staging
-        //   needs a `sync`, and the only site that arms one from `None` (`arm_sync`) is reached from
-        //   Normal-gated triggers or from `enter_cross_epoch_peer_fetch`, which enters `Recovering`
-        //   and drops any owed install on the way in.
-        //
-        // A change that lets `RecoveringHead` hold a staged install must re-arm a deadline
-        // `recover_head_timeouts` drives AND teach it to re-flush: `sync_solicit` is non-serviceable
-        // in that status (`serviceable_now`), so it would leave the barrier with no retry at all.
-        self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
-      }
+      self.arm_owed_install_cadence(now);
       return;
     }
     let dag = CheckpointDag {
@@ -1050,7 +1042,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     let snapshot = install.checkpoint.snapshot_bytes();
     let id = self.mint_write_id();
-    storage.submit_checkpoint(id, pc.target_op, snapshot);
+    // An `EnvelopeFenced` refusal takes the failed-flush disposition above: nothing is staged, the
+    // install stays OWED (retained, its drained DAG GC-protected), and the status cadence re-drives
+    // `flush_and_stage_install` — whose own envelope-lane gate defers until the outstanding orphan
+    // completes, then re-flushes and stages cleanly. The recovery bookkeeping is deliberately NOT
+    // retired here (only a genuine staging retires it, below). Unreachable in the current tree —
+    // `flush_and_stage_install` defers while the lane is occupied and nothing can enter it between
+    // that gate and this completion — so this arm is the structural backstop for a future caller.
+    if storage.submit_checkpoint(id, pc.target_op, snapshot)
+      == crate::storage::CheckpointSubmission::EnvelopeFenced
+    {
+      self.pending_checkpoint = None;
+      self.arm_owed_install_cadence(now);
+      return;
+    }
     self.pending_checkpoint = Some(PendingCheckpoint {
       step: CheckpointStep::AwaitSnapshot(id, dag),
       ..pc
@@ -1064,6 +1069,42 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // leaves the peer-fetch armed for the retry.
     if self.status.is_recovering() || self.status.is_recovering_head() {
       self.retire_recover_for_staged_sync();
+    }
+  }
+
+  /// Re-arm the retry cadence for an install left OWED with nothing staged — the shared disposition
+  /// of a faulted flush barrier and a fenced envelope submission. Arms the cadence THIS status
+  /// actually services: `sync_solicit` is serviced by the Normal-only `sync_timeouts`; while
+  /// Recovering the re-attempt runs from `recover_timeouts` (→ `retry_install_flush`) on the
+  /// `recover_retry` deadline, which that handler keeps armed across the fault. Arming
+  /// `sync_solicit` there would leave a deadline nothing ever services. The recovery deadline may
+  /// only move EARLIER outside its own servicer, so an already-armed one stands.
+  ///
+  /// `RecoveringHead` cannot reach either caller, which is why `sync_solicit` is the right cadence
+  /// on the non-recovering arm. Reaching them needs a `Flush` barrier outstanding for a live
+  /// `pending_install`, and NEITHER entry into that status can hold the pair:
+  ///
+  /// - `recover_progress` decides the faulty head BEHIND its `awaiting_peer_checkpoint` gate,
+  ///   and every install this lane stages runs UNDER that flag — `on_fetch_drained` routes to
+  ///   `complete_recover_peer_fetch` only while it is set, and the `recover_timeouts` re-flush
+  ///   re-drives the install that same lane owed. Only a CLEAN barrier retires the flag
+  ///   (`retire_recover_for_staged_sync`), so an outstanding one pins the node in `Recovering`.
+  /// - `complete_state_sync` resumes the carried verdicts only once the re-persist ROOT landed:
+  ///   `on_sb_done` has already taken `pending_install` and cleared `pending_checkpoint`, and the
+  ///   flip clears `sync` + `block_fetch` ahead of itself. Nor can that node re-stage — staging
+  ///   needs a `sync`, and the only site that arms one from `None` (`arm_sync`) is reached from
+  ///   Normal-gated triggers or from `enter_cross_epoch_peer_fetch`, which enters `Recovering`
+  ///   and drops any owed install on the way in.
+  ///
+  /// A change that lets `RecoveringHead` hold a staged install must re-arm a deadline
+  /// `recover_head_timeouts` drives AND teach it to re-flush: `sync_solicit` is non-serviceable
+  /// in that status (`serviceable_now`), so it would leave the barrier with no retry at all.
+  fn arm_owed_install_cadence(&mut self, now: Instant) {
+    if self.status.is_recovering() {
+      let retry = now + RECOVER_READ_RETRANSMIT;
+      self.timers.recover_retry = Some(self.timers.recover_retry.map_or(retry, |d| d.min(retry)));
+    } else {
+      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
     }
   }
 

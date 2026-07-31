@@ -2009,7 +2009,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///
   /// Single-writer fenced: while a superblock root is in flight (`pending_sb` / `pending_checkpoint`, the
   /// latter being this install's own SyncRepersist once it stages) the re-persist must not begin, so it is
-  /// deferred — the install stays owed and the cadence re-drives it once the root lands.
+  /// deferred — the install stays owed and the cadence re-drives it once the root lands. Likewise while an
+  /// ORPHANED checkpoint-envelope write is still on the medium (a dropped correlation's, surviving in the
+  /// session ledger): the session's envelope fence admits one outstanding envelope, so staging defers until
+  /// the orphan's completion drains it.
   pub(crate) fn flush_and_stage_install<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -2022,6 +2025,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // must not begin while a root is outstanding. The install stays owed; the cadence re-drives it. (On the
     // clean first attempt `apply_sync`'s ingress gate already guarantees both are `None`.)
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return;
+    }
+    // Defer while an ORPHANED envelope write drains. `pending_checkpoint` is `None` past the fence
+    // above, so an envelope the session still carries belongs to a correlation that ended — a view
+    // transition dropped a re-persist at its envelope step, or a rebuild orphaned a predecessor's —
+    // and the session's envelope fence would refuse the write this barrier leads to. The endpoint's
+    // own gates cannot subsume this check: they read correlation state, which a transition or a
+    // rebuild resets while the session ledger still carries the orphan. Deferring costs nothing
+    // (the install stays owed, the DAG stays GC-rooted, and the same cadences that re-drive the
+    // `pending_sb` deferral re-drive this one); the orphan's completion — owed by the backend —
+    // empties the lane and the next re-drive stages cleanly.
+    if storage.checkpoints_in_flight() > 0 {
       return;
     }
     // Issue the durability barrier over the drained blocks as a block job, NAMING the two roots it is

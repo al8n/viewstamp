@@ -179,9 +179,9 @@ use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
   run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
   run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live,
-  run_vopr_with_restart_in_place, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_swap_root_rebuild, run_vopr_with_torn_headers, run_vopr_with_wipe,
-  run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
+  run_vopr_with_restart_in_place, run_vopr_with_sb_reorder, run_vopr_with_slow,
+  run_vopr_with_stale_read, run_vopr_with_swap_root_rebuild, run_vopr_with_torn_headers,
+  run_vopr_with_wipe, run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -813,6 +813,85 @@ fn axis_sweep_seed_count(default: u64) -> u64 {
     .ok()
     .and_then(|v| v.parse().ok())
     .unwrap_or(default)
+}
+
+/// The contiguous seed range for the committed superblock ENVELOPE-LAG sweep (same budget rationale
+/// as [`HOLD_SEEDS`]: this lane is ADDITIVE to the default sweep, and every replica's superblock
+/// runs the per-kind completion model for the whole run).
+const SB_REORDER_SEEDS: u64 = 16;
+
+/// The committed superblock ENVELOPE-LAG sweep: [`run_vopr_with_sb_reorder`] over
+/// `0..SB_REORDER_SEEDS` — the axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`]
+/// pattern: no env var, so it cannot race other tests in this process and cannot be forgotten by a
+/// runner). Every replica's superblock then releases its async completions per KIND: roots strictly
+/// in submission order among themselves — the whole of the trait's ordering contract — while each
+/// checkpoint-envelope write draws an extra seeded delay, so later view/checkpoint roots complete
+/// AROUND a lagging envelope.
+///
+/// The default sweep's superblock is globally FIFO — STRICTER than the contract — under which a
+/// completed root proves every earlier envelope drained, so an orphaned envelope can never coexist
+/// with a re-opened staging gate and the envelope lane's boundedness is never genuinely tested.
+/// This lane runs the contract's actual latitude: a re-persist orphaned at its envelope step (a
+/// view transition drops the correlation; the write stays with the medium) now outlives the
+/// durable-view roots submitted after it, and the session's one-outstanding envelope fence is what
+/// keeps the lane from growing by one orphan per window. The sim superblock's hard assert (one
+/// staged envelope at submit) and the boundedness checker's constant envelope bound judge every
+/// tick, so a fence regression is a REAL finding, reported with its seed, never masked.
+///
+/// The DEFAULT sweep leaves this axis OFF (the per-kind release IS the axis, so enabling it would
+/// change every default seed's superblock completion order and move every pinned schedule);
+/// lag-enabled runs are their own deterministic baselines, byte-identical to `VOPR_SB_REORDER=1`
+/// runs of the same seeds.
+#[test]
+fn vopr_sb_reorder_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(SB_REORDER_SEEDS);
+  let mut total_lags = 0u64;
+  let mut total_overtakes = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR sb-reorder sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, envelope-lag axis \
+     forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_sb_reorder(seed, DEFAULT_TICKS);
+    total_lags += r.sb_envelope_lags();
+    total_overtakes += r.sb_envelope_overtakes();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity: every checkpoint-envelope write across the sweep must have drawn a lag —
+  // otherwise the lane has silently decayed into the FIFO default and the envelope fence is
+  // unguarded here. (An OVERTAKE — a root completing around a staged envelope — additionally needs
+  // a view transition to cross an envelope's in-flight window, a coincidence the seeded schedules
+  // produce only occasionally, so it is reported below as a diagnostic rather than asserted: the
+  // deterministic falsifiers pin the overtake semantics of the mode, and the endpoint regression
+  // pins the protocol schedule it enables.)
+  assert!(
+    total_lags > 0,
+    "no envelope write drew a lag across the sweep (sb_envelope_lags={total_lags}) — the reorder \
+     lane is vacuous (the axis is not plumbed through, or no checkpoint ever wrote an envelope)"
+  );
+  // And the lag-enabled runs still did real work: ops committed (checkpoints ride commits), and at
+  // least one seed drove a view change — the correlation-dropping transition that orphans an
+  // envelope only happens across view changes, so a sweep with no view change could not reach the
+  // class this lane guards.
+  assert!(
+    total_committed > 0,
+    "the sb-reorder sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no sb-reorder seed drove a view change — the correlation-dropping window the envelope fence \
+     guards never opened"
+  );
+  println!(
+    "VOPR sb-reorder sweep OK: sb_envelope_lags={total_lags} \
+     sb_envelope_overtakes={total_overtakes} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
 }
 
 /// The contiguous seed range for the committed BLOCK-JOB DELAY sweep (same budget rationale as
