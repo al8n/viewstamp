@@ -1558,9 +1558,10 @@ impl Cluster {
   /// This models a supervised in-place rebuild — a driver-level restart, a recovery retry — where the
   /// process replaces the endpoint but the submission/completion queues below it (an io_uring ring, a
   /// thread pool's outstanding writes) are neither drained nor cancelled. The skipped drain is
-  /// deliberate: the storage contract makes draining to quiescence load-bearing for a rebuild over
-  /// live handles, and this lane retains the in-flight work precisely to exercise where the two
-  /// incarnations meet over one medium. It is deliberately NOT
+  /// deliberate: the `Storage` session carries safety across the rebuild (the successor inherits the
+  /// slot-quiescence witnesses and the root timeline, so no pre-rebuild drain is load-bearing for
+  /// SAFETY — a drain settles only cleanliness), and this lane retains the in-flight work precisely
+  /// to exercise where the two incarnations meet over one medium. It is deliberately NOT
   /// [`crash`](Self::crash) + [`restart`](Self::restart): `crash` models power loss and so
   /// `discard_inflight`s both fixtures, destroying exactly the writes and completions that survive
   /// here. Nor is it [`wipe_and_restart`](Self::wipe_and_restart), which forfeits the durable state.

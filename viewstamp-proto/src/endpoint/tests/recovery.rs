@@ -7315,6 +7315,102 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
 }
 
 #[test]
+fn recovery_over_an_inflight_root_baselines_on_the_effective_root_and_defers_behind_it() {
+  // CONSENSUS-SAFETY regression (durable-view monotonicity across an in-place rebuild). A
+  // predecessor endpoint submits its view-1 durable-view root; before it lands, the driver
+  // rebuilds the endpoint over the SAME live session. The successor must come up AT the
+  // timeline's view — the landed root still says view 0, but the in-flight root lands in queue
+  // order underneath it, so a successor baselined on the landed root would later write its own
+  // view-0-or-below root AFTER the view-1 landing and regress the medium's durable view. And the
+  // successor's own re-driven root must DEFER behind the predecessor's outstanding one (the root
+  // fence), reaching the backend only once the inherited landing settles.
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // member 1 leads view 1
+  let wal0 = ScriptedWal::with_entries(0);
+  let mut sb0 = TestSb::default();
+  crate::format(&cfg, &genesis(3), &wal0, &mut sb0).expect("format the genesis store");
+  // Re-home the formatted root under an ASYNC superblock, so root writes stay in flight until an
+  // explicit flush — the window an in-place rebuild lands inside.
+  let sb = StepSb {
+    state: sb0.state(),
+    ..StepSb::default()
+  };
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal0, sb);
+  let mut a = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts the formatted store")
+    .expect_active();
+  assert_eq!(a.status(), Status::Normal);
+  while a.poll_message().is_some() {}
+
+  // The predecessor enters the view change to view 1: its SendDoViewChange durable-view root is
+  // submitted and stays IN FLIGHT (StepSb never flushes on its own).
+  a.handle_message(
+    Instant::ZERO,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(a.status(), Status::ViewChange);
+  assert!(
+    a.pending_sb_for_test(),
+    "the view-1 root write is in flight"
+  );
+  drop(a); // the driver replaces the endpoint; the session (and the in-flight root) live on
+
+  // The successor recovers over the live session. Its baseline is the EFFECTIVE root — view 1 —
+  // not the landed view-0 root; a voter recovered with `log_view < view` re-drives the view
+  // change, so it submits its OWN view-1 root, which the session PARKS behind the predecessor's.
+  let mut b = Endpoint::recover(cfg, genesis(3), 1, CountSm::default(), &mut storage)
+    .expect("recover accepts the live store")
+    .expect_active();
+  assert_eq!(
+    b.view(),
+    View::with(1),
+    "the successor baselines on the effective root, never below the timeline"
+  );
+  assert_eq!(
+    b.status(),
+    Status::ViewChange,
+    "log_view < view: the successor re-drives the in-progress view change"
+  );
+  assert!(
+    b.pending_sb_for_test(),
+    "the re-driven view-1 root is pending"
+  );
+  while b.poll_message().is_some() {}
+
+  // First flush: ONLY the predecessor's root can land — the successor's is parked behind it. Its
+  // landing settles through the session (the completion itself is refused as foreign), lifts the
+  // durable-view witness, and releases the parked root to the backend; the successor's own write
+  // is still in flight, so its DoViewChange stays deferred.
+  storage.sb_mut().flush();
+  b.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  assert!(
+    b.pending_sb_for_test(),
+    "the successor's own root was only just released to the backend — not yet durable"
+  );
+  assert!(
+    !b.poll_message()
+      .is_some_and(|m| matches!(m.msg_ref(), Message::DoViewChange(_))),
+    "no vote is cast while the successor's own view write is outstanding"
+  );
+
+  // Second flush: the released root lands, the view is durable, and the deferred vote fires.
+  storage.sb_mut().flush();
+  b.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  assert!(
+    !b.pending_sb_for_test(),
+    "the successor's re-driven root landed after the predecessor's, in queue order"
+  );
+  assert!(!storage.has_inflight(), "the root timeline drained");
+}
+
+#[test]
 fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
   // A `truncate`/`prune` synchronous-cancellation list is COMPLETION-EQUIVALENT data: after a
   // restart in place (the storage layer outlives the endpoint), a conforming backend still holds

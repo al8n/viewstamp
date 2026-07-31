@@ -1888,32 +1888,30 @@ const RESTART_IN_PLACE_SEEDS: u64 = 16;
 /// [`restart_in_place_seed_162_stays_within_the_durability_model`].
 const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 7] = [33, 59, 64, 78, 134, 179, 186];
 
-/// Seed 162 of the restart-in-place axis: the seed that used to wedge because the fault injector put
-/// the run outside the durability model, and now runs clean because the injector is bounded by the
-/// cluster's `f`.
+/// Seed 162 of the restart-in-place axis, pinning two properties at once.
 ///
-/// It was never either of the two lifetime defects the sweep above pins. The storage session closed
-/// every applied-history seed and both stale-landing falsifiers; the lane front closed the un-polled
-/// capture wedge. This seed's failure was unchanged by both — same tick, same high-water, a
-/// byte-identical trajectory — and at the wedge the lane owed nothing at all (no image capture, no
-/// serve, no walk, no in-flight storage of any kind on either replica), so no lane-depth quota was
-/// holding anything closed.
+/// **The durability bound.** At its original two voters this seed wedged because the fault injector
+/// put the run outside the durability model. At tick 1697 both voters were `Normal` in view 40 with
+/// `op = 209`, `commit_max = 208`, `commit_min = 96`: the blocked op 97's durable copies had BOTH
+/// been permanently destroyed at append time (replica 0's by bit-rot, replica 1's by a torn write
+/// whose stored body fails `Header::verify`), and with a unanimous two-voter quorum `f` is 0, so op
+/// 97's bytes existed nowhere — holding the commit at the hole and soliciting forever was the only
+/// safe response. That was a harness fault-model gap, not a protocol defect; the cross-replica
+/// permanent-fault bound closed it, and the third assertion below keeps the bound observed FIRING
+/// on this seed rather than inferred from the pass.
 ///
-/// What the wedge was, at tick 1697 on the two voters:
-///
-/// - both `Normal` in view 40 with `op = 209`, `commit_max = 208`, `commit_min = 96`, and 96 applied
-///   ops — so both KNEW ops through 208 were committed and neither applied past 96;
-/// - the blocked op was 97, and BOTH durable copies of it had been permanently destroyed at append
-///   time: replica 0's by bit-rot, replica 1's by a torn write whose stored body fails
-///   `Header::verify`. Both replicas then restarted, so neither retained the body in memory either;
-/// - the cluster has two voters, where the quorum is unanimous and `f` is 0, so op 97's bytes existed
-///   nowhere. Holding the commit at the hole and soliciting forever was the only safe response — no
-///   repair protocol recovers bytes no replica has.
-///
-/// The seed pinned a harness fault-model gap, not a protocol defect, and it is kept as a live
-/// regression over the cross-replica permanent-fault bound: with the bound in place the injector can
-/// no longer destroy every durable copy of a committed op, and the seed runs to completion under
-/// every standing oracle.
+/// **The rebuild over a staged root.** The permanent-corruption voting-set fold reshaped this seed
+/// to three voters, and the reshaped schedule fires `restart_in_place` while a durable-view root
+/// write is still STAGED: the dead incarnation adopted a view and submitted its root, the endpoint
+/// is rebuilt before it lands, and the staged root then lands underneath the successor. Running
+/// clean here requires the storage session's root timeline: the successor recovers at the
+/// EFFECTIVE root (never below a state the medium is already guaranteed to reach), parks its own
+/// root write behind the inherited one, and lifts its durable-view witness only as the landings
+/// settle. Before the timeline carried recovery, this schedule tripped the view-monotonic oracle —
+/// `durable view regressed to 8 (was 9)` at tick 3792 — the successor recovered at the last LANDED
+/// root, the staged higher-view root landed underneath it, and the successor's own lower root
+/// followed. `VOPR_NO_ASYNC_SB=1` isolates the mechanism: masking the staged-write window makes
+/// the regression unreachable, so a future failure here that survives the mask is NOT this shape.
 #[test]
 fn restart_in_place_seed_162_stays_within_the_durability_model() {
   let r = run_vopr_with_restart_in_place(162, DEFAULT_TICKS);

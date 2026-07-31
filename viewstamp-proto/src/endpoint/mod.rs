@@ -3496,10 +3496,24 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     self.config.max_client_sessions() as usize + MAX_PIPELINE as usize
   }
 
-  /// True iff a VIEW-CHANGING durable-view write is in flight — i.e. `self.view` may not yet be durable
-  /// on this replica's own superblock and a crash would roll it back. This is the precise predicate the
-  /// durable-view-before-participate fence guards on: a replica must not advertise authority/participation
-  /// in a view it has not yet durably entered.
+  /// True iff `self.view` may not yet be durable on this replica's own superblock and a crash would
+  /// roll it back. This is the precise predicate the durable-view-before-participate fence guards
+  /// on: a replica must not advertise authority/participation in a view it has not yet durably
+  /// entered. Two shapes raise it:
+  ///
+  /// - **An own VIEW-CHANGING durable-view write is in flight** (the three `pending_sb` actions
+  ///   below) — the write that will make `self.view` durable is this endpoint's and its completion
+  ///   arm lifts the witness.
+  /// - **The durable-view witness lags the live view outside a catch-up posture**
+  ///   (`view > durable_view && !catching_up()`) — the shape of a successor endpoint recovered
+  ///   over a live session whose predecessor's view-changing root is still in flight: the
+  ///   successor baselined its `view` on the effective root but owns NO write for it (`pending_sb`
+  ///   empty), and the witness lifts when the session settles the inherited landing
+  ///   (`on_sb_done`'s absorb). Without this term the in-flight-write test reads vacuously clear
+  ///   and the successor would participate in a view a process death could still roll back. A
+  ///   CATCH-UP posture is excluded exactly as it always was: its view was adopted in memory only,
+  ///   it can cast no vote there (the DVC regime is unreachable while `catching_up`), and its
+  ///   solicitation/re-entry machinery must keep running.
   ///
   /// It is NOT every `pending_sb` write. `pending_sb` also carries EPOCH/frontier writes through which
   /// `self.view` stays durable:
@@ -3527,7 +3541,8 @@ impl<S: StateMachine, R> Endpoint<S, R> {
           | PendingSbAction::StartViewAsPrimary
           | PendingSbAction::AdoptedStartView
       ))
-    )
+    ) || (self.view > self.durable_view
+      && !self.view_change.as_ref().is_some_and(|vc| vc.catching_up))
   }
 
   /// True iff a state-sync RE-PERSIST root write is already STAGED (its `AwaitRoot` step) — the
@@ -6179,11 +6194,14 @@ where
     self.assert_invariants();
     // The checkpoint-lockstep invariant as a single typed assertion rather than N per-writer
     // floors: when the checkpoint frontier is SETTLED, the in-memory `self.checkpoint_op` EQUALS
-    // the durable `sb.state().checkpoint_op()`. No-rewind itself no longer rests on this equality —
-    // every durable-root writer sources its checkpoint pair from the session's effective root, and
-    // the session asserts monotonicity at submit — so this is the lockstep's OWN witness: any path
-    // that advances one side without the other (or without recording the owed catch-up that
-    // explains the lead) trips here rather than surfacing as a divergent pointer three views later.
+    // the EFFECTIVE root's `checkpoint_op()` — the session's timeline, not the landed root, which
+    // an inherited in-flight checkpoint root legitimately lags (recovery baselines on the
+    // effective root, so the in-memory pointer leads the landed one exactly until that landing
+    // settles). No-rewind itself no longer rests on this equality — every durable-root writer
+    // sources its checkpoint pair from the session's effective root, and the session asserts
+    // monotonicity at submit — so this is the lockstep's OWN witness: any path that advances one
+    // side without the other (or without recording the owed catch-up that explains the lead)
+    // trips here rather than surfacing as a divergent pointer three views later.
     // Excluded windows, each a TRACKED owed catch-up: an own checkpoint mid-flight
     // (`pending_checkpoint` — both sides sit at the OLD value until its root lands); an owed
     // SM-content reconstruction (`sm_reconstruct` — `self.checkpoint_op` is already M while the SM
@@ -6198,10 +6216,10 @@ where
     {
       debug_assert_eq!(
         self.checkpoint_op,
-        storage.sb().state().checkpoint_op(),
-        "settled in-memory checkpoint_op {} != durable {}",
+        storage.effective_checkpoint_pair().0,
+        "settled in-memory checkpoint_op {} != effective {}",
         self.checkpoint_op.get(),
-        storage.sb().state().checkpoint_op().get(),
+        storage.effective_checkpoint_pair().0.get(),
       );
     }
   }

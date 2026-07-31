@@ -177,9 +177,13 @@ fn header(op: u64) -> Header {
 }
 
 fn root(checkpoint_op: u64, checkpoint_id: u128) -> VsrState {
+  root_at_view(1, checkpoint_op, checkpoint_id)
+}
+
+fn root_at_view(view: u64, checkpoint_op: u64, checkpoint_id: u128) -> VsrState {
   VsrState::try_new(
-    View::with(1),
-    View::with(1),
+    View::with(view),
+    View::with(view),
     OpNumber::with(checkpoint_op),
     OpNumber::with(checkpoint_op),
     checkpoint_id,
@@ -349,6 +353,137 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
     "with the timeline drained, the durable root IS the last submitted"
   );
   assert!(!s.has_inflight(), "the root timeline is drained");
+}
+
+#[test]
+fn the_effective_root_is_the_back_of_the_timeline_else_the_durable_one() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  assert_eq!(
+    s.effective_root(),
+    VsrState::new(),
+    "with nothing in flight the durable root is effective"
+  );
+
+  let submitted = root_at_view(3, 4, 40);
+  s.submit_root(WriteId::new(1, 1), submitted.clone());
+  assert_eq!(
+    s.effective_root(),
+    submitted,
+    "an in-flight root is the state the medium converges to — a rebuilt endpoint baselines here"
+  );
+
+  s.sb_mut().land_root();
+  let (_, landed) = s
+    .poll_sb()
+    .expect("the root lands")
+    .landed_root
+    .expect("a root landing is reported");
+  assert_eq!(landed, submitted);
+  assert_eq!(
+    s.effective_root(),
+    submitted,
+    "the drained timeline's effective root IS the durable one — the value never moved"
+  );
+}
+
+#[test]
+fn a_successors_root_parks_behind_a_dead_predecessors_outstanding_one() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  // A dead incarnation's root write is still with the device.
+  let dead = WriteId::new(1, 1);
+  let dead_state = root_at_view(2, 0, 0);
+  s.submit_root(dead, dead_state.clone());
+
+  // The successor's own root write PARKS: it enters the timeline (the effective root moves, and
+  // quiescence waits for it) but the backend does not see it while the predecessor's is
+  // outstanding — the superblock analogue of the append fence.
+  let own = WriteId::new(2, 1);
+  let own_state = root_at_view(3, 0, 0);
+  s.submit_root(own, own_state.clone());
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    1,
+    "the parked root was not handed to the backend"
+  );
+  assert_eq!(
+    s.effective_root(),
+    own_state,
+    "a parked root is a committed point on the timeline"
+  );
+  assert!(s.has_inflight(), "a parked root is still owed");
+
+  // The predecessor's landing releases the fence: the session itself submits the parked root.
+  s.sb_mut().land_root();
+  let (id, state) = s
+    .poll_sb()
+    .expect("the predecessor's root lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!((id, state), (dead, dead_state));
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    1,
+    "the landing handed the parked root to the backend"
+  );
+
+  s.sb_mut().land_root();
+  let (id, state) = s
+    .poll_sb()
+    .expect("the released root lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!((id, state), (own, own_state.clone()));
+  assert_eq!(s.effective_root(), own_state, "the medium converged to it");
+  assert!(!s.has_inflight());
+}
+
+#[test]
+fn same_incarnation_roots_stack_without_parking() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
+  s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    2,
+    "an endpoint's own checkpoint + view-change stacking reaches the backend unfenced"
+  );
+}
+
+#[test]
+fn parked_roots_release_in_queue_order_across_generations() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  // Three incarnations' roots: the first submitted, each later one parked behind the foreign
+  // writes ahead of it (a rebuild-of-a-rebuild leaves exactly this queue).
+  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
+  s.submit_root(WriteId::new(2, 1), root_at_view(3, 0, 0));
+  s.submit_root(WriteId::new(3, 1), root_at_view(4, 0, 0));
+  assert_eq!(s.sb_mut().staged_roots.len(), 1);
+
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("first landing").landed_root.is_some());
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    1,
+    "only the SECOND generation released — the third is still fenced behind it"
+  );
+
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("second landing").landed_root.is_some());
+  assert_eq!(s.sb_mut().staged_roots.len(), 1, "the third released");
+
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("third landing").landed_root.is_some());
+  assert!(!s.has_inflight(), "the timeline drained in queue order");
+}
+
+#[test]
+#[should_panic(expected = "rewind the durable view")]
+fn a_root_below_the_effective_view_is_refused() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.submit_root(WriteId::new(1, 1), root_at_view(3, 0, 0));
+  // A writer that baselined below the timeline (the landed root, a stale scalar) is a bug the
+  // choke catches: landings arrive in queue order, so this root would regress the durable view.
+  s.submit_root(WriteId::new(2, 1), root_at_view(2, 0, 0));
 }
 
 #[test]

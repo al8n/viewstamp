@@ -126,7 +126,13 @@
 //! medium's whole in-process life. A rebuilt endpoint threads the SAME session, so it inherits
 //! every slot-quiescence witness and defers its conflicting re-appends behind a dead predecessor's
 //! outstanding writes exactly as the predecessor would have; the session settles those writes off
-//! the very completions the choke refuses. The alternative — a fresh ledger over a live medium,
+//! the very completions the choke refuses. The superblock's half of the same inheritance is the
+//! ROOT TIMELINE: the session holds every in-flight root write with the exact state it will make
+//! durable, the successor recovers AT the timeline's last root (never below a state the medium is
+//! already guaranteed to reach), defers its own root write behind a predecessor's outstanding one,
+//! and advances its durable-view witness only off the landings the session settles — so an
+//! inherited root landing under the successor can never be followed by a root that rewinds the
+//! durable view or the checkpoint pointer. The alternative — a fresh ledger over a live medium,
 //! which cannot see the slots it must not write and lets an abandoned write land OVER a slot the
 //! successor re-appended and acked — is unrepresentable: the handles are inside the session until
 //! [`Storage::into_parts`] proves the medium quiet. A real crash discharges the same obligation
@@ -211,8 +217,10 @@ pub const HEADER_ENCODED_LEN: usize = 128;
 /// ledger — foreign or own, keyed by the FULL `(incarnation, sequence)` pair so no incarnation's
 /// sequence can alias another's — BEFORE the endpoint's choke judges correlation. The successor
 /// therefore inherits the slot-quiescence witnesses and defers its conflicting re-appends behind a
-/// predecessor's outstanding write, which is why a rebuild threading the same session needs no
-/// pre-rebuild drain for SAFETY.
+/// predecessor's outstanding write; and on the superblock it inherits the ROOT TIMELINE the same
+/// way — it recovers at the last submitted root, defers its own root write behind a predecessor's
+/// outstanding one, and lifts its durable-view witness only as the session settles each landing —
+/// which is why a rebuild threading the same session needs no pre-rebuild drain for SAFETY.
 ///
 /// The id never reaches disk or the wire; a backend treats it as an opaque token to echo back.
 ///

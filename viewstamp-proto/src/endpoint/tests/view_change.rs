@@ -3659,26 +3659,87 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   let (mut e, mut storage) = primed_new_primary_in_pending_view_window();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  // Give this primed primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op it
-  // holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
+  // Settle the primed view-1 window first: flush the view-1 root and discard the deferred
+  // StartView. The window this test exercises is opened again below, over a CHECKPOINTED timeline.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(!e.pending_sb_for_test(), "view 1 is durable");
+  // Give this settled primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op
+  // it holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
   // serve's ship-time gate requires `cr.op() == self.checkpoint_op`, so the injected op must match;
   // the integrity gate additionally requires the read bytes to hash to the DURABLE checkpoint id,
-  // so the durable ROOT must NAME this snapshot — set `sb.state` to a root at checkpoint_op 1 whose
-  // `checkpoint_id == checkpoint_id(snapshot)` (a genuinely durable checkpoint, not a half-faked one).
-  // The view stays 0 (the prior, still-durable view): the view-1 write is the one held inflight, which
-  // is exactly the not-yet-durable-view window this test exercises.
+  // so the durable ROOT must NAME this snapshot — set `sb.state` to the view-1 root re-pointed at
+  // the op-1 checkpoint (a genuinely durable checkpoint, not a half-faked one). Injected while
+  // NOTHING is in flight, so the session's timeline agrees: the effective root IS this root, the
+  // settled-frontier invariant holds, and every root submitted below copy-forwards this pair.
   let snapshot = Bytes::from_static(b"durable-checkpoint-snapshot");
   e.set_own_checkpoint_for_test(1);
   storage.sb_mut().checkpoint = Some((OpNumber::with(1), snapshot.clone()));
   storage.sb_mut().state = VsrState::try_new(
-    View::new(),
-    View::new(),
+    View::with(1),
+    View::with(1),
     OpNumber::with(1),
     OpNumber::with(1),
     crate::checkpoint_id(&snapshot),
     std::vec::Vec::new(),
   )
   .expect("durable root: commit == checkpoint_op, log_view <= view");
+  // Re-open the durable-view window AT VIEW 4 (the next view this replica leads in a 3-voter
+  // ring): join replica 0's escalated StartViewChange — the SVC quorum enters ViewChange and
+  // submits the SendDoViewChange root — then replica 2's DoViewChange forms the quorum and this
+  // replica becomes the NEW PRIMARY of view 4 with the StartViewAsPrimary root STILL inflight
+  // (StepSb does not flush on its own). Both roots copy-forward the op-1 checkpoint pair off the
+  // effective root, so the durable pointer never wavers through the window.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(4),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(4),
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+      ],
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.view(), View::with(4));
+  assert!(
+    e.pending_sb_for_test(),
+    "the view-4 durable-view write must still be pending (the durable-view window is open)"
+  );
   // A lagging peer solicits the checkpoint (its own `checkpoint_op` is 0, strictly below ours) — the
   // RequestSync is delivered WHILE the view write is pending. `on_request_sync` submits the checkpoint
   // read (it does not itself gate on `pending_sb`); the read completes into `serve_sync_checkpoint`,
@@ -3688,7 +3749,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
     &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestSync(crate::RequestSync::new(
-      View::with(1),
+      View::with(4),
       OpNumber::with(0),
       ReplicaId::new(2),
       0xD18F,
@@ -3697,7 +3758,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
     )),
   );
   // Pump storage so the checkpoint read completes (StepSb serves reads eagerly into `ready`) and
-  // `serve_sync_checkpoint` runs — but WITHOUT flushing the inflight view write, so the window stays
+  // `serve_sync_checkpoint` runs — but WITHOUT flushing the inflight view writes, so the window stays
   // open. The serve must DROP (no SyncCheckpoint) because our view is not yet durable.
   e.storage_step(now, &mut storage, &mut blocks);
   let mut sync_checkpoint_in_window = false;
@@ -3714,25 +3775,12 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
     e.pending_sb_for_test(),
     "handling the RequestSync / read completion must not have force-completed the view write"
   );
-  // Make the view durable (this fires the deferred StartView broadcast — discard it), then the SAME
-  // RequestSync IS answered with a SyncCheckpoint carrying the now-durable view 1.
+  // Make the view durable — the StepSb publishes the roots the endpoint REALLY submitted, each
+  // carrying the copy-forwarded op-1 checkpoint pair, so the durable root now names both view 4
+  // and the servable checkpoint with no fixture surgery. (This fires the deferred StartView
+  // broadcast — discard it.) Then the SAME RequestSync IS answered with a SyncCheckpoint carrying
+  // the now-durable view 4.
   storage.sb_mut().flush();
-  // The flushed view-1 root was SUBMITTED by the shared harness before the checkpoint was injected
-  // (when the durable root was `initial()`), so the StepSb published it with checkpoint_op/id 0 — a
-  // harness artifact: the real `submit_durable_view` PRESERVES the durable checkpoint (see its doc).
-  // Re-establish the proto-correct durable root (now at view 1, still naming the op-1 checkpoint) BEFORE
-  // draining storage, so the durable `checkpoint_op` matches the in-memory `checkpoint_op == 1` the
-  // settled-frontier invariant (`assert_invariants` exit) checks — and so the integrity gate sees the
-  // genuine durable id the post-flush serve must match.
-  storage.sb_mut().state = VsrState::try_new(
-    View::with(1),
-    View::with(1),
-    OpNumber::with(1),
-    OpNumber::with(1),
-    crate::checkpoint_id(&snapshot),
-    std::vec::Vec::new(),
-  )
-  .expect("durable root: commit == checkpoint_op, log_view <= view");
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
     !e.pending_sb_for_test(),
@@ -3744,7 +3792,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
     &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestSync(crate::RequestSync::new(
-      View::with(1),
+      View::with(4),
       OpNumber::with(0),
       ReplicaId::new(2),
       0xD18F,
@@ -3763,7 +3811,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
       );
       assert_eq!(
         s.view(),
-        View::with(1),
+        View::with(4),
         "the served SyncCheckpoint advertises the now-durable view"
       );
       assert_eq!(s.nonce(), 0xD18F, "echoes the soliciting nonce");
