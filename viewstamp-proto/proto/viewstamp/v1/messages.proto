@@ -292,6 +292,11 @@ message SyncCheckpoint {
   uint64 nonce = 7;
   bytes snapshot = 8;
   bytes membership = 9;
+  // The op of the last reconfigure that produced the carried membership — the
+  // sender's config_install_op, meaningful only when membership is non-empty.
+  // A cross-epoch laggard records it verbatim (its crossing root and its own
+  // config_install_op), so the producing op survives any number of crossings.
+  uint64 config_install_op = 10;
 }
 
 message RequestBlock {

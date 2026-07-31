@@ -135,6 +135,7 @@ fn assert_invariants_rejects_pending_install_without_sync() {
     held_tail: false,
     successor: None,
     successor_prev_config_id: None,
+    successor_install_op: None,
     checkpoint: crate::SyncCheckpoint::new(
       crate::View::new(),
       OpNumber::with(0),

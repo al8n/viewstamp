@@ -1,8 +1,7 @@
 use bytes::Bytes;
 
 use super::*;
-use crate::block_store::InMemoryBlockStore;
-use crate::block_store::block_address;
+use crate::block_store::{InMemoryBlockStore, block_address};
 
 /// Builds a session record with the given fields. `reply` is the cached `(request_number, body)` or
 /// `None`.

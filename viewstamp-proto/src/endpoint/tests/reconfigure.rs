@@ -1110,17 +1110,22 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e2, successor_e1.config_id()).encode_body();
   let cross_msg = |nonce: u64| {
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m2),
-      cross_id,
-      successor_e2.epoch(),
-      successor_e2.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env.clone(),
-      membership_body.clone(),
-    ))
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m2),
+        cross_id,
+        successor_e2.epoch(),
+        successor_e2.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env.clone(),
+        membership_body.clone(),
+      )
+      // The donor states the op that PRODUCED E+2 — the further reconfiguration the cluster
+      // committed at the crossing checkpoint (`m2`), past this node's own E+1 swap at `n1`.
+      .with_config_install_op(OpNumber::with(m2)),
+    )
   };
   e.handle_message(
     now,
@@ -1305,17 +1310,22 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(n1),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env.clone(),
-      membership_body.clone(),
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(n1),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env.clone(),
+        membership_body.clone(),
+      )
+      // The donor states the op that PRODUCED E1 — the same committed reconfigure op N this node
+      // staged; the crossing checkpoint here sits exactly at it.
+      .with_config_install_op(OpNumber::with(n1)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
   assert!(
@@ -1451,17 +1461,22 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
   let cross_msg = |nonce: u64| {
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(n1),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env.clone(),
-      membership_body.clone(),
-    ))
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(n1),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env.clone(),
+        membership_body.clone(),
+      )
+      // The donor states the op that PRODUCED E1 — the same committed reconfigure op N this node
+      // staged; the crossing checkpoint here sits exactly at it.
+      .with_config_install_op(OpNumber::with(n1)),
+    )
   };
   e.handle_message(
     now,
@@ -8595,5 +8610,101 @@ fn a_delayed_adopt_vote_completion_casts_no_vote_after_a_landing_driven_demotion
   assert!(
     e.poll_message().is_none(),
     "a demoted node emits nothing off the delayed completion — no Reply, no Commit"
+  );
+}
+
+#[test]
+fn a_cross_epoch_sync_install_reports_the_reconfigure_op_not_the_crossing_frontier() {
+  // The cluster reconfigured E0 -> E1 at op N == 1, then checkpointed on at M == 3 — an ordinary
+  // client-op frontier past the swap. A laggard still at E0 with NO local staged swap crosses via
+  // state-sync off that later checkpoint. The `MembershipChanged` the crossing-root landing
+  // reports must name the op that PRODUCED the configuration (the donor-carried N, validated and
+  // recorded verbatim), never the crossing checkpoint frontier M — the durable root, the
+  // in-memory install record, and this node's own future serve gate must all agree on N, so the
+  // event an embedder folds into consensus history names a real `Reconfigure` op.
+  let n: u64 = 1;
+  let m: u64 = 3;
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (wal, sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  e.arm_cross_epoch_sync_for_test(m);
+  let nonce = e.sync_nonce_for_test();
+  let snap = CountSm::default().snapshot();
+  let env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(m),
+    crate::block_address(&snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  blocks.put(snap.clone());
+  let id = crate::checkpoint_id(&env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e1, genesis_mem.config_id()).encode_body();
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(n)),
+    ),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  for _ in 0..6 {
+    e.storage_step(now, &mut storage, &mut blocks);
+    e.block_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(e.state_syncs_applied(), 1, "the crossing installed");
+  assert_eq!(e.membership, successor_e1, "the laggard crossed to E+1");
+  let mc = core::iter::from_fn(|| e.poll_event())
+    .find_map(|ev| match ev {
+      Event::MembershipChanged(mc) => Some(mc),
+      _ => None,
+    })
+    .expect("the crossing install reports MembershipChanged");
+  assert_eq!(
+    mc.op().get(),
+    n,
+    "MembershipChanged names the committed Reconfigure op that produced E+1, not the crossing \
+     checkpoint frontier (an ordinary client op)"
+  );
+  assert_eq!(
+    (mc.epoch(), mc.config_id()),
+    (successor_e1.epoch(), successor_e1.config_id()),
+    "and the successor it reports is the installed configuration"
+  );
+  // The record is VERBATIM everywhere the value lives: the in-memory install record (this node's
+  // own serve gate) and the crossing durable root (what a crash would recover and re-serve).
+  assert_eq!(
+    e.config_install_op,
+    OpNumber::with(n),
+    "the in-memory install record carries the producing op"
+  );
+  assert_eq!(
+    storage.sb().state().config_install_op(),
+    OpNumber::with(n),
+    "the crossing durable root records the producing op, not the frontier"
   );
 }

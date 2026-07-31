@@ -12,10 +12,9 @@
 //! staged) and PASSES once the choke point suppresses any ack of an in-flight op.
 
 use bytes::Bytes;
-use viewstamp_proto::Storage;
 use viewstamp_proto::{
   ClientId, Config, Endpoint, Epoch, Instant, MemberId, Membership, Message, OpNumber, Peer,
-  Prepare, ReplicaId, RequestNumber, StateMachine, View, Wal,
+  Prepare, ReplicaId, RequestNumber, StateMachine, Storage, View, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 

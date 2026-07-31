@@ -666,13 +666,16 @@ pub struct VsrState {
   prior_config_ids: Vec<u128>,
   /// The op of the last reconfigure that produced this root's [`Membership`] — the commit-first SwapEpoch
   /// root for a live single-change, or the offline-restart point for an offline reconfiguration; genesis
-  /// (`0`) when no reconfiguration has occurred. A recovered donor restores it so the cross-epoch
-  /// state-sync SERVE gate — attach the successor membership to a sync answer ONLY when
-  /// `checkpoint_op >= config_install_op` — holds across a restart. Without it a donor recovered into a
-  /// swapped-but-not-yet-checkpointed window (its checkpoint is BELOW the reconfigure op) would re-attach
-  /// its E+1 membership to a checkpoint at op `M < N`, letting a laggard install E+1 at frontier `M`
-  /// WITHOUT the committed prefix through the reconfigure op `N` (an XI-b violation, the same premise the
-  /// NORMAL commit-first path enforces). [`Self::try_new`] defaults it to the root's own
+  /// (`0`) when no reconfiguration has occurred. A cross-epoch state-sync crossing root records the
+  /// DONOR-CARRIED producing op VERBATIM (validated at/below the synced frontier), never the crossing
+  /// frontier itself, so the value stays the real reconfigure op through any number of crossings — the
+  /// landing-driven `MembershipChanged` reports it, and a recovered node re-serves it. A recovered donor
+  /// restores it so the cross-epoch state-sync SERVE gate — attach the successor membership to a sync
+  /// answer ONLY when `checkpoint_op >= config_install_op` — holds across a restart. Without it a donor
+  /// recovered into a swapped-but-not-yet-checkpointed window (its checkpoint is BELOW the reconfigure
+  /// op) would re-attach its E+1 membership to a checkpoint at op `M < N`, letting a laggard install E+1
+  /// at frontier `M` WITHOUT the committed prefix through the reconfigure op `N` (an XI-b violation, the
+  /// same premise the NORMAL commit-first path enforces). [`Self::try_new`] defaults it to the root's own
   /// `checkpoint_op` (a membership-less root has no reconfiguration of its own, so the gate is
   /// trivially satisfied); for a no-reconfiguration cluster it is genesis.
   config_install_op: OpNumber,

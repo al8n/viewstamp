@@ -52,9 +52,10 @@ pub(crate) fn request_sync_from(w: pb::RequestSync) -> Result<RequestSync, Codec
   ))
 }
 
-/// Converts a borrowed [`SyncCheckpoint`] into its wire form: the view/checkpoint_op/epoch/nonce
-/// scalars carried as-is, the replica narrowed to its wire width, the checkpoint id and config id
-/// as 16 big-endian bytes each, and the snapshot and membership bodies carried as-is.
+/// Converts a borrowed [`SyncCheckpoint`] into its wire form: the view/checkpoint_op/epoch/nonce/
+/// config_install_op scalars carried as-is, the replica narrowed to its wire width, the checkpoint
+/// id and config id as 16 big-endian bytes each, and the snapshot and membership bodies carried
+/// as-is.
 pub(crate) fn pb_sync_checkpoint(m: &SyncCheckpoint) -> pb::SyncCheckpoint {
   pb::SyncCheckpoint {
     view: m.view().get(),
@@ -66,6 +67,7 @@ pub(crate) fn pb_sync_checkpoint(m: &SyncCheckpoint) -> pb::SyncCheckpoint {
     nonce: m.nonce(),
     snapshot: m.snapshot_bytes(),
     membership: m.membership_bytes(),
+    config_install_op: m.config_install_op().get(),
     ..Default::default()
   }
 }
@@ -74,17 +76,20 @@ pub(crate) fn pb_sync_checkpoint(m: &SyncCheckpoint) -> pb::SyncCheckpoint {
 /// and membership `Bytes` out rather than copying them. Rejects a replica slot above
 /// [`u16::MAX`], or a wrong-length checkpoint id or config id.
 pub(crate) fn sync_checkpoint_from(w: pb::SyncCheckpoint) -> Result<SyncCheckpoint, CodecError> {
-  Ok(SyncCheckpoint::new(
-    View::with(w.view),
-    OpNumber::with(w.checkpoint_op),
-    u128_from(&w.checkpoint_id, "SyncCheckpoint.checkpoint_id")?,
-    Epoch::new(w.epoch),
-    u128_from(&w.config_id, "SyncCheckpoint.config_id")?,
-    replica_from(w.replica, "SyncCheckpoint.replica")?,
-    w.nonce,
-    w.snapshot,
-    w.membership,
-  ))
+  Ok(
+    SyncCheckpoint::new(
+      View::with(w.view),
+      OpNumber::with(w.checkpoint_op),
+      u128_from(&w.checkpoint_id, "SyncCheckpoint.checkpoint_id")?,
+      Epoch::new(w.epoch),
+      u128_from(&w.config_id, "SyncCheckpoint.config_id")?,
+      replica_from(w.replica, "SyncCheckpoint.replica")?,
+      w.nonce,
+      w.snapshot,
+      w.membership,
+    )
+    .with_config_install_op(OpNumber::with(w.config_install_op)),
+  )
 }
 
 /// Converts a borrowed [`RequestPrepareRange`] into its wire form: the view/lo/hi scalars carried

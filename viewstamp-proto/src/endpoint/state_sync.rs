@@ -971,6 +971,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     } else {
       Bytes::new()
     };
+    // An attached membership travels with the op that PRODUCED it (`self.config_install_op`): a
+    // cross-epoch requester records that op verbatim — in its crossing durable root, its own
+    // install record, and the `MembershipChanged` it reports — so the producing op survives the
+    // crossing instead of being re-approximated by this checkpoint's frontier (which for a donor
+    // checkpointed past the reconfigure op is an ordinary client op). Withheld alongside the
+    // membership (the field is meaningful only with one attached).
+    let attached_install_op = if membership.is_empty() {
+      OpNumber::new()
+    } else {
+      self.config_install_op
+    };
     // Ship the whole envelope as one `SyncCheckpoint`. It is always frame-sized now: the SM bytes
     // are no longer in the envelope (only a 16-byte SM root), and the carried membership is bounded by
     // the active member set — so the over-frame chunked announce/pull path is gone. The requester
@@ -978,17 +989,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // fetching the blocks it is missing via `RequestBlock`.
     self.emit(Outgoing::new(
       Recipient::To(to),
-      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-        self.view,
-        cr.op(),
-        id,
-        self.membership.epoch(),
-        self.membership.config_id(),
-        self.local_slot(),
-        nonce,
-        snapshot,
-        membership,
-      )),
+      Message::SyncCheckpoint(
+        crate::SyncCheckpoint::new(
+          self.view,
+          cr.op(),
+          id,
+          self.membership.epoch(),
+          self.membership.config_id(),
+          self.local_slot(),
+          nonce,
+          snapshot,
+          membership,
+        )
+        .with_config_install_op(attached_install_op),
+      ),
     ));
   }
 
@@ -1900,7 +1914,30 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           if below_timeline {
             return;
           }
-          Some((successor, verified_prev))
+          // The op that PRODUCED the carried successor — the donor's `config_install_op`, recorded
+          // verbatim by this install (the crossing durable root, the in-memory install record, and
+          // the `MembershipChanged` this node reports). Validated before anything stages, against
+          // the two facts the value must be consistent with, refusing the reply (stage nothing;
+          // the solicit timer re-fetches from another donor) rather than recording a value that
+          // trips a fail-stop later:
+          // - at/below the served frontier: the serve gate attaches a membership only when the
+          //   donor's checkpoint covers its install (`checkpoint_op >= config_install_op`), so a
+          //   claim above `M` contradicts the very gate that admitted it;
+          // - at/or above the timeline's own install record: the crossing root must satisfy the
+          //   session's config-install-op monotonicity assert at its submission choke, and that
+          //   assert is a fail-stop — wire data must never be able to reach it. Non-strict, and
+          //   scoped to a membership-bearing effective root, exactly like the assert: an
+          //   equal-epoch re-persist of this node's own in-flight swap legitimately carries the
+          //   SAME producing op the timeline already records.
+          let install_op = m.config_install_op();
+          if install_op > checkpoint_op
+            || effective
+              .membership_opt()
+              .is_some_and(|_| install_op < effective.config_install_op())
+          {
+            return;
+          }
+          Some((successor, verified_prev, install_op))
         }
         Err(_) => return,
       }
@@ -1945,14 +1982,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     // Assemble the verified install — every field the durable re-persist + the deferred `install_sync`
-    // need. Split the verified crossing pair into the two `PendingInstall` fields: the successor
-    // membership and the VERIFIED predecessor `config_id` it chains from (the value that satisfied the
-    // hash-chain). The install + its durable root stamp the lineage from THIS verified chain, never
-    // re-deriving it from the stale current config — so a re-served crossing recomputes the SAME
-    // `config_id` a fresh laggard expects.
-    let (successor, successor_prev_config_id) = match successor {
-      Some((membership, prev)) => (Some(membership), Some(prev)),
-      None => (None, None),
+    // need. Split the verified crossing triple into the three `PendingInstall` fields: the successor
+    // membership, the VERIFIED predecessor `config_id` it chains from (the value that satisfied the
+    // hash-chain), and the VALIDATED op that produced it (the donor's `config_install_op`). The
+    // install + its durable root stamp the lineage and the producing op from THIS verified data,
+    // never re-deriving either from the stale current config or the crossing frontier — so a
+    // re-served crossing recomputes the SAME `config_id` a fresh laggard expects and re-serves the
+    // SAME producing op the original reconfiguration committed.
+    let (successor, successor_prev_config_id, successor_install_op) = match successor {
+      Some((membership, prev, install_op)) => (Some(membership), Some(prev), Some(install_op)),
+      None => (None, None, None),
     };
     let install = PendingInstall {
       checkpoint_op,
@@ -1961,6 +2000,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       held_tail,
       successor,
       successor_prev_config_id,
+      successor_install_op,
       // Carry the verified envelope + its authenticated donor so a post-root SM-restore fault can re-fetch
       // THIS checkpoint's bit-rotted block and retry the restore against the same DAG (the fields flow into
       // the `SmReconstruct` obligation `install_sync` raises on a restore fault — see `PendingInstall`).
@@ -2122,6 +2162,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       held_tail,
       successor,
       successor_prev_config_id,
+      successor_install_op,
       checkpoint,
       donor,
     } = install;
@@ -2220,14 +2261,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         {
           self.push_lineage(verified_prev);
         }
-        // `install_membership(None, ..)` does not set `config_install_op` (a cross-epoch sync has no LOCAL
-        // reconfigure op — the laggard synced PAST it). Set it to the synced frontier `checkpoint_op`: the
-        // donor attached this successor only because ITS checkpoint reached the reconfigure op `N`, and the
-        // laggard's synced `checkpoint_op` equals that donor checkpoint, so `checkpoint_op >= N`. This is a
-        // safe, restart-survivable lower bound that lets this node (now a potential donor) re-serve E+1 at or
-        // above its own frontier while never offering it below it. `checkpoint_op` is the synced install op
-        // (`self.checkpoint_op` is advanced to it just below, in this same call).
-        self.config_install_op = checkpoint_op;
+        // `install_membership(None, ..)` does not set `config_install_op` (a cross-epoch sync commits no
+        // LOCAL reconfigure op — the laggard synced PAST it). Record the DONOR-CARRIED producing op `N`
+        // (`apply_sync` validated it at/below the synced frontier and at/above this node's own record),
+        // VERBATIM — the same value the crossing durable root stamped, so a crash recovers the identical
+        // record. Verbatim is what keeps the value TRUE through any number of crossings: this node, as a
+        // future re-donor, serves `N` onward, its serve gate (`checkpoint_op >= config_install_op`) opens
+        // at exactly the checkpoint that embeds the reconfigure op, and the `MembershipChanged` the root
+        // landing reported named the real committed `Reconfigure` op rather than this crossing's frontier
+        // (an ordinary client op whenever the donor checkpointed past the swap).
+        self.config_install_op =
+          successor_install_op.expect("a crossing install carries its validated producing op");
       }
       // CONSUME any LOCAL staged swap this crossing SUPERSEDED. A laggard can commit a `Reconfigure` op
       // and stage `pending_swap` (the successor membership), enter ViewChange before its SwapEpoch root

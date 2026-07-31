@@ -98,17 +98,33 @@ impl Pending {
   }
 }
 
-/// An append held back by the slot-quiescence fence: its target ring slot still has an older
-/// physical write in flight, so submitting it now would race the device — completions may reorder,
-/// and the OLD bytes could land LAST, leaving the durable slot holding a value this replica's
-/// ack/vote never named. The full submission (the deferred action `kind` plus the exact bytes) waits
-/// in `Endpoint::deferred_appends` until the blocking write's completion proves the slot quiesced;
-/// `release_deferred_append` then performs the real submit. The op number is the map key.
+/// Why an append is parked in `Endpoint::deferred_appends` — which session refusal deferred it,
+/// and therefore which release trigger re-drives it. Re-judged at every re-submission: a released
+/// waiter can be refused again for the OTHER reason, and the re-park records the fresh verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferReason {
+  /// The slot-quiescence fence: an older physical write holds this op's ring slot. Released by
+  /// that exact slot's quiescence (`release_deferred_append`).
+  Slot,
+  /// The session append quota: the medium already carries the full quota of in-flight appends,
+  /// none of which need alias this op's slot. Released by aggregate headroom — any append's
+  /// quiescence (`release_quota_deferred_appends`), not this slot's.
+  Quota,
+}
+
+/// An append held back by a session refusal: the slot-quiescence fence (its target ring slot still
+/// has an older physical write in flight, so submitting now would race the device — completions
+/// may reorder, and the OLD bytes could land LAST, leaving the durable slot holding a value this
+/// replica's ack/vote never named) or the session append quota (the medium already carries its
+/// full in-flight ceiling). The full submission (the deferred action `kind` plus the exact bytes)
+/// waits in `Endpoint::deferred_appends` until its [`DeferReason`]'s release trigger fires;
+/// the release then performs the real submit. The op number is the map key.
 #[derive(Debug, Clone)]
 struct DeferredAppend {
   kind: Pending,
   header: Header,
   body: Bytes,
+  reason: DeferReason,
 }
 
 /// What the endpoint does once its pending durable-view (superblock) write completes. A transition
@@ -500,6 +516,14 @@ pub(crate) struct PendingInstall {
   /// the (mis-chained) crossing forever. For the common single-change E0→E1 case this equals the
   /// laggard's own current `config_id`, so the install is byte-identical to before.
   successor_prev_config_id: Option<u128>,
+  /// The VALIDATED op that PRODUCED the carried successor — the donor's `config_install_op`,
+  /// admitted by [`Endpoint::apply_sync`] only at/below the served frontier and at/above this
+  /// node's own effective install record. `Some` exactly when `successor` is (a crossing install);
+  /// `None` for a same-config sync. The crossing durable root and the in-memory install record it
+  /// VERBATIM — never the crossing frontier, which for a donor checkpointed past the reconfigure
+  /// op is an ordinary client op — so the `MembershipChanged` the landing reports names the real
+  /// committed `Reconfigure` op, and this node (as a future re-donor) serves the same op onward.
+  successor_install_op: Option<OpNumber>,
   /// The verified `SyncCheckpoint` this install was staged from, carried verbatim so the post-advance
   /// SM-reconstruct obligation ([`SmReconstruct`]) can RE-FETCH this checkpoint's bit-rotted block (the
   /// block that failed the verify-on-read restore) and retry against the same DAG. On a restore fault the
@@ -776,6 +800,32 @@ const fn effective_wal_capacity(capacity: u64, checkpoint_ops: u64) -> u64 {
   } else {
     capacity
   }
+}
+/// The SESSION APPEND QUOTA for a store recording `checkpoint_ops` as its checkpoint interval:
+/// twice the proto-imposed ring (`2 × (IMPLIED_RING_INTERVALS × checkpoint_ops + MAX_PIPELINE)`) —
+/// the ceiling the storage session holds the in-flight append ledger to at its submission choke
+/// ([`Storage::submit_append`](crate::Storage)), across every endpoint incarnation and state-sync
+/// generation over one medium.
+///
+/// One implied ring bounds a single generation's legitimate in-flight window: every append targets
+/// an op in `(checkpoint_op, checkpoint_op + effective]` (the mint stall, the backup ring-window
+/// guard, and the adoption/repair wrap checks enforce it), at most one write per op. A state-sync
+/// jump opens a FRESH window while the abandoned generation's writes are still quiescing — the WAL
+/// contract lets them complete arbitrarily late and obliges truncate/prune to cancel none — so
+/// twice the ring admits one full window handover without ever deferring a healthy append, while
+/// a second handover atop un-quiesced backlog meets the quota and waits for real quiescence.
+///
+/// Deliberately a function of the CHECKPOINT GEOMETRY alone, never of [`Wal::capacity`]: on the
+/// default ring-less backend capacity is `u64::MAX` (no bound at all), and on a huge finite ring a
+/// capacity-derived quota would be as vacuous as the fence bound it backstops. A bounded backend
+/// below this value is already held tighter by the per-slot fence. Lives here, beside
+/// [`effective_wal_capacity`], because it is the same implied-ring geometry — the session imports
+/// it rather than restating the constants.
+pub(crate) const fn session_append_quota(checkpoint_ops: u64) -> u64 {
+  checkpoint_ops
+    .saturating_mul(IMPLIED_RING_INTERVALS)
+    .saturating_add(MAX_PIPELINE)
+    .saturating_mul(2)
 }
 /// Peer fault-repair BELOW-head window ([`Endpoint::request_repair_run`]): the maximum number of ops a
 /// single `RequestPrepareRange` solicits — the size of the contiguous below-head `Repairing`/missing
@@ -2465,18 +2515,18 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // (`checkpoint_op >= config_install_op`) holds. A commit-first swap (`Some(op)`) names its committed
     // `Reconfigure` op `N` — until this node's checkpoint reaches `N` it must NOT serve E+1 to a laggard
     // (the laggard would install E+1 below `N`, without the committed prefix through `N`). A cross-epoch
-    // state-sync install (`None`) sets it to the synced frontier separately in `install_sync` — that
-    // frontier is at/above the donor's `N` (the donor served it only because its own checkpoint reached
-    // `N`), so it is a safe, restart-survivable lower bound.
+    // state-sync install (`None`) records the DONOR-CARRIED producing op separately in `install_sync` —
+    // the same `N`, validated at/below the synced frontier, so the gate and the reported history stay
+    // exact through any number of crossings.
     if let Some(op) = reconfigure_op {
       self.config_install_op = op;
     }
     // Emit MembershipChanged only for a commit-first swap (`Some` reconfigure op). A cross-epoch
-    // state-sync install (`None`) has no LOCAL Reconfigure op to name — the laggard synced PAST it — so
-    // naming the sync frontier (a client op) would misreport the consensus-layer applied gap to an
-    // observer; the swap is observable via the sync completion + the installed membership, and the real
-    // Reconfigure op is reported by the replicas that committed it directly. The observer still learns
-    // THIS node's role under the new configuration purely from the committed membership.
+    // state-sync install (`None`) commits no LOCAL Reconfigure op — the laggard synced PAST it — and
+    // its event was already reported at the crossing root's landing (`adopt_landed_configuration`,
+    // which names the donor-carried producing op the root records), so emitting here as well would
+    // report one install twice. The observer still learns THIS node's role under the new
+    // configuration purely from the committed membership.
     if let Some(op) = reconfigure_op {
       let self_is_learner = self
         .local_slot_opt()
@@ -2642,14 +2692,16 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// and for a single-step swap root the recorded block equals the recompute by construction (the
   /// root's writer stamped exactly the push its own install would have performed).
   ///
-  /// `MembershipChanged` is emitted iff the landing completes this endpoint's own staged swap
-  /// (`pending_swap` names the same successor), which is CONSUMED here: the staging latch is the
-  /// one unambiguous witness that this root is the commit-first swap of a `Reconfigure` op this
-  /// node committed, and it carries that op's number for the event. Any other adoption (an
-  /// inherited landing on a successor endpoint that never re-staged, a multi-epoch crossing root)
-  /// is deliberately event-less, exactly like a cross-epoch sync install — there is no local
-  /// `Reconfigure` op to name, and the configuration change stays observable through the
-  /// installed membership.
+  /// `MembershipChanged` is emitted for EVERY install here, and its op is the true producing op
+  /// on every path. A landing that completes this endpoint's own staged swap (`pending_swap`
+  /// names the same successor) CONSUMES the latch and names the committed `Reconfigure` op it
+  /// carries. Any other adoption — an inherited landing on a successor endpoint that never
+  /// re-staged, a superseded swap root, a cross-epoch crossing root — names the durable root's
+  /// `config_install_op`: a swap root stamps the committed `Reconfigure` op directly, and a
+  /// crossing root records the DONOR-CARRIED producing op the sync validated, so the root's field
+  /// is the real op in every case rather than a frontier approximation. The correlated arms that
+  /// re-reach [`Self::install_membership`] after this absorb no-op on its forward-epoch guard, so
+  /// each install is reported exactly once.
   fn adopt_landed_configuration(&mut self, now: Instant, state: &crate::VsrState)
   where
     S: StateMachine,
@@ -4581,6 +4633,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       held_tail: false,
       successor: None,
       successor_prev_config_id: None,
+      successor_install_op: None,
       checkpoint: crate::SyncCheckpoint::new(
         self.view,
         self.checkpoint_op,
@@ -4885,19 +4938,38 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       crate::storage::AppendSubmission::Submitted => {
         self.pending.insert(id.seq(), kind);
       }
+      // Either refusal parks the identical submission — one table, one supersession rule: at most
+      // one waiter per op, and a second deferral for the same op supersedes the first (the newer
+      // submission carries the newer canonical bytes/action for that op — its predecessor was
+      // abandoned by the transition that re-drove it, or is the same fill retried). Only the
+      // recorded reason differs, selecting which release trigger re-drives it.
       crate::storage::AppendSubmission::SlotFenced { header, body } => {
-        // At most one in-flight write per slot exists (this fence's own guarantee), and a second
-        // deferral for the same op supersedes the first — the newer submission carries the newer
-        // canonical bytes/action for that op (its predecessor was abandoned by the transition that
-        // re-drove it, or is the same fill retried).
-        self
-          .deferred_appends
-          .insert(op.get(), DeferredAppend { kind, header, body });
+        self.deferred_appends.insert(
+          op.get(),
+          DeferredAppend {
+            kind,
+            header,
+            body,
+            reason: DeferReason::Slot,
+          },
+        );
+      }
+      crate::storage::AppendSubmission::QuotaExhausted { header, body } => {
+        self.deferred_appends.insert(
+          op.get(),
+          DeferredAppend {
+            kind,
+            header,
+            body,
+            reason: DeferReason::Quota,
+          },
+        );
       }
     }
   }
 
-  /// Submit a deferred append whose blocking write (to `quiesced`'s ring slot) has just quiesced.
+  /// Submit a deferred append whose blocking write (to `quiesced`'s ring slot) has just quiesced,
+  /// then re-drive any quota-parked waiters against the headroom the same quiescence freed.
   /// Usually the surviving deferred entry (transitions/GC clear abandoned ones) is the slot's only
   /// waiter — but two waiters per slot CLASS are constructible on a bounded ring (`K` and
   /// `K + capacity`, the lower one checkpoint-subsumed; see the `deferred_appends` field doc). The
@@ -4905,28 +4977,77 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// whose fresh write then blocks the higher one via the re-check, so the LIVE (highest) op is the
   /// one that lands LAST in the slot. The re-check also guards the otherwise-impossible second
   /// in-flight blocker.
+  ///
+  /// Called at EVERY quiescence event (a drained completion or a synchronous cancellation — the
+  /// only moments the session ledger shrinks), so folding the quota pass into the tail here is
+  /// what makes quota backpressure self-releasing: no quiescence can free headroom without also
+  /// offering it to the parked waiters.
   fn release_deferred_append<W: Wal, B: Superblock>(
     &mut self,
     storage: &mut Storage<W, B, S>,
     quiesced: u64,
   ) {
     let capacity = storage.wal().capacity();
-    let Some(op) = self
+    if let Some(op) = self
       .deferred_appends
       .keys()
       .copied()
       .find(|&op| Self::slots_alias(capacity, op, quiesced))
-    else {
-      return;
-    };
-    let d = self
-      .deferred_appends
-      .remove(&op)
-      .expect("the found key is present");
+    {
+      let d = self
+        .deferred_appends
+        .remove(&op)
+        .expect("the found key is present");
+      self.resubmit_deferred_append(storage, op, d);
+    }
+    self.release_quota_deferred_appends(storage);
+  }
+
+  /// Re-drive the QUOTA-parked deferred appends against the session's current headroom, lowest op
+  /// first (the order the log needs them in). Each attempt is verdict-driven: a submission spends
+  /// one unit of headroom and continues; a fresh [`AppendSubmission::SlotFenced`] re-parks that
+  /// waiter on its slot (its release trigger is now the slot's quiescence) and continues to the
+  /// next; a fresh [`AppendSubmission::QuotaExhausted`] means the headroom is spent — every later
+  /// waiter would meet the same refusal, so the pass stops. Slot-parked entries are skipped
+  /// without a submission attempt: their trigger is their own slot, and re-driving them here
+  /// would burn a fence round per quiescence for waiters that cannot proceed.
+  fn release_quota_deferred_appends<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    loop {
+      let Some(op) = self
+        .deferred_appends
+        .iter()
+        .find(|(_, d)| d.reason == DeferReason::Quota)
+        .map(|(&op, _)| op)
+      else {
+        return;
+      };
+      let d = self
+        .deferred_appends
+        .remove(&op)
+        .expect("the found key is present");
+      if !self.resubmit_deferred_append(storage, op, d) {
+        return;
+      }
+    }
+  }
+
+  /// One verdict-driven re-submission of a parked append: submit, and on a fresh refusal re-park
+  /// with the fresh reason. Returns whether the pass that released it should CONTINUE — `false`
+  /// exactly on [`AppendSubmission::QuotaExhausted`], the refusal every later waiter would share.
+  fn resubmit_deferred_append<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B, S>,
+    op: u64,
+    d: DeferredAppend,
+  ) -> bool {
     let id = self.mint_write_id();
     match storage.submit_append(id, OpNumber::with(op), d.header, d.body) {
       crate::storage::AppendSubmission::Submitted => {
         self.pending.insert(id.seq(), d.kind);
+        true
       }
       crate::storage::AppendSubmission::SlotFenced { header, body } => {
         // The otherwise-impossible second in-flight blocker (or, on a bounded ring, the released
@@ -4938,8 +5059,22 @@ impl<S: StateMachine, R> Endpoint<S, R> {
             kind: d.kind,
             header,
             body,
+            reason: DeferReason::Slot,
           },
         );
+        true
+      }
+      crate::storage::AppendSubmission::QuotaExhausted { header, body } => {
+        self.deferred_appends.insert(
+          op,
+          DeferredAppend {
+            kind: d.kind,
+            header,
+            body,
+            reason: DeferReason::Quota,
+          },
+        );
+        false
       }
     }
   }

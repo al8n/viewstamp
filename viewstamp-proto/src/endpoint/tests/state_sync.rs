@@ -10480,3 +10480,154 @@ fn a_donor_reply_that_always_lands_mid_walk_re_pins_a_dead_donors_transfer() {
     "and the laggard is at the synced checkpoint"
   );
 }
+
+#[test]
+fn repeated_sync_forward_over_a_ring_less_wal_is_bounded_by_the_session_append_quota() {
+  // The ring-less accumulation shape, driven end to end. The backup's WAL is a proactor whose
+  // submitted writes are already at the device (`ReorderWal`, capacity `u64::MAX`): appends stage
+  // and complete only when the test lands them, and truncate/prune cancel NOTHING — the WAL
+  // contract's latitude. Each generation the backup appends a full implied-ring window of
+  // prepares (none of which complete), falls behind, and state-syncs forward: the install
+  // abandons the endpoint's append OWNERSHIP (`pending`/`appending`/`deferred_appends` clear)
+  // while the session's physical-write facts survive, and the prune cancels none of them. On a
+  // bounded ring the slot fence would refuse the next generation at the wrap; ring-less, nothing
+  // ever aliases — so before the session append quota the ledger and the device backlog grew by
+  // one full window per generation with no time-independent bound. The quota must (a) admit two
+  // full windows untouched (healthy operation plus one sync handover is never deferred), (b)
+  // refuse the third generation's submissions retryably at the choke while the ledger holds at
+  // the quota, and (c) release every parked append as the delayed writes finally complete — the
+  // backlog eventually completes, deferral never wedges.
+  let mut e = sync_backup();
+  let (wal, sb) = (ReorderWal::new(), TestSb::default());
+  let mut storage = Storage::new(wal, sb);
+  let mut blocks = InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let quota = storage.append_quota();
+  // One implied-ring window for this config (`checkpoint_ops == 2`): the quota is two of them.
+  // Every prepare carries commit 0, so the backup appends the whole window (head extends at
+  // submit) while APPLYING nothing — it lags on disk, not on apply, which is the accumulation
+  // shape under test (an applying backup would checkpoint every two ops and never need the sync).
+  let window = quota / 2;
+  let mut floor = 0u64; // the durable checkpoint the current generation appends above
+  for generation in 1..=3u64 {
+    for op in floor + 1..=floor + window {
+      e.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
+      assert!(
+        storage.wal_appends_in_flight() as u64 <= quota,
+        "generation {generation}: the append ledger passed the session quota at op {op} \
+         ({} in flight, quota {quota})",
+        storage.wal_appends_in_flight(),
+      );
+      while e.poll_message().is_some() {}
+    }
+    match generation {
+      1 => assert_eq!(
+        storage.wal_appends_in_flight() as u64,
+        window,
+        "generation 1 fits the first implied-ring window untouched"
+      ),
+      2 => assert_eq!(
+        storage.wal_appends_in_flight() as u64,
+        quota,
+        "generation 2 fills the second window — the whole quota is now in flight"
+      ),
+      _ => {
+        assert_eq!(
+          storage.wal_appends_in_flight() as u64,
+          quota,
+          "generation 3 is refused at the choke: the ledger holds at the quota"
+        );
+        assert!(
+          !e.deferred_appends.is_empty(),
+          "the refused submissions are parked for release, not dropped"
+        );
+      }
+    }
+    if generation == 3 {
+      break; // nothing more to install — the third window is parked, awaiting quiescence
+    }
+    // The cluster checkpointed past this backup's entire window: sync forward. The donor
+    // checkpoint is fabricated at `M = head + 1` (an ordinary client-op frontier), its envelope
+    // and both DAGs seeded locally so the install drains without a RequestBlock round trip. The
+    // trigger is a beyond-the-gap prepare ADVERTISING checkpoint `M` with commit still 0: the
+    // backup arms the stale-checkpoint sync off the advertisement alone, applying nothing.
+    let m = floor + window + 1;
+    let snap = CountSm::default().snapshot();
+    let env = Endpoint::<CountSm>::encode_checkpoint(
+      OpNumber::with(m),
+      crate::block_address(&snap),
+      super::super::session_blocks::encode_sessions(
+        &std::collections::BTreeMap::new(),
+        &mut blocks,
+      ),
+    );
+    blocks.put(snap.clone());
+    let id = crate::checkpoint_id(&env);
+    e.handle_message(now, &mut storage, primary_peer(), prepare_ck(m + 1, 0, m));
+    let nonce = captured_sync_nonce(&mut e);
+    e.handle_message(
+      now,
+      &mut storage,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        id,
+        crate::Epoch::new(0),
+        0,
+        ReplicaId::new(0),
+        nonce,
+        env,
+        Bytes::new(),
+      )),
+    );
+    for _ in 0..8 {
+      e.block_step(now, &mut storage, &mut blocks);
+      e.storage_step(now, &mut storage, &mut blocks);
+    }
+    assert_eq!(
+      e.state_syncs_applied(),
+      generation,
+      "the sync-forward installed (generation {generation})"
+    );
+    assert_eq!(
+      storage.wal_appends_in_flight() as u64,
+      generation * window,
+      "the install abandoned ownership but cancelled nothing: every prior generation's \
+       delayed writes still occupy the session ledger"
+    );
+    while e.poll_message().is_some() {}
+    while e.poll_event().is_some() {}
+    floor = m;
+  }
+  // The delayed writes finally complete — arbitrarily late, as the contract allows. Every
+  // completion frees quota headroom, and the release pass re-submits the parked third window;
+  // land those too, until the medium owes nothing.
+  for _ in 0..(4 * window + 8) {
+    let staged: std::vec::Vec<u64> = storage.wal().staged_ops();
+    if staged.is_empty() && storage.wal_appends_in_flight() == 0 {
+      break;
+    }
+    for op in staged {
+      storage.wal_mut().release_latest_for(op);
+    }
+    for _ in 0..4 {
+      e.storage_step(now, &mut storage, &mut blocks);
+    }
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    0,
+    "every delayed and every released append completed — the ledger drained"
+  );
+  assert!(
+    e.deferred_appends.is_empty(),
+    "no parked append was stranded: quota release re-submitted the third window"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2 * (quota / 2) + 2),
+    "the backup ended at the second sync-forward's checkpoint"
+  );
+}

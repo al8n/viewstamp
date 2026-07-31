@@ -1341,7 +1341,11 @@ impl MembershipMonotonicChecker {
 /// view-change or rebuild window) trips within one window. The session's checkpoint-envelope lane
 /// is checked against the CONSTANT bound of one (the envelope fence's guarantee), so an
 /// orphaned-envelope backlog accumulating under a backend slow on envelope writes trips at its
-/// second concurrent write. The medium's RETAINED snapshot generations are checked against the
+/// second concurrent write. The session's in-flight APPEND ledger is checked against the session
+/// append quota read off the session itself — the bound that holds on the DEFAULT ring-less WAL,
+/// where the slot fence bounds nothing — so cross-generation append accumulation (append → lag →
+/// sync-forward, the abandoned writes quiescing arbitrarily late) trips the moment the ledger
+/// passes the quota. The medium's RETAINED snapshot generations are checked against the
 /// CONSTANT bound of three (live + staged-root-named + latest completed), so a completed orphan
 /// accumulating behind overtaking view roots trips even while every in-flight count stays at one.
 /// This arm bounds the retained set's SIZE only; whether the durable root's generation still
@@ -1417,6 +1421,22 @@ impl BoundednessChecker {
            (the submission gate / forfeiture / rebuild collapse is not bounding the root timeline)"
         ));
       }
+      // The in-flight append ledger against the session append quota — the session-enforced
+      // ceiling on outstanding WAL writes, every incarnation and state-sync generation combined.
+      // On the default ring-less WAL the slot fence bounds nothing (distinct ops never alias),
+      // so this pair is the only thing standing between an append → lag → sync-forward cycle and
+      // an unbounded backlog of session entries + backend writes: state-sync abandons append
+      // OWNERSHIP while the physical facts survive, truncate/prune may cancel none of them, and
+      // completions may arrive arbitrarily late. The quota is read from the session itself, so a
+      // formula change cannot desynchronize the oracle from the bound it asserts.
+      let appends = cluster.replica_wal_appends_in_flight(i);
+      let quota = cluster.replica_append_quota(i);
+      if appends as u64 > quota {
+        return CheckResult::violation(format!(
+          "replica {i}: {appends} WAL appends in flight exceed the session append quota {quota} \
+           (the submission-choke quota gate is not bounding the append ledger)"
+        ));
+      }
       // The checkpoint-envelope lane: CONSTANT one, with no per-incarnation concession — the
       // session's envelope fence refuses a second submission while one write is outstanding, and
       // the fence reads the session ledger, which survives endpoint rebuilds and catch-up
@@ -1484,6 +1504,12 @@ impl BoundednessChecker {
 ///    one committed op (two configurations from one reconfiguration) is a split-brain swap. The
 ///    installed epoch is also monotone in the op number — a later committed `Reconfigure` op installs
 ///    a strictly higher epoch — so the swaps form an increasing ladder.
+/// 3. **Inversely** — one epoch is PRODUCED by exactly one op: every replica that reports epoch `E`
+///    names the SAME producing op, whichever path installed it (the committed swap directly, or a
+///    cross-epoch sync crossing that carried the op through the payload). Two ops producing one
+///    epoch is a fabricated producing op — the shape where a crossing reported its checkpoint
+///    frontier (an ordinary client op) instead of the real `Reconfigure` op, which the forward map
+///    in (2) cannot see because the fabricated entry lands under its own (fresh) op key.
 ///
 /// [`check`](Self::check) folds any not-yet-observed tail. The checker is silent (vacuously `Ok`)
 /// until a live reconfiguration is driven, so every run that never reconfigures passes trivially.
@@ -1497,6 +1523,10 @@ pub struct ReconfigureAppliedOnceChecker {
   /// The global map `op -> (epoch, config_id)`: the single successor every replica that swaps op `o`
   /// must agree on. A disagreement is a divergent (forked) swap of one committed reconfiguration.
   successor_of: HashMap<u64, (u64, u128)>,
+  /// The inverse map `epoch -> op`: the single producing op every replica that installs epoch `E`
+  /// must agree on. A second distinct op at a known epoch is a fabricated producing op — a replica
+  /// reported an install under an op number the reconfiguration never had.
+  producer_of: HashMap<u64, u64>,
 }
 
 impl ReconfigureAppliedOnceChecker {
@@ -1506,6 +1536,7 @@ impl ReconfigureAppliedOnceChecker {
       cursor: vec![0; replica_count],
       seen: vec![HashSet::new(); replica_count],
       successor_of: HashMap::new(),
+      producer_of: HashMap::new(),
     }
   }
 
@@ -1540,6 +1571,23 @@ impl ReconfigureAppliedOnceChecker {
           Some(_) => {}
           None => {
             self.successor_of.insert(op, (epoch, config_id));
+          }
+        }
+        // (3) Inversely: one epoch is produced by exactly one op — a second distinct op reported
+        // for a known epoch is a fabricated producing op (a crossing that named its checkpoint
+        // frontier, or any other path that reported an install under an op the reconfiguration
+        // never had). The forward map above cannot catch this: the fabricated entry lands under
+        // its own fresh op key, colliding with nothing.
+        match self.producer_of.get(&epoch) {
+          Some(&o2) if o2 != op => {
+            return CheckResult::violation(format!(
+              "epoch {epoch} was reported as produced by two different ops: {o2} vs {op} \
+               (replica {i}) — a replica fabricated the producing op of a reconfiguration"
+            ));
+          }
+          Some(_) => {}
+          None => {
+            self.producer_of.insert(epoch, op);
           }
         }
       }

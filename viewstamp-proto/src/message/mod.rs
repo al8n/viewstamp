@@ -2338,6 +2338,7 @@ pub struct SyncCheckpoint {
   nonce: u64,
   snapshot: Bytes,
   membership: Bytes,
+  config_install_op: OpNumber,
 }
 
 impl SyncCheckpoint {
@@ -2347,6 +2348,9 @@ impl SyncCheckpoint {
   /// configuration — the configuration the served snapshot reflects. A cross-epoch state-sync (the
   /// requester's `config_id` differs from the carried one) reconstructs and installs that successor
   /// configuration from `(epoch, config_id, membership)`; a same-config sync leaves `membership` unread.
+  ///
+  /// The producing op of the carried membership defaults to `0` (unrecorded) here; a sender that
+  /// attaches a membership stamps it via [`Self::with_config_install_op`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[allow(clippy::too_many_arguments)]
   pub fn new(
@@ -2370,7 +2374,20 @@ impl SyncCheckpoint {
       nonce,
       snapshot,
       membership,
+      config_install_op: OpNumber::new(),
     }
+  }
+
+  /// Stamps the op of the last reconfigure that produced the carried [`Self::membership`] — the
+  /// sender's own `config_install_op`. Meaningful only when the membership is attached (non-empty);
+  /// a cross-epoch requester validates it against the served frontier and records it VERBATIM (its
+  /// crossing durable root and its own install record), so the producing op survives any number of
+  /// crossings instead of being re-approximated by each one's checkpoint frontier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_config_install_op(mut self, op: OpNumber) -> Self {
+    self.config_install_op = op;
+    self
   }
 
   /// The sender's configuration lineage id (the agnostic epoch-policy field).
@@ -2437,6 +2454,17 @@ impl SyncCheckpoint {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn membership(&self) -> &[u8] {
     &self.membership
+  }
+
+  /// The op of the last reconfigure that produced the carried [`Self::membership`] — the sender's
+  /// `config_install_op`, stamped via [`Self::with_config_install_op`]. Meaningful only when the
+  /// membership is non-empty; `0` means unrecorded (or a genesis/offline-born configuration whose
+  /// producing point is genuinely `0`). A cross-epoch requester admits it only at or below
+  /// [`Self::checkpoint_op`] (the serve gate's own guarantee, reflected back) and at or above its
+  /// own effective install record, then records it verbatim.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_install_op(&self) -> OpNumber {
+    self.config_install_op
   }
 
   /// The carried membership encoding as a cloned [`Bytes`] handle.
@@ -2738,7 +2766,7 @@ impl Message {
         fixed_fields_bound(7, 1).saturating_add(log_wire_size_bound(m.log_slice()))
       }
       Self::RequestSync(_) => fixed_fields_bound(5, 1),
-      Self::SyncCheckpoint(m) => fixed_fields_bound(5, 2)
+      Self::SyncCheckpoint(m) => fixed_fields_bound(6, 2)
         .saturating_add(LEN_FIELD_OVERHEAD)
         .saturating_add(m.snapshot().len())
         .saturating_add(LEN_FIELD_OVERHEAD)
