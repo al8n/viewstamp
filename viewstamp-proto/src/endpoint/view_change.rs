@@ -562,8 +562,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.submit_durable_view(PendingSbAction::SendDoViewChange, storage);
   }
 
-  /// Send our full log + position to the prospective primary of the current view.
+  /// Send our full log + position to the prospective primary of the current view. A NON-VOTER sends
+  /// nothing: the vote is dropped rather than emitted.
   pub(crate) fn send_do_view_change(&mut self, _now: Instant) {
+    // A vote is valid only from a voter of the membership in force when it is EMITTED, never the one
+    // in force when it was staged. A durable-root landing installs the successor configuration before
+    // the actions correlated with that landing run, so a node the successor demotes to a learner — or
+    // drops from the configuration outright — arrives here holding a vote staged under the predecessor
+    // voter set; emitting it would put a non-voter's `DoViewChange` on the wire. The timer plane
+    // refuses this through `serviceable_now`, but the deferred durable-view path does not run through
+    // the timer plane, so the check belongs at the emission point both paths share.
+    if !self.is_voter() {
+      return;
+    }
     let primary = self.membership.primary(self.view);
     let entries = self.log_entries();
     self.emit(Outgoing::new(
