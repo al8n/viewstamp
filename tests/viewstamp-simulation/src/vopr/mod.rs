@@ -96,6 +96,15 @@ pub struct VoprReport {
   /// storage layer — staged writes and queued completions retained). `0` off-axis; NOT folded into
   /// the report digest (axis-gated, identically zero on the default schedule).
   in_place_restarts: u64,
+  /// How many of those in-place rebuilds were taken while an epoch-ADVANCING durable root was still
+  /// in flight on that same replica — the commit-first epoch swap handed to the medium, not yet
+  /// landed, and the endpoint that submitted it replaced underneath it. A subset of
+  /// [`Self::in_place_restarts`]. `0` unless the reconfiguration axis and the in-place rebuild run
+  /// together, which no single-axis lane does; the crossed sweep asserts the cross-seed sum is `> 0`,
+  /// since a lane where the two axes never actually met would read as coverage while covering
+  /// nothing. NOT folded into the report digest (axis-gated, identically zero on the default
+  /// schedule).
+  swap_root_rebuilds: u64,
   /// How many partition (isolate-a-replica) actions fired.
   partitions: u64,
   /// How many heal actions fired (outside calm windows).
@@ -449,6 +458,14 @@ impl VoprReport {
   /// everything the backend still owed the predecessor retained). `0` off-axis.
   pub const fn in_place_restarts(&self) -> u64 {
     self.in_place_restarts
+  }
+
+  /// How many in-place rebuilds landed INSIDE a replica's own epoch-swap root window — the durable
+  /// root carrying the successor epoch already with the device, the endpoint that submitted it
+  /// replaced before it landed. The crossing witness: `0` means the reconfiguration axis and the
+  /// rebuild axis never actually met, however many of each the run performed.
+  pub const fn swap_root_rebuilds(&self) -> u64 {
+    self.swap_root_rebuilds
   }
 
   /// How many partition (isolate-a-replica) actions fired.
@@ -910,6 +927,27 @@ struct Vopr {
   /// layer ([`Cluster::restart_in_place`]): staged writes stay staged and queued completions stay
   /// queued, so the successor endpoint inherits everything the backend still owes its predecessor.
   restart_in_place_axis: bool,
+  /// Whether the SWAP-ROOT REBUILD crossing is enabled for this run: the `VOPR_SWAP_REBUILD` env
+  /// var, or force-enabled via [`run_vopr_with_swap_root_rebuild`] (the committed crossed sweep).
+  /// Only meaningful alongside the live-reconfiguration axis, which is what mints the epoch-swap
+  /// roots it targets. Same discipline as [`Self::hold_axis`]: with the crossing OFF its per-tick
+  /// scan is skipped entirely and no PRNG value is consumed, so both single-axis lanes keep their
+  /// exact schedules; an enabled run is its OWN deterministic baseline.
+  ///
+  /// Unlike the ordinary rebuild draw this one is TARGETED rather than periodic. The swap-root
+  /// window is a handful of ticks wide and opens only on the few ticks per run where a committed
+  /// `Reconfigure` op's root is with the device, so a periodic draw crossed with it essentially
+  /// never — the same reason [`Cluster::probe_pending_view_window`] probes its window instead of
+  /// waiting for a coincidence.
+  swap_rebuild_axis: bool,
+  /// How many swap-root rebuilds this run has taken (counted against [`SWAP_REBUILD_BUDGET`]).
+  swap_rebuild_actions: u64,
+  /// The successor epoch of the last swap-root rebuild taken on each replica, `0` for none. A
+  /// rebuild retains the in-flight root, so the window it was taken in stays open across it — this
+  /// spends the crossing on DISTINCT swap windows instead of re-rebuilding one replica until the
+  /// budget runs out. Genesis is epoch `0` and an advancing root carries at least `1`, so `0` is a
+  /// sound "never" sentinel.
+  swap_rebuilt_epoch: Vec<u64>,
   /// How many wipe ACTIONS this run has taken (counted against [`WIPE_BUDGET`]). Advances whether or
   /// not the `VOPR_NO_WIPE` mask downgraded the effect, so a masked shrink run keeps the exact same
   /// action schedule + PRNG stream as the unmasked run it is diagnosing.
@@ -1497,6 +1535,45 @@ pub fn run_vopr_with_reconfig_live(seed: u64, ticks: u64) -> VoprReport {
   run_seeded(v, ticks)
 }
 
+/// Like [`run_vopr`] but with the LIVE single-change reconfiguration axis, the RESTART-IN-PLACE
+/// axis, the WAL WRITE-CHAOS axis, and the SWAP-ROOT REBUILD crossing all FORCE-ENABLED (the same
+/// programmatic-override pattern as [`run_vopr_with_hold`]). This is the CROSSING of the two axes
+/// no other lane runs together.
+///
+/// Each alone leaves the target window shut. [`run_vopr_with_reconfig_live`] mints epoch swaps but
+/// never replaces an endpoint, so every SwapEpoch root lands under the incarnation that submitted
+/// it. [`run_vopr_with_restart_in_place`] replaces endpoints over live storage but never
+/// reconfigures, so a rebuild only ever inherits WAL appends and checkpoint/view roots — never a
+/// root that carries a NEW EPOCH. Crossed, a rebuild can be taken while a committed `Reconfigure`
+/// op's durable root is with the device: the successor endpoint inherits an outstanding write whose
+/// epoch (and whose membership) is ahead of everything the medium has published, and it must
+/// baseline its recovery on that submitted root rather than the landed one and park its own root
+/// behind the inherited one. A successor that baselined on the landed root instead writes its own
+/// root after the inherited landing and rewinds the durable epoch and view underneath a cluster
+/// that already acted on them.
+///
+/// The crossing is TARGETED rather than left to coincidence — see [`Vopr::swap_rebuild_axis`] — and
+/// [`VoprReport::swap_root_rebuilds`] counts the rebuilds that genuinely landed inside a swap-root
+/// window, so the lane cannot pass while the two axes never actually met. Write chaos rides along
+/// for the reason [`run_vopr_with_restart_in_place`] gives: without it the inherited WAL work
+/// completes in submission order and the rebuild inherits nothing that can reorder.
+///
+/// Every standing oracle judges the outcome every tick — agreement, no committed op rewritten or
+/// lost, applied-once, the epoch/view + durable-config monotonicity nets, the two live-reconfig swap
+/// nets, the stale-landing oracle, and the calm-window/final-quiesce liveness gates. A panic here is
+/// a REAL finding in the rebuild's root-timeline continuity, reported with its seed, never masked. A
+/// run is a pure function of `(seed, ticks)` and its own deterministic baseline.
+pub fn run_vopr_with_swap_root_rebuild(seed: u64, ticks: u64) -> VoprReport {
+  // Learners are FORCED on for the same reason [`run_vopr_with_reconfig_live`] forces them: the
+  // expanded live-reconfig axis seed-chooses a `PromoteLearner` lane that needs a genesis learner.
+  let mut v = Vopr::new(seed, true);
+  v.live_reconfig_axis = true;
+  v.restart_in_place_axis = true;
+  v.write_chaos_axis = true;
+  v.swap_rebuild_axis = true;
+  run_seeded(v, ticks)
+}
+
 /// The shared run loop behind [`run_vopr`] / [`run_vopr_with_hold`]: the driver `v` already carries
 /// the seed and the axis configuration.
 fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
@@ -1705,6 +1782,15 @@ const RECONFIG_BUDGET: u64 = 2;
 /// Small enough to keep each run's observable swap history bounded.
 const LIVE_RECONFIG_BUDGET: u64 = 4;
 
+/// The per-run SWAP-ROOT REBUILD budget (crossed-lane runs only): at most this many in-place
+/// rebuilds taken inside an epoch-swap root window. Bounded for the same reason the wipe budget is:
+/// the crossing is targeted, so an unbounded probe would rebuild an endpoint on every tick of every
+/// swap window on every replica, which is a different (and far coarser) experiment than the one this
+/// lane is for. A handful is more than enough — [`LIVE_RECONFIG_BUDGET`] caps the run's swaps, each
+/// swap opens a window on every committing replica, and the crossing only has to be reached, not
+/// saturated.
+const SWAP_REBUILD_BUDGET: u64 = 8;
+
 /// The pseudo-`MemberId` the live-reconfig axis ADDS as a learner — a high sentinel past every genesis
 /// member id, so the `AddLearner` delta is always structurally valid (the id is brand-new) and the
 /// added learner never collides with a running node. It need not have a running endpoint: a learner
@@ -1830,6 +1916,9 @@ impl Vopr {
       torn_header_axis: env_flag("VOPR_TORN_HEADER"),
       write_chaos_axis: env_flag("VOPR_WRITE_CHAOS"),
       restart_in_place_axis: env_flag("VOPR_RESTART_IN_PLACE"),
+      swap_rebuild_axis: env_flag("VOPR_SWAP_REBUILD"),
+      swap_rebuild_actions: 0,
+      swap_rebuilt_epoch: vec![0; node_count],
       wipe_actions: 0,
       churn_axis: env_flag("VOPR_CHURN"),
       churn_actions: 0,
@@ -2529,6 +2618,33 @@ impl Vopr {
       self.report.in_place_restarts += 1;
     }
 
+    // (c''') SWAP-ROOT REBUILD: the same in-place rebuild, aimed at the ONE window that crosses it
+    // with reconfiguration. A committed `Reconfigure` op stages its successor membership and submits
+    // a durable root carrying the successor epoch; until that root lands the endpoint still runs at
+    // the predecessor configuration. Rebuilding THERE is what makes the successor endpoint inherit
+    // an outstanding root whose state is ahead of anything the medium has published — so it must
+    // baseline its recovery on the submitted root rather than the landed one, and park its own root
+    // behind the inherited one, or the inherited landing arrives underneath it and rewinds the
+    // durable epoch/view the cluster already acted on.
+    //
+    // TARGETED, not periodic (the `probe_pending_view_window` rationale): the window is a few ticks
+    // wide and opens only around a swap, so a periodic draw crossed with it would be vacuous —
+    // exactly the failure this lane exists to avoid. One rebuild per (replica, swap window), within
+    // `SWAP_REBUILD_BUDGET`, and no minority budget is charged (the replica is never crashed).
+    if self.swap_rebuild_axis
+      && self.swap_rebuild_actions < SWAP_REBUILD_BUDGET
+      && let Some((i, epoch)) = self.pick_live_in_swap_root_window(c)
+    {
+      if trace {
+        eprintln!("tick {tick}: SWAP-ROOT REBUILD replica {i} (staged epoch {epoch})");
+      }
+      self.swap_rebuild_actions += 1;
+      self.swap_rebuilt_epoch[i] = epoch;
+      c.restart_in_place(i);
+      self.report.in_place_restarts += 1;
+      self.report.swap_root_rebuilds += 1;
+    }
+
     // (c') WIPE-and-restart a crashed replica (the amnesia axis): it comes back with FRESH, EMPTY
     // durable storage — a replaced disk — so every promise its pre-wipe durable state made (view
     // participation, durable quorum copies) is forfeit. Only with the axis enabled (a wipe-enabled
@@ -3202,6 +3318,28 @@ impl Vopr {
       .filter(|&i| !c.is_crashed(i) && !c.is_retired(i))
       .collect();
     self.pick(&candidates)
+  }
+
+  /// Pick a LIVE replica currently inside its own epoch-SWAP root window — an epoch-advancing
+  /// durable root submitted to its superblock and not yet landed — returning it with the successor
+  /// epoch that root carries, if any. Same eligibility as [`Self::pick_live_for_in_place`] (the
+  /// storage layer must be running underneath the swap, and a parked node is never rebuilt), plus:
+  /// a replica whose LAST swap-root rebuild already spent this same epoch is skipped, since the
+  /// rebuild retains the in-flight root and so leaves the window it was taken in still open.
+  ///
+  /// The window is read off the MEDIUM, not the endpoint: the endpoint that submitted the root is
+  /// the one the rebuild replaces, so its own view of the write cannot be the crossing's witness.
+  fn pick_live_in_swap_root_window(&mut self, c: &Cluster) -> Option<(usize, u64)> {
+    let candidates: Vec<(usize, u64)> = (0..self.node_count)
+      .filter(|&i| !c.is_crashed(i) && !c.is_retired(i))
+      .filter_map(|i| c.sb_staged_epoch_advance_for_test(i).map(|e| (i, e)))
+      .filter(|&(i, e)| self.swap_rebuilt_epoch[i] != e)
+      .collect();
+    if candidates.is_empty() {
+      None
+    } else {
+      Some(candidates[self.prng.below(candidates.len() as u64) as usize])
+    }
   }
 
   /// Pick a currently-crashed replica to restart, if any. Excludes a RETIRED node (a reconfiguration

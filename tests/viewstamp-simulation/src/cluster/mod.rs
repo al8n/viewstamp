@@ -2958,6 +2958,20 @@ impl Cluster {
     self.sbs[i].borrow().staged_checkpoint_root_op_for_test()
   }
 
+  /// Test-only: the successor epoch named by a staged (in-flight) epoch-ADVANCING root write on
+  /// replica `i`'s superblock, if one is in flight — the commit-first epoch swap after its root
+  /// reached the device and before that root landed. `None` outside that window.
+  ///
+  /// This is the crossing detector an in-place rebuild lane needs: a rebuild taken while this is
+  /// `Some(e)` hands the successor endpoint a predecessor's outstanding swap root, so the successor
+  /// must baseline its recovery on a state the medium has not reached yet and its own root must
+  /// queue behind the inherited one. Read off the medium rather than the endpoint, because the
+  /// endpoint that submitted the root is precisely the one the rebuild is about to replace.
+  #[doc(hidden)]
+  pub fn sb_staged_epoch_advance_for_test(&self, i: usize) -> Option<u64> {
+    self.sbs[i].borrow().staged_epoch_advance_for_test()
+  }
+
   /// Test-only: whether replica `i`'s DURABLE root names a checkpoint envelope its own store holds
   /// (the stored generation at the root's `checkpoint_op` hashes to the root's `checkpoint_id`).
   /// `false` is the self-poisoned pointer: the pair was assembled from two checkpoints' timelines,

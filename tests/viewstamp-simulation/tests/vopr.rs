@@ -47,7 +47,12 @@
 //! for a few storage steps (so a job is genuinely OUTSTANDING while the pump must keep committing,
 //! and a materialize can still be running when a view transition abandons it), and
 //! [`vopr_block_fault_sweep_no_violations`] fails durability barriers and faults reconstruct reads,
-//! under the standing oracle that no durable checkpoint root ever names an un-flushed block. An
+//! under the standing oracle that no durable checkpoint root ever names an un-flushed block. A
+//! committed CROSSED sweep ([`vopr_swap_root_rebuild_sweep_no_violations`]) runs the
+//! live-reconfiguration axis and the in-place endpoint rebuild TOGETHER, which no single-axis lane
+//! does, and TARGETS the one window where they meet: a rebuild taken while a committed
+//! `Reconfigure` op's durable root is still with the device, so the successor endpoint inherits an
+//! outstanding root carrying an epoch the medium has not published yet. An
 //! `#[ignore]`d
 //! TORN-HEADER probe
 //! ([`vopr_torn_header_sweep_no_violations`])
@@ -175,8 +180,8 @@ use viewstamp_simulation::{
   run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
   run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live,
   run_vopr_with_restart_in_place, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_torn_headers, run_vopr_with_wipe, run_vopr_with_wipe_learners,
-  run_vopr_with_write_chaos,
+  run_vopr_with_swap_root_rebuild, run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -1996,5 +2001,127 @@ fn vopr_restart_in_place_sweep_no_violations() {
   println!(
     "VOPR restart-in-place sweep OK: in_place_restarts={total_in_place} \
      committed={total_committed} permanent_faults_refused={total_permanent_refused}"
+  );
+}
+
+/// Replay ONE crossed swap-root-rebuild seed in isolation, with every axis of the crossing forced
+/// on — the per-seed lane the sweep needs when a seed has to be attributed rather than merely
+/// counted. Set `VOPR_SWAP_REBUILD_SEED` and run with `--ignored --nocapture`. (Ignored for the same
+/// reason as [`replay_single_seed`]: a debugging aid, not a gate.)
+#[test]
+#[ignore = "single-seed replay: set VOPR_SWAP_REBUILD_SEED and run with --ignored --nocapture to attribute one crossed seed"]
+fn replay_single_swap_root_rebuild_seed() {
+  let seed = std::env::var("VOPR_SWAP_REBUILD_SEED")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(0);
+  let r = run_vopr_with_swap_root_rebuild(seed, DEFAULT_TICKS);
+  println!(
+    "vopr swap-root-rebuild seed {} OK: ticks={} replicas={} max_committed={} \
+     live_reconfigs_proposed={} live_swaps_observed={} in_place_restarts={} \
+     swap_root_rebuilds={} crashes={} restarts={} calm_windows={} max_view={}",
+    r.seed(),
+    r.ticks(),
+    r.replicas(),
+    r.max_committed(),
+    r.live_reconfigs_proposed(),
+    r.live_swaps_observed(),
+    r.in_place_restarts(),
+    r.swap_root_rebuilds(),
+    r.crashes(),
+    r.restarts(),
+    r.calm_windows(),
+    r.max_view(),
+  );
+}
+
+/// The contiguous seed range for the crossed SWAP-ROOT REBUILD sweep (same budget rationale as
+/// [`HOLD_SEEDS`]: this lane is ADDITIVE to the default sweep, and every seed runs the
+/// live-reconfiguration, in-place-rebuild and write-chaos axes at once).
+const SWAP_ROOT_REBUILD_SEEDS: u64 = 16;
+
+/// The committed SWAP-ROOT REBUILD sweep: [`run_vopr_with_swap_root_rebuild`] over
+/// `0..SWAP_ROOT_REBUILD_SEEDS` — the LIVE-RECONFIGURATION axis crossed with the IN-PLACE ENDPOINT
+/// REBUILD, both FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var, so
+/// the lane cannot race another test's schedule and cannot be forgotten by a runner).
+///
+/// Neither axis alone reaches the window this lane guards, which is why the pair had never been
+/// crossed. [`vopr_reconfig_live_sweep_no_violations`] mints epoch swaps, but no endpoint is ever
+/// replaced, so every swap root lands under the incarnation that submitted it.
+/// [`vopr_restart_in_place_sweep_no_violations`] replaces endpoints over live storage, but nothing
+/// ever reconfigures, so a rebuild inherits WAL appends and checkpoint/view roots and never a root
+/// that carries a NEW EPOCH. The crossing is the commit-first swap's own window: the `Reconfigure`
+/// op commits, the successor membership is staged, a durable root carrying the SUCCESSOR epoch goes
+/// to the device, and the endpoint keeps running at the PREDECESSOR configuration until it lands.
+/// Rebuild there and the successor endpoint inherits an outstanding write whose epoch, membership
+/// and consensus frontier are all ahead of anything the medium has published.
+///
+/// What the run then asserts is the whole session-owned root timeline: the successor must baseline
+/// its recovery on the SUBMITTED root rather than the landed one, and park its own root behind the
+/// inherited one, so the two incarnations' writes reach the backend in one order. A successor
+/// baselined on the landed root instead writes its own root AFTER the inherited landing, rewinding
+/// the durable epoch and view under a cluster that already acted on them — which the
+/// view-monotonicity and epoch/durable-config monotonicity oracles catch as a regression, and the
+/// swap-correctness nets catch as a double-swap or a forked successor. Every standing oracle judges
+/// the run meanwhile (agreement, no committed op rewritten or lost, applied-once, the stale-landing
+/// oracle over the chaos WAL, and the calm-window + final-quiesce liveness gates), so a panic here
+/// is a REAL finding, reported with its seed, never masked.
+///
+/// The DEFAULT sweep leaves every one of these axes OFF; a run of this lane is its own deterministic
+/// baseline. `VOPR_SEEDS` widens the contiguous count at runtime, the same override the other axis
+/// lanes take.
+#[test]
+fn vopr_swap_root_rebuild_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(SWAP_ROOT_REBUILD_SEEDS);
+  let mut total_swaps = 0u64;
+  let mut total_in_place = 0u64;
+  let mut total_crossings = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_crossing = 0u64;
+  println!(
+    "VOPR swap-root-rebuild sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, \
+     live-reconfig + restart-in-place + write-chaos axes forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_swap_root_rebuild(seed, DEFAULT_TICKS);
+    total_swaps += r.live_swaps_observed();
+    total_in_place += r.in_place_restarts();
+    total_crossings += r.swap_root_rebuilds();
+    total_committed += r.max_committed();
+    if r.swap_root_rebuilds() > 0 {
+      seeds_with_crossing += 1;
+    }
+  }
+  // Non-vacuity, in the order the coverage is built up. First each axis on its own: swaps genuinely
+  // installed, and endpoints genuinely rebuilt over live storage. Either at zero and there is
+  // nothing for the crossing to be made of.
+  assert!(
+    total_swaps > 0,
+    "the live-reconfig axis never installed a swap across the sweep \
+     (live_swaps_observed={total_swaps}) — there was no epoch swap to rebuild across"
+  );
+  assert!(
+    total_in_place > 0,
+    "the axis never rebuilt an endpoint in place across the sweep \
+     (in_place_restarts={total_in_place}) — the rebuild half of the crossing never happened"
+  );
+  // And then the crossing itself, which is the entire point of the lane. A sweep that reconfigured
+  // and rebuilt but never did both AT ONCE would be green while covering nothing the two existing
+  // single-axis lanes do not already cover — worse than no lane, because it reads as coverage.
+  assert!(
+    total_crossings > 0,
+    "no in-place rebuild landed inside an epoch-swap root window across the sweep \
+     (swap_root_rebuilds={total_crossings}, live_swaps_observed={total_swaps}, \
+     in_place_restarts={total_in_place}) — reconfiguration and rebuild both happened, but never \
+     together, so the inherited-swap-root window is untested and this lane is vacuous"
+  );
+  assert!(
+    total_committed > 0,
+    "the swap-root-rebuild sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  println!(
+    "VOPR swap-root-rebuild sweep OK: live_swaps_observed={total_swaps} \
+     in_place_restarts={total_in_place} swap_root_rebuilds={total_crossings} \
+     crossing_seeds={seeds_with_crossing} committed={total_committed}"
   );
 }
