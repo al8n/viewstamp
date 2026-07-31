@@ -20,7 +20,8 @@ pub use block_store::MemBlockStore;
 pub use checker::{
   AppliedOnceChecker, BoundednessChecker, CheckResult, ConfigLineageChecker, DurabilityChecker,
   DurableQuorumChecker, EpochViewMonotonicChecker, MembershipMonotonicChecker,
-  ReconfigureAppliedOnceChecker, StalenessChecker, ViewMonotonicChecker, check_safety,
+  ReconfigureAppliedOnceChecker, StalenessChecker, ViewMonotonicChecker, check_medium_integrity,
+  check_safety,
 };
 pub use cluster::{AppliedEvent, Cluster, OfflineReconfig};
 pub use network::{Faults, SlowProfile};

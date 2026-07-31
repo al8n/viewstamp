@@ -1373,7 +1373,7 @@ impl Cluster {
   }
 
   /// Replica `i`'s retained checkpoint snapshot-generation count on the simulated superblock (for
-  /// the boundedness checker): the live generation, a staged root's, and the newest completed one
+  /// the boundedness checker): the live generation, a staged root's, and the latest-completed one
   /// — at most three at any observable instant. Growth here is the relocated checkpoint backlog
   /// the in-flight ledgers cannot see: one completed orphan retained per view/checkpoint cycle.
   pub fn replica_retained_snapshot_generations(&self, i: usize) -> usize {

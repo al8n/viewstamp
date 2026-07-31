@@ -31,12 +31,12 @@ use viewstamp_proto::{
 };
 use viewstamp_simulation::{
   Cluster, ConfigLineageChecker, DurabilityChecker, DurableQuorumChecker, Faults,
-  ReconfigureAppliedOnceChecker, StorageFaults,
+  ReconfigureAppliedOnceChecker, StorageFaults, check_medium_integrity,
 };
 
-/// Tick the cluster once and fold the four live-reconfiguration checkers, panicking on any violation
-/// with the tick. The checkers must hold THROUGHOUT the change (the swap straddle is the load-bearing
-/// window), not merely at the end.
+/// Tick the cluster once and fold the four live-reconfiguration checkers plus the medium-integrity
+/// predicate, panicking on any violation with the tick. The checkers must hold THROUGHOUT the change
+/// (the swap straddle is the load-bearing window), not merely at the end.
 ///
 /// The retention oracle ([`DurableQuorumChecker`]) is folded per tick alongside the rest because this
 /// lane is where its config-aware obligation is most exercised: a promotion or a demotion moves the
@@ -63,6 +63,13 @@ fn tick_checked(
   assert!(
     lin.observe(c).is_ok(),
     "config-lineage violated at tick {t}"
+  );
+  // The epoch-swap straddle rewrites the durable root while checkpoint envelopes are in flight —
+  // exactly a window where a wrong retention choice would leave the new root naming an absent
+  // generation, so the medium-integrity predicate rides every tick here as well.
+  assert!(
+    check_medium_integrity(c).is_ok(),
+    "medium integrity violated at tick {t}"
   );
 }
 

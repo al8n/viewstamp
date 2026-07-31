@@ -687,6 +687,22 @@ fn root_naming_checkpoint(checkpoint_op: u64) -> VsrState {
   .expect("commit == checkpoint_op and log_view <= view")
 }
 
+/// A durable VSR root whose `(checkpoint_op, checkpoint_id)` pair BOTH come from the given envelope
+/// bytes — the step-2 root exactly as the proto mints it (the id is the envelope's content hash).
+/// For tests that assert the root-names-stored-checkpoint integrity predicate, where
+/// [`root_naming_checkpoint`]'s placeholder id would trip the id half of the check on its own.
+fn root_naming_envelope(checkpoint_op: u64, snap: &[u8]) -> VsrState {
+  VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(checkpoint_op),
+    OpNumber::with(checkpoint_op),
+    viewstamp_proto::checkpoint_id(snap),
+    std::vec::Vec::new(),
+  )
+  .expect("commit == checkpoint_op and log_view <= view")
+}
+
 /// Pump an async-mode superblock until its staged writes have all become durable and all `Wrote`
 /// completions are consumed (bounded). Used by the supersession test to land each staged root/
 /// snapshot in FIFO order.
@@ -895,8 +911,7 @@ fn a_staged_root_defers_the_live_checkpoint_handoff_until_it_lands() {
   // retained without being served. (The historical supersession arm — a LATER root naming an
   // OLDER checkpoint completing behind a newer-op root — can no longer be submitted at all: the
   // proto session refuses a checkpoint-pointer rewind at its submission choke and hands the
-  // backend one root write at a time, which the submit_write assert above enforces. The GC's
-  // drain-before-collect deferral stays as a general-backend belt.)
+  // backend one root write at a time, which the submit_write assert above enforces.)
   let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
   // Establish a rooted checkpoint at op 4 first (drain fully).
   sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"snap4"));
@@ -965,7 +980,10 @@ fn repeated_root_over_envelope_overtakes_retain_a_constant_generation_count() {
   // no correlation left to root it. In-flight counts stay at one root / one envelope throughout —
   // yet without collection at the envelope landing the store retained every such completed
   // orphan, one distinct generation per view/checkpoint cycle, indefinitely. The collect holds
-  // the retained set to live + staged-root-named + newest completed: at most three, every cycle.
+  // the retained set to live + staged-root-named + latest completed: at most three, every cycle.
+  // This test pins the retained COUNT under orphan churn; which generations the collect must
+  // KEEP — identity over numeric order — is pinned by
+  // `a_completion_below_an_orphaned_generation_is_retained_until_rooted`.
   use viewstamp_proto::SuperblockDone;
   let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
   sb.set_envelope_lag(Some(9));
@@ -1014,6 +1032,50 @@ fn repeated_root_over_envelope_overtakes_retain_a_constant_generation_count() {
     sb.envelope_overtakes_fired() > overtakes_before,
     "no root ever overtook a staged envelope — the schedule under test never occurred"
   );
+}
+
+#[test]
+fn a_completion_below_an_orphaned_generation_is_retained_until_rooted() {
+  // A cancelled pre-root install can leave a completed orphan generation ABOVE the local frontier:
+  // with checkpoint 4 live, a state-sync envelope for op 12 lands after a view transition dropped
+  // its install (no root for 12 will ever come), and the next local checkpoint then writes its
+  // envelope at the still-valid frontier 8 — numerically BELOW the dead orphan. The generation a
+  // live correlation can still root is identified by the LATEST COMPLETION (the session's envelope
+  // lane admits one write at a time, and a fresh correlation rewrites its envelope before rooting,
+  // so a new envelope submission is itself the witness that every older unrooted generation's
+  // correlation is dead) — NOT by numeric order: selecting the numeric maximum deletes generation
+  // 8 at its own landing and keeps dead 12, so the monotone step-2 root for 8 then names a
+  // generation the store no longer holds. The retained COUNT stays within its bound throughout —
+  // only the integrity predicate sees the self-poisoning: live-checkpoint reads fault on a medium
+  // with no injected fault anywhere, so a solo replica cannot recover from its own disk and a
+  // cluster escalates to a needless peer fetch.
+  let mut sb = InMemorySuperblock::new();
+  sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"snap4"));
+  let _ = sb.poll();
+  sb.submit_write(write_id(2), root_naming_envelope(4, b"snap4"));
+  let _ = sb.poll();
+  assert!(sb.root_names_stored_checkpoint_for_test());
+  // The cancelled install's orphan: its envelope completes; no root for it ever comes.
+  sb.submit_write_checkpoint(
+    write_id(3),
+    OpNumber::with(12),
+    Bytes::from_static(b"snap12"),
+  );
+  let _ = sb.poll();
+  // The valid local-frontier envelope lands BELOW the orphan...
+  sb.submit_write_checkpoint(write_id(4), OpNumber::with(8), Bytes::from_static(b"snap8"));
+  let _ = sb.poll();
+  // ...and its step-2 root (submitted only after that envelope completed) makes it live.
+  sb.submit_write(write_id(5), root_naming_envelope(8, b"snap8"));
+  let _ = sb.poll();
+  assert!(
+    sb.root_names_stored_checkpoint_for_test(),
+    "the durable root names checkpoint 8 but its generation is gone — collected at its own \
+     landing while the dead orphan 12 was retained as the numeric maximum"
+  );
+  assert_eq!(read_live_checkpoint(&mut sb), (8, b"snap8".to_vec()));
+  // The dead orphan was superseded by the newer completion; only the live generation remains.
+  assert_eq!(sb.retained_snapshot_generations(), 1);
 }
 
 #[test]
