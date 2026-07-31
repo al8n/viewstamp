@@ -4,7 +4,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_wal_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     polled: crate::storage::WalPolled,
   ) {
     let crate::storage::WalPolled { done, freed_slot } = polled;
@@ -210,7 +210,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///   time; a still-cancelling backend degrades to the solicit-retry cadence, never a silent leak).
   fn resubmit_cancelled_append<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     kind: Pending,
   ) {
     let op = kind.op();
@@ -246,7 +246,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_sb_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     polled: crate::storage::SbPolled,
   ) {
     let crate::storage::SbPolled { done, landed_root } = polled;
@@ -392,7 +392,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               // `maybe_pay_checkpoint_debt` (sticky from every commit-advance tail and from recovery,
               // under the same SM guard) re-forces it once the SM is ready + a flush succeeds; the
               // cross-epoch serve gate stays correctly withheld until then.
-              self.force_checkpoint();
+              self.force_checkpoint(storage);
             }
           }
         }
@@ -513,7 +513,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
                 // block. None of that tail is justified until the SM actually holds M, which is
                 // exactly why it hangs off the completion — and returning here keeps a swap root
                 // from being submitted while the SM still lags the checkpoint it names.
-                self.install_sync(now, install);
+                self.install_sync(now, storage, install);
                 return;
               }
               // NOTHING TO INSTALL: a view transition cancelled the pre-root staging while this root
@@ -541,7 +541,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               // Prune SM checkpoint blocks unreachable from the now-durable checkpoint root (mark-and-
               // sweep from the live roots). Runs AFTER the durable root, so a freed block is provably
               // unreferenced by any live checkpoint.
-              self.gc_blocks();
+              self.gc_blocks(storage);
               // `checkpoint_op` advanced (the ring window slid forward): re-drive any adopted-tail
               // append that was skipped over the old window.
               self.retry_unappended_adopted_tail(storage);
@@ -567,12 +567,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn complete_state_sync<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
     // checkpoint root (the old checkpoint's no-longer-referenced blocks). The sync's own block-fetch
     // already drained + cleared, so no in-flight sync-target root is live.
-    self.gc_blocks();
+    self.gc_blocks(storage);
     // Observability: the synced checkpoint is installed AND durable — the sync is complete (covers both the
     // deferred Normal install and the deferred recovery install). `self.checkpoint_op` is M (advanced by
     // the install). Scalar copy only.
@@ -713,7 +713,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `commit_min`. The snapshot reflects the SM state at `commit_min` exactly (all ops `<= commit_min`
   /// applied, none above), so the checkpoint covers a committed+applied prefix; `target_op = commit_min`
   /// keeps the snapshot↔op correspondence exact even when a batch commit jumps past the boundary.
-  pub(crate) fn maybe_checkpoint(&mut self) {
+  pub(crate) fn maybe_checkpoint<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     // Only checkpoint once the view is settled and durable-consistent: Normal status AND
     // `log_view == view`. `advance_commit` is also called mid-view-change (in
     // `start_view_as_new_primary` / `on_start_view`, applying prior-view committed ops) — there
@@ -756,7 +756,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // The materialize runs off the pump; a flush fault there simply publishes nothing. The cadence
     // re-evaluates on the next commit-advance (`commit_min` only grows), so the checkpoint is simply
     // re-attempted; there is nothing to roll back.
-    self.force_checkpoint();
+    self.force_checkpoint(storage);
   }
 
   /// The COMMITTED dedup projection of the live session table, for a checkpoint. The live `self.clients`
@@ -812,7 +812,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the DAG is being written, therefore advances no pointer at all; the cadence / debt-pay /
   /// commit-advance re-forces the checkpoint next time, exactly as a failed inline flush used to.
   ///
-  /// AT MOST ONE IMAGE CAPTURE IS EVER OWED TO THE LANE ([`Endpoint::materializing`]). The callers'
+  /// AT MOST ONE IMAGE CAPTURE IS EVER OWED TO THE LANE (the lane front's capture quota). The callers'
   /// shared `pending_checkpoint.is_none()` fence is the LOGICAL guard, and a view transition CLEARS it
   /// while the `Materialize` it named is still queued — the job cannot be retracted (the lane executes
   /// serially in issue order), so the cleared guard would let the cadence capture a second full image
@@ -822,8 +822,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// completion. All three force sites tolerate that — `maybe_checkpoint` re-fires from the commit
   /// tails and the primary heartbeat, `maybe_pay_checkpoint_debt` is sticky on the durable debt, and
   /// the `SwapEpoch` arm's deferral leaves that same debt owed.
-  pub(crate) fn force_checkpoint(&mut self) {
-    if self.materializing.is_some() {
+  pub(crate) fn force_checkpoint<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
+    if storage.materialize_owed() {
       return;
     }
     // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
@@ -857,11 +857,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // [`Self::committed_session_projection`].
     let image = self.sm.checkpoint_image();
     let sessions = SessionImage(self.committed_session_projection());
-    let job = self.issue_block_job(BlockJobKind::Materialize { image, sessions });
-    // The PHYSICAL half, recorded independently of the logical `pending_checkpoint` below: a view
-    // transition drops that tracker, but the lane still owes this completion and the image it carries
-    // still occupies the queue until it lands.
-    self.materializing = Some(job);
+    // The PHYSICAL half is recorded by the LANE, independently of the logical `pending_checkpoint`
+    // below: a view transition drops that tracker, but the lane still owes this completion and the
+    // image it carries still occupies the queue until it lands.
+    let job = self.issue_block_job(storage, BlockJobKind::Materialize { image, sessions });
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
       step: CheckpointStep::FlushingBlocks(job),
@@ -886,21 +885,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(super) fn on_checkpoint_materialized<W: Wal, B: Superblock>(
     &mut self,
     job: crate::JobId,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     sm_root: BlockAddress,
     sessions_root: BlockAddress,
     flush: Result<(), crate::BlockStoreError>,
   ) {
-    // The lane has returned the image capture it owed, so the capture site is free again — whatever
-    // this completion goes on to publish, supersede, or drop. At most one is ever outstanding
-    // ([`Self::force_checkpoint`]), and completions arrive in issue order, so this completion is that
-    // one.
-    debug_assert_eq!(
-      self.materializing,
-      Some(job),
-      "a materialize completed that the capture site never recorded as owed"
-    );
-    self.materializing = None;
     let Some(pc) = self
       .pending_checkpoint
       .filter(|pc| pc.step == CheckpointStep::FlushingBlocks(job))
@@ -943,7 +932,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     &mut self,
     now: Instant,
     job: crate::JobId,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     flush: Result<(), crate::BlockStoreError>,
   ) {
     let Some(pc) = self
@@ -1052,7 +1041,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn maybe_pay_checkpoint_debt<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // No debt unless the durable root names a membership AHEAD of the checkpoint.
     if self.config_install_op.get() <= self.checkpoint_op.get() {
@@ -1096,7 +1085,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // (`config_install_op > checkpoint_op`) STAYS owed. This routine is sticky — it re-runs from
       // every commit-advance tail and from `complete_recovery` — so it re-forces the moment a later
       // flush succeeds; nothing is advanced now and the cross-epoch serve gate stays correctly withheld.
-      self.force_checkpoint();
+      self.force_checkpoint(storage);
     }
   }
 
@@ -1187,7 +1176,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     )
   }
 
-  fn run_gc<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>) {
+  fn run_gc<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     let floor = if self.is_primary() {
       self.prune_floor().get()
     } else {
@@ -1277,7 +1266,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the moment the durable root that justifies them landed; the job's serial-in-issue-order
   /// execution is what keeps those roots valid when the sweep finally runs — a later `Materialize`
   /// queued behind this sweep cannot have its fresh blocks freed by it.
-  pub(crate) fn gc_blocks(&mut self) {
+  pub(crate) fn gc_blocks<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     // TYPED roots: an SM set and a session set, each followed by its own resolver. The in-flight
     // `block_fetch` roots are split the SAME typed way (its `sm_root` into the SM set, `sessions_root`
     // into the session set) — a sync target's partially-fetched blocks of either kind survive until
@@ -1306,10 +1295,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if sm_roots.is_empty() && session_roots.is_empty() {
       return; // no durable root established yet — nothing is safely prunable.
     }
-    self.issue_block_job(BlockJobKind::Gc {
-      sm_roots,
-      session_roots,
-    });
+    self.issue_block_job(
+      storage,
+      BlockJobKind::Gc {
+        sm_roots,
+        session_roots,
+      },
+    );
   }
 
   /// Free the in-memory `log`-cache entries a durable checkpoint snapshot subsumes: drop every op
@@ -1447,7 +1439,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn submit_durable_view<W: Wal, B: Superblock>(
     &mut self,
     action: PendingSbAction,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // The checkpoint pair comes off the session's EFFECTIVE root — the last-submitted root if any
     // is in flight, else the durable one — so BOTH halves are read from one root value on one
@@ -1508,7 +1500,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   #[must_use = "an ignored seal may leave the durable root behind commit_max; check it fired"]
   pub fn seal_committed_frontier<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) -> bool {
     if self.status.is_normal() && !self.has_inflight_storage(storage) {
       self.submit_durable_view(PendingSbAction::Seal, storage);

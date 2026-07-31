@@ -17,7 +17,7 @@
 //! inline lane executes on the submitting thread under one mutex, which is serial by the same
 //! argument. Neither placement can reorder, and the cursor fail-stops if one ever did.
 //!
-//! # The lane-lifetime state: the cursor, and the occupancy
+//! # The lane-lifetime state: the cursor
 //!
 //! The cursor belongs to the LANE, and the lane OWNS the store — the store cannot be handed to a
 //! rebuilt endpoint without its lane, because there is no way to take it back out. That is what
@@ -29,22 +29,22 @@
 //! driver in place passes the SAME lane, and its cursor — with any job the dead endpoint still owed
 //! — carries across the rebuild.
 //!
-//! The admission half crosses the same way. The endpoint's lane quotas — one un-consumed checkpoint
-//! image capture, the outstanding-serve cap — bound this lane's DEPTH, so like the cursor they have
-//! the lane's lifetime, and an endpoint rebuilt over a surviving lane must be constructed with what
-//! it still holds ([`BlockLaneOccupancy`](viewstamp_proto::BlockLaneOccupancy), a required
-//! `Endpoint::recover` input). The lane accounts for that itself, from its own traffic — a job
-//! counts from [`submit`](BlockLane::submit) until its completion is handed back out of
-//! [`recv`](BlockLane::recv)/[`try_recv`](BlockLane::try_recv) — so
-//! [`occupancy`](BlockLane::occupancy) is correct however the previous driver ended, clean drain or
-//! abandoned deadline, and a rebuilt driver reads the truth off the lane it was handed rather than
-//! trusting its predecessor's teardown to have said goodbye.
+//! The admission half is not this lane's to carry. The queue jobs wait in, the quotas that bound
+//! its depth (one un-consumed image capture, the outstanding-serve cap, one frontier walk) and the
+//! order their completions must arrive in live in the
+//! [`Storage`](viewstamp_proto::Storage) session, whose lifetime is the store's for the same reason
+//! this cursor's is — so a rebuilt endpoint inherits them with the session and there is nothing to
+//! hand across. What this lane keeps of the admission picture is a CROSS-CHECK on its own traffic
+//! ([`Holds`]): a job counts from [`submit`](BlockLane::submit) until its completion is handed back
+//! out of [`recv`](BlockLane::recv)/[`try_recv`](BlockLane::try_recv), a window strictly inside the
+//! session's, so a second image capture reaching this lane means the front's quota did not hold and
+//! the lane fail-stops rather than executing it.
 
 use std::sync::{Arc, Mutex};
 
 use viewstamp_proto::{
-  BlockJob, BlockJobCursor, BlockJobDone, BlockJobTag, BlockLaneOccupancy, BlockStore, JobId,
-  StateMachine, execute_block_job,
+  BlockJob, BlockJobCursor, BlockJobDone, BlockJobTag, BlockStore, JobId, StateMachine,
+  execute_block_job,
 };
 
 /// The store, the execution-order cursor, and (for a spawned lane) the thread block jobs run on.
@@ -65,14 +65,16 @@ pub struct BlockLane<S: StateMachine> {
   /// always-ready select winner.
   done_tx: flume::Sender<BlockJobDone<S>>,
   done_rx: flume::Receiver<BlockJobDone<S>>,
-  /// The lane's own admission accounting, shared by every clone: what this lane holds between a
+  /// The lane's own admission cross-check, shared by every clone: what this lane holds between a
   /// job's [`submit`](Self::submit) and its completion leaving [`recv`](Self::recv)/
-  /// [`try_recv`](Self::try_recv). Derived from the lane's traffic alone so it stays truthful
-  /// across an unclean predecessor teardown; see [`occupancy`](Self::occupancy).
+  /// [`try_recv`](Self::try_recv). The authoritative quotas live in the session's lane front; this
+  /// window sits strictly inside theirs, so it can only ever CONFIRM them — and fail-stops if it
+  /// cannot.
   holds: Arc<Mutex<Holds>>,
 }
 
-/// The quota-bounded jobs a lane currently holds — the source [`BlockLane::occupancy`] reports.
+/// The quota-bounded jobs a lane currently holds — a cross-check on the session's lane front, whose
+/// admission window strictly contains this one.
 #[derive(Default)]
 struct Holds {
   /// The `Materialize` between submit and hand-out, if any. At most one can exist: the endpoint's
@@ -268,25 +270,6 @@ impl<S: StateMachine> BlockLane<S> {
       done_rx,
       holds: Arc::new(Mutex::new(Holds::default())),
     }
-  }
-
-  /// What this lane currently holds — every job between its [`submit`](Self::submit) and its
-  /// completion leaving [`recv`](Self::recv)/[`try_recv`](Self::try_recv) — in the exact form
-  /// `Endpoint::recover` requires when an endpoint is rebuilt over this lane.
-  ///
-  /// Derived from the lane's own traffic, never from the endpoint above it, so it is truthful
-  /// however the previous driver ended: a job abandoned mid-execution at a drain deadline is still
-  /// held (its completion will surface here later and be refused by the successor, which is what
-  /// releases the quota), while a completion the dead driver consumed but never delivered is NOT —
-  /// nothing will ever deliver it, so nothing may wait on it. Read it when constructing a driver
-  /// over a lane that may have served a predecessor; a fresh lane reports
-  /// [`BlockLaneOccupancy::empty`].
-  pub fn occupancy(&self) -> BlockLaneOccupancy {
-    let holds = self
-      .holds
-      .lock()
-      .expect("the block-storage lane's accounting mutex is poisoned");
-    BlockLaneOccupancy::new(holds.materializing, holds.serves)
   }
 
   /// Hands one job to the lane, to execute after every job already submitted.

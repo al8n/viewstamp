@@ -13,9 +13,17 @@ use std::vec::Vec;
 
 use bytes::Bytes;
 
-use crate::OpNumber;
+use crate::{
+  JobId, OpNumber,
+  block_job::{BlockJob, BlockJobDone, BlockJobKind},
+  state_machine::StateMachine,
+};
 
 use super::{Header, ReadId, Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId};
+
+mod lane;
+
+use lane::LaneFront;
 
 #[cfg(test)]
 mod tests;
@@ -101,26 +109,36 @@ pub(crate) struct SbPolled {
 /// The storage session: owns the [`Wal`] and [`Superblock`] handles together with every physical
 /// write fact that outlives an endpoint — the in-flight append ledger (the slot-quiescence fence's
 /// witness set), the in-flight root writes with the exact states they will make durable (the root
-/// timeline), and the in-flight checkpoint-envelope writes.
+/// timeline), the in-flight checkpoint-envelope writes, and the block lane's front (its job queue,
+/// its admission quotas, and its issue-order witness).
 ///
-/// **One session per medium, for the medium's whole in-process lifetime.** Construct it once over
+/// **One session per store, for the store's whole in-process lifetime.** Construct it once over
 /// quiesced handles — freshly formatted, or freshly opened after a process start — and thread
 /// `&mut Storage` through every endpoint entry point. An endpoint rebuild (`Endpoint::recover`
-/// over the same session) inherits every fence automatically, because the fences were never the
-/// endpoint's to lose.
+/// over the same session) inherits every fence and every queued block job automatically, because
+/// none of them were the endpoint's to lose.
 ///
-/// **A fresh ledger over a live medium is unrepresentable.** The constructor consumes the handles;
+/// **A fresh ledger over a live store is unrepresentable.** The constructor consumes the handles;
 /// while anything is in flight they cannot come back out ([`Self::into_parts`] refuses); and the
-/// only route to [`Wal::submit_append`]/[`Superblock::submit_write`] is through the recording
-/// methods here. So a second session over the same handles — the construction in which a reborn
-/// ledger forgets the medium's outstanding writes — cannot be written: the handles to build it
-/// with are inside the first session until the first session proves the medium quiet.
+/// only route to [`Wal::submit_append`]/[`Superblock::submit_write`], or to the block lane's
+/// queue, is through the recording methods here. So a second session over the same handles — the
+/// construction in which a reborn ledger forgets what the store still owes — cannot be written:
+/// the handles to build it with are inside the first session until the first session proves the
+/// store quiet.
+///
+/// The block lane's front rides here for exactly that reason. Its queue and the quotas that bound
+/// its depth are one object with one lifetime, so an endpoint rebuild can neither drop a queued job
+/// while inheriting its weight nor start a fresh quota over a queue that never drained; and because
+/// the front is reachable only through this session, "a fresh front over a live lane" is as
+/// unsayable as a fresh append ledger. The lane's own half — the store, the worker, and the
+/// [`BlockJobCursor`](crate::BlockJobCursor) that witnesses EXECUTION order — stays with the
+/// driver's lane, which owns the store and cannot hand it back.
 ///
 /// What no in-process type can seal: a second `W` aliasing the same OS resource (two `File`s onto
 /// one path, a second process on one WAL directory). That single operational assumption — one
-/// live handle pair per medium — belongs to the embedder's `Wal`/`Superblock` implementation
+/// live handle pair per store — belongs to the embedder's `Wal`/`Superblock` implementation
 /// (`flock` or equivalent), and it is the only one left outside the type system.
-pub struct Storage<W, B> {
+pub struct Storage<W, B, S: StateMachine> {
   wal: W,
   sb: B,
   /// EVERY in-flight physical WAL append over this medium: full id → op. Entered at submit,
@@ -146,9 +164,12 @@ pub struct Storage<W, B> {
   /// the durable root stores the envelope's content hash, so a lost same-slot race is DETECTED at
   /// the next recovery (checksum mismatch → peer fetch) rather than silently restored.
   checkpoints: BTreeMap<SessionKey, u64>,
+  /// The block lane's front: every job issued over this store and not yet completed, the quotas
+  /// they occupy, and the order they must execute in.
+  lane: LaneFront<S>,
 }
 
-impl<W, B> Storage<W, B> {
+impl<W, B, S: StateMachine> Storage<W, B, S> {
   /// Opens the session over `wal` and `sb`, taking ownership. The ONLY constructor.
   ///
   /// The handles must be QUIESCED: freshly formatted ([`format`](crate::format) confirms its
@@ -163,16 +184,22 @@ impl<W, B> Storage<W, B> {
       wal_writes: BTreeMap::new(),
       roots: VecDeque::new(),
       checkpoints: BTreeMap::new(),
+      lane: LaneFront::new(),
     }
   }
 
-  /// Hands the raw handles back — only when nothing is in flight on the medium.
+  /// Hands the raw handles back — only when nothing is in flight on the store.
   ///
   /// # Errors
-  /// Returns `Err(self)` unchanged while any append, root write, or checkpoint-envelope write is
-  /// still un-quiesced: releasing the handles then would let a successor session (or bare trait
-  /// calls) write over slots the medium still owes completions for — the reborn-ledger shape this
-  /// type exists to make unrepresentable.
+  /// Returns `Err(self)` unchanged while any append, root write, checkpoint-envelope write, or
+  /// block job is still outstanding: releasing the handles then would let a successor session (or
+  /// bare trait calls) write over slots the store still owes completions for, and would drop a
+  /// queued job while the lane's cursor still expects it — the reborn-ledger shape this type exists
+  /// to make unrepresentable.
+  // The `Err` variant IS the session, handed back untouched so the caller keeps draining it. Boxing
+  // it to shrink the variant would allocate on the one path whose whole purpose is to return the
+  // caller's own value unchanged.
+  #[allow(clippy::result_large_err)]
   pub fn into_parts(self) -> Result<(W, B), Self> {
     if self.has_inflight() {
       return Err(self);
@@ -180,11 +207,63 @@ impl<W, B> Storage<W, B> {
     Ok((self.wal, self.sb))
   }
 
-  /// Whether the medium still owes any completion: an append, a root write, or a
-  /// checkpoint-envelope write submitted through this session and not yet quiesced — whichever
-  /// endpoint incarnation submitted it.
+  /// Whether the store still owes any completion: an append, a root write, a checkpoint-envelope
+  /// write, or a block job issued through this session and not yet completed — whichever endpoint
+  /// incarnation issued it.
   pub fn has_inflight(&self) -> bool {
-    !self.wal_writes.is_empty() || !self.roots.is_empty() || !self.checkpoints.is_empty()
+    !self.wal_writes.is_empty()
+      || !self.roots.is_empty()
+      || !self.checkpoints.is_empty()
+      || self.lane.owes_completion()
+  }
+
+  /// Takes the next block-storage job the endpoint has issued, or `None` when none is queued.
+  ///
+  /// The driver executes it with [`execute_block_job`](crate::execute_block_job) on its storage
+  /// lane and feeds the result back through `Endpoint::on_block_done`. Jobs MUST be executed, and
+  /// their completions delivered, SERIALLY IN THE ORDER THEY ARE POLLED — see the
+  /// [job seam contract](crate::BlockJob) for why that order is a storage-safety obligation and how
+  /// a violation is caught.
+  ///
+  /// Taken from the session rather than from the endpoint because the queue is the LANE's: a job
+  /// issued by an endpoint that has since been replaced is still owed by the lane, still executes,
+  /// and still releases the quota it claimed.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn poll_block_job(&mut self) -> Option<BlockJob<S>> {
+    self.lane.poll()
+  }
+
+  /// Queue a block job the endpoint has issued, claiming the lane quota its kind occupies. The ONLY
+  /// route into the lane's queue.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn enqueue_block_job(&mut self, id: JobId, kind: BlockJobKind<S>) {
+    self.lane.enqueue(id, kind);
+  }
+
+  /// Settle a block-job completion against the lane's issue-order witness and quotas, before the
+  /// endpoint judges correlation. See [`LaneFront::settle`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn settle_block_job(&mut self, done: &BlockJobDone<S>) {
+    self.lane.settle(done);
+  }
+
+  /// Whether the lane already owes an un-consumed image capture — the capture site's admission
+  /// gate.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn materialize_owed(&self) -> bool {
+    self.lane.materialize_owed()
+  }
+
+  /// How many `Serve` jobs the lane owes completions for — the serve cap's admission count.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn serves_outstanding(&self) -> usize {
+    self.lane.serves_outstanding()
+  }
+
+  /// Whether the lane already owes a frontier walk — the walk's admission gate.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn walk_owed(&self) -> bool {
+    self.lane.walk_owed()
   }
 
   /// The WAL's synchronous views (`op_head`/`header`/`status`/`capacity`). Read-only: every
@@ -216,7 +295,7 @@ impl<W, B> Storage<W, B> {
   }
 }
 
-impl<W: Wal, B: Superblock> Storage<W, B> {
+impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// Whether `a` and `b` occupy the same physical WAL slot under this medium's capacity: the same
   /// op, or — on a bounded backend, whose placement is `op mod capacity` (the trait-level
   /// placement contract) — ring aliases. A ring-less backend (`capacity == u64::MAX`) stores every

@@ -36,7 +36,7 @@ fn labeled_conn(cluster: u128, me: u16, accept: bool) -> Conn<Labeled<Passthroug
 /// `try_note_established_member` fires without needing a real inbound frame.
 fn register_and_validate_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   _blocks: &mut crate::block_store::InMemoryBlockStore,
   member_idx: u128,
 ) -> ConnId {
@@ -951,12 +951,13 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
 /// committed + installed — generalizing `endpoint::tests::reconfigure::demoted_self_primary` to any
 /// voter and carrying it through the GC. Two validated conns for members 1 and 2 are registered
 /// BEFORE the departure, so the caller can inspect how `reconcile_routing` treated each afterward.
+#[allow(clippy::type_complexity)]
 fn commit_and_install_a_voter_departure(
   local: u128,
   who: u128,
 ) -> (
   StreamCoordinator<CountSm, MockRecords>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   crate::block_store::InMemoryBlockStore,
   ConnId,
   ConnId,
@@ -988,7 +989,7 @@ fn commit_and_install_a_voter_departure(
 /// `reconcile_routing` inside each install's `handle_storage` runs against each successive membership.
 fn drive_voter_departure_to_installed(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   blocks: &mut crate::block_store::InMemoryBlockStore,
   local: u128,
   who: u128,
@@ -1137,7 +1138,7 @@ fn drive_voter_departure_to_installed(
 /// `None`). Returns its `ConnId`.
 fn register_and_quarantine_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   _blocks: &mut crate::block_store::InMemoryBlockStore,
   out_idx: u128,
 ) -> ConnId {

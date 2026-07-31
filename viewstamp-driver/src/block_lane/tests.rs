@@ -58,7 +58,7 @@ fn genesis(n: u8) -> Membership {
 /// A sole voter is its own quorum, so its own durable append commits the op with no peer traffic.
 fn single_voter() -> (
   Endpoint<LogSm, SingleChange>,
-  Storage<InMemoryWal, InMemorySuperblock>,
+  Storage<InMemoryWal, InMemorySuperblock, LogSm>,
 ) {
   let config = Config::with_checkpoint_ops(CLUSTER, MemberId::new(0_u128), 1)
     .expect("a valid single-voter config");
@@ -72,7 +72,6 @@ fn single_voter() -> (
     LogSm::default(),
     &mut storage,
     // Every test's lane is created fresh, after this endpoint: nothing can occupy it yet.
-    viewstamp_proto::BlockLaneOccupancy::empty(),
   )
   .expect("the formatted store builds an endpoint");
   (endpoint, storage)
@@ -81,7 +80,7 @@ fn single_voter() -> (
 /// Commit one client op and return the first block job the endpoint queues for it.
 fn first_job(
   endpoint: &mut Endpoint<LogSm, SingleChange>,
-  storage: &mut Storage<InMemoryWal, InMemorySuperblock>,
+  storage: &mut Storage<InMemoryWal, InMemorySuperblock, LogSm>,
 ) -> BlockJob<LogSm> {
   let now = Instant::ZERO;
   endpoint.handle_message(
@@ -96,7 +95,7 @@ fn first_job(
   );
   for _ in 0..64 {
     endpoint.handle_storage(now, storage);
-    if let Some(job) = endpoint.poll_block_job() {
+    if let Some(job) = storage.poll_block_job() {
       return job;
     }
   }
@@ -129,7 +128,7 @@ fn a_spawned_lane_carries_a_checkpoint_to_its_durable_root() {
       "the spawned lane left the endpoint owing storage after {LANE_ANSWER_DEADLINE:?}",
     );
     endpoint.handle_storage(now, &mut storage);
-    while let Some(job) = endpoint.poll_block_job() {
+    while let Some(job) = storage.poll_block_job() {
       issued.push(job.id());
       lane.submit(job);
     }
@@ -177,7 +176,7 @@ fn an_inline_lane_answers_within_the_submit() {
 /// reaches the cursor rather than the lane's occupancy fail-stop.
 fn first_sweep_job(
   endpoint: &mut Endpoint<LogSm, SingleChange>,
-  storage: &mut Storage<InMemoryWal, InMemorySuperblock>,
+  storage: &mut Storage<InMemoryWal, InMemorySuperblock, LogSm>,
 ) -> BlockJob<LogSm> {
   let now = Instant::ZERO;
   let mut cursor = viewstamp_proto::BlockJobCursor::new();
@@ -187,7 +186,7 @@ fn first_sweep_job(
   endpoint.on_block_done(now, storage, done);
   for _ in 0..64 {
     endpoint.handle_storage(now, storage);
-    if let Some(job) = endpoint.poll_block_job() {
+    if let Some(job) = storage.poll_block_job() {
       if job.tag() == viewstamp_proto::BlockJobTag::Gc {
         return job;
       }
@@ -263,61 +262,16 @@ fn one_lane_refuses_a_second_image_at_submit() {
   lane.submit(dead_job);
 }
 
-/// The lane accounts for its own occupancy: a quota-bounded job counts from `submit` until its
-/// completion leaves `try_recv`, EXECUTION notwithstanding — an inline lane has already run the job
-/// by the time `submit` returns, but the image still occupies the lane until the completion is
-/// handed back, because handing it back is what lets the endpoint above release the capture.
-#[test]
-fn a_lane_holds_a_materialize_from_submit_until_its_completion_leaves() {
-  use viewstamp_proto::BlockLaneOccupancy;
-
-  let (mut endpoint, mut storage) = single_voter();
-  let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
-  assert_eq!(
-    lane.occupancy(),
-    BlockLaneOccupancy::empty(),
-    "a fresh lane holds nothing"
-  );
-
-  let job = first_job(&mut endpoint, &mut storage);
-  let id = job.id();
-  lane.submit(job);
-  assert_eq!(
-    lane.occupancy(),
-    BlockLaneOccupancy::new(Some(id), 0),
-    "the submitted materialize occupies the lane even though the inline lane already executed it"
-  );
-  // A clone shares the accounting, exactly as it shares the cursor — it is the SAME lane.
-  let carried = lane.clone();
-  assert_eq!(
-    carried.occupancy(),
-    BlockLaneOccupancy::new(Some(id), 0),
-    "a clone reports the same occupancy"
-  );
-
-  let done = carried
-    .try_recv()
-    .expect("the inline lane executed the job");
-  assert_eq!(done.id(), id);
-  assert_eq!(
-    lane.occupancy(),
-    BlockLaneOccupancy::empty(),
-    "handing the completion out — from any clone — frees the lane"
-  );
-}
-
 /// THE REBUILD CARRY, end to end at the driver seam: an endpoint dies with a materialize on its
-/// lane; the embedder rebuilds over the surviving lane clone and the same storage, passing
-/// [`BlockLane::occupancy`]; the successor starts with the capture site closed, the dead
-/// completion arrives foreign — refused, publishing nothing — and that refusal is what re-opens
-/// the capture, after which the successor checkpoints normally.
+/// lane; the embedder rebuilds over the surviving lane clone and the same session; the successor
+/// starts with the capture site closed (the quota is the session's, and the session is the same
+/// one), the dead completion arrives foreign — refused, publishing nothing — and that refusal is
+/// what re-opens the capture, after which the successor checkpoints normally.
 ///
-/// Built empty instead, the successor would capture a second full image behind the dead one: one
-/// image per rebuild, on a lane that never drained.
+/// Were the quota reborn with the endpoint, the successor would capture a second full image behind
+/// the dead one: one image per rebuild, on a lane that never drained.
 #[test]
-fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
-  use viewstamp_proto::BlockLaneOccupancy;
-
+fn a_rebuilt_endpoint_inherits_the_surviving_lanes_capture() {
   let config = Config::with_checkpoint_ops(CLUSTER, MemberId::new(0_u128), 1)
     .expect("a valid single-voter config");
   let (mut dead, mut storage) = single_voter();
@@ -327,20 +281,8 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
   lane.submit(dead_job);
   drop(dead); // the driver holding the endpoint is gone; the embedder kept the lane and storage
 
-  let occupancy = lane.occupancy();
-  assert_eq!(
-    occupancy,
-    BlockLaneOccupancy::new(Some(dead_id), 0),
-    "the surviving lane still holds the dead endpoint's image"
-  );
-  let mut live = crate::build_endpoint(
-    config,
-    genesis(1),
-    LogSm::default(),
-    &mut storage,
-    occupancy,
-  )
-  .expect("the dirty store rebuilds an endpoint over its surviving lane");
+  let mut live = crate::build_endpoint(config, genesis(1), LogSm::default(), &mut storage)
+    .expect("the dirty store rebuilds an endpoint over its surviving lane");
 
   // The dead job's completion lands foreign: refused wholesale — and the refusal releases the
   // inherited capture, which is what lets the successor checkpoint again below.
@@ -366,10 +308,10 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
   while live.has_inflight_storage(&storage) {
     assert!(
       std::time::Instant::now() < deadline,
-      "the rebuilt endpoint never quiesced after inheriting the lane's occupancy",
+      "the rebuilt endpoint never quiesced after inheriting the lane's capture",
     );
     live.handle_storage(now, &mut storage);
-    while let Some(job) = live.poll_block_job() {
+    while let Some(job) = storage.poll_block_job() {
       lane.submit(job);
     }
     while let Some(done) = lane.try_recv() {

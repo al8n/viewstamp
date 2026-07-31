@@ -45,7 +45,7 @@ const CLUSTER: u128 = 0x5151;
 /// One coordinator plus its in-memory storage doubles (WAL, superblock, block store).
 pub(super) type Replica = (
   QuicCoordinator<CountSm, ProvidedIdentity>,
-  crate::storage::Storage<TestWal, TestSb>,
+  crate::storage::Storage<TestWal, TestSb, CountSm>,
   crate::block_store::InMemoryBlockStore,
 );
 
@@ -590,7 +590,7 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
                seed: [u8; 32]|
    -> (
     QuicCoordinator<CountSm, WrongClusterSource>,
-    crate::storage::Storage<TestWal, TestSb>,
+    crate::storage::Storage<TestWal, TestSb, CountSm>,
     crate::block_store::InMemoryBlockStore,
   ) {
     let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();

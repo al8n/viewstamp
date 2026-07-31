@@ -125,19 +125,17 @@ where
 /// until it proves the medium quiet. (Distinct from the recovery nonce above: that fences stale
 /// RECOVERY RESPONSES between peers, this fences stale STORAGE COMPLETIONS within one process.)
 ///
-/// What that fence does NOT cover is the block lane's DEPTH, which is why `lane` is required: the
-/// endpoint's block-job admission quotas (one image capture, the serve cap) bound the lane, the
-/// lane can outlive the endpoint it served (an embedder rebuilding a driver passes the same
-/// [`BlockLane`](crate::BlockLane) clone), and quotas reborn empty over its un-drained queue would
-/// admit one more full checkpoint image per rebuild. The drivers read the truth off the lane they
-/// were handed ([`BlockLane::occupancy`](crate::BlockLane::occupancy)) — correct for a fresh lane
-/// and a survivor alike, however the predecessor ended.
+/// The block lane's DEPTH crosses a rebuild the same way and for the same reason: its queue, the
+/// admission quotas that bound it (one image capture, the serve cap, one frontier walk) and the
+/// order its completions must arrive in are all in the session, so an endpoint rebuilt over it
+/// polls exactly the jobs its predecessor queued and each completion — refused at the choke,
+/// publishing nothing — releases the quota that admitted it. Nothing about the lane is stated to
+/// this constructor, so nothing about it can be stated wrong.
 pub fn build_endpoint<S, W, B>(
   config: Config,
   membership: Membership,
   sm: S,
-  storage: &mut Storage<W, B>,
-  lane: viewstamp_proto::BlockLaneOccupancy,
+  storage: &mut Storage<W, B, S>,
 ) -> Result<Endpoint<S, SingleChange>, DriverError>
 where
   S: StateMachine,
@@ -158,9 +156,7 @@ where
   // zero-sized PhantomData witness with no runtime representation; the driver always carries the
   // capability so the coordinators can call `propose_membership` without the embedder opting in
   // per-instance.
-  match Endpoint::<S, SingleChange>::recover_with_reconfig(
-    config, membership, seed, sm, storage, lane,
-  )? {
+  match Endpoint::<S, SingleChange>::recover_with_reconfig(config, membership, seed, sm, storage)? {
     Recovered::Active(endpoint) => Ok(endpoint),
     Recovered::Retired(retired) => Err(DriverError::Retired {
       local: retired.local(),

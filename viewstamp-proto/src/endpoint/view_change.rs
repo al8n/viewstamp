@@ -95,7 +95,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn view_change_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     if self.timers.svc_message.is_some_and(|d| d <= now) {
       self.push_svc(self.svc_target); // re-broadcast the live SVC target (drives escalation under loss)
@@ -239,7 +239,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_start_view_change<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     m: crate::StartViewChange,
   ) {
     if self.is_learner() {
@@ -270,7 +270,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn maybe_start_view_change<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     if (self.svc_from.count_ones() as usize) >= self.membership.quorum_view_change() {
       self.transition_to_view_change_status(now, storage, self.svc_target);
@@ -286,7 +286,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn transition_to_view_change_status<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     view_new: View,
   ) {
     if self.sync_repersist_root_staged() {
@@ -313,7 +313,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn enter_view_change_from_recovery<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     view_new: View,
   ) {
     debug_assert!(
@@ -425,11 +425,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // above, so a kept one would be orphaned + incoherent); it re-solicits, its committed prefix
     // recovered from the canonical log.
     //
-    // Only the LOGICAL half is dropped. The `Materialize` job a `FlushingBlocks` drop orphans is
-    // already queued on the lane and executes to completion regardless — the issue-order contract
-    // admits no retraction — so `materializing` (the PHYSICAL half) deliberately SURVIVES this reset.
-    // That is what keeps the capture site closed until the lane returns the image it is already
-    // carrying; clearing it here would re-open the very accumulation the split exists to bound.
+    // Only the LOGICAL half is dropped, and it is the only half this reset can reach. The
+    // `Materialize` job a `FlushingBlocks` drop orphans is already queued on the lane and executes to
+    // completion regardless — the issue-order contract admits no retraction — and the capture quota
+    // it occupies belongs to the lane, not to this endpoint, so it stays claimed until the lane hands
+    // the image back. That is what keeps the capture site closed across the transition rather than
+    // re-opening the accumulation the split exists to bound.
     if self.pending_checkpoint.as_ref().is_some_and(|pc| {
       matches!(pc.kind, CheckpointKind::SyncRepersist)
         || matches!(pc.step, CheckpointStep::FlushingBlocks(_))
@@ -522,7 +523,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn enter_view_change<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     view_new: View,
   ) {
     self.view = view_new;
@@ -640,7 +641,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_do_view_change<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     m: crate::DoViewChange,
   ) {
     // NOTE (deferred to a later milestone): we do not yet validate incoming DVC well-formedness
@@ -927,7 +928,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn start_view_as_new_primary<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // No NEW checkpoint starts when forming a new primary's view (`maybe_checkpoint` is gated on Normal
     // status). An ORDINARY checkpoint kept in flight ACROSS the transition is permitted: it completes
@@ -1185,7 +1186,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn start_view_participate<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
     // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
@@ -1363,7 +1364,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_start_view<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     m: crate::StartView,
   ) {
     // Adopt only a strictly newer view, or the current view while we have not yet returned to Normal
@@ -1410,7 +1411,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// exactly the adopted head; done in the caller because it owns the `wal` handle.)
   pub(crate) fn truncate_wal_above_adopted_head<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Committed-survival backstop on the BOUNDARY freed WAL slot `self.op + 1`: the adopted head is the
     // view's authoritative head, so nothing strictly above it is committed (the uncommitted clause).
@@ -1453,7 +1454,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn adopt_canonical_head<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     view: View,
     op: OpNumber,
     commit: OpNumber,
@@ -1576,7 +1577,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// hundreds of redundant AdoptAck appends per view change and starving the repair fills that actually
   /// advance the commit. Bounding the re-append to `(commit_max .. op]` keeps it at the pipeline-depth
   /// tail it is meant to cover.
-  pub(crate) fn start_view_acks<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>) {
+  pub(crate) fn start_view_acks<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     let lo = self.commit_min.get().max(self.commit_max.get());
     for op in (lo + 1)..=self.op.get() {
       self.adopt_append(storage, op, Pending::AdoptAck(OpNumber::with(op)));
@@ -1613,7 +1614,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `StartViewAsPrimary` completion arm).
   pub(crate) fn retry_unappended_adopted_tail<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     if !self.status.is_normal() || self.pending_durable_view() {
       return;
@@ -1640,7 +1641,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// No-op if the op is not held (a committed op the canonical log omitted is peer-repaired instead).
   fn adopt_append<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     op: u64,
     kind: Pending,
   ) {

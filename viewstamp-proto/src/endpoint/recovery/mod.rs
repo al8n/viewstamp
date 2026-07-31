@@ -447,10 +447,9 @@ impl<S: StateMachine> Endpoint<S, RestartOnly> {
     membership: Membership,
     seed: u64,
     sm: S,
-    storage: &mut Storage<W, B>,
-    lane: crate::BlockLaneOccupancy,
+    storage: &mut Storage<W, B, S>,
   ) -> Result<Recovered<S, RestartOnly>, RecoverError> {
-    Self::recover_with_reconfig(config, membership, seed, sm, storage, lane)
+    Self::recover_with_reconfig(config, membership, seed, sm, storage)
   }
 }
 
@@ -532,21 +531,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// same replica. (The deterministic simulation does this with its seeded PRNG, drawing a distinct
   /// value per replica incarnation.)
   ///
-  /// **`lane` must describe the block-storage lane this endpoint is recovered OVER.** The block-job
-  /// admission quotas — one un-consumed checkpoint image capture, the outstanding-serve cap — bound
-  /// the LANE's depth, and the lane can outlive the endpoint being replaced (a restart in place
-  /// leaves its queue and its completion delivery running). Quotas reborn empty over a lane that
-  /// never drained would admit one more full image (and a fresh cap of serves) per incarnation, an
-  /// unbounded accumulation the incarnation choke does not bound: it stops stale jobs from
-  /// PUBLISHING, not from weighing. So every recover states the lane's occupancy: what the endpoint
-  /// being replaced still had outstanding
-  /// ([`Endpoint::lane_occupancy`](crate::Endpoint::lane_occupancy), or the lane's own accounting)
-  /// when the lane survives, or [`BlockLaneOccupancy::empty`](crate::BlockLaneOccupancy::empty)
-  /// when none does — a cold start, or a crash that discarded the queue with the process. The
-  /// inherited quotas release as the surviving lane delivers the dead jobs' completions, each one
-  /// refused at the incarnation choke; an occupancy that does not match what the lane will deliver
-  /// therefore either wedges the capture site (claimed but never delivered) or re-opens the
-  /// accumulation (delivered but never claimed).
+  /// **The block lane is not this constructor's concern**, because nothing about it is reborn here.
+  /// Its queue, the admission quotas that bound its depth (one un-consumed checkpoint image
+  /// capture, the outstanding-serve cap, one frontier walk) and the order its completions must
+  /// arrive in all live in the [`Storage`] session, whose lifetime is the store's. So an endpoint
+  /// rebuilt over a lane that never drained polls exactly the jobs its predecessor queued, and each
+  /// completion — refused at the incarnation choke, publishing nothing — still releases the quota
+  /// that admitted it. There is no occupancy to state, and therefore no way to state one that does
+  /// not match what the lane will deliver.
   ///
   /// **Fail-fast parameter validation (the WAL-geometry fence).** Before any storage I/O, the live
   /// parameters are validated against the store. [`Wal::capacity`] below
@@ -576,8 +568,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     membership: Membership,
     seed: u64,
     sm: S,
-    storage: &mut Storage<W, B>,
-    lane: crate::BlockLaneOccupancy,
+    storage: &mut Storage<W, B, S>,
   ) -> Result<Recovered<S, R>, RecoverError> {
     let state = storage.sb().state();
     // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
@@ -819,13 +810,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       incarnation: super::next_incarnation(),
       next_op_id: 1,
       foreign_completions_rejected: 0,
-      block_jobs: VecDeque::new(),
-      block_jobs_outstanding: VecDeque::new(),
       block_jobs_superseded: 0,
-      // INHERITED from the lane this endpoint is recovered over, not reset: the serve cap bounds
-      // the LANE's depth, and a surviving lane still holds the dead endpoint's serves. Each one
-      // frees its slot when the lane delivers its completion (refused at the incarnation choke).
-      block_serves_outstanding: lane.serves,
       block_serves_refused: 0,
       pending: BTreeMap::new(),
       // The slot-quiescence witnesses do NOT restart with the endpoint: they live in the
@@ -842,13 +827,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       pending_sb: None,
       pending_checkpoint: None,
       inherited_frontier: None,
-      // INHERITED, not reset. A surviving lane may still hold the dead endpoint's `Materialize` —
-      // a full image the choke's refusal cannot retract — and this guard is what keeps the capture
-      // site closed until the lane hands that image back. Starting `None` over such a lane would
-      // let every incarnation capture one more image behind its predecessors': an unbounded queue
-      // built one rebuild at a time. The inherited job's completion can only arrive FOREIGN, so its
-      // refusal at the incarnation choke doubles as this guard's release.
-      materializing: lane.materializing,
       checkpoint_op: OpNumber::with(checkpoint_op),
       // Set when the durable checkpoint envelope is read back + restored (`on_recover_sb_done`),
       // which decodes the `sm_root`; `None` until then (block GC skips a cycle without a live root).
@@ -981,7 +959,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `OpId` (never aliases a future real op — `next_op_id` grows).
   fn submit_recover_tail_batch<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     lo: u64,
     hi: u64,
   ) {
@@ -1014,7 +992,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_recover_wal_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     done: WalDone,
   ) {
     // The OpId of the completed read identifies which tail op it resolves (recover.reads). An
@@ -1276,7 +1254,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// both apply, so they cannot drift.
   fn inflight_tail_repairing_identity<W: Wal, B: Superblock>(
     &self,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
     op: u64,
   ) -> Option<(ClientId, RequestNumber, u128)> {
     let canonical = self
@@ -1340,7 +1318,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// number be silently re-minted, the committed loss this closes.)
   fn resolve_exhausted_tail_read<W: Wal, B: Superblock>(
     &mut self,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
     op: u64,
   ) {
     let keep = self.inflight_tail_repairing_identity(storage, op);
@@ -1380,7 +1358,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// lands or the budget exhausts into a peer fetch.
   pub(crate) fn on_recover_sb_done<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     done: SuperblockDone,
   ) {
     match done {
@@ -1438,7 +1416,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // DISCARD, leaving the checkpoint outstanding so `recover_timeouts` exhausts the budget and
         // escalates to a peer block-fetch.
         let id = self.mint_job_id();
-        self.enqueue_block_job(
+        storage.enqueue_block_job(
           id,
           BlockJobKind::Walk {
             walks: super::block_sync::BlockWalks::new(sm_root, sessions_root),
@@ -1483,7 +1461,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(super) fn on_recovered_checkpoint_restored<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     checkpoint: RecoveredCheckpoint,
     result: Result<(S, std::collections::BTreeMap<u128, Session>), crate::RestoreError>,
   ) {
@@ -1843,7 +1821,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the apply path), so the replica safely returns to `Normal` and re-fetches the op on demand via
   /// `RequestPrepare` when its commit reaches it — HOLDING the commit below the hole until then. This
   /// is what lets a recovering replica with a rotted committed slot rejoin without losing the op.
-  fn recover_progress<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
+  fn recover_progress<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     let Some(rec) = self.recover.as_ref() else {
       return;
     };
@@ -1983,7 +1965,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn complete_recovery<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
     // exemption below. A re-latched recovery (`on_recover_sync_checkpoint` builds a default state)
@@ -2063,7 +2045,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn resume_solo_voter_pipeline<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.inflight.clear();
     let own = 1u64 << self.local_slot().get();
@@ -2120,7 +2102,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn recover_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     if self.timers.recover_retry.is_none_or(|d| d > now) {
       return;
@@ -2130,7 +2112,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // + re-stage LOCALLY here (the Normal-only `sync_timeouts` does not run while Recovering). On success the
     // re-persist root drives `install_sync` + the flip to Normal; a still-failing flush leaves it owed and
     // the recover cadence re-attempts. No-op when none is owed / a write is in flight.
-    self.retry_install_flush(now);
+    self.retry_install_flush(now, storage);
     // A durability barrier (or the re-persist it stages) is now outstanding: the node waits on that
     // completion, not on a read retry. Keep the cadence armed so a FAULTED barrier is re-attempted —
     // the recovery bookkeeping is retired by the staging itself
@@ -2158,7 +2140,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // its ARQ: re-send the one outstanding `RequestBlock` for the frontier's next-missing block first,
     // exactly as `sync_timeouts` does for a Normal receiver.
     if awaiting_peer && self.sync.is_some() {
-      self.send_request_block(now);
+      self.send_request_block(now, storage);
       self.send_request_sync(now);
     }
     for op in ops {
@@ -2274,7 +2256,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn recover_head_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     if self.timers.recover_head.is_none_or(|d| d > now) {
       return;
@@ -2381,7 +2363,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn retire_recover_and_escalate<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.recover = None;
     self.enter_view_change_from_recovery(now, storage, self.view.next());
@@ -2411,9 +2393,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// participation by the central ingress — so there is NO window where a Normal node holds an advanced
   /// commit frontier + pruned WAL over a durable root still naming the OLD checkpoint. Recovery is
   /// complete the instant the synced checkpoint root is durable.
-  pub(crate) fn on_recover_sync_checkpoint(
+  pub(crate) fn on_recover_sync_checkpoint<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     m: crate::SyncCheckpoint,
   ) {
@@ -2452,7 +2435,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       && self.pending_install.is_none()
       && m.checkpoint_op() == self.checkpoint_op
     {
-      self.refetch_sm_reconstruct(now, from, &m);
+      self.refetch_sm_reconstruct(now, storage, from, &m);
       return;
     }
     // Decode must succeed before we commit to applying (apply_sync also decodes, but verifying here
@@ -2476,7 +2459,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // same-config reply whose blocks are already local drains immediately, but `apply_sync` keeps
     // `sync` Some for a crossing and `recover_timeouts` re-arms the `RequestSync` solicit — so the
     // crossing is never permanently wedged by a stale drain.
-    self.begin_recover_block_sync(now, from, &m, sm_root, sessions_root);
+    self.begin_recover_block_sync(now, storage, from, &m, sm_root, sessions_root);
   }
 
   /// The recovery peer-fetch's POST-FETCH tail: both DAGs of the verified `SyncCheckpoint` `m` are now
@@ -2493,7 +2476,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(super) fn complete_recover_peer_fetch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     donor: Peer,
     m: crate::SyncCheckpoint,
   ) {
@@ -2611,7 +2594,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //
     // `apply_sync` records the pinned donor on the staged install so a POST-ROOT reconstruct fault can
     // re-pull THIS checkpoint's block from the same donor `Peer`.
-    self.apply_sync(now, donor, &m);
+    self.apply_sync(now, storage, donor, &m);
     // `apply_sync` accepts or rejects the reply; on acceptance it issues the durability barrier whose
     // completion STAGES the re-persist. The recovery READ phase is retired by that staging
     // ([`Endpoint::on_checkpoint_blocks_flushed`] → `retire_recover_for_staged_sync`), never here: a
@@ -2627,9 +2610,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// into [`Self::complete_recover_peer_fetch`] once both DAGs drain. Mirrors
   /// [`Self::begin_block_sync`], except the install + flip-to-Normal defer to the durable re-persist
   /// root rather than running here.
-  fn begin_recover_block_sync(
+  fn begin_recover_block_sync<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     m: &crate::SyncCheckpoint,
     sm_root: BlockAddress,
@@ -2697,7 +2681,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // duplicate; a genuine NEW root resets to `None` so its first absent legitimately re-solicits.
       resolicited_front: self.carry_resolicit_latch(sm_root, sessions_root),
     });
-    self.issue_walk(WalkPurpose::Arm, None);
+    self.issue_walk(storage, WalkPurpose::Arm, None);
     // While Recovering the `recover_retry` cadence (not `sync_solicit`) re-drives the pull, so re-arm
     // that timer to keep the ARQ alive.
     self.arm_timers(now);
@@ -2710,8 +2694,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// malformed/oversized DAG, is treated exactly like a corrupt read: DISCARD and leave the checkpoint
   /// read outstanding, so `recover_timeouts` — the sole owner of the retry + ABSOLUTE budget —
   /// exhausts it into a peer block-fetch.
-  pub(super) fn on_recover_probe_walked(
+  pub(super) fn on_recover_probe_walked<W: Wal, B: Superblock>(
     &mut self,
+    storage: &mut Storage<W, B, S>,
     job: crate::JobId,
     checkpoint: RecoveredCheckpoint,
     next: Result<Option<BlockAddress>, ()>,
@@ -2743,12 +2728,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // walk block above. The token on the recovery bookkeeping is what makes a superseded reconstruct's
     // verdict inert.
     let seed = self.sm.restore_seed();
-    let job = self.issue_block_job(BlockJobKind::Restore {
-      sm_root: checkpoint.sm_root,
-      sessions_root: checkpoint.sessions_root,
-      seed,
-      purpose: RestorePurpose::RecoveredCheckpoint(checkpoint),
-    });
+    let job = self.issue_block_job(
+      storage,
+      BlockJobKind::Restore {
+        sm_root: checkpoint.sm_root,
+        sessions_root: checkpoint.sessions_root,
+        seed,
+        purpose: RestorePurpose::RecoveredCheckpoint(checkpoint),
+      },
+    );
     if let Some(rec) = self.recover.as_mut() {
       rec.reconstruct = Some(job);
     }
@@ -2955,7 +2943,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_recovery_response<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     m: crate::RecoveryResponse,
   ) {
     if !self.status.is_recovering_head() {

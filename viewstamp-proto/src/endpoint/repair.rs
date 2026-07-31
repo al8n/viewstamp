@@ -161,7 +161,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// re-elicits nacks until the quorum is reached or a holder fills the hole.
   pub(crate) fn on_nack<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     m: crate::Nack,
   ) {
@@ -240,7 +240,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// at least a header (so never nacks), hence a committed op can never accrue `f+1` nacks.
   fn truncate_uncommitted_tail_from<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     gap: u64,
   ) {
     let head = self.op.get();
@@ -593,7 +593,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_repair_batch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     m: crate::RepairBatch,
   ) {
     let commit = m.commit();
@@ -659,7 +659,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn fill_repair<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     p: &Prepare,
   ) -> bool {
     let _ = (now, &mut *storage); // the apply/advance is deferred to on_wal_done; no commit here

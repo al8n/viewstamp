@@ -32,7 +32,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn primary_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Deferred forfeit: a primary that hit the force-sync strand
     // ([`Self::maybe_force_sync`]) flagged a step-down rather than reset its `op` (which would let it
@@ -270,7 +270,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `propose_membership` returns a retryable [`ProposeMembershipError`](crate::ProposeMembershipError).
   pub(crate) fn check_new_op_admission<W: Wal, B: Superblock>(
     &self,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
   ) -> Result<(), NewOpReject> {
     if !self.status.is_normal() || !self.is_primary() {
       return Err(NewOpReject::NotNormalPrimary);
@@ -340,7 +340,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_request<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     _from: Peer,
     r: crate::Request,
   ) {
@@ -496,7 +496,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn mint_op<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     client: ClientId,
     request: RequestNumber,
     body_bytes: Bytes,
@@ -635,7 +635,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn try_commit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Do NOT apply ops while the SM is mid-replacement or does not yet hold its checkpoint — the SAME gate
     // `advance_commit` takes. A node owing a post-root SM-reconstruct (`self.checkpoint_op == M`, SM still
@@ -704,7 +704,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // the cadence below computes its boundary off the adopted pointer in the same tail.
     self.maybe_adopt_inherited_frontier();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
-    self.maybe_checkpoint();
+    self.maybe_checkpoint(storage);
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint (the re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here). No-op when no debt is owed.
@@ -726,7 +726,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn commit_op<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     op: u64,
   ) -> bool {
     // Faults-as-data (peer fault-repair): a committed op whose body read back
@@ -828,7 +828,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     &mut self,
     op: u64,
     body: &Body,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) -> bool {
     let Some(payload) = body.as_reconfigure() else {
       return false;
@@ -925,7 +925,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_prepare<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     p: Prepare,
   ) {
     // Peer fault-repair: a `Prepare` answering our `RequestPrepare` for a committed-op hole is
@@ -1153,7 +1153,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_prepare_batch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     m: crate::PrepareBatch,
   ) {
     let (view, commit, checkpoint_op, epoch, config_id) = (
@@ -1296,7 +1296,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.seats_new_voter_against_current(&payload)
   }
 
-  fn append_prepare<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>, p: Prepare) {
+  fn append_prepare<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>, p: Prepare) {
     // Refuse a direct voter admission at the append seam: dropped exactly like the ring-window/band
     // stalls (no WAL write, no log entry, no head advance, and — by append-before-ack — no PrepareOk),
     // so the op cannot commit on compliant replicas. See `commit_reconfigure`'s fence for the safety
@@ -1352,7 +1352,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// either committed-or-current-view-canonical, and only a stale superseded earlier-view body is replaced.
   fn reappend_canonical_prepare<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     p: &Prepare,
   ) {
     // The same direct-voter-admission screen as `append_prepare`: an interior overwrite also appends
@@ -1398,7 +1398,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// checkpoint is NOT yet durable.
   pub(crate) fn op_durably_appended<W: Wal, B: Superblock>(
     &self,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
     op: u64,
   ) -> bool {
     op <= self.checkpoint_op.get()
@@ -1474,7 +1474,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn advance_commit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     target: u64,
   ) {
     // A PRE-ROOT staged install (`pending_install`) is about to wholesale-REPLACE the SM at the synced
@@ -1562,7 +1562,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // the cadence below computes its boundary off the adopted pointer in the same tail.
     self.maybe_adopt_inherited_frontier();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
-    self.maybe_checkpoint();
+    self.maybe_checkpoint(storage);
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint. The re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here (the loop above already drove commit). No-op when
@@ -1921,7 +1921,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_prepare_ok<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     ok: PrepareOk,
   ) {
     if ok.view().get() > self.view.get() {
@@ -1979,7 +1979,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_commit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     c: Commit,
   ) {
     if c.view().get() > self.view.get() {

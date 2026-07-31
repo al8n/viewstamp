@@ -37,7 +37,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn maybe_forfeit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Only ever called from `primary_timeouts` (the Normal-primary tick); a backup behind on
     // checkpoint catches up via state-sync/force-sync and never forfeits.
@@ -112,7 +112,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn forfeit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.timers.forfeit_armed = None;
     self.pending_forfeit = true;
@@ -180,7 +180,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_primary_idle<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.propose_next_view(now, storage);
   }
@@ -196,7 +196,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn propose_next_view<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     if self.is_learner() {
       // A non-voting replica never initiates or joins a view change: it has no vote to cast and is

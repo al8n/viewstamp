@@ -4,7 +4,7 @@
 //! The endpoint never touches a [`BlockStore`] — no entry point of it takes one. Where it used to
 //! materialize a checkpoint, flush, sweep, serve a peer's block, rebuild the state machine, or walk a
 //! transfer's missing-block frontier inline, it now queues a [`BlockJob`] (drained via
-//! `Endpoint::poll_block_job`) and later consumes the matching [`BlockJobDone`] (fed back via
+//! `Storage::poll_block_job`) and later consumes the matching [`BlockJobDone`] (fed back via
 //! `Endpoint::on_block_done`). The embedder executes each job against its store with
 //! [`execute_block_job`] — the ONE place block work touches a store, and the one that sequences
 //! write-all-then-flush for a materialize, runs the typed per-DAG GC walks, reconstructs into a
@@ -331,87 +331,15 @@ impl<S: StateMachine> core::fmt::Debug for BlockJobDone<S> {
 /// driver that mints a fresh cursor when it rebuilds its endpoint in place forfeits the
 /// cross-incarnation guarantee entirely, because a fresh cursor's first admission has nothing to
 /// follow and is unchecked.
+///
+/// This is the EXECUTING side of the lane's order. Its issuing side — the queue jobs wait in, the
+/// admission quotas that bound the lane's depth, and the order their completions must arrive in —
+/// lives in the [`Storage`](crate::Storage) session, whose lifetime is the store's for the same
+/// reason. Both halves therefore cross an endpoint rebuild by being owned by something that
+/// outlives the endpoint, never by being handed across it.
 #[derive(Debug, Default)]
 pub struct BlockJobCursor {
   last: Option<(u64, u64)>,
-}
-
-/// The admission half of the lane-lifetime state: which resource-bounded jobs the storage lane still
-/// holds, carried from a dead endpoint into the one rebuilt over the same lane.
-///
-/// Two admission quotas bound what may sit on a lane at once — one un-consumed checkpoint image
-/// capture (each `Materialize` carries a full state-machine image plus a session projection) and a
-/// cap on outstanding peer block serves. Both bound the LANE's depth, so both have the LANE's
-/// lifetime — but the endpoint is what enforces them at issue time, and an endpoint rebuilt in place
-/// (the storage layer, its lane included, never torn down) is a fresh value whose quotas would
-/// restart empty over a queue that never drained. Each incarnation would then admit one more full
-/// image (and a fresh cap of serves) behind everything its predecessors already queued: restart in
-/// place faster than the serial lane drains, and the queue grows without bound. The incarnation
-/// choke keeps those stale jobs from PUBLISHING; it cannot make their images weigh nothing.
-///
-/// This type is how the quotas keep the lane's lifetime:
-/// [`Endpoint::recover`](crate::Endpoint::recover) requires one, so every rebuild answers what its
-/// lane still holds —
-///
-/// - [`Endpoint::lane_occupancy`](crate::Endpoint::lane_occupancy) read from the endpoint being
-///   replaced, when the lane (its queue and its completion delivery) survives the rebuild — the
-///   restart-in-place shape; or
-/// - [`BlockLaneOccupancy::empty`] when no lane survives: a lane created with this process, or one
-///   whose queued jobs AND undelivered completions were genuinely discarded (a crash, which loses
-///   the queue with the process).
-///
-/// The value passed must match what the lane will still execute and deliver, because delivery is
-/// what releases it: a completion naming a dead incarnation is refused wholesale at the endpoint's
-/// incarnation choke, and that same refused delivery is the lane's own signal that the job — and the
-/// image it carried — has left the queue. An occupancy claimed for a lane that will never deliver it
-/// wedges the capture site; an occupancy omitted for a lane that still holds an image re-opens the
-/// unbounded accumulation above.
-///
-/// The other half of the lane-lifetime state is [`BlockJobCursor`], the execution-order witness: it
-/// lives on the lane's executing side and crosses rebuilds by being owned by the lane itself (see
-/// its docs), where this half lives on the endpoint's issuing side and crosses rebuilds by being
-/// handed through `recover`. One discipline, split only by which side writes it: anything whose
-/// lifetime is the lane's must be owned by the lane or carried across the rebuild — never left to a
-/// field that is silently reborn empty with the next endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockLaneOccupancy {
-  /// The `Materialize` occupying the lane — whichever incarnation issued it — or `None` when the
-  /// lane owes no image. See the endpoint's `materializing` field docs for the two release sites.
-  pub(crate) materializing: Option<JobId>,
-  /// How many `Serve` jobs are outstanding on the lane, counted against
-  /// `MAX_OUTSTANDING_BLOCK_SERVES` at admission.
-  pub(crate) serves: usize,
-}
-
-impl BlockLaneOccupancy {
-  /// The occupancy of a lane that holds nothing: one created with this process, or one whose queued
-  /// jobs and undelivered completions were genuinely discarded. The only correct value for a boot
-  /// where no storage lane survives — and a LIE for a restart in place over a lane that still holds
-  /// its dead endpoint's jobs, which is exactly the case this type exists to carry.
-  pub const fn empty() -> Self {
-    Self {
-      materializing: None,
-      serves: 0,
-    }
-  }
-
-  /// Assembles an occupancy from a lane's own accounting — for a driver-owned lane that tracks what
-  /// it holds (`viewstamp-driver`'s `BlockLane`) rather than reading it off the dying endpoint.
-  /// Not an embedder entry point: the values must come from real lane accounting, never be guessed.
-  #[doc(hidden)]
-  pub const fn new(materializing: Option<JobId>, serves: usize) -> Self {
-    Self {
-      materializing,
-      serves,
-    }
-  }
-}
-
-impl Default for BlockLaneOccupancy {
-  /// [`BlockLaneOccupancy::empty`] — the fresh-lane value.
-  fn default() -> Self {
-    Self::empty()
-  }
 }
 
 impl BlockJobCursor {

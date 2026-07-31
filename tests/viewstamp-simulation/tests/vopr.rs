@@ -1868,18 +1868,33 @@ const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 7] = [33, 59, 64, 78, 134, 179, 1
 
 /// Seed 162 of the restart-in-place axis: a calm-window LIVELOCK — every replica up, the network
 /// healed, no faults, client work outstanding, and the committed high-water stops advancing (at 96,
-/// tick 1697). It is NOT the medium-lifetime defect the sweep above pins: the storage session
-/// closed every applied-history seed and both stale-landing falsifiers, and this seed's failure is
-/// unchanged by it. The remaining suspect is the block lane's occupancy — an endpoint-sourced
-/// snapshot that can claim an image no lane holds, which permanently closes the successor's capture
-/// site (see the proto-side pin
-/// `a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site`) and would freeze
-/// the checkpoint frontier exactly this way. That attribution is unproven, so this stays a pinned
-/// open seed rather than a claim.
+/// tick 1697).
+///
+/// It is neither of the two lifetime defects the sweep above pins. The storage session closed every
+/// applied-history seed and both stale-landing falsifiers; the lane front closed the un-polled
+/// capture wedge. This seed's failure is unchanged by both — same tick, same high-water, a
+/// byte-identical trajectory — and at the wedge the lane owes nothing at all (no image capture, no
+/// serve, no walk, no in-flight storage of any kind on either replica), so no lane-depth quota can
+/// be holding anything closed.
+///
+/// What the wedge actually looks like, at tick 1697 on the two voters:
+///
+/// - both are `Normal` in view 40 with `op = 209`, `commit_max = 208`, `commit_min = 96`, and 96
+///   applied ops — so both KNOW ops through 208 are committed and neither applies past 96;
+/// - the blocked op is 97, and its durable WAL slot differs between them: replica 0's slot 97 is
+///   `Faulty` (durably written, later corrupt), replica 1's is `Clean`. Every neighbouring slot
+///   (94..=100) is `Clean` on both, and 97 is not wrapped away on either;
+/// - replica 1 therefore holds a good durable copy of the very op it is refusing to apply, in a
+///   healed all-up window with no faults being injected, for the window's whole 800 ticks (over
+///   three seconds of virtual time).
+///
+/// So this is a repair/apply liveness shape on the committed band, not a storage-lifetime one: the
+/// hole at 97 is never closed even though a quorum member holds it durably. Left pinned and
+/// UNFIXED — it wants its own slice — rather than folded into a lifetime change it is not about.
 #[test]
-#[ignore = "pins an open defect: a calm-window livelock on the restart-in-place axis that the \
-            storage session does not close; un-ignore when the lane's occupancy has an owner whose \
-            lifetime is the lane's"]
+#[ignore = "pins an open defect that neither lifetime slice closes: a committed-band repair wedge \
+            (replica 0's slot 97 faulty, replica 1's clean, neither applies past 96) surfacing as a \
+            calm-window livelock on the restart-in-place axis"]
 fn restart_in_place_livelock_seed() {
   let r = run_vopr_with_restart_in_place(162, DEFAULT_TICKS);
   assert!(
