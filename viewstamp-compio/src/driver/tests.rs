@@ -43,7 +43,9 @@ fn genesis(n: u8) -> Membership {
   )
   .expect("valid genesis membership")
 }
-use viewstamp_driver::{DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT};
+use viewstamp_driver::{
+  DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT, SHUTDOWN_DRAIN_DEADLINE,
+};
 
 const CLUSTER: u128 = 0x5151;
 
@@ -583,11 +585,18 @@ async fn the_pending_scan_is_deadline_gated_quic() {
 async fn next_deadline_folds_the_pending_scan_deadline_quic() {
   let (mut driver, handle) = test_quic_driver_with_handle().await;
 
-  // Baseline: nothing pending, no peers, a never-driven endpoint — the ~50ms idle fallback
-  // governs, proving the (elapsed) scan deadline is not folded for an empty pending map.
-  let baseline = driver.next_deadline();
+  // Baseline: nothing pending, no peers, a never-driven endpoint, so the scan deadline must not be
+  // folded. Checked structurally rather than against a wall-clock reading: `next_pending_scan` is
+  // still its zero-initialized sentinel (nothing has ever scanned), so an unconditionally-folded
+  // result would equal exactly `driver.clock.to_std` of it. Every deadline `next_deadline` can
+  // LEGITIMATELY return — the idle fallback, or a real armed timer such as the primary's own
+  // commit heartbeat — is a `now` reading (real or `clock`-relative) plus a positive offset, and
+  // `now` is never earlier than the clock's own epoch, so it is always strictly later than the
+  // sentinel. This holds regardless of how long construction or scheduling took, unlike comparing
+  // against a freshly re-read `Instant::now() + N`.
+  let unfolded_scan = driver.clock.to_std(driver.next_pending_scan);
   assert!(
-    baseline >= std::time::Instant::now() + std::time::Duration::from_millis(40),
+    driver.next_deadline() > unfolded_scan,
     "with nothing pending the idle fallback governs (the scan deadline is not folded)"
   );
 
@@ -1107,4 +1116,121 @@ async fn an_active_reconfigure_across_retirement_resolves_to_retired_quic() {
       "expected Ready(Err(Retired)) for an in-flight reconfigure across retirement, got {other:?}"
     ),
   }
+}
+
+/// A WAL whose staged appends need more polls to land than any teardown could deliver: the backend
+/// simply never completes what the endpoint submitted to it.
+const APPENDS_NEVER_LAND: u32 = u32::MAX;
+
+/// A WAL whose staged appends land only after this many polls. Chosen far above the TWO polls
+/// `run()`'s pre-loop `pump_outputs` delivers before the loop's first command drain takes the
+/// already-queued `Shutdown` — so an append staged here is provably still in flight when the
+/// shutdown is received, and only the teardown drain can complete it — while still finishing in
+/// tens of milliseconds at the drain's poll cadence.
+const APPENDS_LAND_AFTER: u32 = 64;
+
+/// Put one client request into the endpoint through the REAL `Handle::submit` + `handle_command`
+/// crossing, leaving its WAL append in flight, and assert the endpoint says so.
+///
+/// That assertion is the anti-vacuity precondition every drain test needs: a drain over an endpoint
+/// that owes storage nothing reports quiescence for free, so without it a green result would prove
+/// nothing. The returned submit future must be kept alive — dropping it cancels the reply receiver.
+fn submit_one_append_in_flight<'h>(
+  driver: &mut TestQuicDriver,
+  handle: &'h crate::Handle,
+) -> std::pin::Pin<Box<SubmitFut<'h>>> {
+  let mut fut: std::pin::Pin<Box<SubmitFut<'h>>> =
+    Box::pin(handle.submit(Bytes::from_static(b"durable")));
+  assert!(
+    poll_submit(fut.as_mut()).is_none(),
+    "the submit parks on its reply"
+  );
+  drain_one_command(driver);
+  assert!(
+    driver.coord.endpoint().has_inflight_storage(),
+    "the submitted request must leave a WAL append in flight, or the drain has nothing to prove"
+  );
+  fut
+}
+
+/// DEADLINE EXPIRY REPORTS HONESTLY (QUIC driver): against a backend that never completes the append
+/// the endpoint submitted, the teardown cannot reach quiescence — so it waits out
+/// `SHUTDOWN_DRAIN_DEADLINE`, then acks with `storage_quiesced() == false` and releases storage
+/// anyway. Both halves are the property: an unbounded wait would wedge every shutdown behind a stuck
+/// device, and reporting a clean stop would make an abandoned mid-write indistinguishable from a
+/// drained one. The elapsed floor is what proves it genuinely tried to drain rather than answering
+/// `false` on the spot.
+#[compio::test]
+async fn deadline_expiry_acks_shutdown_unquiesced_quic() {
+  let (mut driver, handle) = test_quic_driver_with_storage(
+    InMemoryWal::with_async_appends(APPENDS_NEVER_LAND),
+    InMemorySuperblock::new(),
+  )
+  .await;
+  let submit = submit_one_append_in_flight(&mut driver, &handle);
+
+  let started = std::time::Instant::now();
+  compio::runtime::spawn(driver.run()).detach();
+  let report = compio::time::timeout(SHUTDOWN_DRAIN_DEADLINE * 4, handle.shutdown())
+    .await
+    .expect("the shutdown acks rather than hanging on a backend that never completes")
+    .expect("shutdown acks teardown");
+  let elapsed = started.elapsed();
+
+  assert!(
+    !report.storage_quiesced(),
+    "an append the backend never completed must be reported as NOT quiesced"
+  );
+  assert!(
+    elapsed >= SHUTDOWN_DRAIN_DEADLINE,
+    "the teardown waited out the drain deadline before giving up, took {elapsed:?}"
+  );
+  assert!(
+    elapsed < SHUTDOWN_DRAIN_DEADLINE * 3,
+    "the wait is BOUNDED by the deadline, not open-ended; took {elapsed:?}"
+  );
+  drop(submit);
+}
+
+/// THE DRAIN GENUINELY COMPLETES IN-FLIGHT WORK (QUIC driver): an append the endpoint still owed
+/// when the `Shutdown` arrived is carried to completion by the teardown drain, and the ack reports
+/// `storage_quiesced() == true`.
+///
+/// Non-vacuous by construction, not by hope. The `Shutdown` is enqueued BEFORE `run()` exists, so it
+/// is the first command the loop drains; the endpoint's own in-flight-storage signal is asserted
+/// true at that point; and the fixture needs `APPENDS_LAND_AFTER` polls to land against the two the
+/// pre-loop pump can deliver. So the append is still in flight when the shutdown is received, and a
+/// `true` report can only come from the drain having polled it through.
+#[compio::test]
+async fn the_teardown_drain_completes_an_in_flight_append_quic() {
+  let (mut driver, handle) = test_quic_driver_with_storage(
+    InMemoryWal::with_async_appends(APPENDS_LAND_AFTER),
+    InMemorySuperblock::new(),
+  )
+  .await;
+  let submit = submit_one_append_in_flight(&mut driver, &handle);
+
+  let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+  let mut shutdown_fut = Box::pin(handle.shutdown());
+  assert!(
+    std::future::Future::poll(shutdown_fut.as_mut(), &mut cx).is_pending(),
+    "the shutdown enqueues its command and parks on the ack"
+  );
+  assert!(
+    driver.coord.endpoint().has_inflight_storage(),
+    "the append is STILL in flight now the shutdown is queued: this is the moment the drain must \
+     act on"
+  );
+
+  compio::runtime::spawn(driver.run()).detach();
+  let report = compio::time::timeout(SHUTDOWN_DRAIN_DEADLINE * 2, shutdown_fut)
+    .await
+    .expect("a completing backend drains well inside the deadline")
+    .expect("shutdown acks teardown");
+
+  assert!(
+    report.storage_quiesced(),
+    "the drain carried the in-flight append to completion, so the stop was orderly"
+  );
+  drop(submit);
 }

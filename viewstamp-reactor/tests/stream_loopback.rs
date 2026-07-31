@@ -345,8 +345,19 @@ async fn three_node_tcp_cluster_commits_a_client_request() {
   // the first committed op replies 1.
   assert_eq!(&reply[..], &1u64.to_be_bytes());
 
-  for h in &handles {
-    let _ = h.shutdown().await;
+  // A cluster that just committed a request has written its WAL and durable root, so an orderly
+  // stop must be able to say so: each node's teardown drains what its endpoint still owed and the
+  // ack reports storage quiesced. A driver that acked without draining would be indistinguishable
+  // here from one that was cut off mid-write.
+  for (i, h) in handles.iter().enumerate() {
+    let report = h
+      .shutdown()
+      .await
+      .unwrap_or_else(|e| panic!("node {i} acks shutdown: {e:?}"));
+    assert!(
+      report.storage_quiesced(),
+      "node {i} stopped with storage still in flight"
+    );
   }
 }
 

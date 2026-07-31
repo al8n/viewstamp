@@ -12,9 +12,9 @@ use viewstamp_proto::{
 
 use viewstamp_driver::{
   Clock, Command, DriverConfig, DriverError, Handle, InflightBudget, Pending, PendingMap,
-  Retirement, build_endpoint, deliver_event, drain_pending, finish_reconfigure_on_retire,
-  gate_command_on_retirement, jittered, pending_scan_interval, reap_and_collect_retransmits,
-  retire,
+  Retirement, ShutdownReport, StorageQuiescence, build_endpoint, deliver_event, drain_pending,
+  drain_storage, finish_reconfigure_on_retire, gate_command_on_retirement, jittered,
+  pending_scan_interval, reap_and_collect_retransmits, retire,
 };
 
 const RECV_BUF_LEN: usize = 65_507; // IP-layer max UDP payload
@@ -357,16 +357,19 @@ where
 
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
   ///
-  /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are fd-release
-  /// barriers: the driver is the SOLE owner of its socket (the recv arm borrows it in-loop; no
-  /// helper task holds a clone), so the teardown's `drop` of the socket closes the fd
-  /// synchronously, and an embedder may bind a new driver to the same address the moment
-  /// `shutdown().await` (or an awaited `run()` task) returns. Cancelling the `run()` future
-  /// itself releases the fd just as promptly — dropping the future drops the whole driver,
-  /// socket included — but reaching that cancellation is runtime-specific: aborting the spawned
-  /// task cancels everywhere, while dropping a raw spawn handle does NOT (tokio detaches, leaving
-  /// the task running and the socket owned; smol cancels). The portable stop paths are
-  /// [`Handle::shutdown`], dropping every `Handle`, or an explicit task abort.
+  /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are STORAGE-QUIESCE
+  /// and fd-release barriers. The teardown first drains the endpoint's in-flight WAL/superblock ops
+  /// (bounded; see [`Self::quiesce_storage`]) so an orderly stop is distinguishable from a crash,
+  /// and reports the outcome in the ack's [`ShutdownReport`]. It then drops the socket — the driver
+  /// is its SOLE owner (the recv arm borrows it in-loop; no helper task holds a clone), so that drop
+  /// closes the fd synchronously — and an embedder may bind a new driver to the same address the
+  /// moment `shutdown().await` (or an awaited `run()` task) returns. Cancelling the `run()` future
+  /// itself releases the fd just as promptly — dropping the future drops the whole driver, socket
+  /// included — but it skips the storage drain (drop glue cannot await) and reaching that
+  /// cancellation is runtime-specific: aborting the spawned task cancels everywhere, while dropping
+  /// a raw spawn handle does NOT (tokio detaches, leaving the task running and the socket owned;
+  /// smol cancels). The portable stop paths are [`Handle::shutdown`], dropping every `Handle`, or an
+  /// explicit task abort.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
@@ -378,7 +381,7 @@ where
     let now = self.clock.now();
     self.pump_outputs(now).await;
 
-    let mut shutdown_ack: Option<futures_channel::oneshot::Sender<()>> = None;
+    let mut shutdown_ack: Option<futures_channel::oneshot::Sender<ShutdownReport>> = None;
     loop {
       let now = self.clock.now();
 
@@ -550,6 +553,13 @@ where
     // driver's life. A `Submit` still queued in the command channel releases in the
     // close-then-drain below, its guard with it.
     drain_pending(&mut self.pending);
+    // The durability barrier, before anything is released: the run loop has exited, so nothing
+    // further enters consensus, and the endpoint's outstanding WAL/superblock ops are drained to
+    // quiescence (or to the bounded deadline) while its storage handles are still owned here. It
+    // runs AFTER `drain_pending` so a caller awaiting a submit is released immediately rather than
+    // being held for the drain window — the entries dropped there are driver-side bookkeeping and
+    // touch neither the endpoint nor the store.
+    let storage = self.quiesce_storage().await;
     // The command channel is the one queue whose senders OUTLIVE the driver (every `Handle`
     // clone), so its release must not depend on them dropping: close-then-drain makes the queued
     // commands airtight at the ack. `close()` turns the channel non-admitting — a `Handle` racing
@@ -571,8 +581,29 @@ where
     // return) an immediate-rebind contract.
     drop(self.socket);
     if let Some(ack) = shutdown_ack {
-      let _ = ack.send(());
+      let _ = ack.send(ShutdownReport::new(storage));
     }
+  }
+
+  /// Drain the endpoint's in-flight storage at teardown, bounded by
+  /// [`SHUTDOWN_DRAIN_DEADLINE`](viewstamp_driver::SHUTDOWN_DRAIN_DEADLINE).
+  ///
+  /// Each pass feeds the backend's ready completions through the endpoint — the same
+  /// `handle_storage` the run loop pumps — and stops as soon as the endpoint owes none. Only the
+  /// storage half is pumped: outputs a completion produces (datagrams, events) belong to a driver
+  /// that is still running, and this one is releasing its socket next.
+  async fn quiesce_storage(&mut self) -> StorageQuiescence {
+    drain_storage(
+      || {
+        let now = self.clock.now();
+        self
+          .coord
+          .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+        !self.coord.endpoint().has_inflight_storage()
+      },
+      R::sleep,
+    )
+    .await
   }
 
   /// Handle one [`Command`]; returns `true` when the loop should exit (a `Shutdown`).
@@ -583,7 +614,7 @@ where
     &mut self,
     now: Instant,
     cmd: Command,
-    shutdown_ack: &mut Option<futures_channel::oneshot::Sender<()>>,
+    shutdown_ack: &mut Option<futures_channel::oneshot::Sender<ShutdownReport>>,
   ) -> bool {
     // Gate on the retirement latch at CONSUMPTION time: a Submit/Reconfigure buffered (or racing the
     // Handle's preflight) before the run loop latched retirement is resolved terminally here rather

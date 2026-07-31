@@ -6,6 +6,7 @@ use viewstamp_proto::Event;
 use crate::{
   DriverError,
   session::{InflightBudget, ReservationGuard, Retirement},
+  shutdown::ShutdownReport,
 };
 
 /// A committed reply body returned by [`Handle::submit`].
@@ -28,12 +29,14 @@ pub enum Command {
     /// manually here.
     reservation: ReservationGuard,
   },
-  /// Ask the driver to stop; `ack` is signalled once teardown completes.
+  /// Ask the driver to stop; `ack` answers once teardown completes.
   Shutdown {
-    /// Signalled after the driver loop exits and its socket/listener fd is fully RELEASED
-    /// (closed, with every helper-task and in-flight-op reference gone) — so the bound address is
-    /// immediately rebindable when the ack arrives.
-    ack: futures_channel::oneshot::Sender<()>,
+    /// Answered after the driver loop exits, its storage drain has settled, and its socket/listener
+    /// fd is fully RELEASED (closed, with every helper-task and in-flight-op reference gone) — so
+    /// the bound address is immediately rebindable when the ack arrives. It carries the
+    /// [`ShutdownReport`] rather than a bare signal, so the teardown's findings (today: whether
+    /// storage quiesced) reach the caller.
+    ack: futures_channel::oneshot::Sender<ShutdownReport>,
   },
   /// Drive an arbitrary-target reconfiguration to convergence (a per-step plan loop in the driver task).
   Reconfigure {
@@ -218,16 +221,27 @@ impl Handle {
     viewstamp_proto::max_request_body_len().min(self.budget.max_bytes())
   }
 
-  /// Request shutdown and await teardown completion.
+  /// Request shutdown and await teardown completion, answering with what the teardown found.
   ///
-  /// The returned future resolves only after the driver has fully RELEASED its socket/listener
-  /// fd — the fd is closed, not merely scheduled to close — so the address the driver was bound
-  /// to is immediately rebindable: constructing a new driver on the same address right after this
-  /// returns must succeed.
+  /// The returned future resolves only after the driver has stopped admitting work, DRAINED the
+  /// endpoint's in-flight WAL/superblock ops (bounded by
+  /// [`SHUTDOWN_DRAIN_DEADLINE`](crate::SHUTDOWN_DRAIN_DEADLINE)), and fully RELEASED its
+  /// socket/listener fd — the fd is closed, not merely scheduled to close — so the address the
+  /// driver was bound to is immediately rebindable: constructing a new driver on the same address
+  /// right after this returns must succeed.
+  ///
+  /// The drain is what makes an orderly stop distinguishable from a crash, and
+  /// [`ShutdownReport::storage_quiesced`] is where that distinction is reported. It answers `false`
+  /// when the deadline expired with work still in flight and the driver released storage anyway;
+  /// that is a safe outcome rather than an error (see the accessor), so it is reported alongside a
+  /// successful teardown, not in place of one.
   ///
   /// # Errors
-  /// [`DriverError::DriverGone`] if the driver task has already stopped.
-  pub async fn shutdown(&self) -> Result<(), DriverError> {
+  /// [`DriverError::DriverGone`] if the driver task has already stopped;
+  /// [`DriverError::ReplyDropped`] if the driver stopped without answering (it was cancelled or
+  /// panicked mid-teardown), which — unlike an expired drain — means the teardown's outcome is
+  /// unknown rather than reported.
+  pub async fn shutdown(&self) -> Result<ShutdownReport, DriverError> {
     let (ack, rx) = futures_channel::oneshot::channel();
     // A fresh sender clone starts unparked with its own guaranteed channel slot, so the Shutdown
     // enqueues immediately even when the buffer is full of submits; the only send failure is a

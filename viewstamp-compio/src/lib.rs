@@ -7,4 +7,7 @@ mod stream_driver;
 
 pub use driver::CompioQuicDriver;
 pub use stream_driver::CompioStreamDriver;
-pub use viewstamp_driver::{Clock, Command, DriverConfig, DriverError, Handle, Reply};
+pub use viewstamp_driver::{
+  Clock, Command, DriverConfig, DriverError, Handle, Reply, SHUTDOWN_DRAIN_DEADLINE,
+  ShutdownReport, StorageQuiescence,
+};
