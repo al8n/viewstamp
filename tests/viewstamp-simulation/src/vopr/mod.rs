@@ -1,8 +1,10 @@
 //! A VOPR-style deterministic adversarial test driver (TigerBeetle's VOPR, in miniature).
 //!
-//! [`run_vopr`] runs a single seeded simulation: it builds a cluster (size 2..=6, including even N and
-//! the sharp N=2 unanimous-quorum case, a handful of
-//! clients, **async WAL** + seeded storage/network faults), then for `ticks` steps applies a
+//! [`run_vopr`] runs a single seeded simulation: it builds a cluster (size 3..=6, including even N —
+//! the sharp N=2 unanimous-quorum case is drawn only by the reconfig axis, the one lane that masks
+//! permanent corruption, since a two-voter quorum cannot absorb a permanently destroyed durable
+//! copy; a handful of clients, **async WAL** + seeded storage/network faults), then applies for
+//! `ticks` steps a
 //! seed-chosen mix of adversarial actions — client load, network chaos (reorder / duplicate / drop /
 //! delay), storage chaos (async-append delays + transient read faults + occasional permanent
 //! torn/bit-rot), crash/restart, and partition/heal — and `cluster.tick()`s. Everything is drawn from
@@ -78,7 +80,9 @@ pub struct VoprReport {
   seed: u64,
   /// The number of ticks executed.
   ticks: u64,
-  /// The replica count chosen for this run (2..=6, including even N and N=2).
+  /// The replica count chosen for this run: 3..=6 whenever the run injects permanent corruption
+  /// (a two-voter quorum is unanimous, so it cannot absorb a permanently destroyed copy), and 2..=6
+  /// on the reconfig axis, which masks those faults and therefore still covers the sharp N=2 case.
   replicas: usize,
   /// The client count chosen for this run.
   clients: usize,
@@ -239,6 +243,19 @@ pub struct VoprReport {
   /// probe genuinely made completed appends vanish header-and-all, the exact shape the `Wal`
   /// header-durability contract forbids.
   torn_headers_fired: u64,
+  /// The high-water of PERMANENT WAL body-fault verdicts the cluster-wide durability budget REFUSED:
+  /// rolls that would have destroyed one op's durable copy on more than `f` replicas, putting the op
+  /// beyond any repair protocol's reach. `> 0` proves the bound is LIVE on this run rather than
+  /// merely armed — the injector genuinely tried to cross the durability boundary and was stopped.
+  /// The lanes that draw small clusters read this as their non-vacuity witness, so the bound cannot
+  /// silently decay into dead code while every sweep still passes.
+  ///
+  /// Deliberately NOT folded into the report digest, though for a different reason than the
+  /// axis-gated witnesses that are also left out: this one is NOT identically zero off-axis, since
+  /// the permanent storage-fault axis is always on. It stays out because a refusal only spares
+  /// durable bytes the run may never read back, so it can move while nothing observable moves —
+  /// folding it would change that hash's schema without any behavioural change.
+  permanent_faults_refused: u64,
   /// How many CLIENT-CHURN actions fired this run (an active client RETIRED + a fresh `ClientId`
   /// spawned in its place). `0` unless the churn axis is enabled (`VOPR_CHURN`, or
   /// [`run_vopr_with_churn`]); bounded by the per-run churn budget. The churn sweep asserts the
@@ -401,7 +418,9 @@ impl VoprReport {
     self.ticks
   }
 
-  /// The replica count chosen for this run (2..=6, including even N and N=2).
+  /// The replica count chosen for this run: 3..=6 whenever the run injects permanent corruption
+  /// (a two-voter quorum is unanimous, so it cannot absorb a permanently destroyed copy), and 2..=6
+  /// on the reconfig axis, which masks those faults and therefore still covers the sharp N=2 case.
   pub const fn replicas(&self) -> usize {
     self.replicas
   }
@@ -597,6 +616,13 @@ impl VoprReport {
   /// non-vacuity witness.
   pub const fn torn_headers_fired(&self) -> u64 {
     self.torn_headers_fired
+  }
+
+  /// The high-water of permanent WAL body faults the cluster-wide durability budget refused (rolls
+  /// that would have left a committed op with no readable durable copy anywhere). `> 0` proves the
+  /// bound genuinely fired this run; the lanes that draw small clusters assert it across their seeds.
+  pub const fn permanent_faults_refused(&self) -> u64 {
+    self.permanent_faults_refused
   }
 
   /// How many client-churn actions fired (a client retired + a fresh `ClientId` spawned). `0` with
@@ -1430,9 +1456,10 @@ pub fn run_vopr_with_learners(seed: u64, ticks: u64) -> VoprReport {
 /// reconfig-enabled run is a pure function of `(seed, ticks)` and its own deterministic baseline; this
 /// is the entry point for the committed reconfig sweep.
 pub fn run_vopr_with_reconfig(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
-  v.reconfig_axis = true;
-  run_seeded(v, ticks)
+  run_seeded(
+    Vopr::with_reconfig(seed, env_flag("VOPR_LEARNER"), true),
+    ticks,
+  )
 }
 
 /// Like [`run_vopr`] but with the LIVE single-change reconfiguration axis FORCE-ENABLED, independent
@@ -1716,6 +1743,16 @@ const LEARNER_SEED_MAGIC: u64 = 0x1EA2_4E11_5EED_C0DE;
 
 impl Vopr {
   fn new(seed: u64, learner_axis: bool) -> Self {
+    Self::with_reconfig(seed, learner_axis, env_flag("VOPR_RECONFIG"))
+  }
+
+  /// Like [`Self::new`] but with the RECONFIG axis supplied by the caller instead of read from the
+  /// environment. It has to be a CONSTRUCTOR parameter rather than a field assigned afterwards, for
+  /// the same reason `learner_axis` is: it decides the MEMBERSHIP SIZE. The reconfig axis masks the
+  /// permanent torn/bit-rot faults, and whether a run injects permanent corruption is exactly what
+  /// decides whether the voting set may be two (see the size draw below), so the flag must be known
+  /// before the draw rather than after it.
+  fn with_reconfig(seed: u64, learner_axis: bool, reconfig_axis: bool) -> Self {
     let mut prng = Prng::new(seed);
     // VOTING-replica count from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (covering
     // the quorum/nack arithmetic). `Config::try_new` accepts any `1..=64`, and the derived quorums are
@@ -1723,6 +1760,29 @@ impl Vopr {
     // (N=2 → quorum 2 = unanimous, vc/nack 1 = a single DVC/nack suffices; N=4 → 3 / 2; N=6 → 4 / 3),
     // and the replication↔view-change intersection `quorum + quorum_view_change > n` holds for all.
     let voting_count = 2 + (prng.below(5) as usize);
+    // FAULT-MODEL CONSTRAINT on the size: a run that injects PERMANENT corruption never runs two
+    // voters. Permanent corruption destroys a durable copy for good, so the cluster must own a copy it
+    // can afford to lose: at most `f = n − quorum(n)` replicas may lose one op and still leave an
+    // acking replica holding readable bytes. At n=2 the quorum is unanimous, so `f` is 0 and the
+    // budget refuses EVERY permanent body fault on a committed op — the axis is armed, draws its
+    // rates, and injects nothing for the whole run. Those seeds would spend their entire tick budget
+    // exercising the transient axes alone while appearing to carry permanent corruption. n=3 is the
+    // smallest size that can host it (quorum 2, `f` 1), so the 2-slot folds onto 3; the other four
+    // sizes keep their draw, which is why only the seeds that drew two voters change schedule at all.
+    // This is the size-side counterpart of the argument the TRANSIENT misdirect rate carries in
+    // `chaos_storage_faults`: a misdirected read never removes a correct copy, so it is quorum-safe at
+    // any size and needs no such constraint.
+    //
+    // Keyed on the RECONFIG axis alone, which genuinely masks permanent corruption and is its own
+    // deterministic baseline. DELIBERATELY NOT on `VOPR_NO_PERM`: that is a SHRINK mask, and a shrink
+    // mask must never move the schedule — every `VOPR_NO_*` mask only zeroes an already-drawn result
+    // so a masked repro replays the exact same run. A `VOPR_NO_PERM` run therefore keeps the size its
+    // unmasked seed chose and simply injects nothing.
+    let voting_count = if reconfig_axis {
+      voting_count
+    } else {
+      voting_count.max(3)
+    };
     // The learner count: 1..=3 NON-VOTING learners when the axis is on, none otherwise. Drawn from a
     // SEPARATE per-seed PRNG (`seed ^ LEARNER_SEED_MAGIC`), NOT the action stream `self.prng`, so with
     // the axis OFF no draw is consumed and `node_count` equals `voting_count` — the default per-seed
@@ -1787,7 +1847,7 @@ impl Vopr {
       learner_repairs_seen: vec![0; node_count],
       learner_crash_until: 0,
       learner_crashed: None,
-      reconfig_axis: env_flag("VOPR_RECONFIG"),
+      reconfig_axis,
       reconfig_actions: 0,
       epoch_view: EpochViewMonotonicChecker::new(node_count),
       membership: MembershipMonotonicChecker::new(),
@@ -2051,6 +2111,9 @@ impl Vopr {
     // replica's whole log would make recovery arbitrarily slow under the other concurrent faults.
     // To keep a shrink run on the SAME PRNG stream, draws stay in their original order/condition; the
     // env masks only ZERO the already-drawn result, never skip a draw.
+    // These rates are only meaningful because the run's VOTING SET can absorb what they destroy: a
+    // permanent fault removes a durable copy for good, so a cluster hosting this axis needs `f =
+    // n − quorum(n) >= 1`, which the size draw guarantees by never running two voters here.
     let permanent = self.prng.chance(1, 3);
     let read = self.prng.below(40) as u32;
     let (torn, rot) = if permanent {
@@ -3778,6 +3841,14 @@ impl Vopr {
       .map(|i| c.wal_torn_headers_fired(i))
       .sum();
     self.report.torn_headers_fired = self.report.torn_headers_fired.max(th);
+    // Durability-bound witness: how many permanent body-fault rolls the cluster-wide budget refused
+    // because admitting them would have destroyed one op's durable copy on more than `f` replicas.
+    // Monotone within a budget, and taken as a high-water like `torn_headers_fired` so a mid-run
+    // reseed (which legitimately starts a fresh, empty budget over fresh media) can never lower it.
+    self.report.permanent_faults_refused = self
+      .report
+      .permanent_faults_refused
+      .max(c.permanent_faults_refused());
     // Genuine-WRAP witness: a BOUNDED seed whose committed FRONTIER passed its ring size `N` has had an
     // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
     // once true. Trivially false on an unbounded seed (`wal_capacity` is `None`).

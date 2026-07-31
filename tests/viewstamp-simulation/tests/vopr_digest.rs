@@ -194,6 +194,13 @@ fn report_digest(r: &VoprReport) -> u64 {
     // so the counter is identically zero on the default schedule, and an accidental off-axis
     // engagement would rebuild endpoints mid-run and perturb the applied/committed columns
     // regardless.
+    // The durability-bound witness (permanent_faults_refused) is NOT folded either, but for a
+    // different reason than the axis-gated ones above: it is NOT zero on the default schedule — the
+    // permanent storage-fault axis is always on, and the cross-replica bound genuinely refuses rolls
+    // on the seeds that draw small clusters. It stays out because a refusal only spares durable bytes,
+    // which this run may never read back, so the counter can move while nothing observable moves;
+    // folding it would make this hash differ between checkouts for a non-behavioural reason. The
+    // lanes that assert it non-zero read the counter directly in the vopr sweep instead.
   ] {
     fnv1a_u64(&mut h, v);
   }
@@ -232,10 +239,20 @@ fn report_digest(r: &VoprReport) -> u64 {
 /// are untouched, as they must be — the block-lane plumbing added alongside is inert with both block
 /// axes off (no job is held, no barrier fails, no read is faulted), and those witnesses are
 /// deliberately NOT folded here for exactly that reason.
+///
+/// Seeds 0, 1 and 2's REPORT digests were re-pinned when the permanent-corruption axis stopped
+/// drawing two-voter clusters. Those three seeds drew two voters — the voting count is the FIRST
+/// draw off the run's `Prng`, so which seeds are affected is a pure function of the seed — and now
+/// run three, which moves `replicas` and every counter that depends on how much a bigger cluster
+/// gets done inside the fixed tick budget. It is a genuine schedule change, not a schema change, and
+/// exactly the seeds that drew two voters move: seed 3 draws five and is byte-identical in BOTH
+/// columns, which is the control that no other consumer of the stream shifted. All four
+/// APPLIED-history digests are untouched and could not have moved — [`applied_digest`] builds its own
+/// fixed three-replica cluster and never consults the driver's size draw.
 const BASELINE_DIGESTS: &[(u64, u64, u64)] = &[
-  (0, 0x3011_cd95_7970_09d6, 0x5c5d_df1a_e170_2f0f),
-  (1, 0x8180_484c_aaf2_15a4, 0x8bf2_5d5b_c5ec_0fc0),
-  (2, 0x27fd_ef6b_3b83_c631, 0x02ba_1540_e115_c519),
+  (0, 0x3011_cd95_7970_09d6, 0x8470_2118_e2d7_4ad4),
+  (1, 0x8180_484c_aaf2_15a4, 0xd7f8_a26b_f9db_899e),
+  (2, 0x27fd_ef6b_3b83_c631, 0x13d2_bb6f_f6de_eb40),
   (3, 0x94d1_3cab_40a7_0dc2, 0x316a_24d0_9351_bf84),
 ];
 

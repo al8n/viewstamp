@@ -1,6 +1,8 @@
 //! VOPR sweep: the seeded adversarial driver (`run_vopr`) over a seed range, asserting no panics.
 //!
-//! Each seed builds a fresh cluster (size 2..=6 — including even N and the N=2 unanimous-quorum case)
+//! Each seed builds a fresh cluster (size 3..=6, including even N; the N=2 unanimous-quorum case is
+//! drawn only by the reconfig sweep, the one lane that masks permanent corruption, since a two-voter
+//! quorum cannot absorb a permanently destroyed durable copy)
 //! and explores a randomized adversarial schedule WITHIN the crash-stop fault model (a quorum always
 //! survives). Adversarial axes: async WAL + async Superblock, with a crash that DISCARDS in-flight WAL
 //! appends (modelling real fsync-loss-on-crash); network reorder/drop/duplicate/delay; storage
@@ -1380,6 +1382,7 @@ fn learner_axis_is_non_vacuous() {
   let mut total_view_changes_followed = 0u64;
   let mut total_committed = 0usize;
   let mut seeds_with_view_change = 0u64;
+  let mut total_permanent_refused = 0u64;
   println!(
     "VOPR learner sweep: 0..{LEARNER_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, learner axis \
      forced on"
@@ -1390,6 +1393,7 @@ fn learner_axis_is_non_vacuous() {
     total_repairs += r.learner_repairs_served();
     total_view_changes_followed += r.learner_view_changes_followed();
     total_committed += r.max_committed();
+    total_permanent_refused += r.permanent_faults_refused();
     if r.max_view() >= 1 {
       seeds_with_view_change += 1;
     }
@@ -1428,11 +1432,27 @@ fn learner_axis_is_non_vacuous() {
     "no learner-sweep seed drove a view change — the view-following path this lane guards never came \
      under test"
   );
+  // The cross-replica DURABILITY BOUND is non-vacuous on this lane, and this is the lane that carries
+  // the widest margin of any that assert it. No seed here runs a unanimous quorum — the permanent
+  // storage-fault axis never draws two voters — so `f` is at least 1 everywhere and a refusal takes
+  // `f + 1` media drawing a permanent fault on the SAME op. What makes that reachable often enough to
+  // rely on is the LEARNERS: every medium in the cluster is charged against the VOTING `f`, and this
+  // lane adds 1..=3 learner media on top of the voting set, so a collision has more disks to occur
+  // among than a voter-only lane offers at the same `f`. Its 64 seeds also spread the chance widest.
+  // Asserting the cross-seed sum here is what keeps the bound from silently decaying into dead code:
+  // without it a change that stopped the budget refusing anything would leave every sweep green.
+  assert!(
+    total_permanent_refused > 0,
+    "the cross-replica durability bound refused nothing across the sweep \
+     (permanent_faults_refused={total_permanent_refused}) — the bound is armed but never fires, so \
+     nothing is testing that a committed op stays recoverable"
+  );
   println!(
     "VOPR learner sweep OK: learner_ops_applied={total_ops_applied} \
      learner_repairs_served={total_repairs} \
      learner_view_changes_followed={total_view_changes_followed} committed={total_committed} \
-     view_change_seeds={seeds_with_view_change}"
+     view_change_seeds={seeds_with_view_change} \
+     permanent_faults_refused={total_permanent_refused}"
   );
 }
 
@@ -1802,7 +1822,7 @@ fn replay_single_seed() {
     "vopr seed {} OK: ticks={} replicas={} clients={} max_committed={} crashes={} restarts={} \
      partitions={} heals={} calm_windows={} max_view={} all_clients_done={} \
      wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} \
-     bounded_seed_wrapped={} large_bodies={} oversized_dropped={}",
+     bounded_seed_wrapped={} large_bodies={} oversized_dropped={} permanent_faults_refused={}",
     r.seed(),
     r.ticks(),
     r.replicas(),
@@ -1821,6 +1841,7 @@ fn replay_single_seed() {
     r.bounded_seed_wrapped(),
     r.large_bodies_sent(),
     r.oversized_dropped(),
+    r.permanent_faults_refused(),
   );
 }
 
@@ -1837,16 +1858,18 @@ fn replay_single_restart_in_place_seed() {
     .unwrap_or(33);
   let r = run_vopr_with_restart_in_place(seed, DEFAULT_TICKS);
   println!(
-    "vopr restart-in-place seed {} OK: ticks={} max_committed={} in_place_restarts={} \
-     crashes={} restarts={} calm_windows={} max_view={}",
+    "vopr restart-in-place seed {} OK: ticks={} replicas={} max_committed={} in_place_restarts={} \
+     crashes={} restarts={} calm_windows={} max_view={} permanent_faults_refused={}",
     r.seed(),
     r.ticks(),
+    r.replicas(),
     r.max_committed(),
     r.in_place_restarts(),
     r.crashes(),
     r.restarts(),
     r.calm_windows(),
     r.max_view(),
+    r.permanent_faults_refused(),
   );
 }
 
@@ -1902,6 +1925,15 @@ fn restart_in_place_seed_162_stays_within_the_durability_model() {
     r.max_committed() > 0,
     "the seed must do real work, not merely survive by making no progress"
   );
+  // The bound is what turned this seed from a wedge into a clean run, so it must be observed firing
+  // here rather than inferred from the pass. Both voters ran a unanimous quorum, where `f` is 0, and
+  // the old run destroyed two durable copies of op 97 — so both of those rolls are refusals now, and
+  // this count can only be zero if the budget stopped being consulted.
+  assert!(
+    r.permanent_faults_refused() > 0,
+    "the durability bound never fired on the seed it exists to keep inside the model \
+     (permanent_faults_refused=0) — this seed now passes for some other reason"
+  );
 }
 
 /// The committed RESTART-IN-PLACE sweep: [`run_vopr_with_restart_in_place`] over
@@ -1920,6 +1952,7 @@ fn restart_in_place_seed_162_stays_within_the_durability_model() {
 fn vopr_restart_in_place_sweep_no_violations() {
   let mut total_in_place = 0u64;
   let mut total_committed = 0usize;
+  let mut total_permanent_refused = 0u64;
   println!(
     "VOPR restart-in-place sweep: 0..{RESTART_IN_PLACE_SEEDS} contiguous + \
      {RESTART_IN_PLACE_REGRESSION_SEEDS:?} pinned, {DEFAULT_TICKS} ticks each, restart-in-place + \
@@ -1929,6 +1962,7 @@ fn vopr_restart_in_place_sweep_no_violations() {
     let r = run_vopr_with_restart_in_place(seed, DEFAULT_TICKS);
     total_in_place += r.in_place_restarts();
     total_committed += r.max_committed();
+    total_permanent_refused += r.permanent_faults_refused();
   }
   // Non-vacuity: endpoints really were rebuilt over live storage, and the runs did real work.
   assert!(
@@ -1940,8 +1974,29 @@ fn vopr_restart_in_place_sweep_no_violations() {
     total_committed > 0,
     "the restart-in-place sweep committed no ops at all — the driver is not exercising the protocol"
   );
+  // The cross-replica DURABILITY BOUND is non-vacuous here too, and this is the lane that most needs
+  // it: a rebuilt endpoint loses its warm log, so it must re-read the medium — the one path on which
+  // a destroyed durable copy actually decides the outcome.
+  //
+  // This lane carries the THINNEST margin of any that assert the bound, and the reason is structural.
+  // It runs voters only, so the media a permanent fault can land on ARE the voting set, and no seed
+  // here runs a unanimous quorum (the permanent axis never draws two voters), so `f` is at least 1
+  // everywhere. A refusal therefore needs `f + 1` replicas to draw a permanent fault on the SAME op,
+  // which is rare: only a handful of seeds contribute, a few refusals each. The assertion is EMPIRICAL
+  // — the seed set is fixed rather than env-overridable, so the sum is a stable fact of this seed
+  // list, not a coin flip — but it is no longer structurally certain the way a unanimous quorum made
+  // it. It still fails LOUDLY for the failure it exists to catch: if the budget stops being consulted
+  // every contributing seed drops to zero together. What it no longer tolerates is being assumed
+  // through an unrelated schedule change — a change that moves these seeds must RE-MEASURE this sum
+  // rather than trust that it stayed positive.
+  assert!(
+    total_permanent_refused > 0,
+    "the cross-replica durability bound refused nothing across the sweep \
+     (permanent_faults_refused={total_permanent_refused}) — the bound is armed but never fires, so \
+     nothing is testing that a committed op stays recoverable"
+  );
   println!(
     "VOPR restart-in-place sweep OK: in_place_restarts={total_in_place} \
-     committed={total_committed}"
+     committed={total_committed} permanent_faults_refused={total_permanent_refused}"
   );
 }
