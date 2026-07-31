@@ -192,8 +192,16 @@ fn report_digest(r: &VoprReport) -> u64 {
 /// digests were re-pinned because the retired `sync_chunk_transfers` observability counter (always 0
 /// off-axis, an artefact of the removed over-frame chunked path) was dropped from the report fold; its
 /// removal shifts the FNV-folded report hash without any behavioural change.
+///
+/// Seed 0's REPORT digest was re-pinned once more when block work left the consensus pump. The
+/// ingress and timer paths no longer execute a checkpoint's block writes, so its superblock write is
+/// submitted one storage step later and the run does marginally less inside its fixed tick budget:
+/// exactly two of the report's counters move, `max_committed` 724 -> 723 and `prepare_batches_sent`
+/// 456 -> 409. That is the intended consequence of the change, and it is bounded — all four
+/// APPLIED-history digests stay byte-identical (what gets applied is unchanged, there is simply one
+/// fewer op inside the budget), seeds 1-3's report digests are untouched, and no oracle fires.
 const BASELINE_DIGESTS: &[(u64, u64, u64)] = &[
-  (0, 0x3011_cd95_7970_09d6, 0x5310_fabf_544b_7a19),
+  (0, 0x3011_cd95_7970_09d6, 0xe92c_4ebb_0e1d_332f),
   (1, 0x8180_484c_aaf2_15a4, 0x704d_dc76_945b_97c0),
   (2, 0x27fd_ef6b_3b83_c631, 0x07a5_5860_35bf_4bf9),
   (3, 0x94d1_3cab_40a7_0dc2, 0x0249_a3f9_dcb7_b704),

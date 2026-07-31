@@ -3049,6 +3049,7 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
       Bytes::new(),
     )),
   );
+  r.run_block_lane(now, &mut sb, &mut blocks);
   assert!(
     r.install_flush_retry_owed(),
     "the faulted flush retains the verified install for a local retry"

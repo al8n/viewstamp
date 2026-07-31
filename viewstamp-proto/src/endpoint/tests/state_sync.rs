@@ -1374,6 +1374,9 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
     wal.entries.contains_key(&1) && wal.entries.contains_key(&2),
     "the WAL is NOT pruned at STAGE (the destructive prune is deferred to the install)"
   );
+  // Run the staged install's durability barrier off the pump; only its clean completion submits the
+  // snapshot write (step 1).
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   // Complete step 1 (snapshot durable → root submitted), still NO install (the root is now in flight).
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
@@ -1499,6 +1502,9 @@ fn state_sync_view_change_defers_while_a_re_persist_root_is_staged() {
       Bytes::new(),
     )),
   );
+  // Run the staged install's durability barrier off the pump; only its clean completion submits the
+  // snapshot write.
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   // Advance step 1 (snapshot durable → root submitted) but withhold the ROOT (it stays in flight).
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
@@ -6786,6 +6792,8 @@ fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
 
   assert_eq!(
     e.state_syncs_applied(),
@@ -6977,6 +6985,8 @@ fn laggard_owing_sm_reconstruct_at_m() -> (
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
 
   assert_eq!(
     e.state_syncs_applied(),
@@ -7136,8 +7146,10 @@ fn laggard_owing_two_leaf_at_m(
   );
   assert!(e.pending_install.is_some(), "M staged");
 
-  // Corrupt the TARGETED leaf, then drive the two-write re-persist: install_sync's restore faults on it.
+  // Corrupt the TARGETED leaf, then drive the barrier + the two-write re-persist: install_sync's
+  // restore faults on it.
   blocks.insert_raw(corrupt, Bytes::copy_from_slice(b"post-stage-corruption"));
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   sb.flush();

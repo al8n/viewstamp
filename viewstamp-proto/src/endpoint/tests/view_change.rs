@@ -2775,6 +2775,9 @@ fn the_new_primary_re_drives_skipped_adoptions_when_its_view_root_lands() {
     )),
   );
   assert_eq!(e.commit(), OpNumber::with(8), "the view-0 band is applied");
+  // The commit crossed the checkpoint boundary and issued the materialize; run the storage step so the
+  // completed DAG submits its snapshot write.
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     sb.has_inflight(),
     "precondition: the checkpoint snapshot write is in flight"

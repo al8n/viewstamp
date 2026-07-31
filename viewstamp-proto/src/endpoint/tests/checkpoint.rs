@@ -1454,3 +1454,373 @@ fn async_cancellation_of_a_live_ops_write_degrades_to_a_resubmit() {
     "nothing lingers once the retried append quiesced"
   );
 }
+
+/// A `Normal` backup of a 3-voter cluster with a two-op checkpoint interval — the fixture the
+/// block-job falsifiers below drive. A BACKUP is used deliberately: it applies its committed prefix
+/// from an incoming `Commit`, so the checkpoint it triggers is issued on the INGRESS path, where the
+/// endpoint runs no block work of its own. That is what lets a test hold the materialize.
+fn backup_checkpointing_every(ops: u64) -> Endpoint<EchoSm> {
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::with_checkpoint_ops(1, MemberId::new(1), ops).expect("valid cluster config"),
+    genesis(3),
+    0,
+    EchoSm,
+    u64::MAX,
+  )
+}
+
+/// Accept `[1..=op]` and commit through `commit`, driving the WAL to durability in between so the
+/// backup's appends quiesce.
+fn accept_and_commit(
+  e: &mut Endpoint<EchoSm>,
+  wal: &mut TestWal,
+  sb: &mut StepSb,
+  blocks: &mut crate::block_store::InMemoryBlockStore,
+  ops: core::ops::RangeInclusive<u64>,
+  commit: u64,
+) {
+  let now = Instant::ZERO;
+  for op in ops {
+    e.handle_message(now, wal, sb, blocks, primary_peer(), prepare(op, 0));
+  }
+  e.handle_storage(now, wal, sb, blocks);
+  e.handle_message(
+    now,
+    wal,
+    sb,
+    blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(commit),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+}
+
+#[test]
+fn commits_advance_while_a_checkpoint_materialize_is_still_being_written() {
+  // ANTI-STALL. The whole point of the job seam: writing a checkpoint's block DAG is storage work,
+  // not consensus work, so the pump must keep committing while it runs. Before the seam this test
+  // could not even be expressed — `force_checkpoint` materialized both DAGs, flushed, and submitted
+  // the superblock write in ONE synchronous call inside the commit, so there was no interval during
+  // which a materialize was outstanding and no job to hold.
+  //
+  // Here the driver's storage lane TAKES the job and does not execute it (a slow disk), and the
+  // backup keeps accepting and applying ops the whole time.
+  let mut e = backup_checkpointing_every(2);
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+
+  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the interval boundary is applied"
+  );
+
+  // The lane takes the job. ANTI-VACUITY: a materialize really is outstanding — this is the
+  // precondition the rest of the test is meaningless without.
+  let job = e
+    .poll_block_job()
+    .expect("crossing the checkpoint boundary issues the materialize");
+  assert_eq!(
+    job.tag(),
+    crate::BlockJobTag::Materialize,
+    "the queued job is the checkpoint's DAG write"
+  );
+  assert!(
+    e.has_inflight_storage(),
+    "the held materialize counts as outstanding durability work"
+  );
+  assert!(
+    !sb.has_inflight(),
+    "no superblock write exists yet — the pointer may not name blocks that are not flushed"
+  );
+
+  // CONSENSUS PROGRESS WHILE IT IS HELD: accept + commit two more ops purely through the ingress
+  // path, and observe the endpoint still answering.
+  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 3..=4, 4);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(4),
+    "commits advanced past the boundary while the materialize was still being written"
+  );
+  assert!(
+    core::iter::from_fn(|| e.poll_message()).count() > 0,
+    "the replica kept answering its primary while the materialize was outstanding"
+  );
+  // ANTI-VACUITY (the second half): the job was STILL unexecuted across all of that — the progress
+  // above genuinely overlapped the write rather than following it.
+  assert!(
+    e.has_inflight_storage(),
+    "the materialize is still outstanding after the commits advanced"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(0),
+    "and no checkpoint was published while its blocks were unwritten"
+  );
+
+  // Now the lane finishes. Only THEN does the checkpoint's superblock write appear.
+  let mut cursor = crate::BlockJobCursor::new();
+  let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
+  e.on_block_done(now, &mut sb, done);
+  assert!(
+    sb.has_inflight(),
+    "the completed+flushed DAG releases the snapshot write"
+  );
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "the checkpoint publishes once its blocks are durable"
+  );
+}
+
+#[test]
+fn a_materialize_that_crosses_a_view_change_is_superseded_and_never_published() {
+  // SUPERSESSION. A checkpoint abandoned by a view transition while its DAG was being written must
+  // publish NOTHING when the write finally lands: its completion carries roots for a checkpoint the
+  // endpoint no longer owns, and naming them would advance the durable pointer off a generation the
+  // replica abandoned.
+  let mut e = backup_checkpointing_every(2);
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+
+  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  let job = e
+    .poll_block_job()
+    .expect("crossing the checkpoint boundary issues the materialize");
+  let durable_before = sb.state().checkpoint_op();
+
+  // A VIEW CHANGE fires while the DAG is being written: this backup's own idle timeout proposes
+  // view 1 and a peer's StartViewChange completes the quorum.
+  let later = now + core::time::Duration::from_millis(300);
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "ANTI-VACUITY: the transition really happened while the materialize was in flight"
+  );
+  assert_eq!(
+    e.block_jobs_superseded(),
+    0,
+    "nothing has been dropped yet — the job has not completed"
+  );
+
+  // The lane finishes AFTER the transition. Its result must be refused.
+  let mut cursor = crate::BlockJobCursor::new();
+  let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
+  e.on_block_done(later, &mut sb, done);
+  assert_eq!(
+    e.block_jobs_superseded(),
+    1,
+    "ANTI-VACUITY: the superseded completion really was refused here, not merely absent"
+  );
+  assert!(
+    e.pending_checkpoint.is_none(),
+    "no checkpoint write was submitted for the abandoned checkpoint (the only write in flight is \
+     the transition's own durable-view root)"
+  );
+  assert!(
+    e.pending_sb.is_some(),
+    "ANTI-VACUITY: the transition's durable-view write IS in flight, so the superblock was reachable \
+     — the checkpoint's absence is a refusal, not an unreachable superblock"
+  );
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    durable_before,
+    "the durable checkpoint pointer never moved"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(0),
+    "and the in-memory pointer never regressed or advanced"
+  );
+}
+
+/// Drive a backup to a DURABLE checkpoint, then hand back two freshly issued block jobs (two GC
+/// sweeps over the live roots) plus the parts. Two OUTSTANDING jobs is the precondition every
+/// issue-order falsifier needs, and it is asserted at every use.
+fn two_outstanding_block_jobs() -> (
+  Endpoint<EchoSm>,
+  TestWal,
+  StepSb,
+  crate::block_store::InMemoryBlockStore,
+  BlockJob<EchoSm>,
+  BlockJob<EchoSm>,
+) {
+  let mut e = backup_checkpointing_every(2);
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "precondition: a durable checkpoint establishes the live GC roots"
+  );
+  while e.poll_block_job().is_some() {} // drain the post-root sweep the completion queued
+  e.gc_blocks_for_test();
+  e.gc_blocks_for_test();
+  let first = e.poll_block_job().expect("the first sweep is queued");
+  let second = e.poll_block_job().expect("the second sweep is queued");
+  assert_ne!(
+    first.id(),
+    second.id(),
+    "precondition: two DISTINCT jobs are outstanding"
+  );
+  (e, wal, sb, blocks, first, second)
+}
+
+#[test]
+fn the_storage_lane_executes_block_jobs_in_issue_order() {
+  // CONTROL ARM for the two falsifiers below: in issue order, both the lane's cursor and the
+  // endpoint's completion gate accept the pair. Without this the `should_panic` arms could pass for
+  // the wrong reason (any panic, from any cause).
+  let (mut e, _wal, mut sb, mut blocks, first, second) = two_outstanding_block_jobs();
+  let mut cursor = crate::BlockJobCursor::new();
+  let d1 = crate::execute_block_job(&mut cursor, first, &mut blocks);
+  let d2 = crate::execute_block_job(&mut cursor, second, &mut blocks);
+  e.on_block_done(Instant::ZERO, &mut sb, d1);
+  e.on_block_done(Instant::ZERO, &mut sb, d2);
+  assert!(
+    !e.has_inflight_storage(),
+    "both jobs retired, so the endpoint owes no storage work"
+  );
+}
+
+#[test]
+#[should_panic(expected = "block job executed out of issue order")]
+fn a_storage_lane_that_executes_out_of_issue_order_fails_stop() {
+  // THE DRIVER-CONTRACT FALSIFIER. Serial execution in issue order is a storage-SAFETY obligation,
+  // not a convenience: a sweep carrying one generation's live roots, run after the next generation's
+  // materialize, frees the very blocks the next durable root is about to name. A lane that reorders
+  // is CAUGHT here, before the second job touches the store — never tolerated.
+  let (_e, _wal, _sb, mut blocks, first, second) = two_outstanding_block_jobs();
+  let mut cursor = crate::BlockJobCursor::new();
+  let _ = crate::execute_block_job(&mut cursor, second, &mut blocks);
+  let _ = crate::execute_block_job(&mut cursor, first, &mut blocks);
+}
+
+#[test]
+#[should_panic(expected = "block job completion out of issue order")]
+fn a_storage_lane_that_delivers_completions_out_of_order_fails_stop() {
+  // The endpoint's half of the same contract: even a lane that EXECUTES in order must deliver the
+  // completions in order, because the endpoint's correlation decisions (publish this checkpoint,
+  // retire that obligation) are sequenced against the issue order it minted.
+  let (mut e, _wal, mut sb, mut blocks, first, second) = two_outstanding_block_jobs();
+  let mut cursor = crate::BlockJobCursor::new();
+  let d1 = crate::execute_block_job(&mut cursor, first, &mut blocks);
+  let d2 = crate::execute_block_job(&mut cursor, second, &mut blocks);
+  e.on_block_done(Instant::ZERO, &mut sb, d2);
+  let _ = d1;
+}
+
+#[test]
+fn a_block_job_completion_from_a_dead_incarnation_is_refused_and_counted() {
+  // THE INCARNATION CHOKE, on the block-job lane. Two endpoints built over the same storage mint
+  // their correlation sequences INDEPENDENTLY from 1, so a dead instance's completion can carry the
+  // exact sequence number the live instance has outstanding. Driven identically, these two reach the
+  // checkpoint boundary having minted the SAME sequence — so without the incarnation check the dead
+  // endpoint's materialize would answer the live endpoint's, publishing a checkpoint root naming a
+  // DAG that was written into another store entirely.
+  let build = || {
+    let e = backup_checkpointing_every(2);
+    (
+      e,
+      TestWal::default(),
+      StepSb::default(),
+      crate::block_store::InMemoryBlockStore::new(),
+    )
+  };
+  let (mut dead, mut dead_wal, mut dead_sb, mut dead_blocks) = build();
+  let (mut live, mut live_wal, mut live_sb, mut live_blocks) = build();
+  let now = Instant::ZERO;
+  accept_and_commit(
+    &mut dead,
+    &mut dead_wal,
+    &mut dead_sb,
+    &mut dead_blocks,
+    1..=2,
+    2,
+  );
+  accept_and_commit(
+    &mut live,
+    &mut live_wal,
+    &mut live_sb,
+    &mut live_blocks,
+    1..=2,
+    2,
+  );
+  let dead_job = dead
+    .poll_block_job()
+    .expect("the dead instance's materialize");
+  let live_job = live
+    .poll_block_job()
+    .expect("the live instance's materialize");
+  // ANTI-VACUITY: the ids genuinely ALIAS on the sequence and differ only in the incarnation, which
+  // is exactly the case the choke exists for.
+  assert_eq!(
+    dead_job.id().seq(),
+    live_job.id().seq(),
+    "the two instances minted the same correlation sequence"
+  );
+  assert_ne!(
+    dead_job.id().incarnation(),
+    live_job.id().incarnation(),
+    "but different incarnations"
+  );
+
+  let mut cursor = crate::BlockJobCursor::new();
+  let foreign = crate::execute_block_job(&mut cursor, dead_job, &mut dead_blocks);
+  assert_eq!(live.foreign_completions_rejected(), 0);
+  live.on_block_done(now, &mut live_sb, foreign);
+  assert_eq!(
+    live.foreign_completions_rejected(),
+    1,
+    "the foreign completion was refused at the choke and counted"
+  );
+  assert!(
+    !live_sb.has_inflight(),
+    "and it published nothing: no checkpoint write was submitted off it"
+  );
+  assert!(
+    live.has_inflight_storage(),
+    "the live endpoint's own materialize is still owed — the refusal did not retire it"
+  );
+
+  // The live endpoint's OWN completion still lands, proving the refusal was surgical.
+  let mut live_cursor = crate::BlockJobCursor::new();
+  let own = crate::execute_block_job(&mut live_cursor, live_job, &mut live_blocks);
+  live.on_block_done(now, &mut live_sb, own);
+  assert!(
+    live_sb.has_inflight(),
+    "its own materialize publishes the checkpoint write"
+  );
+}
