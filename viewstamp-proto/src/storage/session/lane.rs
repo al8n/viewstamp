@@ -63,6 +63,12 @@ impl<S: StateMachine> LaneFront<S> {
     !self.outstanding.is_empty()
   }
 
+  /// How many completions the lane owes — queued or executing, every kind.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn outstanding_len(&self) -> usize {
+    self.outstanding.len()
+  }
+
   /// Whether the lane already holds an un-consumed image capture.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn materialize_owed(&self) -> bool {

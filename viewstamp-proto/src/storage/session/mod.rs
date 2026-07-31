@@ -17,17 +17,23 @@
 //! - **appends** — the slot-quiescence fence: at most one in-flight write per physical ring slot
 //!   ([`Storage::submit_append`] returns [`AppendSubmission::SlotFenced`] otherwise), so the append
 //!   ledger never exceeds the ring capacity;
-//! - **durable roots** — the one-deep pipeline: at most one root with the backend
-//!   ([`Storage::submit_root`] parks the rest in queue order), and forfeiture
-//!   ([`Storage::forfeit_root`]) keeps the parked queue within the live correlations;
+//! - **durable roots** — the CONSTANT-depth timeline: at most one root with the backend
+//!   ([`Storage::submit_root`] parks the rest in queue order), at most [`MAX_INFLIGHT_ROOTS`]
+//!   entries on the whole timeline (asserted at the submission choke in every profile) —
+//!   supersession forfeits a live correlation's replaced root ([`Storage::forfeit_root`]) and
+//!   endpoint construction collapses every parked leftover of the dead incarnations
+//!   ([`Storage::collapse_parked_roots`]), so the depth never scales with the rebuild count;
 //! - **checkpoint envelopes** — the one-outstanding fence: at most one envelope write on the
 //!   medium ([`Storage::submit_checkpoint`] returns [`CheckpointSubmission::EnvelopeFenced`]
 //!   otherwise);
 //! - **block jobs** — the lane front's per-kind admission quotas (one image capture, one frontier
-//!   walk, the serve cap).
+//!   walk, the serve cap), which cap the lane's total depth at the serve cap plus a small
+//!   per-obligation constant.
 //!
-//! Each bound has a per-tick oracle in the simulation (the backend asserts and the boundedness
-//! checker), so a caller change that would re-open a lane trips a sweep instead of growing quietly.
+//! Each bound is a CONSTANT — independent of ops, views, time, and the endpoint rebuild count —
+//! and each has a per-tick oracle in the simulation (the backend asserts and the boundedness
+//! checker), so a caller change that would re-open a lane trips a sweep instead of growing
+//! quietly.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::vec::Vec;
@@ -56,6 +62,20 @@ mod tests;
 /// incarnation — so the medium ledger must key by the full pair or a successor's write could alias
 /// a predecessor's.
 type SessionKey = (u64, u64);
+
+/// The CONSTANT depth cap of the durable-root timeline, asserted at the submission choke:
+/// the submitted front (at most one root is ever with the backend — possibly a dead
+/// predecessor's, owed to the medium until it lands) plus the live endpoint's two awaited
+/// roots (its one durable-view write and its one checkpoint root — each a single-slot
+/// correlation whose re-submission forfeits the root it supersedes).
+///
+/// Independent of the endpoint rebuild count by construction: a rebuild collapses every parked
+/// root of the dead incarnations at endpoint construction ([`Storage::collapse_parked_roots`]),
+/// so dead incarnations contribute at most the submitted front. A fourth entry therefore has no
+/// author — it is a caller that either leaked a correlation or grew a third one — and the
+/// submission assert refuses it fail-stop rather than letting a leak grow the timeline (and this
+/// ledger, each entry cloning a header-bearing state) by one root per view-change window.
+const MAX_INFLIGHT_ROOTS: usize = 3;
 
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn key(id: WriteId) -> SessionKey {
@@ -205,12 +225,15 @@ pub struct Storage<W, B, S: StateMachine> {
   /// the landings ahead of it settle, so a conforming backend that is merely slow holds one root
   /// write, never a backlog. Parked or submitted, an entry is a committed point on the timeline:
   /// the effective root includes it, and quiescence ([`Self::has_inflight`],
-  /// [`Self::into_parts`]) waits for it — unless its submitter FORFEITS it
-  /// ([`Self::forfeit_root`]), which removes a parked entry the moment no correlation awaits it.
-  /// Forfeiture is what keeps the queue itself constant-bounded: a live endpoint awaits at most
-  /// two roots at a time (its durable-view write and its checkpoint root), so the queue holds the
-  /// front, the awaited roots, and at most the awaited pair of each dead incarnation that ended
-  /// with correlations in flight — each of those drains at a landing.
+  /// [`Self::into_parts`]) waits for it — unless it is FORFEITED: supersession removes a live
+  /// correlation's replaced parked root the moment nothing awaits it ([`Self::forfeit_root`]),
+  /// and endpoint construction collapses every parked leftover of the dead incarnations
+  /// ([`Self::collapse_parked_roots`] — a rebuild is the one moment "no live correlation awaits
+  /// any parked entry" is a structural fact rather than a caller promise). Together those keep
+  /// the timeline at a CONSTANT depth — the front plus the live endpoint's two awaited roots,
+  /// never a function of the rebuild count — and [`Self::submit_root`] asserts that cap
+  /// ([`MAX_INFLIGHT_ROOTS`]) in every profile, so a caller that leaks a correlation is refused
+  /// fail-stop instead of growing this ledger by one header-bearing state per view-change window.
   roots: VecDeque<(WriteId, VsrState)>,
   /// How many entries at the FRONT of [`Self::roots`] have been handed to
   /// [`Superblock::submit_write`] — `0` or `1`, never more: the physical root pipeline is one
@@ -352,11 +375,12 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
   }
 
   /// The number of durable-root writes on the in-flight timeline — the submitted front plus every
-  /// parked entry behind it.
+  /// parked entry behind it. Never exceeds [`MAX_INFLIGHT_ROOTS`]: the submission choke asserts
+  /// the constant cap, supersession forfeits replaced roots, and endpoint construction collapses
+  /// the dead incarnations' parked leftovers.
   ///
-  /// Exposed for the simulation boundedness checker: the submission gate keeps the backend at one
-  /// outstanding root, and forfeiture keeps this queue within the live endpoint's awaited roots
-  /// plus any dead incarnation's leftovers. Not part of the stable API.
+  /// Exposed for the simulation boundedness checker, which independently re-asserts the constant
+  /// per tick. Not part of the stable API.
   #[doc(hidden)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn roots_in_flight(&self) -> usize {
@@ -374,6 +398,20 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn checkpoints_in_flight(&self) -> usize {
     self.checkpoints.len()
+  }
+
+  /// The number of block jobs the lane owes completions for — queued or executing, every kind.
+  ///
+  /// Bounded by the per-kind admission quotas plus the obligations that issue the unquota'd
+  /// kinds: at most one image capture and one frontier walk (the lane's own quotas), the serve
+  /// cap, and a small constant of flush/sweep/reconstruct jobs (each issued under a single-slot
+  /// endpoint obligation and serialized by the lane's own drain). Exposed for the simulation
+  /// boundedness checker, which asserts a constant bound per tick — the oracle that the lane's
+  /// depth is genuinely capped rather than argued. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn block_jobs_in_flight(&self) -> usize {
+    self.lane.outstanding_len()
   }
 
   /// Test-only escape hatch to the raw WAL handle, for fixture knobs (staging, landing order,
@@ -614,6 +652,16 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
       self.roots_submitted = 1;
     }
     self.roots.push_back((id, state));
+    // The constant depth cap, enforced AT the choke in every profile: the push above is refused
+    // (fail-stop, like the no-rewind asserts — the caller's correlation state already assumes the
+    // submission) rather than admitted as a fourth entry no live correlation can account for. See
+    // [`MAX_INFLIGHT_ROOTS`] for why three is the whole timeline.
+    assert!(
+      self.roots.len() <= MAX_INFLIGHT_ROOTS,
+      "the durable-root timeline exceeded its constant depth ({} > {MAX_INFLIGHT_ROOTS}) — a \
+       submitter leaked a root correlation instead of forfeiting or collapsing it",
+      self.roots.len(),
+    );
   }
 
   /// Hand the next queued root to the backend once nothing is outstanding. Runs after every root
@@ -651,6 +699,29 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     {
       self.roots.remove(self.roots_submitted + at);
     }
+  }
+
+  /// Remove EVERY parked root from the timeline — the endpoint-construction collapse, called by
+  /// `Endpoint::recover` before it baselines on this session. The submitted front (if any) stays:
+  /// it is with the backend and owed to the medium until it lands.
+  ///
+  /// At endpoint construction every parked entry is DISOWNED as a structural fact, not a caller
+  /// promise: the session serves one endpoint at a time, the constructing one has minted nothing
+  /// yet, so whoever submitted a parked root is dead and awaits nothing. Removal is then sound
+  /// entry-by-entry for exactly [`Self::forfeit_root`]'s reasons — the backend never saw the
+  /// write, no completion can ever name it, and the retained entries are a subsequence of a
+  /// monotone queue, so no landing rewinds another. The effective root steps back to the
+  /// submitted front (or the landed root), which is precisely what a crash restart would recover
+  /// PLUS the still-owed front — every promise the dead incarnation made was gated on landings,
+  /// never on parked writes, so nothing durable-licensed is retracted.
+  ///
+  /// This collapse is what makes the timeline's constant depth ([`MAX_INFLIGHT_ROOTS`])
+  /// independent of the rebuild count: without it, every incarnation that died awaiting roots
+  /// behind a slow front would leave its parked pair queued, and a driver rebuilding endpoints
+  /// faster than the backend lands roots would grow the timeline — and the backend's eventual
+  /// service queue — without bound, each entry holding a full header-bearing state.
+  pub(crate) fn collapse_parked_roots(&mut self) {
+    self.roots.truncate(self.roots_submitted);
   }
 
   /// Fenced checkpoint-envelope submission — the ONLY route to

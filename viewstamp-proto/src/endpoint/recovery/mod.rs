@@ -614,6 +614,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `on_sb_done` absorbs it (the durable-view lift, the configuration adoption, the inherited
     // checkpoint frontier). With no root in flight (every recovery after a real process death —
     // the queue died with the process) the two roots are one value and nothing here changes.
+    //
+    // FIRST, collapse every PARKED root on the timeline. Construction is the one moment at which
+    // "no live correlation awaits any parked entry" is a structural fact — the session serves one
+    // endpoint at a time and this one has minted nothing yet — so whoever parked a root is dead,
+    // and a parked root was never handed to the medium (no completion can ever name it, nothing
+    // physical exists for quiescence to wait on). Baselining on it would be baselining on state
+    // only a dead endpoint ever promised to write; keeping it queued would let a driver that
+    // rebuilds endpoints faster than the backend lands roots grow the timeline without bound (one
+    // or two parked roots per dead incarnation, each a full header-bearing state). Collapsing
+    // reduces the timeline to what a crash restart would recover PLUS the still-owed submitted
+    // front — every schedule this produces, a crash at the same point also produces, minus the
+    // front the medium still owes either way.
+    storage.collapse_parked_roots();
     let landed = storage.sb().state();
     let effective = storage.effective_root();
     // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
@@ -1416,7 +1429,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `CheckpointRead` (verified against the durable root) restores the SM + client sessions and drives
   /// `recover_progress`; a `Fault` or a verify-mismatch is DISCARDED — `recover_timeouts` is the sole owner
   /// of the checkpoint retry + ABSOLUTE budget (decremented per tick), re-submitting until a valid read
-  /// lands or the budget exhausts into a peer fetch.
+  /// lands or the budget exhausts into a peer fetch. A valid read that cannot start its presence
+  /// probe because the lane still owes an inherited walk is neither restored nor discarded: it is
+  /// RETAINED as a verified obligation (`probe_deferred`) the walk's settle re-drives, outside the
+  /// read budget — deferral is not a read fault.
   pub(crate) fn on_recover_sb_done<W: Wal, B: Superblock>(
     &mut self,
     storage: &mut Storage<W, B, S>,
@@ -1491,12 +1507,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // incarnation's, but the lane's one-walk quota has the SESSION's lifetime: an endpoint
         // rebuilt over a live session inherits a predecessor's queued-or-executing walk (a transfer
         // ARQ's, or this same probe's), and admitting a second one is refused fail-stop at the
-        // lane's admission assert. Discarding the read here is the same disposition as a fault:
-        // the checkpoint stays outstanding, `recover_timeouts` re-reads on its cadence, and the
-        // inherited walk's completion — refused by the incarnation choke but settled by the lane —
-        // frees the quota for the retry's probe. (The transfer walk's issuer, `issue_walk`,
-        // observes this same gate.)
+        // lane's admission assert. The read is NOT discarded: it already VERIFIED against the
+        // durable root, so the deferral RETAINS it as an obligation (`probe_deferred`) that the
+        // inherited walk's settle re-drives directly — the completion is refused by the
+        // incarnation choke, but the lane settles it first, and that settle frees the quota this
+        // probe needs ([`Endpoint::redrive_deferred_recover_probe`]). While the obligation is
+        // held, `recover_timeouts` neither re-reads nor decrements the checkpoint budget: that
+        // budget pays for READ faults, and spending it on lane contention would exhaust it into a
+        // peer fetch while the local checkpoint is perfectly valid — on a solo deployment (or any
+        // replica with no reachable donor) a permanent wedge, since nothing re-arms the local path
+        // after the escalation. (The transfer walk's issuer, `issue_walk`, observes this same
+        // lane gate; its re-drive is the ARQ cadence, which spends no budget.)
         if storage.walk_owed() {
+          if let Some(rec) = self.recover.as_mut() {
+            rec.probe_deferred = Some((
+              state.checkpoint_id(),
+              RecoveredCheckpoint {
+                op: cr.op(),
+                sm_root,
+                sessions_root,
+              },
+            ));
+          }
           return;
         }
         let id = self.mint_job_id();
@@ -1514,6 +1546,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         );
         if let Some(rec) = self.recover.as_mut() {
           rec.reconstruct = Some(id);
+          // A retained obligation is answered by this admission: the probe it deferred is the one
+          // just enqueued (a fresh read re-verified the same durable root), so an already-settled
+          // walk must not re-drive it again behind this one.
+          rec.probe_deferred = None;
         }
       }
       SuperblockDone::Fault(_) => {
@@ -2221,15 +2257,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Snapshot the PENDING ops (the in-flight tail reads) so we can re-borrow `recover` per op while
     // iterating. Faulty ops are NOT re-read (already resolved to a peer-repaired hole).
-    let (ops, want_checkpoint, checkpoint_retries, awaiting_peer) = match self.recover.as_ref() {
-      Some(rec) => (
-        rec.pending.keys().copied().collect::<std::vec::Vec<u64>>(),
-        rec.checkpoint,
-        rec.checkpoint_retries,
-        rec.awaiting_peer_checkpoint,
-      ),
-      None => (std::vec::Vec::new(), None, 0, false),
-    };
+    let (ops, want_checkpoint, checkpoint_retries, awaiting_peer, probe_deferred) =
+      match self.recover.as_ref() {
+        Some(rec) => (
+          rec.pending.keys().copied().collect::<std::vec::Vec<u64>>(),
+          rec.checkpoint,
+          rec.checkpoint_retries,
+          rec.awaiting_peer_checkpoint,
+          rec.probe_deferred.is_some(),
+        ),
+        None => (std::vec::Vec::new(), None, 0, false, false),
+      };
     // Peer-fetch: if our own checkpoint read exhausted and we are awaiting a PEER `SyncCheckpoint`,
     // re-broadcast the `RequestSync` on this cadence (the Normal-only `sync_timeouts` does not run
     // while Recovering). A peer holding a checkpoint `>= ours` answers; until then we stay here.
@@ -2277,7 +2315,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // the count is independent of which id any fault arrives under. On exhaustion (budget zero) escalate to
     // a PEER FETCH — the durable root names a permanently-unreadable or root-inconsistent snapshot
     // (bit-rot/torn write in this replica's single durable copy), unrecoverable from local disk.
-    if want_checkpoint.is_some() {
+    //
+    // NOT while a verified read is retained as a deferred probe obligation (`probe_deferred`): the
+    // read phase already SUCCEEDED — the wait is on the inherited walk's completion, which the
+    // lane owes and whose settle re-drives the probe directly. Re-reading would only duplicate a
+    // verified result, and decrementing here would spend the READ-fault budget on lane contention:
+    // exhausted, it escalates to a peer fetch that nothing ever re-arms the local path from — on a
+    // solo replica (or any replica with no reachable donor) a permanent wedge over a perfectly
+    // valid local checkpoint, strictly worse than the wait. This mirrors the `pending_checkpoint`
+    // early-return above: an owed completion is waited on, never retried against.
+    if want_checkpoint.is_some() && !probe_deferred {
       if checkpoint_retries == 0 {
         // Permanently-unreadable OWN checkpoint: any peer at/above it subsumes ours — NOT a cross-epoch
         // crossing (no epoch target to pin), so target our own `checkpoint_op` with the requirement off.
@@ -2782,6 +2829,57 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // While Recovering the `recover_retry` cadence (not `sync_solicit`) re-drives the pull, so re-arm
     // that timer to keep the ARQ alive.
     self.arm_timers(now);
+  }
+
+  /// Re-drive a deferred cold-start presence probe the moment the lane's walk quota frees.
+  ///
+  /// Runs on every walk settle (`on_block_done`, BEFORE the incarnation choke): the walk that held
+  /// the quota is typically an inherited one — a dead incarnation's, whose completion the choke
+  /// refuses — so the settle is the ONLY event that can resume the deferred local recovery, and it
+  /// must fire on refused completions too. A no-op unless a verified obligation is actually held
+  /// (`probe_deferred`), the quota is genuinely free, and no probe/reconstruct of this incarnation
+  /// is already executing.
+  ///
+  /// The obligation carries the durable `checkpoint_id` it was verified against, and the re-drive
+  /// re-checks the durable root against it: an inherited checkpoint root landing between the
+  /// deferral and this settle moves the root to a NEWER generation, and walking the stale roots
+  /// would probe (and then restore) a checkpoint the durable root no longer names. A stale
+  /// obligation is dropped instead — the checkpoint read is still outstanding, so
+  /// `recover_timeouts` re-reads the new generation on its cadence with the budget intact (one
+  /// extra retransmit interval, never a wedge; the same one-extra-round shape as the read-time
+  /// race in `on_recover_sb_done`).
+  pub(super) fn redrive_deferred_recover_probe<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    if storage.walk_owed() {
+      return; // another walk still holds the quota — its settle re-runs this
+    }
+    let Some(rec) = self.recover.as_mut() else {
+      return;
+    };
+    if rec.reconstruct.is_some() {
+      return; // this incarnation's probe/reconstruct is already executing
+    }
+    let Some((verified_id, checkpoint)) = rec.probe_deferred.take() else {
+      return;
+    };
+    let state = storage.sb().state();
+    if state.checkpoint_op() != checkpoint.op || state.checkpoint_id() != verified_id {
+      return; // stale — an inherited root landed past it; the retry cadence re-reads
+    }
+    let id = self.mint_job_id();
+    storage.enqueue_block_job(
+      id,
+      BlockJobKind::Walk {
+        walks: super::block_sync::BlockWalks::new(checkpoint.sm_root, checkpoint.sessions_root),
+        fetched: None,
+        purpose: WalkPurpose::RecoverProbe(checkpoint),
+      },
+    );
+    if let Some(rec) = self.recover.as_mut() {
+      rec.reconstruct = Some(id);
+    }
   }
 
   /// The cold-start LOCAL presence probe completed: every block reachable from BOTH roots of this

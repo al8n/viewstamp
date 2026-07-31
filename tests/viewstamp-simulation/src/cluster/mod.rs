@@ -1350,9 +1350,9 @@ impl Cluster {
   }
 
   /// Replica `i`'s in-flight durable-root queue length — the submitted front plus every parked
-  /// entry (for the boundedness checker). The session's submission gate keeps the backend at one
-  /// outstanding root; forfeiture keeps the queue itself within the live endpoint's awaited roots
-  /// plus any dead incarnation's leftovers.
+  /// entry (for the boundedness checker). Constant at most three: the session's submission gate
+  /// keeps the backend at one outstanding root, supersession forfeits a live correlation's
+  /// replaced root, and endpoint construction collapses the dead incarnations' parked leftovers.
   pub fn replica_roots_in_flight(&self, i: usize) -> usize {
     self.storages[i].roots_in_flight()
   }
@@ -1362,6 +1362,22 @@ impl Cluster {
   /// across endpoint rebuilds and catch-up postures, because the fence reads the session ledger.
   pub fn replica_checkpoints_in_flight(&self, i: usize) -> usize {
     self.storages[i].checkpoints_in_flight()
+  }
+
+  /// Replica `i`'s block-lane depth — every job the lane owes a completion for, queued or
+  /// executing, whichever incarnation issued it (for the boundedness checker). Capped by the
+  /// lane's per-kind admission quotas plus the single-slot endpoint obligations that issue the
+  /// unquota'd kinds.
+  pub fn replica_block_jobs_in_flight(&self, i: usize) -> usize {
+    self.storages[i].block_jobs_in_flight()
+  }
+
+  /// Replica `i`'s retained checkpoint snapshot-generation count on the simulated superblock (for
+  /// the boundedness checker): the live generation, a staged root's, and the newest completed one
+  /// — at most three at any observable instant. Growth here is the relocated checkpoint backlog
+  /// the in-flight ledgers cannot see: one completed orphan retained per view/checkpoint cycle.
+  pub fn replica_retained_snapshot_generations(&self, i: usize) -> usize {
+    self.sbs[i].borrow().retained_snapshot_generations()
   }
 
   /// True iff replica `i`'s WAL PHYSICALLY holds op `op` right now — its slot is `Clean` or `Faulty`

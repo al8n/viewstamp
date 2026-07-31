@@ -578,6 +578,87 @@ fn forfeiting_the_parked_back_steps_the_effective_root_to_the_previous_entry() {
 }
 
 #[test]
+fn endpoint_construction_collapses_every_parked_root_keeping_the_owed_front() {
+  // The rebuild collapse: at endpoint construction every parked root belongs to a dead
+  // incarnation and nothing awaits it, so the whole parked tail leaves the timeline while the
+  // submitted front — owed to the medium — stays. The effective root steps back to the front,
+  // which is what the successor soundly baselines on: everything above it was promised only by
+  // writes the medium never saw.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let front = WriteId::new(1, 1);
+  let front_state = root_at_view(2, 0, 0);
+  s.submit_root(front, front_state.clone());
+  s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
+  s.submit_root(WriteId::new(1, 3), root_at_view(4, 0, 0));
+  assert_eq!(s.roots_in_flight(), 3, "front + the dead pair");
+
+  s.collapse_parked_roots();
+  assert_eq!(
+    s.roots_in_flight(),
+    1,
+    "the parked tail collapsed; the submitted front is still owed"
+  );
+  assert_eq!(
+    s.effective_root(),
+    front_state,
+    "the effective root stepped back to the state the medium still owes"
+  );
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    1,
+    "the backend still holds exactly the front — no collapsed entry was ever submitted"
+  );
+
+  // The successor's own submissions then run against the collapsed timeline as usual.
+  let successor = WriteId::new(2, 1);
+  let successor_state = root_at_view(5, 0, 0);
+  s.submit_root(successor, successor_state.clone());
+  s.sb_mut().land_root();
+  let (id, state) = s
+    .poll_sb()
+    .expect("the front lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!((id, state), (front, front_state));
+  s.sb_mut().land_root();
+  let (id, state) = s
+    .poll_sb()
+    .expect("the successor lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!((id, state), (successor, successor_state));
+  assert!(!s.has_inflight(), "no collapsed entry is left owed");
+}
+
+#[test]
+fn collapsing_an_all_parked_or_empty_timeline_is_safe() {
+  // No submitted front (nothing ever submitted): collapse is a no-op on empty, and after a full
+  // drain it leaves the quiesced session quiesced.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.collapse_parked_roots();
+  assert_eq!(s.roots_in_flight(), 0);
+  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("lands").landed_root.is_some());
+  s.collapse_parked_roots();
+  assert_eq!(s.roots_in_flight(), 0, "a drained timeline stays drained");
+  assert!(!s.has_inflight());
+}
+
+#[test]
+#[should_panic(expected = "the durable-root timeline exceeded its constant depth")]
+fn a_fourth_root_on_the_timeline_is_refused_fail_stop() {
+  // The constant depth cap at the submission choke: the front plus the live endpoint's two
+  // awaited roots is the whole timeline, so a fourth concurrent entry has no author — it is a
+  // leaked correlation, refused fail-stop in every profile rather than admitted as growth.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
+  s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
+  s.submit_root(WriteId::new(1, 3), root_at_view(4, 0, 0));
+  s.submit_root(WriteId::new(1, 4), root_at_view(5, 0, 0));
+}
+
+#[test]
 fn parked_roots_release_in_queue_order_across_generations() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   // Three incarnations' roots: the first submitted, each later one parked behind the foreign

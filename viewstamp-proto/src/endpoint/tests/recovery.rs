@@ -7801,8 +7801,8 @@ fn a_rebuild_over_an_inherited_walk_defers_the_recovery_probe_until_it_settles()
   // The lane's one-walk quota has the SESSION's lifetime, but the recovery probe's own
   // reconstruct guard is per incarnation: an endpoint rebuilt over a live session inherits its
   // predecessor's queued walk, and a successor whose valid checkpoint read completes before that
-  // walk settles must DEFER its probe (discard the read; the retry cadence re-reads) rather than
-  // enqueue a second walk into the lane's admission assert.
+  // walk settles must DEFER its probe (retain the verified read as an obligation the walk's
+  // settle re-drives) rather than enqueue a second walk into the lane's admission assert.
   let (_donor, mut storage) = donor_primary_at_checkpoint(4);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
@@ -7825,8 +7825,8 @@ fn a_rebuild_over_an_inherited_walk_defers_the_recovery_probe_until_it_settles()
   drop(r1);
 
   // Incarnation 2, in place, over the same session. Its own checkpoint read completes while the
-  // inherited walk is still owed: the probe must defer, leaving the checkpoint read outstanding
-  // for the retry cadence.
+  // inherited walk is still owed: the probe must defer, retaining the verified read as an
+  // obligation (the checkpoint read stays outstanding, so recovery stays open).
   let mut r2 = Endpoint::recover(cfg, genesis(3), 2, CountSm::default(), &mut storage)
     .expect("the rebuild accepts the same store")
     .expect_active();
@@ -7841,8 +7841,8 @@ fn a_rebuild_over_an_inherited_walk_defers_the_recovery_probe_until_it_settles()
   );
 
   // The inherited walk executes and settles — its completion is refused by the incarnation choke
-  // but releases the lane quota — and the retry cadence re-reads the checkpoint; the successor's
-  // probe now admits, reconstructs, and recovery completes.
+  // but releases the lane quota, and the settle re-drives the retained probe obligation directly;
+  // the successor's probe now admits, reconstructs, and recovery completes.
   let mut t = now;
   for _ in 0..8 {
     r2.storage_step(t, &mut storage, &mut blocks);
@@ -7858,6 +7858,104 @@ fn a_rebuild_over_an_inherited_walk_defers_the_recovery_probe_until_it_settles()
     r2.status(),
     Status::Normal,
     "the deferred probe resumed once the inherited walk settled"
+  );
+  assert_eq!(
+    r2.checkpoint_op(),
+    OpNumber::with(4),
+    "recovery restored the durable checkpoint"
+  );
+  assert!(
+    !storage.walk_owed(),
+    "the lane owes no walk once recovery completed"
+  );
+  while r2.poll_message().is_some() {}
+}
+
+#[test]
+fn a_solo_replicas_inherited_walk_outlasting_the_read_budget_still_recovers_locally() {
+  // A SOLO deployment has no donor: once local recovery escalates to a peer fetch, nothing can
+  // ever answer it. So a valid checkpoint read deferred behind an inherited walk must not spend
+  // the ABSOLUTE read budget on the wait — that budget pays for READ faults, and this read
+  // SUCCEEDED. Here the inherited walk outlasts the full budget: the retained obligation must
+  // hold the read phase open (no re-reads, no decrements, above all no escalation), and the
+  // walk's eventual settle — refused by the incarnation choke, settled by the lane — must
+  // re-drive the probe directly, completing recovery from the replica's own valid disk.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 4).unwrap();
+  let mut donor =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, CountSm::default(), u64::MAX);
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  // Drive the solo voter to a durable checkpoint at op 4 (quorum 1: its own durable append
+  // commits), keeping the block store the checkpoint DAGs were written into.
+  for rn in 1..=4u64 {
+    donor.handle_message(
+      now,
+      &mut storage,
+      Peer::Client(ClientId::new(7)),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      )),
+    );
+    donor.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    donor.checkpoint_op(),
+    OpNumber::with(4),
+    "the solo voter's checkpoint is durable"
+  );
+  drop(donor);
+
+  // Incarnation 1: recover to the point its valid checkpoint read enqueues the probe walk —
+  // QUEUED, never executed — then die (the session keeps the lane and its one-walk quota).
+  let mut r1 = Endpoint::recover(cfg, genesis(1), 1, CountSm::default(), &mut storage)
+    .expect("recover accepts the checkpointed store")
+    .expect_active();
+  r1.handle_storage(now, &mut storage);
+  assert!(
+    storage.walk_owed(),
+    "precondition: the predecessor's probe walk is queued on the lane"
+  );
+  drop(r1);
+
+  // Incarnation 2, in place, over the same session: its own valid checkpoint read completes
+  // while the inherited walk is still owed, so the probe defers.
+  let mut r2 = Endpoint::recover(cfg, genesis(1), 2, CountSm::default(), &mut storage)
+    .expect("the rebuild accepts the same store")
+    .expect_active();
+  r2.handle_storage(now, &mut storage);
+  assert!(
+    r2.status().is_recovering(),
+    "the deferral keeps recovery open"
+  );
+
+  // Drive the retry cadence well PAST the full absolute budget with the walk still unexecuted.
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    if let Some(deadline) = r2.poll_timeout() {
+      t = deadline;
+      r2.handle_timeout(t, &mut storage);
+    }
+    r2.handle_storage(t, &mut storage);
+  }
+  assert!(
+    r2.status().is_recovering(),
+    "the wait stays open — never resolved blind"
+  );
+  assert!(
+    !r2.awaiting_peer_checkpoint_for_test(),
+    "lane contention must not exhaust the read budget into a peer fetch no donor exists to answer"
+  );
+
+  // The stalled walk finally executes. Its settle frees the quota and re-drives the retained
+  // probe; recovery completes from the local disk — the only source a solo replica has.
+  r2.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r2.status(),
+    Status::Normal,
+    "the solo replica recovered locally once the inherited walk settled"
   );
   assert_eq!(
     r2.checkpoint_op(),

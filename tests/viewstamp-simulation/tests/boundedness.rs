@@ -25,6 +25,66 @@ use viewstamp_simulation::{
 };
 
 #[test]
+fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
+  // The durable-root timeline's CONSTANT bound, driven through the checker at exactly the shape
+  // that used to grow the queue: a superblock so slow the front root write never lands, a
+  // view-change escalation that keeps a durable-view root submitted behind it, and an endpoint
+  // rebuilt in place over the live session faster than the backend services roots. Each dead
+  // incarnation used to leave its parked durable-view root on the timeline — no correlation-ending
+  // path runs at a rebuild, so nothing forfeited it — growing the queue by one header-bearing
+  // state per rebuild cycle, while the checker's then-affine allowance (three plus two per
+  // incarnation) grew right along with it and could never fail. The endpoint-construction
+  // collapse now removes the dead incarnations' parked roots, and the checker holds the queue to
+  // the constant three: the held front plus the live endpoint's awaited roots.
+  for seed in 0..4u64 {
+    let mut c = Cluster::new(3, 1, 1, seed);
+    // Every superblock write stays staged for the whole run: the first root any survivor submits
+    // occupies its backend forever — the held-front precondition.
+    c.set_async_superblock_delay(Some(u32::MAX));
+    let bound = BoundednessChecker::new(64, 8);
+    // Crash the primary: the survivors escalate a view change whose durable-view roots can never
+    // land, so the victim backup always holds the front plus its one live awaited root.
+    c.crash(0);
+    let victim = 2usize;
+    let mut max_roots = 0usize;
+    let mut drive = |c: &mut Cluster, max_roots: &mut usize, phase: &str| {
+      for _ in 0..6_000 {
+        c.tick();
+        *max_roots = (*max_roots).max(c.replica_roots_in_flight(victim));
+        assert_eq!(
+          check_safety(c),
+          CheckResult::Ok,
+          "seed {seed}: safety ({phase})"
+        );
+        assert_eq!(
+          bound.observe(c),
+          CheckResult::Ok,
+          "seed {seed}: the root timeline stays constant-bounded ({phase})"
+        );
+      }
+    };
+    // Let the first escalation submit the roots that will hold each survivor's backend.
+    drive(&mut c, &mut max_roots, "initial escalation");
+    for round in 0..8 {
+      // The in-place rebuild: the session (and the held front) survive; the dead incarnation's
+      // parked durable-view root must NOT.
+      c.restart_in_place(victim);
+      drive(&mut c, &mut max_roots, &format!("rebuild round {round}"));
+    }
+    // Non-vacuity: submissions genuinely queued behind the held front (the accumulation shape was
+    // reachable), and the front itself is still owed — the run never quietly drained.
+    assert!(
+      max_roots >= 2,
+      "seed {seed}: VACUOUS — no root was ever parked behind the held front (max {max_roots})"
+    );
+    assert!(
+      c.replica_roots_in_flight(victim) >= 1,
+      "seed {seed}: VACUOUS — the front was not held to the end"
+    );
+  }
+}
+
+#[test]
 fn long_run_with_gc_stays_bounded_and_survives_crash_through_the_prune() {
   for seed in 0..8u64 {
     // N=5 (crashing one backup keeps a 4-of-5 committing quorum), a SMALL checkpoint interval so the

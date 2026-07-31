@@ -865,6 +865,21 @@ struct RecoverState {
   /// than starting a second reconstruct, and each completion is applied only when its id matches — so
   /// a superseded step can never install content.
   reconstruct: Option<crate::JobId>,
+  /// A VALID checkpoint read whose local presence probe was DEFERRED because the block lane still
+  /// owed an inherited walk (a dead incarnation's, queued-or-executing) at completion time: the
+  /// durable `checkpoint_id` the read was verified against, plus the verified checkpoint it
+  /// yielded. The verification already succeeded, so this is a RETAINED OBLIGATION, not a retry
+  /// candidate: while it is held `recover_timeouts` neither re-reads nor spends the absolute
+  /// checkpoint-read budget (that budget pays for READ faults; the wait here is on a lane
+  /// completion the medium owes, exactly like `pending_checkpoint`'s), and the walk settle that
+  /// frees the lane quota re-drives the probe directly
+  /// ([`Endpoint::redrive_deferred_recover_probe`]). Discarding the read instead would let lane
+  /// contention exhaust the read budget and escalate a replica with a perfectly valid local
+  /// checkpoint into a peer fetch no donor may exist to answer — a permanent wedge on a solo
+  /// deployment. The stored id gates staleness at re-drive: an inherited checkpoint root landing
+  /// in between moves the durable root, and the obligation is then dropped so the retry cadence
+  /// re-reads (and re-verifies) the new generation instead.
+  probe_deferred: Option<(u128, RecoveredCheckpoint)>,
   /// Whether the durable root this recovery started from was FORMATTED — written by [`format()`](crate::format) with a
   /// pinned nonzero `checkpoint_ops`, which an empty-consensus wipe cannot forge. Gates
   /// `complete_recovery`'s genesis-primary exemption: only a formatted store may resume Normal at
@@ -6440,6 +6455,14 @@ where
     done: BlockJobDone<S>,
   ) {
     storage.settle_block_job(&done);
+    // A walk settle frees the lane's one-walk quota, and a deferred cold-start probe waits on
+    // exactly that. Run the re-drive BEFORE the incarnation choke: the walk that deferred the
+    // probe is typically a dead incarnation's, so its completion arrives foreign and is refused
+    // below — but the settle above is the lane's own delivery, and it is the only event that can
+    // resume the deferred local recovery. A no-op unless an obligation is held.
+    if done.tag().is_walk() {
+      self.redrive_deferred_recover_probe(storage);
+    }
     if self.is_foreign_completion(done.id.op_id()) {
       return;
     }

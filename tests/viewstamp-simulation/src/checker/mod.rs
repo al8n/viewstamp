@@ -1305,12 +1305,19 @@ impl MembershipMonotonicChecker {
 /// headroom. The bounds are generous constants chosen so a real leak (no GC) trips while normal
 /// fluctuation does not. The `clients` table is bounded separately by the active client set (one
 /// session per client), so it is checked against a client-count-derived bound, not the per-op bound.
-/// The session's durable-root queue is checked against its own bound — affine in the replica's
-/// incarnation (restart) count and independent of ops, views, and time — so a root backlog
-/// accumulating under a slow superblock (one superseded root per view-change window) trips within a
-/// few windows. The session's checkpoint-envelope lane is checked against the CONSTANT bound of one
-/// (the envelope fence's guarantee, incarnation-independent), so an orphaned-envelope backlog
-/// accumulating under a backend slow on envelope writes trips at its second concurrent write.
+/// The session's durable-root queue is checked against the CONSTANT bound of three (the submitted
+/// front plus the live endpoint's two awaited roots) — independent of ops, views, time, AND the
+/// incarnation count, since a rebuild collapses the dead incarnations' parked roots at endpoint
+/// construction — so a root backlog accumulating under a slow superblock (one superseded root per
+/// view-change or rebuild window) trips within one window. The session's checkpoint-envelope lane
+/// is checked against the CONSTANT bound of one (the envelope fence's guarantee), so an
+/// orphaned-envelope backlog accumulating under a backend slow on envelope writes trips at its
+/// second concurrent write. The medium's RETAINED snapshot generations are checked against the
+/// CONSTANT bound of three (live + staged-root-named + newest completed), so a completed orphan
+/// accumulating behind overtaking view roots trips even while every in-flight count stays at one.
+/// The block lane's total depth is checked against the serve cap plus constant headroom, so a
+/// quota that stopped releasing (or an obligation that re-issues without consuming) trips within a
+/// few cycles.
 #[derive(Debug)]
 pub struct BoundednessChecker {
   /// Max allowed entries in any per-op map (`log`, `inflight`) and any WAL.
@@ -1361,18 +1368,21 @@ impl BoundednessChecker {
           self.max_clients
         ));
       }
-      // The durable-root queue: one submitted front + at most the live endpoint's two awaited
-      // roots (its durable-view write and its checkpoint root), plus at most that awaited pair per
-      // predecessor incarnation that died with correlations in flight (an in-place rebuild bumps
-      // the incarnation; a crash restart rebuilds the session, only shrinking the queue). Affine
-      // in the restart count, NOT in ops, views, or time — an unbounded backlog under a slow
-      // superblock blows past this within a few view-change windows.
+      // The durable-root queue: CONSTANT three — one submitted front (possibly a dead
+      // predecessor's, owed to the medium) + the live endpoint's two awaited roots (its
+      // durable-view write and its checkpoint root). NO per-incarnation concession: an in-place
+      // rebuild collapses the dead incarnations' parked roots at endpoint construction and a
+      // crash restart rebuilds the session, so the restart count buys nothing — a bound that
+      // scaled with it would bless exactly the lifetime growth it exists to refuse (a driver
+      // rebuilding endpoints faster than the backend lands roots would grow the queue without
+      // limit, one parked header-bearing state per rebuild/view cycle, and the checker would
+      // never fail). An unbounded backlog under a slow superblock now trips within one window.
       let roots = cluster.replica_roots_in_flight(i);
-      let roots_bound = 3 + 2 * cluster.replica_incarnation(i) as usize;
+      let roots_bound = 3;
       if roots > roots_bound {
         return CheckResult::violation(format!(
           "replica {i}: durable-root queue {roots} exceeds bound {roots_bound} \
-           (the submission gate / forfeiture is not bounding the root timeline)"
+           (the submission gate / forfeiture / rebuild collapse is not bounding the root timeline)"
         ));
       }
       // The checkpoint-envelope lane: CONSTANT one, with no per-incarnation concession — the
@@ -1387,6 +1397,33 @@ impl BoundednessChecker {
         return CheckResult::violation(format!(
           "replica {i}: {envelopes} checkpoint-envelope writes in flight \
            (the session's envelope fence admits one)"
+        ));
+      }
+      // The RETAINED snapshot generations on the medium itself: CONSTANT three — the live
+      // generation, a staged root's, and the newest completed one. This is the store the
+      // in-flight ledgers cannot see: with one envelope outstanding and one root with the
+      // backend, a view root overtaking an orphaned envelope still deposits that envelope's
+      // bytes, and without collection at the envelope landing each view/checkpoint cycle retains
+      // one more completed orphan forever while every in-flight count stays green.
+      let generations = cluster.replica_retained_snapshot_generations(i);
+      if generations > 3 {
+        return CheckResult::violation(format!(
+          "replica {i}: {generations} checkpoint snapshot generations retained \
+           (the superblock collect keeps live + staged-root-named + newest)"
+        ));
+      }
+      // The block lane's total depth: the serve cap (128 in the proto) plus headroom for the
+      // quota'd kinds (one image capture, one walk) and the single-slot-obligation kinds
+      // (flush/sweep/reconstruct, each serialized by the obligation that issues it and by the
+      // lane's own drain). A leak in ANY kind — a quota that stopped releasing, an obligation
+      // that re-issues without consuming — grows past this within a few cycles, where before
+      // only the per-kind quotas were asserted and the unquota'd kinds were bounded by argument
+      // alone.
+      let jobs = cluster.replica_block_jobs_in_flight(i);
+      if jobs > 144 {
+        return CheckResult::violation(format!(
+          "replica {i}: {jobs} block jobs in flight \
+           (the lane's admission quotas cap the depth at the serve cap plus headroom)"
         ));
       }
     }
