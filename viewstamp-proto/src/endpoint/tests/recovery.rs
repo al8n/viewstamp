@@ -7394,9 +7394,14 @@ fn recovery_over_an_inflight_root_baselines_on_the_effective_root_and_defers_beh
     b.pending_sb_for_test(),
     "the successor's own root was only just released to the backend — not yet durable"
   );
+  // Drain the WHOLE outbox: a single `poll_message` would pass on a vote queued behind any other
+  // message, so the absence of a vote has to be asserted over every message the step produced.
+  let mut voted = false;
+  while let Some(m) = b.poll_message() {
+    voted |= matches!(m.msg_ref(), Message::DoViewChange(_));
+  }
   assert!(
-    !b.poll_message()
-      .is_some_and(|m| matches!(m.msg_ref(), Message::DoViewChange(_))),
+    !voted,
     "no vote is cast while the successor's own view write is outstanding"
   );
 
@@ -7408,6 +7413,17 @@ fn recovery_over_an_inflight_root_baselines_on_the_effective_root_and_defers_beh
     "the successor's re-driven root landed after the predecessor's, in queue order"
   );
   assert!(!storage.has_inflight(), "the root timeline drained");
+  // The deferred vote now FIRES. Asserted positively so the pre-landing check above cannot pass by
+  // the endpoint simply never voting at all: the outbox was drained empty before this flush, so a
+  // vote found here was produced by the landing.
+  let mut voted = false;
+  while let Some(m) = b.poll_message() {
+    voted |= matches!(m.msg_ref(), Message::DoViewChange(_));
+  }
+  assert!(
+    voted,
+    "the vote deferred behind the successor's own view write fires once that root lands"
+  );
 }
 
 #[test]

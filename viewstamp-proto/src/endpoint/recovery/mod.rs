@@ -461,15 +461,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// defers here, so every bare `Endpoint::recover(..)` call resolves unannotated.
   ///
   /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the session's
-  /// EFFECTIVE root ([`Storage::effective_root`]: the last root on the timeline, which is the
-  /// durable `sb.state()` whenever no root write is in flight) for `(view, log_view,
-  /// checkpoint_op, checkpoint_id)` and `wal.header(op)` (the durable-header scan that derives the
-  /// written extent) — and constructs the endpoint with:
-  /// - `view = state.view()`, `log_view = state.log_view()`, `op` = the scanned written extent floored
-  ///   at the durable commit (never the `op_head()` scalar),
-  ///   `checkpoint_op = state.checkpoint_op()`, `commit_min = checkpoint_op` (the restored SM already
-  ///   reflects `[1..=checkpoint_op]`, so this prevents a double-apply), and `commit_max = state.commit()`
-  ///   — the DURABLE known-committed frontier, `>= checkpoint_op` and possibly above it, so
+  /// two roots (the LANDED `sb.state()` and the EFFECTIVE [`Storage::effective_root`], one value
+  /// whenever no root write is in flight; the constructor body states the per-field split rule)
+  /// and `wal.header(op)` (the durable-header scan that derives the written extent) — and
+  /// constructs the endpoint with:
+  /// - `view`/`log_view` from the EFFECTIVE root (every root this endpoint writes stamps them from
+  ///   live memory, so baselining below the timeline would mint rewinding roots), `op` = the
+  ///   scanned written extent floored at the durable commit (never the `op_head()` scalar),
+  ///   `checkpoint_op` from the LANDED root (the backend serves reads against the durable root's
+  ///   generation), `commit_min = checkpoint_op` (the restored SM already
+  ///   reflects `[1..=checkpoint_op]`, so this prevents a double-apply), and `commit_max` from the
+  ///   EFFECTIVE root's commit — the known-committed frontier the medium is guaranteed to reach,
+  ///   `>= checkpoint_op` and possibly above it, so
   ///   the replica never FORGETS a known-committed op on recover (its DVC would else under-report and a
   ///   known-committed op could be truncated in a view change). `op >= commit_min` and `commit_max >=
   ///   commit_min` hold; `op >= commit_max` does NOT (a stale/faulty/truncated head can leave
@@ -515,18 +518,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// which lifts the witness — until then every participation gate holds, exactly as it holds for
   /// an own durable-view write still in flight.
   ///
-  /// **`membership` (the EFFECTIVE-membership rule).** The active membership is resolved from the
-  /// DURABLE root, not blindly from the param: a membership-bearing root
-  /// (`state.membership_opt().is_some()`) wins — the durable config is authoritative, so an offline
+  /// **`membership` (the DURABLE-membership rule).** The active membership is resolved from the
+  /// LANDED root — never from a root still in flight, and not blindly from the param: installing a
+  /// configuration (or retiring a member) is participation, and participation follows durable
+  /// proof, so an in-flight epoch-advancing root confers nothing until its landing is absorbed
+  /// (`on_sb_done`'s configuration adoption installs it then, with the durable proof in hand). A
+  /// membership-bearing landed root wins — the durable config is authoritative, so an offline
   /// reconfiguration pre-written into the root takes effect on the next recover regardless of what
   /// the caller passes. A membership-less root (`membership_opt().is_none()`) has no durable
   /// membership, so `recover` BRIDGES to the passed `membership` — the genesis the embedder
   /// supplies (the param stays in the signature solely as this fallback). This node is then
-  /// resolved against the effective membership by its stable [`MemberId`] ([`Config::local`]):
+  /// resolved against that membership by its stable [`MemberId`] ([`Config::local`]):
   /// present (a voter or learner) → [`Recovered::Active`] holding the recovering endpoint; ABSENT →
-  /// [`Recovered::Retired`] (a reconfiguration removed it — it must not act as a replica). The
-  /// `Active` endpoint stores the EFFECTIVE membership (a durable membership, never the param, when
-  /// the root carries one).
+  /// [`Recovered::Retired`] (a reconfiguration DURABLY removed it — it must not act as a replica;
+  /// an in-flight root that would remove it retires it live at the landing instead, never off
+  /// un-landed state). The `Active` endpoint stores the resolved membership (a durable membership,
+  /// never the param, when the root carries one).
   ///
   /// **`seed` must carry fresh entropy per incarnation.** The freshness nonce that tags this
   /// incarnation's solicitations (`Recovery`/`GetView`/`RequestSync`) is derived deterministically
@@ -581,15 +588,34 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sm: S,
     storage: &mut Storage<W, B, S>,
   ) -> Result<Recovered<S, R>, RecoverError> {
-    // The recovery baseline is the session's EFFECTIVE root — the last root on the timeline, which
-    // an inherited in-flight write may still be carrying to the device. Root completions arrive in
-    // queue order and the last one wins, so this is the state the medium is GUARANTEED to converge
-    // to; baselining on the landed `sb().state()` instead would build a successor BELOW a state
-    // already owed to the medium, whose own root writes would then rewind the durable
-    // view/commit/checkpoint the moment the inherited root landed underneath it. With no root in
-    // flight (every recovery after a real process death — the queue died with the process) the
-    // effective root IS the landed root, and nothing here changes.
-    let state = storage.effective_root();
+    // The recovery baseline is SPLIT across the session's two roots, by one rule per field:
+    //
+    // - A field baselines on the EFFECTIVE root (the back of the timeline — the state the medium
+    //   is guaranteed to converge to, since completions arrive in queue order and the last one
+    //   wins) iff this endpoint's own root writes stamp it FROM LIVE MEMORY, so an under-baseline
+    //   would mint a root that lands after an inherited one and rewinds the durable value. That is
+    //   `view`/`log_view` (every root carries `self.view`/`self.log_view`) and the known-committed
+    //   frontier (every root carries `self.commit_max`).
+    // - A field baselines on the LANDED root (`sb().state()` — what a crash of this process would
+    //   recover, and what the backend serves reads against) iff participation or a terminal
+    //   verdict depends on it, so an over-baseline would act on state a process death rolls back.
+    //   That is the durable-view witness, the CONFIGURATION block (membership, `prev_epoch`, the
+    //   lineage ring, `config_install_op`, and the `Active`/`Retired` resolution — installing a
+    //   configuration, or retiring a member, off a root that never lands would be participation
+    //   without durable proof), and the checkpoint anchor (`checkpoint_op`, the canonical band,
+    //   `log_floor` — the backend's `submit_read_checkpoint` serves the DURABLE root's generation,
+    //   so a restore targeted off the timeline could never read back locally).
+    //
+    // Landed-baselined fields never rewind through this endpoint's writes because the ROOT WRITERS
+    // source them from the timeline, not from these baselines: the checkpoint pair and the
+    // configuration block are copied forward off the effective root at every submit. The gap the
+    // split leaves — memory at the landed root while an inherited root is still in flight — closes
+    // without any action of this endpoint's: the landing settles through the session and
+    // `on_sb_done` absorbs it (the durable-view lift, the configuration adoption, the inherited
+    // checkpoint frontier). With no root in flight (every recovery after a real process death —
+    // the queue died with the process) the two roots are one value and nothing here changes.
+    let landed = storage.sb().state();
+    let effective = storage.effective_root();
     // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
     // first (an under-sized ring is unsafe regardless of what the root pinned), then the pinned
     // geometry pair on any NON-virgin store — recorded-ness before value comparison, so the
@@ -607,8 +633,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `VsrState::new()`, geometry `(0, 0)`). On every path that proceeds past the fence the two
     // notions coincide (`formatted == !virgin`): a virgin root's geometry is `(0, 0)` by
     // construction, and a non-virgin root with EITHER half unrecorded is refused just below.
-    let virgin = state == crate::VsrState::new();
-    let formatted = state.checkpoint_ops() != 0;
+    let virgin = landed == crate::VsrState::new();
+    let formatted = landed.checkpoint_ops() != 0;
     if !virgin {
       // A non-virgin store's geometry pair must be FULLY recorded. Every root this codebase writes
       // records both halves nonzero (`format` validates the floor; a live endpoint stamps its
@@ -619,38 +645,43 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // auto-pins an unrecorded store (that would bless the live geometry as if it were the
       // writer's — a committed-loss hazard on a dirty store); the remedy is an explicit offline
       // migration to a root recording the verified historical geometry.
-      if state.checkpoint_ops() == 0 || state.wal_capacity() == 0 {
+      if landed.checkpoint_ops() == 0 || landed.wal_capacity() == 0 {
         return Err(RecoverError::GeometryNotRecorded {
-          checkpoint_ops: state.checkpoint_ops(),
-          wal_capacity: state.wal_capacity(),
+          checkpoint_ops: landed.checkpoint_ops(),
+          wal_capacity: landed.wal_capacity(),
         });
       }
       // The recorded pair MUST match the live configuration — the recovery scan window and a bounded
       // ring's op→slot placement are both derived from it, so a restart under different geometry
       // silently clips a committed tail.
-      if state.checkpoint_ops() != config.checkpoint_ops() {
+      if landed.checkpoint_ops() != config.checkpoint_ops() {
         return Err(RecoverError::CheckpointOpsChanged {
-          stored: state.checkpoint_ops(),
+          stored: landed.checkpoint_ops(),
           configured: config.checkpoint_ops(),
         });
       }
-      if state.wal_capacity() != capacity {
+      if landed.wal_capacity() != capacity {
         return Err(RecoverError::WalCapacityChanged {
-          stored: state.wal_capacity(),
+          stored: landed.wal_capacity(),
           reported: capacity,
         });
       }
     }
-    // The EFFECTIVE membership: a root's OWN membership is authoritative (the durable config wins,
-    // so an offline reconfiguration pre-written into the root takes effect here); a membership-less
-    // root carries none, so bridge to the passed genesis `membership`. The struct stores THIS one.
-    let membership = match state.membership_opt() {
+    // The DURABLE membership: the LANDED root's own membership is authoritative (the durable
+    // config wins, so an offline reconfiguration pre-written into the root takes effect here); a
+    // membership-less root carries none, so bridge to the passed genesis `membership`. The struct
+    // stores THIS one — never a membership still in flight on the timeline: installing it (or
+    // retiring on it) before its root lands would be participation a process death rolls back, so
+    // an in-flight successor installs at its landing instead (`adopt_landed_configuration`).
+    let membership = match landed.membership_opt() {
       Some(durable) => durable.clone(),
       None => membership,
     };
-    // Resolve this node by its stable `MemberId` against the effective membership. ABSENT ⇒ a
-    // reconfiguration removed it: recover Retired (a terminal handle that never participates), BEFORE
-    // any storage read is submitted. PRESENT (a voter or learner) ⇒ build the recovering Endpoint.
+    // Resolve this node by its stable `MemberId` against the durable membership. ABSENT ⇒ a
+    // reconfiguration DURABLY removed it: recover Retired (a terminal handle that never
+    // participates), BEFORE any storage read is submitted. PRESENT (a voter or learner) ⇒ build
+    // the recovering Endpoint — a still-in-flight root that removes it retires it live at the
+    // landing, with the durable proof in hand, never here off un-landed state.
     let Some(local_slot) = membership.slot_of(config.local()) else {
       return Ok(Recovered::Retired(Retired {
         local: config.local(),
@@ -658,7 +689,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }));
     };
     let nonce = Prng::new(seed).next_u64();
-    let checkpoint_op = state.checkpoint_op().get();
+    let checkpoint_op = landed.checkpoint_op().get();
     // The recovery head is DERIVED by scanning the WAL's durable headers — TigerBeetle's
     // `op = journal.op_maximum()` — never trusted from the `op_head()` scalar, which bit-rot can turn
     // in EITHER direction: inflated (a phantom tail that would force unbounded work) or under-reporting
@@ -733,7 +764,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if virgin && membership.is_voter(local_slot) {
       return Err(RecoverError::UnformattedVoter);
     }
-    let canonical_top = state
+    let canonical_top = landed
       .committed_headers_slice()
       .last()
       .map(|h| h.op().get())
@@ -761,7 +792,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // admits nothing extra). For a no-reconfiguration cluster the durable lineage is genesis-only, so this
     // equals the plain `[config_id; LINEAGE_RING]` seeding.
     let mut lineage = [membership.config_id(); LINEAGE_RING];
-    for (slot, id) in lineage.iter_mut().zip(state.prior_config_ids()) {
+    for (slot, id) in lineage.iter_mut().zip(landed.prior_config_ids()) {
       *slot = *id;
     }
     let mut endpoint = Self {
@@ -774,7 +805,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // membership-less root reads `prev_epoch == epoch == 0`, which equals the bridged genesis
       // membership's epoch — so this is correct for both, and every durable-root write this
       // incarnation makes re-persists the membership as a membership-bearing root carrying it.
-      prev_epoch: state.prev_epoch(),
+      prev_epoch: landed.prev_epoch(),
       lineage,
       // RESTORE the cross-epoch serve gate: the op that produced the recovered membership. The root
       // carries it durably (the SwapEpoch / checkpoint / sync-successor / offline-restart writer threaded
@@ -782,20 +813,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // recovered into a swapped-but-not-yet-checkpointed window would re-attach its E+1 membership to a
       // checkpoint BELOW the reconfigure op, letting a laggard install E+1 without the committed prefix
       // through it.
-      config_install_op: state.config_install_op(),
+      config_install_op: landed.config_install_op(),
       status: Status::Recovering,
-      view: state.view(),
+      view: effective.view(),
       // The durable-view witness measures what a CRASH recovers, so it baselines on the LANDED
       // root — never the effective one: an inherited in-flight root dies with the process, and a
       // view licensed off it would be participation a crash rolls back (the cross-crash
       // double-vote the witness exists to prevent). While the timeline is ahead of the landed
       // root, `durable_view < view` and every participation gate holds; the inherited landing —
       // settled by the session, absorbed in `on_sb_done` — lifts the witness without any write of
-      // this endpoint's. With no root in flight this is `state.view()` exactly as before.
-      durable_view: storage.sb().state().view(),
+      // this endpoint's. With no root in flight this equals the effective view exactly as before.
+      durable_view: landed.view(),
       op: OpNumber::with(op),
       // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those ops
-      // are NOT re-applied. commit_max = state.commit() (the DURABLE known-committed frontier),
+      // are NOT re-applied. commit_max = the EFFECTIVE root's commit (the known-committed frontier
+      // the medium is guaranteed to reach — every root this endpoint writes stamps `commit_max`
+      // from memory, so baselining below the timeline would mint a commit-rewinding root),
       // which is `>= checkpoint_op` (a `VsrState` invariant) and may EXCEED it: a replica whose
       // root says op N is committed must NOT forget that on recover, else its DoViewChange under-reports
       // and a known-committed op N whose WAL slot is stale/faulty (dropped → repair hole) can be
@@ -813,10 +846,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // is exactly the recovery behind-window the (5c) content witness exempts by status. With no
       // durable checkpoint (`checkpoint_op == 0`, nothing to restore) the two start equal.
       sm_at: OpNumber::new(),
-      commit_max: state.commit(),
-      log_view: state.log_view(),
+      commit_max: effective.commit(),
+      log_view: effective.log_view(),
       svc_from: 0,
-      svc_target: state.view(),
+      svc_target: effective.view(),
       // ViewChange-only collection — `None` in `Status::Recovering` (this constructor's status). A
       // recovery-driven view change (`enter_view_change_from_recovery` / `catch_up_to_view`) sets it.
       view_change: None,
@@ -865,7 +898,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // before. `state.log_floor() >= checkpoint_op` is decode-validated, and `op >= checkpoint_op`
       // by construction above, so the cap keeps both `(5b)` invariants (`log_floor >= checkpoint_op`,
       // `op >= log_floor`).
-      log_floor: OpNumber::with(state.log_floor().get().min(op)),
+      log_floor: OpNumber::with(landed.log_floor().get().min(op)),
       peer_checkpoint: BTreeMap::new(),
       nack_from: BTreeMap::new(),
       // The quorum-th order statistic over {own durable checkpoint, no peer reports} — coherent with
@@ -947,7 +980,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // an op with NO canonical entry; a held committed op above a lower hole keeps its entry and is
     // verified individually. Only ops at/below the persisted `commit` are committed, so
     // we never cross-check (and thus never drop) an op the root did not record as committed.
-    for h in state.committed_headers_slice() {
+    // The band comes off the LANDED root while `commit_max` comes off the effective one, so a held
+    // op committed only by a still-in-flight root ((landed commit .. effective commit]) has no
+    // entry here: the read loop then classes its local copy UNPROVEN and peer-repairs it — the
+    // conservative lane for identity evidence this store cannot yet vouch durably.
+    for h in landed.committed_headers_slice() {
       rec
         .canonical
         .insert(h.op().get(), (h.client(), h.request(), h.body_checksum()));
@@ -1406,20 +1443,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         }
         // VERIFY before restore: a `CheckpointRead` matching our read id is NOT yet
         // trustworthy — a corrupted / stale / torn superblock checkpoint could return wrong bytes.
-        // The session's EFFECTIVE root is the authority for which checkpoint this recovery
-        // targets — the same value Phase 1 baselined `checkpoint_op` on, and it holds still while
-        // the landings underneath drain (this endpoint submits no new root mid-recovery before
-        // this read resolves) — so the read must match it on BOTH the op and the content hash, AND
-        // parse cleanly. Verifying against a fresh `sb().state()` instead would make the verdict
-        // timing-dependent: an inherited checkpoint root landing mid-recovery flips what the
-        // landed root names, and the read (which serves the landed-root-named generation) would
-        // pass or fail by which side of the landing it raced. The state-sync path verifies the id
+        // The CURRENT DURABLE root is the authority for which checkpoint this read can have
+        // served: the backend's `submit_read_checkpoint` contract serves the snapshot the durable
+        // root names at service time — never a staged-but-unrooted one — so the read must match
+        // the durable root on BOTH the op and the content hash, AND parse cleanly. Phase 1
+        // baselined `checkpoint_op` on the same (landed) root, so the common case verifies on the
+        // first read and recovery completes locally, whatever is still in flight on the timeline.
+        // The verdict is read at COMPLETION time, so an inherited checkpoint root landing between
+        // the read's service and this handler can race it: the served bytes then name the
+        // PRE-landing generation while this check reads the post-landing root — the mismatch
+        // reads as a fault, the retry re-reads the new generation, and the restore-above-frontier
+        // branch in `on_recovered_checkpoint_restored` carries the recovery scalars up to it. One
+        // extra retry round, never a deterministic wedge. The state-sync path verifies the id
         // the same way (`on_sync_checkpoint`); the recover path must too, or a bad read would
         // restore the wrong SM/sessions while `commit_min == checkpoint_op` — silent
-        // committed-prefix loss, exactly what the checkpoint hash exists to prevent. (While an
-        // inherited checkpoint root is still in flight the serve-side generation lags this
-        // target; the mismatch reads as a fault and the retry budget rides out the landing.)
-        let state = storage.effective_root();
+        // committed-prefix loss, exactly what the checkpoint hash exists to prevent.
+        let state = storage.sb().state();
         let id_ok = crate::checkpoint_id(cr.snapshot()) == state.checkpoint_id();
         let op_ok = cr.op() == state.checkpoint_op();
         let decoded = Self::decode_checkpoint(cr.snapshot());

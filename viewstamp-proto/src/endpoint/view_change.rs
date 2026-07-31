@@ -139,19 +139,25 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // RecoveryResponse adoption, no SVC takers — is the corrupted-scalar class
         // ([`MAX_VIEW_JUMP`]'s documented adversary), and the posture is otherwise un-exitable
         // (GetView for it is unanswerable, our successor SVCs are implausible to every peer, and
-        // all real cluster traffic reads as stale). REVERT to the durable view instead of
-        // stranding until a process restart. Only voters reach this expiry (`arm_timers` leaves
-        // `view_change_status` disarmed for learners), and a voter's catch-up entry advanced the
-        // view strictly above the durable one; the guard keeps that precondition explicit.
+        // all real cluster traffic reads as stale). REVERT instead of stranding until a process
+        // restart. Only voters reach this expiry (`arm_timers` leaves `view_change_status`
+        // disarmed for learners), and a voter's catch-up entry advanced the view strictly above
+        // the landing computed below; the guard keeps that precondition explicit.
+        //
+        // The landing is the TIMELINE'S BACK, not the landed root. That is where a crash during
+        // this posture recovers — recovery baselines `view` on the effective root — so landing
+        // there is what makes the revert equivalent to the crash it stands in for. Landing on the
+        // landed view instead would drop a live endpoint BELOW a view already owed to the medium,
+        // and the inherited root's landing would then lift the durable-view witness past the live
+        // view. With no root in flight the two coincide and this is the landed view exactly.
+        let revert_to = self.durable_view.max(storage.effective_root().view());
         let vc = self
           .view_change
           .as_mut()
           .expect("ViewChange status implies a live collection");
         vc.catchup_windows = vc.catchup_windows.saturating_add(1);
-        if vc.catchup_windows >= CATCH_UP_VALIDATION_WINDOWS
-          && self.view.get() > self.durable_view.get()
-        {
-          self.revert_catch_up_to_durable_view(now);
+        if vc.catchup_windows >= CATCH_UP_VALIDATION_WINDOWS && self.view.get() > revert_to.get() {
+          self.revert_catch_up_to_effective_view(now, revert_to);
           return;
         }
       }
@@ -160,14 +166,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
-  /// Abandon an UNVALIDATED catch-up posture and return to the durable view. Vote-safe by
-  /// construction: the abandoned view was adopted in memory only (never submitted for persistence —
-  /// a crash at any point during the posture recovers the durable view, exactly where this revert
-  /// lands), and the posture cast no vote in it (the `catching_up` discriminant never flips, so the
-  /// DVC regime was unreachable; SVCs are proposals, not votes).
+  /// Abandon an UNVALIDATED catch-up posture and return to `revert_to` — the view a crash during
+  /// the posture would recover, which is the timeline's back (the durable view raised by any root
+  /// still owed to the medium), NOT the landed root's view. Vote-safe by construction: the
+  /// abandoned view was adopted in memory only (never submitted for persistence — a crash at any
+  /// point during the posture recovers exactly where this revert lands), and the posture cast no
+  /// vote in it (the `catching_up` discriminant never flips, so the DVC regime was unreachable;
+  /// SVCs are proposals, not votes).
+  ///
+  /// Landing on the timeline's back rather than the landed root is what keeps the durable-view
+  /// witness at or below the live view: a root already owed to the medium carries a view this
+  /// endpoint must not fall beneath, since its landing lifts the witness unconditionally.
   ///
   /// The landing is NOT sticky (shared with the crash-recovery path, which lands the same way): the
-  /// replica returns to a durable view the cluster may have legitimately moved far beyond, and
+  /// replica returns to a view the cluster may have legitimately moved far beyond, and
   /// rejoins through either ordinary channel — authoritative traffic from a live primary re-opens
   /// the higher-view catch-up ([`Self::catch_up_to_view`]), and any live voter's strictly-higher
   /// `StartViewChange` proposal is joinable at any distance ([`Self::on_start_view_change`]), so a
@@ -175,12 +187,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the whole window becomes reachable again the moment any of its survivors proposes a successor
   /// off its idle timer.
   ///
-  /// The revert's landing depends on this replica's role at the durable view:
+  /// The revert's landing depends on this replica's role at `revert_to`:
   /// - A BACKUP resumes Normal directly. The probe's entry reset dropped only generation-local state
   ///   a backup re-derives (its ack bookkeeping re-fires off the primary's retransmits; its session
   ///   rows of record are the APPLIED ones, which the reset retains), so the resumed backup is
   ///   behaviorally the pre-probe backup.
-  /// - The PRIMARY of the durable view must NOT resume serving: the probe's entry reset destroyed
+  /// - The PRIMARY of that view must NOT resume serving: the probe's entry reset destroyed
   ///   its accepted-but-uncommitted generation state (the provisional session watermarks and the
   ///   vote tallies), so a resumed primary would re-mint a retried request it already holds in its
   ///   log — a double-execution once a later view change re-commits both copies — and could never
@@ -189,8 +201,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///   continue with a torn-down pipeline): minting is refused (`SteppingDown`) and the next primary
   ///   tick proposes the successor view, whose formation re-selects the canonical log (the held ops
   ///   re-commit under fresh quorums) and re-seeds the session watermarks (the retry dedups).
-  fn revert_catch_up_to_durable_view(&mut self, now: Instant) {
-    self.view = self.durable_view;
+  fn revert_catch_up_to_effective_view(&mut self, now: Instant, revert_to: View) {
+    self.view = revert_to;
     self.svc_target = self.view;
     self.svc_from = 0;
     // Exit ViewChange: the collection is the posture (`is_some() == is_view_change()` coupling).
@@ -463,12 +475,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `advance_commit` starts ABOVE the already-committed op and never re-stages it). The successor is
     // membership-derived and view-INDEPENDENT (a view change changes neither the membership nor the
     // epoch), so the staged value stays valid across the transition. Its in-flight `SwapEpoch` root (if
-    // any) is superseded on the superblock by the imminent durable-view write (its stale completion is
-    // ignored in `on_sb_done`), but `pending_swap` survives and `maybe_swap_epoch` RE-SUBMITS it once a
+    // any) is superseded on the superblock by the imminent durable-view write — its CORRELATION only:
+    // the write itself stays on the session timeline, its landing still installs the successor (the
+    // `on_sb_done` configuration adoption, which consumes this staged swap and emits the event), and
+    // the durable-view root minted here carries the successor configuration forward off that timeline
+    // (`durable_root`'s copy-forward), so no landing order can rewind the durable configuration.
+    // With NO swap root in flight (the stage deferred behind an in-flight checkpoint/view write),
+    // `pending_swap` survives and `maybe_swap_epoch` RE-SUBMITS it once a
     // superblock slot frees: from `on_sb_done` when the durable-view root lands, and from the commit
     // tails (`try_commit` / `advance_commit`) for the `catch_up_to_view` path that issues no durable-view
-    // write. The durable-epoch-before-participate fence holds throughout — the membership is installed
-    // only off a durable SwapEpoch root, never the superseded one. (Invariant (7) — "a staged swap always
+    // write. The durable-epoch-before-participate fence holds throughout — the membership installs
+    // only at an epoch-advancing root's landing. (Invariant (7) — "a staged swap always
     // has a superblock write outstanding" — is momentarily relaxed across this reset: the superseding
     // durable-view write keeps a write in flight whenever a view change issues one, and the commit-tail
     // re-submit covers the no-write `catch_up_to_view` path; `assert_invariants` does not run mid-reset.)
