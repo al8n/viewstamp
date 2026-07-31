@@ -393,3 +393,50 @@ fn armed_read_faults_answer_absent_and_are_counted() {
   assert!(store.read_block(addr).is_some());
   assert_eq!(store.read_faults_fired(), 2);
 }
+
+#[test]
+fn a_wipe_empties_the_medium_and_keeps_the_deployment() {
+  let mut store = MemBlockStore::new();
+  let root = checkpoint_log(9, &mut store);
+  let staged = store.put(Bytes::from_static(b"still owed to the next barrier"));
+  store.flush().expect("no fault plan installed");
+  let later = store.put(Bytes::from_static(b"written after the barrier"));
+  assert!(store.is_flushed(root) && store.is_flushed(staged));
+  assert_eq!(store.staged_len(), 1);
+
+  store.arm_read_faults(3);
+  let _ = store.read_block(root);
+  let fired = store.read_faults_fired();
+  assert_eq!(fired, 1);
+
+  store.wipe();
+  assert!(
+    store.is_empty(),
+    "a wiped medium holds nothing — the checkpoint DAGs go with the disk"
+  );
+  assert!(
+    !store.has_block(root) && !store.has_block(later),
+    "neither a flushed block nor a staged one survives the swap"
+  );
+  assert!(
+    !store.is_flushed(root),
+    "a block the medium no longer carries must not still read as durable"
+  );
+  assert_eq!(
+    store.staged_len(),
+    0,
+    "the barrier owes nothing after the medium it would have flushed is gone"
+  );
+  assert_eq!(
+    store.read_faults_fired(),
+    fired,
+    "the lifetime fault witnesses belong to the deployment, so a wipe cannot retract a fault an \
+     axis already observed"
+  );
+
+  // A re-put after the wipe STAGES: the address is no longer durable anywhere, so the barrier owes
+  // it again.
+  let readdr = store.put(Bytes::from_static(b"written to the fresh medium"));
+  assert!(!store.is_flushed(readdr));
+  assert_eq!(store.staged_len(), 1);
+}

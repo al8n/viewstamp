@@ -181,3 +181,96 @@ fn long_down_replica_state_syncs_and_converges() {
     );
   }
 }
+
+/// A WIPED learner re-fetches its ENTIRE checkpoint block DAG from peers.
+///
+/// A wipe forfeits all three durable media — WAL, superblock, and block store — so a learner that
+/// comes back on the replaced disk holds no checkpoint block at all. It cannot restore from its own
+/// store, and it cannot shortcut the fetch with blocks it happened to keep: every block the
+/// checkpoint it syncs to names must arrive over the `RequestBlock`/`BlockResponse` path. That
+/// full-DAG fetch is the hardest work a genuinely empty replica owes, and it is unreachable if the
+/// wipe spares the store — a store-sparing wipe leaves the replica holding the shared leaves of the
+/// very DAG it is supposed to have lost, so it re-fetches only the tail.
+///
+/// A LEARNER is the node this can be observed on: a wiped VOTER fail-stops on `UnformattedVoter` (an
+/// empty-log voter must never rejoin the voting set) and stays down, so it never syncs anything.
+#[test]
+fn a_wiped_learner_refetches_its_whole_checkpoint_dag() {
+  // The learner must hold a DAG with real SHARED structure before the wipe, so that a store-sparing
+  // wipe would visibly re-use most of it and this test can tell the two apart.
+  const MIN_DAG: usize = 8;
+  for seed in 0..4u64 {
+    // Three voters plus one non-voting learner, a small checkpoint interval so the cluster
+    // checkpoints often and the learner's DAG grows a leaf at a time.
+    let mut c = Cluster::with_members(3, 1, 2, 200, seed, /*checkpoint_ops*/ 4);
+    let mut dur = DurabilityChecker::new(c.replica_count());
+    let learner = 3usize;
+
+    let mut warmed = false;
+    for _ in 0..200_000 {
+      c.tick();
+      assert!(dur.observe(&c).is_ok(), "seed {seed}: durability (warm-up)");
+      if c.replica_reachable_block_count(learner) >= MIN_DAG {
+        warmed = true;
+        break;
+      }
+    }
+    assert!(
+      warmed,
+      "seed {seed}: the learner materialized a checkpoint DAG of at least {MIN_DAG} blocks before \
+       the wipe (held {})",
+      c.replica_reachable_block_count(learner)
+    );
+    let fetched_before = c.replica_blocks_fetched(learner);
+
+    // Take the learner down, then bring it back on a replaced disk. A learner never votes, so an
+    // empty one rejoins rather than fail-stopping.
+    c.crash(learner);
+    assert!(
+      c.wipe_and_restart(learner),
+      "seed {seed}: a wiped LEARNER rejoins empty (only a voter fail-stops)"
+    );
+    // Its per-replica checkpoint baseline goes with the disk — the learner legitimately restarts at
+    // checkpoint 0. The CLUSTER-level obligations are untouched: the committed history is kept as-is,
+    // so the prefix the learner re-applies below must still agree with it.
+    dur.note_wipe(learner);
+    assert_eq!(
+      c.replica_blocks_fetched(learner),
+      fetched_before,
+      "seed {seed}: the wipe itself fetches nothing — every block counted below arrives over the wire"
+    );
+
+    // The learner comes back at op 0, far below the cluster checkpoint, so the sync trigger fires at
+    // once. Sample the instant its FIRST post-wipe sync completes: at that point its reachable DAG is
+    // exactly the checkpoint it just restored, and every block of it came over the wire — no later
+    // checkpoint of its own has yet mixed locally-materialized blocks into the count.
+    let mut at_sync = None;
+    for _ in 0..600_000 {
+      c.tick();
+      assert!(dur.observe(&c).is_ok(), "seed {seed}: durability (re-sync)");
+      assert_eq!(check_safety(&c), CheckResult::Ok, "seed {seed}: agreement");
+      if c.replica_state_sync_count(learner) >= 1 {
+        at_sync = Some((
+          c.replica_blocks_fetched(learner) - fetched_before,
+          c.replica_reachable_block_count(learner),
+        ));
+        break;
+      }
+    }
+    let (fetched, dag) = at_sync.expect("the wiped learner completes a state-sync");
+    assert!(
+      dag >= MIN_DAG,
+      "seed {seed}: the synced checkpoint's DAG ({dag} blocks) is too small to distinguish a whole \
+       fetch from a shared-leaf one"
+    );
+
+    // THE WITNESS: it obtained the WHOLE DAG over the wire. Holding nothing at restart, the learner
+    // had no shared leaf to skip — unlike a replica whose wipe spared its store, which would re-use
+    // the leaves of the very DAG it is supposed to have lost and fetch only the tail.
+    assert!(
+      fetched >= dag as u64,
+      "seed {seed}: the wiped learner fetched {fetched} blocks for a {dag}-block checkpoint DAG — it \
+       is re-using blocks a replaced disk should not still carry"
+    );
+  }
+}

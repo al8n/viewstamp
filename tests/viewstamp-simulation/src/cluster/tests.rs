@@ -843,3 +843,123 @@ fn network_drops_an_oversized_inter_replica_message_but_not_small_or_client_ones
     "a client-bound message is not subject to the inter-replica frame cap (different path)"
   );
 }
+
+#[test]
+fn a_wipe_forfeits_the_checkpoint_blocks_with_the_rest_of_the_disk() {
+  // A short checkpoint interval so a checkpoint is published (and its DAG written) within the run.
+  let mut c = Cluster::with_checkpoint_ops(3, 2, 40, /*seed*/ 3, /*checkpoint_ops*/ 8);
+  for _ in 0..20_000 {
+    c.tick();
+    if c.replica_reachable_block_count(2) > 0 {
+      break;
+    }
+  }
+  assert!(
+    !c.block_stores[2].is_empty() && c.replica_reachable_block_count(2) > 0,
+    "the replica must hold a materialized checkpoint DAG before the wipe, or the wipe below proves \
+     nothing"
+  );
+
+  c.crash(2);
+  c.wipe_and_restart(2);
+
+  // The blocks ARE the durable checkpoint's contents, so they go with the WAL and the superblock. A
+  // wipe that spared them would leave the replica able to restore its state — and to serve it to a
+  // peer's `RequestBlock` — from a disk it is supposed to have lost.
+  assert!(
+    c.block_stores[2].is_empty(),
+    "a wiped disk carries no checkpoint block"
+  );
+  assert_eq!(
+    c.replica_reachable_block_count(2),
+    0,
+    "no block of the pre-wipe checkpoint DAG is still reachable on the replaced medium"
+  );
+}
+
+#[test]
+fn a_wiped_voter_reports_no_durable_evidence() {
+  // Far enough to publish a checkpoint AND leave committed ops resident in the WAL above it, so both
+  // clauses of `replica_appended_op` have something to lose.
+  let mut c = Cluster::with_checkpoint_ops(3, 2, 40, /*seed*/ 3, /*checkpoint_ops*/ 8);
+  for _ in 0..20_000 {
+    c.tick();
+    if c.replica_checkpoint_op(2).get() > 0
+      && c.replica_op(2).get() > c.replica_checkpoint_op(2).get()
+    {
+      break;
+    }
+  }
+  let checkpointed = c.replica_checkpoint_op(2).get();
+  let head = c.replica_op(2).get();
+  assert!(
+    checkpointed > 0 && head > checkpointed,
+    "the replica must hold a durable checkpoint AND a resident tail above it before the wipe, or the \
+     wipe below proves nothing (checkpoint_op={checkpointed}, op={head})"
+  );
+  assert!(
+    c.replica_appended_op(2, OpNumber::with(checkpointed))
+      && c.replica_appended_op(2, OpNumber::with(head)),
+    "the replica holds both a snapshot-subsumed op and a WAL-resident one before the wipe"
+  );
+
+  c.crash(2);
+  let rejoined = c.wipe_and_restart(2);
+
+  // A VOTER fail-stops on the empty disk, so recovery installs no successor endpoint: the handle
+  // reachable through the accessors is the PRE-WIPE one, still remembering a checkpoint whose blocks
+  // and superblock root are gone. What the accessors report must follow the disk, not the handle —
+  // otherwise a replica holding NOTHING is counted as a durable holder of everything it once had.
+  assert!(
+    !rejoined && c.is_crashed(2),
+    "a wiped voter fail-stops and stays down"
+  );
+  assert!(
+    c.replica_storage_wiped(2),
+    "the replaced disk has had no endpoint rebuilt over it"
+  );
+  assert_eq!(
+    c.replica_checkpoint_op(2).get(),
+    0,
+    "a wiped disk backs no checkpoint, whatever the stale endpoint remembers"
+  );
+  for op in 1..=head {
+    assert!(
+      !c.replica_appended_op(2, OpNumber::with(op)),
+      "a wiped disk holds op {op} neither in a WAL slot nor under a subsuming checkpoint"
+    );
+  }
+}
+
+#[test]
+fn a_wiped_learner_that_rejoins_reports_its_own_empty_disk() {
+  // The complementary case: a non-voting learner recovers over the emptied store, so an endpoint IS
+  // rebuilt and the forfeit state ends at that instant — the accessors go back to reporting the
+  // handle, which now reads the replacement disk honestly (empty, so still nothing held).
+  let mut c = Cluster::with_members(3, 1, 2, 40, /*seed*/ 3, /*checkpoint_ops*/ 8);
+  const LEARNER: usize = 3;
+  for _ in 0..20_000 {
+    c.tick();
+    if c.replica_checkpoint_op(LEARNER).get() > 0 {
+      break;
+    }
+  }
+  assert!(
+    c.replica_checkpoint_op(LEARNER).get() > 0,
+    "the learner must hold a durable checkpoint before the wipe"
+  );
+
+  c.crash(LEARNER);
+  let rejoined = c.wipe_and_restart(LEARNER);
+
+  assert!(rejoined, "a wiped learner rejoins on the empty disk");
+  assert!(
+    !c.replica_storage_wiped(LEARNER),
+    "the rebuilt endpoint reads the replacement disk, so nothing is stale to correct for"
+  );
+  assert_eq!(
+    c.replica_checkpoint_op(LEARNER).get(),
+    0,
+    "the rejoined learner recovered an empty store and reports it"
+  );
+}

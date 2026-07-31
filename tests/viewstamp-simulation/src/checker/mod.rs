@@ -326,8 +326,10 @@ impl ConfigView {
 ///
 /// An op is HELD by a replica iff its WAL slot is occupied (`Clean` or `Faulty` — a committed slot is
 /// never dropped by prune/truncate, and bit-rot does not un-occupy it) or it is folded into that
-/// replica's durable checkpoint. Holders are counted among VOTERS only: the commit quorum is a voter
-/// quorum, so a learner holding the op cannot stand in for a voter.
+/// replica's durable checkpoint. Both clauses are read off the MEDIUM, so a replica whose disk was
+/// wiped holds nothing until it genuinely re-establishes durable state. Holders are counted among
+/// VOTERS only: the commit quorum is a voter quorum, so a learner holding the op cannot stand in for
+/// a voter.
 #[derive(Debug)]
 pub struct DurableQuorumChecker {
   /// The committed ops still under active obligation. Ops at or below [`Self::discharged`] are absent
@@ -362,7 +364,15 @@ impl DurableQuorumChecker {
 
   /// Record that a replica's durable storage was WIPED ([`Cluster::wipe_and_restart`]): its durable
   /// copies are permanently forfeit with the disk, so the retention envelope relaxes by exactly the
-  /// wiped count (floored at one holder — see [`Self::fold`]).
+  /// wiped count, floored at one holder — a committed op held durably NOWHERE is an outright loss no
+  /// fault budget excuses.
+  ///
+  /// That relaxed bound is the ONLY concession a wipe earns. The wiped replica itself is not counted
+  /// as a holder and does not raise the discharge floor: [`Cluster::replica_checkpoint_op`] and
+  /// [`Cluster::replica_appended_op`] report an emptied disk as holding nothing, so the evidence
+  /// side stays honest. Conceding the same physical fact twice — once by lowering the bound and
+  /// again by crediting a phantom holder — would cost the oracle a second replica the wipe never
+  /// took.
   pub fn note_wipe(&mut self) {
     self.wipes += 1;
   }
@@ -456,6 +466,12 @@ impl DurableQuorumChecker {
     // wipe axis off (`wipes == 0` always) this is exactly the strict quorum bound — the base gates
     // are untouched. The end-of-run check (post-quiesce, full committed history applied on an
     // operational replica) stays fully strict on every lane.
+    //
+    // The wipe is conceded HERE and only here. On the evidence side a wiped replica reports an empty
+    // disk — no occupied slot, no subsuming checkpoint — so it is counted in neither the holders
+    // below nor the discharge floor above. Relaxing the bound AND crediting the wiped replica as a
+    // holder would spend the same fault twice, leaving the obligation a full replica weaker than the
+    // wipe budget actually buys.
     let required = quorum.saturating_sub(self.wipes).max(1);
     for &op in &self.tracked {
       let holders = cfg
