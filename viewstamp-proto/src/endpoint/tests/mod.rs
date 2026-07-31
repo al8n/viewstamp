@@ -16,11 +16,11 @@ use super::*;
 /// in-order by construction, and job ids only grow across calls, so a fresh cursor accepts exactly
 /// the same sequence a persistent one would. The order contract's falsifiers drive an explicit
 /// long-lived cursor instead, which is what makes a deliberate reordering observable.
-trait StorageStep {
+trait StorageStep<S: StateMachine> {
   fn storage_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut crate::Storage<W, B>,
+    storage: &mut crate::Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   );
 
@@ -33,22 +33,22 @@ trait StorageStep {
   fn block_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut crate::Storage<W, B>,
+    storage: &mut crate::Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   );
 }
 
-impl<S: StateMachine, R: Reconfig> StorageStep for Endpoint<S, R> {
+impl<S: StateMachine, R: Reconfig> StorageStep<S> for Endpoint<S, R> {
   fn storage_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut crate::Storage<W, B>,
+    storage: &mut crate::Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   ) {
     let mut cursor = crate::BlockJobCursor::new();
     loop {
       self.handle_storage(now, storage);
-      let Some(job) = self.poll_block_job() else {
+      let Some(job) = storage.poll_block_job() else {
         break;
       };
       let done = crate::execute_block_job(&mut cursor, job, blocks);
@@ -59,11 +59,11 @@ impl<S: StateMachine, R: Reconfig> StorageStep for Endpoint<S, R> {
   fn block_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut crate::Storage<W, B>,
+    storage: &mut crate::Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   ) {
     let mut cursor = crate::BlockJobCursor::new();
-    while let Some(job) = self.poll_block_job() {
+    while let Some(job) = storage.poll_block_job() {
       let done = crate::execute_block_job(&mut cursor, job, blocks);
       self.on_block_done(now, storage, done);
     }
@@ -1016,7 +1016,7 @@ fn new_primary_with_op2_candidate(
   membership: Membership,
 ) -> (
   Endpoint<NoopSm>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, NoopSm>,
   crate::block_store::InMemoryBlockStore,
 ) {
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
@@ -1083,7 +1083,7 @@ fn new_primary_with_op2_candidate(
 fn recovering_with_hole(
   head: u64,
   faulty_op: u64,
-) -> (Endpoint<CountSm>, Storage<ScriptedWal, TestSb>) {
+) -> (Endpoint<CountSm>, Storage<ScriptedWal, TestSb, CountSm>) {
   assert!(faulty_op < head, "the hole must be below the head");
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX); // permanent: never clears on disk
@@ -1099,7 +1099,6 @@ fn recovering_with_hole(
     0,
     CountSm::default(),
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1117,7 +1116,7 @@ fn recovering_with_hole(
 /// returns rather than spins.
 fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
   r: &mut Endpoint<S>,
-  storage: &mut Storage<W, B>,
+  storage: &mut Storage<W, B, S>,
   blocks: &mut dyn BlockStore,
   now: Instant,
 ) {
@@ -1145,7 +1144,7 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
 /// Drive a replica (replica 1 of 3) into `RecoveringHead` by permanently faulting its head op's
 /// read, returning the recovered endpoint + its (still-faulty) storage session. The head op is
 /// `head`.
-fn recovering_head(head: u64) -> (Endpoint<NoopSm>, Storage<ScriptedWal, TestSb>) {
+fn recovering_head(head: u64) -> (Endpoint<NoopSm>, Storage<ScriptedWal, TestSb, NoopSm>) {
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(head), u8::MAX); // head read never clears → permanently faulty
   // A store that RAN (its head read faults), not a wipe: a FORMATTED root so recovery of this voter
@@ -1160,7 +1159,6 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, Storage<ScriptedWal, TestSb>
     0,
     NoopSm,
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1289,7 +1287,8 @@ fn wal_in_view(head: u64, view: u64) -> TestWal {
 /// completions (the AdoptVote append for op 2) are pumped so they do not muddy the window; the
 /// superblock write is left inflight (not flushed), so the view is NOT yet durable.
 #[cfg(test)]
-fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, Storage<TestWal, StepSb>) {
+fn primed_new_primary_in_pending_view_window()
+-> (Endpoint<NoopSm>, Storage<TestWal, StepSb, NoopSm>) {
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -1432,7 +1431,7 @@ impl ScriptedCheckpointSb {
 /// escalated replica stays Recovering (awaiting a peer checkpoint), so the loop runs its full budget there.
 fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
   r: &mut Endpoint<S>,
-  storage: &mut Storage<W, ScriptedCheckpointSb>,
+  storage: &mut Storage<W, ScriptedCheckpointSb, S>,
   blocks: &mut dyn BlockStore,
   now: Instant,
 ) {
@@ -1453,7 +1452,9 @@ fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
 /// Drive a real 3-replica primary (replica 0) to a DURABLE checkpoint at `ckpt`, returning the
 /// endpoint + its storage so a test can read the checkpoint envelope back (the donor for sync apply
 /// tests). `checkpoint_ops == ckpt`, so committing `ckpt` ops takes exactly one checkpoint.
-fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, Storage<TestWal, TestSb>) {
+fn donor_primary_at_checkpoint(
+  ckpt: u64,
+) -> (Endpoint<CountSm>, Storage<TestWal, TestSb, CountSm>) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
@@ -1500,7 +1501,7 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, Storage<TestWal
 }
 
 /// Read the durable checkpoint envelope (+ its id) back from a donor's superblock.
-fn donor_envelope<W: Wal>(storage: &Storage<W, TestSb>) -> (Bytes, u128) {
+fn donor_envelope<W: Wal, S: StateMachine>(storage: &Storage<W, TestSb, S>) -> (Bytes, u128) {
   let (_op, env) = storage
     .sb()
     .checkpoint
@@ -1541,7 +1542,12 @@ fn sync_backup() -> Endpoint<CountSm> {
 /// `donor_sb` provides the durable checkpoint snapshot the laggard re-persists to.
 fn sync_apply_harness(
   checkpoint_op: u64,
-) -> (Endpoint<CountSm>, Storage<TestWal, TestSb>, Bytes, u128) {
+) -> (
+  Endpoint<CountSm>,
+  Storage<TestWal, TestSb, CountSm>,
+  Bytes,
+  u128,
+) {
   let (_donor, donor_storage) = donor_primary_at_checkpoint(checkpoint_op);
   let (env, id) = donor_envelope(&donor_storage);
   let e = sync_backup();

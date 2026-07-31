@@ -1,5 +1,5 @@
 //! The super-state-machine: the consensus [`Endpoint`] composed with per-peer conns + the router.
-//! Storage stays external (the third orthogonal axis) — `handle_*` take `&mut Storage<W, B>`.
+//! Storage stays external (the third orthogonal axis) — `handle_*` take `&mut Storage<W, B, S>`.
 
 #[cfg(not(feature = "std"))]
 use std::vec::Vec;
@@ -99,7 +99,7 @@ where
   pub fn propose_membership<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     delta: SingleVoterDelta,
     ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
@@ -146,7 +146,7 @@ where
     bytes: &[u8],
     eof: bool,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Feed the driver read in bounded chunks, decoding and draining between each, so the transport's
     // per-conn intake memory (record staging, the frame decoder's complete-frame queue) stays
@@ -278,7 +278,7 @@ where
   pub fn submit_client_request<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     request: Request,
   ) {
     if request.body().len() > super::frame::max_request_body_len() {
@@ -315,7 +315,7 @@ where
   fn deliver_inbound<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: Message,
   ) {
@@ -331,7 +331,7 @@ where
   pub fn handle_timeout<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.endpoint.handle_timeout(now, storage);
     // A timeout-driven advance may have installed a new membership; reconcile routing against it
@@ -351,12 +351,12 @@ where
   fn drain_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   ) {
     loop {
       self.endpoint.handle_storage(now, storage);
-      let Some(job) = self.endpoint.poll_block_job() else {
+      let Some(job) = storage.poll_block_job() else {
         break;
       };
       let done = crate::execute_block_job(&mut self.block_lane, job, blocks);
@@ -368,7 +368,7 @@ where
   pub fn handle_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   ) {
     self.drain_storage(now, storage, blocks);
@@ -377,7 +377,8 @@ where
 
   /// Drives WAL/superblock completions through the consensus endpoint and pumps, leaving the block
   /// jobs the pass queued for an EXTERNAL storage lane: the caller drains them with
-  /// [`Self::poll_block_job`] and answers each with [`Self::on_block_done`].
+  /// [`Storage::poll_block_job`](crate::Storage::poll_block_job) — the queue is the lane's, so it
+  /// comes off the session — and answers each with [`Self::on_block_done`].
   ///
   /// The lane-placement alternative to [`Self::handle_storage`]: that one holds the store and
   /// executes every job on the calling thread, this one holds no store at all, so a long
@@ -387,16 +388,10 @@ where
   pub fn handle_storage_deferred<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.endpoint.handle_storage(now, storage);
     self.settle();
-  }
-
-  /// Takes the next block job the endpoint has queued, for a caller running an external storage
-  /// lane (see [`Self::handle_storage_deferred`]). `None` when none is queued.
-  pub fn poll_block_job(&mut self) -> Option<crate::BlockJob<S>> {
-    self.endpoint.poll_block_job()
   }
 
   /// Feeds back the completion of a block job an external storage lane executed, then pumps.
@@ -406,7 +401,7 @@ where
   pub fn on_block_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     done: crate::BlockJobDone<S>,
   ) {
     self.endpoint.on_block_done(now, storage, done);
@@ -614,7 +609,7 @@ where
   pub(crate) fn inject_message_for_test<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: Message,
   ) {

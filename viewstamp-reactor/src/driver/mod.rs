@@ -52,7 +52,7 @@ struct PeerLink {
 /// losing select arm drops it — so no helper task or socket clone exists.
 pub struct ReactorQuicDriver<R: Runtime, S: StateMachine, W, B, I> {
   coord: QuicCoordinator<S, I>,
-  storage: Storage<W, B>,
+  storage: Storage<W, B, S>,
   /// The embedder-provided block-storage lane, the peer of `wal`/`sb` in the node's durable store:
   /// large bodies (state-sync chunks, snapshots) are addressed by content hash there while the
   /// WAL/superblock hold the consensus log and durable root. The lane owns the store; the run loop
@@ -267,15 +267,7 @@ where
     // slot-quiescence fence, the root timeline, the in-flight envelopes — outlive any endpoint
     // built over it.
     let mut storage = Storage::new(wal, sb);
-    let endpoint = build_endpoint(
-      config,
-      membership,
-      state_machine,
-      &mut storage,
-      // The lane's own accounting: what it still holds for a dead predecessor endpoint, if an
-      // embedder handed this driver a surviving lane clone; empty on a fresh lane.
-      blocks.occupancy(),
-    )?;
+    let endpoint = build_endpoint(config, membership, state_machine, &mut storage)?;
     let mut coord = QuicCoordinator::with_identity(endpoint, opts, rng_seed, identity);
 
     let now = clock.now();
@@ -650,7 +642,7 @@ where
     let mut any = false;
     loop {
       let mut moved = false;
-      while let Some(job) = self.coord.poll_block_job() {
+      while let Some(job) = self.storage.poll_block_job() {
         self.block_lane.submit(job);
         moved = true;
       }

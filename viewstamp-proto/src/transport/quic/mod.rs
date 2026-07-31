@@ -274,7 +274,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn propose_membership<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     delta: SingleVoterDelta,
     ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
@@ -395,7 +395,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     remote: SocketAddr,
     ecn: Option<EcnCodepoint>,
     data: &[u8],
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_datagram(std_now, remote, ecn, data);
@@ -410,7 +410,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn handle_timeout<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_timeout(std_now);
@@ -433,12 +433,12 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   fn drain_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   ) {
     loop {
       self.endpoint.handle_storage(now, storage);
-      let Some(job) = self.endpoint.poll_block_job() else {
+      let Some(job) = storage.poll_block_job() else {
         break;
       };
       let done = crate::execute_block_job(&mut self.block_lane, job, blocks);
@@ -450,7 +450,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn handle_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     blocks: &mut dyn BlockStore,
   ) {
     self.drain_storage(now, storage, blocks);
@@ -459,7 +459,8 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
 
   /// Drive WAL/superblock completions through the consensus endpoint and pump, leaving the block
   /// jobs the pass queued for an EXTERNAL storage lane: the caller drains them with
-  /// [`Self::poll_block_job`] and answers each with [`Self::on_block_done`].
+  /// [`Storage::poll_block_job`](crate::Storage::poll_block_job) — the queue is the lane's, so it
+  /// comes off the session — and answers each with [`Self::on_block_done`].
   ///
   /// The lane-placement alternative to [`Self::handle_storage`]: that one holds the store and
   /// executes every job on the calling thread, this one holds no store at all, so a long
@@ -469,16 +470,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn handle_storage_deferred<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.endpoint.handle_storage(now, storage);
     self.settle(now, storage);
-  }
-
-  /// Takes the next block job the endpoint has queued, for a caller running an external storage
-  /// lane (see [`Self::handle_storage_deferred`]). `None` when none is queued.
-  pub fn poll_block_job(&mut self) -> Option<crate::BlockJob<S>> {
-    self.endpoint.poll_block_job()
   }
 
   /// Feeds back the completion of a block job an external storage lane executed, then pumps.
@@ -488,7 +483,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn on_block_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     done: crate::BlockJobDone<S>,
   ) {
     self.endpoint.on_block_done(now, storage, done);
@@ -499,7 +494,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// release consensus messages that arrive as frames), reconcile routing against a membership the
   /// advance may have installed — BEFORE the pump, so this pass's outputs use the new slots — then
   /// pump the endpoint's outputs.
-  fn settle<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
+  fn settle<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B, S>) {
     self.drain_bridge(now, storage);
     self.reconcile_routing(now);
     self.pump(now);
@@ -653,7 +648,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn submit_client_request<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     request: Request,
   ) {
     if request.body().len() > crate::transport::frame::max_request_body_len() {
@@ -694,7 +689,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   ///   stream bytes still readable defers the connection to the NEXT pump, so a buffered receive window
   ///   drains one budget per pump rather than all at once;
   /// - `lost` → reap the closed connection.
-  fn drain_bridge<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
+  fn drain_bridge<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B, S>) {
     let std_now = self.quinn_now(now);
     while let Some(h) = self.bridge.take_connected() {
       // Open the send stream and write our control preface as frame-0. `Hello` writes the hello
@@ -819,7 +814,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   fn deliver_decoded<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: Message,
   ) {
@@ -1075,7 +1070,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub(crate) fn inject_message_for_test<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: Message,
   ) {
@@ -1140,7 +1135,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub(crate) fn receive_pump_for_test<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     self.drain_bridge(now, storage);
     self.pump(now);

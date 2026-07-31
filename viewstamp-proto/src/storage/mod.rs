@@ -339,7 +339,7 @@ impl ReadId {
 }
 
 /// The correlation id of an issued BLOCK JOB (a [`BlockJob`](crate::BlockJob) drained via
-/// `Endpoint::poll_block_job` and answered via `Endpoint::on_block_done`).
+/// [`Storage::poll_block_job`] and answered via `Endpoint::on_block_done`).
 ///
 /// The third id namespace beside [`WriteId`] and [`ReadId`]: block jobs are neither WAL/superblock
 /// writes nor reads, and giving them their own type keeps a job completion from ever naming a

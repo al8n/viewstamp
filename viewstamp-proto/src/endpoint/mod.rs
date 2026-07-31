@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use bytes::Bytes;
 
 use crate::{
-  BlockAddress, BlockJob, BlockJobDone, BlockStore, ClientId, Commit, Config, DoViewChange, Epoch,
-  Event, Header, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Prepare,
-  PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status,
-  Superblock, SuperblockDone, View, Wal, WalDone,
+  BlockAddress, BlockJobDone, BlockStore, ClientId, Commit, Config, DoViewChange, Epoch, Event,
+  Header, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Prepare, PrepareOk,
+  Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status, Superblock,
+  SuperblockDone, View, Wal, WalDone,
   block_job::{BlockJobKind, BlockJobOutput, RecoveredCheckpoint, RestorePurpose, WalkPurpose},
   storage::Storage,
 };
@@ -1387,31 +1387,11 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// landing into this one after a restart in place. Observability only: the refusal itself is the
   /// safety property. Stays `0` on a process that never rebuilds an endpoint over live storage.
   foreign_completions_rejected: u64,
-  /// Block-storage jobs the endpoint has ISSUED and the driver has not yet drained
-  /// ([`Self::poll_block_job`]), in issue order. The pump never executes these: it appends here and
-  /// reacts to the completion, so no block I/O runs on the consensus path.
-  block_jobs: VecDeque<BlockJob<S>>,
-  /// The ids of every issued block job whose completion is still owed — queued-but-undrained AND
-  /// executing — in ISSUE order. Two duties: it is the durability-drain witness
-  /// ([`Self::has_inflight_storage`]), and its front is the ONLY completion
-  /// [`Self::on_block_done`] accepts, which is how a driver that executes or delivers out of issue
-  /// order is CAUGHT rather than silently tolerated (see the [job seam docs](crate::BlockJob)).
-  block_jobs_outstanding: VecDeque<crate::JobId>,
   /// How many block-job completions were dropped because the state they answered had been
   /// SUPERSEDED (a checkpoint a view transition abandoned while its DAG was being written). The
   /// drop is the safety property — a superseded materialize must never publish a root — and this is
   /// the non-vacuity witness that the supersession path is genuinely exercised.
   block_jobs_superseded: u64,
-  /// How many `Serve` jobs (peer `RequestBlock` answers) are outstanding ON THE LANE — whichever
-  /// incarnation issued them — bounded by [`MAX_OUTSTANDING_BLOCK_SERVES`] so an inbound request
-  /// rate above the storage lane's drain rate cannot grow the job queue without limit.
-  ///
-  /// The bound is on the lane's depth, so this count has the LANE's lifetime, not this endpoint's:
-  /// a rebuild over a surviving lane inherits it ([`crate::BlockLaneOccupancy`] through `recover`),
-  /// and a dead incarnation's serve releases its slot when its completion is REFUSED at the
-  /// incarnation choke — the same delivery that would have consumed it. Counting only own serves
-  /// would let every incarnation admit a fresh cap behind its predecessors' still-queued serves.
-  block_serves_outstanding: usize,
   /// How many peer `RequestBlock`s were dropped at the outstanding-serve cap. Observability only —
   /// the requester's ARQ re-sends — and the non-vacuity witness that the bound engaged.
   block_serves_refused: u64,
@@ -1469,36 +1449,6 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
   /// (their ids never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
   pending_checkpoint: Option<PendingCheckpoint>,
-  /// The `Materialize` job of the image capture the storage lane still owes a completion for — the
-  /// PHYSICAL half of a checkpoint, tracked independently of the LOGICAL `pending_checkpoint` that
-  /// publishes it.
-  ///
-  /// The two halves have different lifetimes. `pending_checkpoint` is generation state: a view
-  /// transition DROPS it at [`CheckpointStep::FlushingBlocks`], which is what makes the crossing
-  /// materialize unpublishable. The job it dropped is NOT retractable — it is already queued on
-  /// `block_jobs` (or executing) and must run to completion for the issue-order contract to hold — so
-  /// the logical drop leaves a full state-machine image plus a session projection sitting in the lane.
-  /// With the logical guard cleared, the cadence is free to capture ANOTHER image the moment Normal
-  /// resumes, and repeated view churn against a lane that drains slower than the churn rate would pile
-  /// up arbitrarily many superseded images.
-  ///
-  /// So the capture site ([`Self::force_checkpoint`]) gates on THIS instead: at most one image capture
-  /// is ever owed to the lane, whatever the logical half does. A refused capture is exactly a capture
-  /// whose flush faulted — nothing is published, no pointer moves, and the sticky cadence
-  /// (`maybe_checkpoint` / `maybe_pay_checkpoint_debt` from the commit tails and the primary heartbeat)
-  /// re-forces it once the lane returns the completion this field is waiting for.
-  ///
-  /// The image occupies the LANE, so this guard has the LANE's lifetime, not this endpoint's — it
-  /// may name a job a DEAD incarnation issued. An endpoint rebuilt over a surviving lane (a restart
-  /// in place) inherits the outstanding capture through [`crate::BlockLaneOccupancy`] rather than
-  /// starting `None` over a queue that never drained; started `None`, every incarnation would
-  /// capture one more full image behind its predecessors' (the same accumulation the view-churn
-  /// paragraph above describes, driven by rebuilds instead of transitions). Released at exactly one
-  /// of two sites, both of them the lane handing the image back: the completion is CONSUMED
-  /// ([`Self::on_checkpoint_materialized`], an own-incarnation job) or REFUSED at the incarnation
-  /// choke ([`Self::on_block_done`], a dead incarnation's job — the refusal publishes nothing, but
-  /// it is still the delivery proving the image left the queue).
-  materializing: Option<crate::JobId>,
   /// The op number of this replica's latest durable checkpoint (0 until the first checkpoint
   /// goes durable). Carried on `Commit` and `PrepareOk` as the checkpoint-quorum signal.
   checkpoint_op: OpNumber,
@@ -2156,10 +2106,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       incarnation: next_incarnation(),
       next_op_id: 1,
       foreign_completions_rejected: 0,
-      block_jobs: VecDeque::new(),
-      block_jobs_outstanding: VecDeque::new(),
       block_jobs_superseded: 0,
-      block_serves_outstanding: 0,
       block_serves_refused: 0,
       pending: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
@@ -2168,10 +2115,6 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       pending_sb: None,
       pending_checkpoint: None,
       inherited_frontier: None,
-      // Genesis runs over a store formatted virgin in the same call, so no storage lane over it can
-      // hold anything yet: the lane quotas (this and `block_serves_outstanding` above) start empty
-      // BY CONSTRUCTION here, where `recover` must be TOLD what a possibly-surviving lane holds.
-      materializing: None,
       checkpoint_op: OpNumber::new(),
       checkpoint_sm_root: None,
       checkpoint_sessions_root: None,
@@ -2693,7 +2636,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     &mut self,
     reconfigure_op: OpNumber,
     successor: Membership,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) where
     S: StateMachine,
     R: Reconfig,
@@ -2786,7 +2729,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// durable-view write. This also covers the `start_view_as_new_primary` formation, where `advance_commit`
   /// can re-commit a carried `Reconfigure` op while status is still ViewChange — the swap defers here and
   /// fires once the new view is durable.
-  fn maybe_swap_epoch<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>)
+  fn maybe_swap_epoch<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>)
   where
     S: StateMachine,
     R: Reconfig,
@@ -2850,7 +2793,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     &mut self,
     reconfigure_op: OpNumber,
     successor: Membership,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) where
     S: StateMachine,
     R: Reconfig,
@@ -3755,9 +3698,13 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// Whether this replica has ANY storage op (WAL append or superblock write/read) still in flight —
   /// a submitted [`Wal`]/[`Superblock`] op whose completion the driver still owes.
   ///
-  /// `true` iff at least one durability-relevant set is non-empty. On the SESSION (the medium's
-  /// facts, whichever endpoint incarnation submitted them): every in-flight physical WAL append,
-  /// root write, and checkpoint-envelope write. On the ENDPOINT (this incarnation's logical
+  /// `true` iff at least one durability-relevant set is non-empty. On the SESSION (the store's
+  /// facts, whichever endpoint incarnation issued them): every in-flight physical WAL append,
+  /// root write, and checkpoint-envelope write, plus every block job the lane still owes a
+  /// completion for — queued for the driver or executing on its storage lane. (A materialize in
+  /// flight is durability work exactly as a superblock write is — it is the write half of the
+  /// durable checkpoint transaction — so a drain that ignored it would call an endpoint quiesced
+  /// while its checkpoint DAG was still being written.) On the ENDPOINT (this incarnation's logical
   /// pendings): the outstanding append actions (`pending`, plus its `appending` append-before-ack
   /// gate — a subset of `pending`, ORed for explicitness), the in-flight durable-view superblock
   /// write (`pending_sb`), the in-flight checkpoint write sequence (`pending_checkpoint`, and its
@@ -3778,7 +3725,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// quiesce target for a shutdown of a participating replica), and they resolve via
   /// `handle_storage`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn has_inflight_storage<W: Wal, B: Superblock>(&self, storage: &Storage<W, B>) -> bool {
+  pub fn has_inflight_storage<W: Wal, B: Superblock>(&self, storage: &Storage<W, B, S>) -> bool {
     storage.has_inflight()
       || !self.pending.is_empty()
       || !self.appending.is_empty()
@@ -3789,11 +3736,6 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       || self.pending_checkpoint.is_some()
       || self.pending_install.is_some()
       || !self.sync_serving.is_empty()
-      // Block-storage jobs issued and not yet completed — queued for the driver or executing on its
-      // storage lane. A materialize in flight is durability work exactly as a superblock write is
-      // (it is the write half of the durable checkpoint transaction), so a drain that ignored it
-      // would call an endpoint quiesced while its checkpoint DAG was still being written.
-      || !self.block_jobs_outstanding.is_empty()
   }
 
   /// The number of entries in this replica's in-memory `log` cache (the per-op tail cache).
@@ -4172,11 +4114,11 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// the live-root set (the durable checkpoint, an in-flight `block_fetch`, AND a RETAINED `pending_install`)
   /// shields the right blocks without needing an ordinary checkpoint to complete on the cadence.
   #[cfg(test)]
-  fn gc_blocks_for_test(&mut self)
+  fn gc_blocks_for_test<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>)
   where
     R: Reconfig,
   {
-    self.gc_blocks();
+    self.gc_blocks(storage);
   }
 
   /// Test/observability counter: how many state-syncs have fully applied + become durable on
@@ -4594,35 +4536,21 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   }
 
   /// Queue a block-storage job for the driver to execute OFF the pump, returning the `JobId` the
-  /// completion will echo. The single place a block job enters the seam: it mints the id, records
-  /// the completion as owed (both the drain witness and the issue-order witness), and appends to the
-  /// queue — so no job can be issued without being ordered and accounted.
-  fn issue_block_job(&mut self, kind: BlockJobKind<S>) -> crate::JobId {
+  /// completion will echo. The single place a block job enters the seam: it mints the id and hands
+  /// it to the lane's front, which claims the admission quota its kind occupies, records the
+  /// completion as owed, and queues it — so no job can be issued without being ordered and
+  /// accounted, and no quota can be claimed for a job that is not queued.
+  ///
+  /// The queue is the LANE's, not this endpoint's ([`Storage`]): a job issued here outlives the
+  /// endpoint that issued it, exactly as the image or cap slot it occupies does.
+  fn issue_block_job<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B, S>,
+    kind: BlockJobKind<S>,
+  ) -> crate::JobId {
     let id = self.mint_job_id();
-    self.enqueue_block_job(id, kind);
+    storage.enqueue_block_job(id, kind);
     id
-  }
-
-  /// Records an already-minted job as owed and queues it. Split out of [`Self::issue_block_job`] for
-  /// the one caller that must know the id BEFORE it can build the payload — a walk job moves the
-  /// transfer's frontiers into itself and leaves the id behind as the token its completion matches.
-  fn enqueue_block_job(&mut self, id: crate::JobId, kind: BlockJobKind<S>) {
-    self.block_jobs.push_back(BlockJob { id, kind });
-    self.block_jobs_outstanding.push_back(id);
-  }
-
-  /// Takes the next block-storage job the endpoint has issued, or `None` when none is queued.
-  ///
-  /// The driver executes it with [`execute_block_job`](crate::execute_block_job) on its storage lane
-  /// and feeds the result back through [`Self::on_block_done`]. Jobs MUST be executed, and their
-  /// completions delivered, SERIALLY IN THE ORDER THEY ARE POLLED — see the
-  /// [job seam contract](crate::BlockJob) for why that order is a storage-safety obligation and how
-  /// a violation is caught.
-  ///
-  /// A typed accessor rather than an [`Event`]: a job carries the state machine's captured image,
-  /// whose type is an associated type of `S`, so it cannot ride the untyped event stream.
-  pub fn poll_block_job(&mut self) -> Option<BlockJob<S>> {
-    self.block_jobs.pop_front()
   }
 
   /// How many block-job completions this endpoint dropped as SUPERSEDED: the work was still
@@ -4661,15 +4589,6 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     self.foreign_completions_rejected
   }
 
-  /// What this endpoint still has outstanding on its block-storage lane — the value a rebuild over
-  /// that SURVIVING lane must hand to [`recover`](Self::recover), read from the endpoint being
-  /// replaced (after its last completion was delivered, before the successor is constructed). See
-  /// [`BlockLaneOccupancy`](crate::BlockLaneOccupancy) for the lifetime rule this carries.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn lane_occupancy(&self) -> crate::BlockLaneOccupancy {
-    crate::BlockLaneOccupancy::new(self.materializing, self.block_serves_outstanding)
-  }
-
   /// Whether `id` was minted by a PREVIOUS endpoint instance over this storage, counting it if so.
   ///
   /// The single choke: both storage completion routers — and the synchronous-cancellation absorber
@@ -4688,7 +4607,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
 
   /// This WAL's [`effective_wal_capacity`] under this endpoint's checkpoint interval — see the free
   /// function for the geometry contract.
-  fn effective_wal_capacity<W: Wal, B: Superblock>(&self, storage: &Storage<W, B>) -> u64 {
+  fn effective_wal_capacity<W: Wal, B: Superblock>(&self, storage: &Storage<W, B, S>) -> u64 {
     effective_wal_capacity(storage.wal().capacity(), self.config.checkpoint_ops())
   }
 
@@ -4702,7 +4621,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// evict a committed, un-pruned op (the committed-op-loss class the ring-residency oracle checks).
   fn ring_append_would_wrap<W: Wal, B: Superblock>(
     &self,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
     op: u64,
   ) -> bool {
     op.saturating_sub(self.checkpoint_op.get()) > self.effective_wal_capacity(storage)
@@ -4734,7 +4653,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// append-before-ack gate and duplicate-append guards treat a deferred append as in flight).
   fn submit_or_defer_append<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     op: OpNumber,
     header: Header,
     body: Bytes,
@@ -4775,7 +4694,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// in-flight blocker.
   fn release_deferred_append<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     quiesced: u64,
   ) {
     let capacity = storage.wal().capacity();
@@ -4826,7 +4745,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// (one that can discard its own queue synchronously) never even opens a deferral window.
   fn absorb_wal_cancellations<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     cancelled: std::vec::Vec<crate::storage::SettledCancellation>,
   ) {
     for c in cancelled {
@@ -5591,7 +5510,7 @@ where
   pub fn handle_message<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: Message,
   ) {
@@ -5668,7 +5587,7 @@ where
   fn handle_message_inner<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     msg: Message,
   ) {
@@ -5746,10 +5665,10 @@ where
     if self.status.is_recovering() {
       if self.awaiting_peer_checkpoint() {
         match msg {
-          Message::SyncCheckpoint(m) => self.on_recover_sync_checkpoint(now, from, m),
+          Message::SyncCheckpoint(m) => self.on_recover_sync_checkpoint(now, storage, from, m),
           // While the recovery peer-fetch is pulling the SM checkpoint DAG, accept block responses
           // that feed the frontier (the over-frame chunked path is gone — the SM state IS the DAG).
-          Message::BlockResponse(m) => self.on_block_response(now, from, m),
+          Message::BlockResponse(m) => self.on_block_response(now, storage, from, m),
           _ => {}
         }
       }
@@ -5817,7 +5736,7 @@ where
       // (`on_request_sync`); a sync response is verified, its SM checkpoint DAG fetched, then applied
       // (`on_sync_checkpoint`).
       Message::RequestSync(m) => self.on_request_sync(now, storage, from, m),
-      Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, from, m),
+      Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, storage, from, m),
       Message::RepairBatch(m) => self.on_repair_batch(now, storage, m),
       // A learner's NON-VOTING progress report: record the durable frontier in `peer_progress` (touches
       // no quorum/vote state). It is a liveness HINT for a later `propose_membership(PromoteLearner)`.
@@ -5841,8 +5760,8 @@ where
       Message::EpochAhead(_) => {}
       // Block-DAG state-sync: serve a requested block from our store (stateless, content-addressed),
       // or feed a fetched block into the in-progress block-fetch frontier.
-      Message::RequestBlock(addr) => self.on_request_block(from, addr),
-      Message::BlockResponse(m) => self.on_block_response(now, from, m),
+      Message::RequestBlock(addr) => self.on_request_block(storage, from, addr),
+      Message::BlockResponse(m) => self.on_block_response(now, storage, from, m),
       // The negative repair answer: count the sender's durable LACK of a repair-or-truncate candidate op
       // toward the nack quorum that truncates the uncommitted tail (a new-primary-only tally).
       Message::Nack(m) => self.on_nack(storage, from, m),
@@ -6086,7 +6005,7 @@ where
   fn learner_status_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // Only a non-voting learner reports; a voter participates directly. (The call site already gates on
     // Normal; this gates on learner — together they match `serviceable_now(LearnerStatus)`.)
@@ -6125,7 +6044,7 @@ where
   pub fn handle_timeout<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     // BOUNDED QUARANTINE PROBE — checked FIRST, before the status dispatch, on a wall-clock deadline
     // INDEPENDENT of `sync_solicit` (which a quarantined higher-epoch heartbeat keeps re-soliciting, so a
@@ -6158,7 +6077,7 @@ where
         // flush fault would defer the checkpoint (and its WAL prune) until fresh client traffic. The cadence
         // self-gates on the boundary (`commit_min >= checkpoint_op + checkpoint_ops`) + a free superblock, so
         // it is a no-op unless a checkpoint is genuinely due, leaving the steady-state heartbeat unchanged.
-        self.maybe_checkpoint();
+        self.maybe_checkpoint(storage);
       }
       Status::Normal => {
         // backup: bootstrap + fire primary_idle, then re-arm THIS timer only so we
@@ -6209,7 +6128,7 @@ where
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one), re-drive the one
       // outstanding block pull of an in-progress block-fetch transfer, AND self-heal an owed local
       // flush-retry install (re-flush + re-stage locally, no donor reply needed).
-      self.sync_timeouts(now);
+      self.sync_timeouts(now, storage);
       // Learner progress report likewise runs only in Normal, and only for a non-voting learner — it
       // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
       self.learner_status_timeouts(now, storage);
@@ -6241,12 +6160,12 @@ where
   /// Drain completed WAL and superblock ops and react.
   ///
   /// Block work is NOT drained here: the endpoint holds no store, so the block jobs it issues are
-  /// taken by [`Self::poll_block_job`] and answered through [`Self::on_block_done`] on whatever
+  /// taken by [`Storage::poll_block_job`] and answered through [`Self::on_block_done`] on whatever
   /// execution context the driver gives its storage lane.
   pub fn handle_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
   ) {
     while let Some(polled) = storage.poll_wal() {
       self.on_wal_done(now, storage, polled);
@@ -6292,20 +6211,24 @@ where
   /// The block-storage twin of `on_wal_done` / `on_sb_done`, and gated the same two
   /// ways before any correlation state is read:
   ///
-  /// 1. **THE INCARNATION CHOKE.** A [`JobId`](crate::JobId) carries the incarnation of the endpoint
+  /// 1. **THE LANE'S OWN BOOKS** ([`Storage::settle_block_job`]), settled first and for EVERY
+  ///    completion, whichever incarnation minted it. Two facts, both the lane's: the ISSUE-ORDER
+  ///    WITNESS — only the front of the lane's outstanding queue may complete, because block jobs
+  ///    must execute serially in issue order (a `Gc` carrying generation N's roots reordered after
+  ///    generation N+1's `Materialize` frees the very blocks the next durable root names), and a
+  ///    driver that violates it is caught HERE rather than corrupting the store silently — and the
+  ///    ADMISSION QUOTA the job occupied (an image capture, a serve's cap slot, a frontier walk),
+  ///    which the delivery releases whether or not anything is published.
+  /// 2. **THE INCARNATION CHOKE.** A [`JobId`](crate::JobId) carries the incarnation of the endpoint
   ///    that minted it, so a completion naming another one belongs to a DEAD endpoint over this same
   ///    storage (a restart in place, whose lane still owed jobs). It is refused wholesale and
   ///    counted, exactly as a foreign WAL/superblock completion is — the sequence numbers restart at
   ///    1 in every incarnation, so letting one reach the dispatch below could publish a dead
-  ///    endpoint's checkpoint DAG under THIS endpoint's in-flight checkpoint token. The refusal is
-  ///    also where an INHERITED lane quota releases ([`crate::BlockLaneOccupancy`]): a refused
-  ///    completion is still the lane's delivery that the dead job — a materialize's image capture, a
-  ///    serve's cap slot — has left the queue, so the quota it occupied frees here, without any of
-  ///    its output being consumed.
-  /// 2. **THE ISSUE-ORDER WITNESS.** Only the FRONT of the outstanding queue may complete: block
-  ///    jobs must execute serially in issue order (a `Gc` carrying generation N's roots reordered
-  ///    after generation N+1's `Materialize` frees the very blocks the next durable root names), and
-  ///    a driver that violates it is caught HERE rather than corrupting the store silently.
+  ///    endpoint's checkpoint DAG under THIS endpoint's in-flight checkpoint token.
+  ///
+  /// The split is the same one the WAL and superblock completions get: the lane fact is settled
+  /// unconditionally, the correlation fact is judged per incarnation. A refused completion still
+  /// left the lane, so its quota must free — and it can only ever arrive refused.
   ///
   /// Only then does the outcome dispatch, and each arm re-validates its own correlation token: a
   /// completion whose state was superseded while it executed is dropped and counted
@@ -6313,42 +6236,13 @@ where
   pub fn on_block_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     done: BlockJobDone<S>,
   ) {
+    storage.settle_block_job(&done);
     if self.is_foreign_completion(done.id.op_id()) {
-      // The dead job's LANE QUOTA releases on its refusal — occupancy accounting, not correlation:
-      // no output is consumed, no correlation table is touched, nothing publishes. The quotas bound
-      // the LANE's depth and were inherited across the rebuild (`BlockLaneOccupancy`), and this
-      // refused delivery is the lane's own proof that the job — and the image or cap slot it
-      // occupied — has left the queue. Without the release an inherited materialize would hold the
-      // capture site closed forever (its completion can only ever arrive foreign).
-      //
-      // The release ASSUMES nothing beyond what it can match, keeping the choke's posture (refuse
-      // whatever arrives, however it got here): the materialize slot frees only on the FULL id —
-      // incarnation included, so a stray completion whose sequence merely aliases can free neither
-      // the inherited capture nor an own one — and the serve decrement floors at zero, so a stray
-      // serve never wraps the cap. A stray that matches nothing is simply refused, as before.
-      match &done.output {
-        BlockJobOutput::Materialized { .. } => {
-          if self.materializing == Some(done.id) {
-            self.materializing = None;
-          }
-        }
-        BlockJobOutput::Served { .. } => {
-          self.block_serves_outstanding = self.block_serves_outstanding.saturating_sub(1);
-        }
-        _ => {}
-      }
       return;
     }
-    let expected = self.block_jobs_outstanding.pop_front();
-    assert_eq!(
-      expected,
-      Some(done.id),
-      "block job completion out of issue order (expected {expected:?}) — the storage lane must \
-       execute jobs serially in issue order and deliver completions in that same order",
-    );
     match done.output {
       BlockJobOutput::Materialized {
         sm_root,
@@ -6372,7 +6266,7 @@ where
       // the walk it was waiting on.
       BlockJobOutput::Walked(walked) => {
         self.on_walked(now, storage, done.id, walked);
-        self.redeliver_deferred_pin(now);
+        self.redeliver_deferred_pin(now, storage);
       }
       BlockJobOutput::Restored { purpose, result } => match purpose {
         // A synced checkpoint's content: the obligation carries the token, so a reconstruct whose

@@ -4,10 +4,47 @@ use std::vec::Vec;
 use bytes::Bytes;
 
 use super::{AppendSubmission, Storage};
+use crate::block_job::{BlockJobDone, BlockJobKind, BlockJobOutput, BlockJobTag, WalkPurpose};
+use crate::block_store::{BlockAddress, BlockStore};
+use crate::endpoint::block_sync::BlockWalks;
+use crate::state_machine::StateMachine;
 use crate::storage::{
   Header, ReadId, SlotStatus, Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId,
 };
-use crate::{ClientId, OpNumber, RequestNumber, View};
+use crate::{ClientId, JobId, OpNumber, RequestNumber, View};
+
+/// The minimal state machine the session needs to be generic over: block jobs carry the SM's image
+/// type, so the lane front is parameterized by one.
+struct MockSm;
+
+impl StateMachine for MockSm {
+  type Image = ();
+
+  fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
+    Bytes::new()
+  }
+
+  fn checkpoint_image(&self) -> Self::Image {}
+
+  fn materialize(_image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(Bytes::new())
+  }
+
+  fn restore_seed(&self) -> Self {
+    Self
+  }
+
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &crate::VerifiedView<'_>,
+  ) -> Result<(), crate::RestoreError> {
+    store
+      .read_block(root)
+      .map(|_| ())
+      .ok_or(crate::RestoreError::new(root))
+  }
+}
 
 /// A staging WAL: appends park until the test lands them, truncate/prune cancel whatever is staged
 /// in range — the minimal medium the session's ledger semantics are exercised against.
@@ -151,13 +188,13 @@ fn root(checkpoint_op: u64, checkpoint_id: u128) -> VsrState {
   .expect("a well-formed test root")
 }
 
-fn submit(s: &mut Storage<MockWal, MockSb>, id: WriteId, op: u64) -> AppendSubmission {
+fn submit(s: &mut Storage<MockWal, MockSb, MockSm>, id: WriteId, op: u64) -> AppendSubmission {
   s.submit_append(id, OpNumber::with(op), header(op), Bytes::from_static(&[1]))
 }
 
 #[test]
 fn a_second_append_to_a_fenced_slot_is_refused_until_the_slot_quiesces() {
-  let mut s = Storage::new(MockWal::unbounded(), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let first = WriteId::new(1, 1);
   assert_eq!(submit(&mut s, first, 7), AppendSubmission::Submitted);
   assert!(
@@ -184,7 +221,7 @@ fn a_second_append_to_a_fenced_slot_is_refused_until_the_slot_quiesces() {
 
 #[test]
 fn the_fence_holds_across_incarnations_and_ring_aliases() {
-  let mut s = Storage::new(MockWal::bounded(4), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::bounded(4), MockSb::new());
   // A dead incarnation's write to op 1 is still with the device.
   let dead = WriteId::new(1, 1);
   assert_eq!(submit(&mut s, dead, 1), AppendSubmission::Submitted);
@@ -224,7 +261,7 @@ fn the_fence_holds_across_incarnations_and_ring_aliases() {
 
 #[test]
 fn settlement_is_keyed_by_the_full_id_never_the_sequence() {
-  let mut s = Storage::new(MockWal::unbounded(), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   // Two incarnations, SAME sequence number, different ops — the aliasing shape seq-only keying
   // would corrupt.
   let dead = WriteId::new(1, 1);
@@ -246,7 +283,7 @@ fn settlement_is_keyed_by_the_full_id_never_the_sequence() {
 
 #[test]
 fn truncate_settles_a_dead_incarnations_cancellations() {
-  let mut s = Storage::new(MockWal::unbounded(), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let dead = WriteId::new(1, 1);
   let kept = WriteId::new(2, 1);
   assert_eq!(submit(&mut s, dead, 5), AppendSubmission::Submitted);
@@ -269,7 +306,7 @@ fn truncate_settles_a_dead_incarnations_cancellations() {
 
 #[test]
 fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
-  let mut s = Storage::new(MockWal::unbounded(), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   assert_eq!(
     s.effective_checkpoint_pair(),
     (OpNumber::new(), 0),
@@ -316,7 +353,7 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
 
 #[test]
 fn an_envelope_landing_settles_without_claiming_the_root_timeline() {
-  let mut s = Storage::new(MockWal::unbounded(), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.submit_checkpoint(
     WriteId::new(1, 1),
     OpNumber::with(4),
@@ -340,7 +377,7 @@ fn an_envelope_landing_settles_without_claiming_the_root_timeline() {
 
 #[test]
 fn into_parts_refuses_while_the_medium_owes_completions() {
-  let mut s = Storage::new(MockWal::unbounded(), MockSb::new());
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let id = WriteId::new(1, 1);
   assert_eq!(submit(&mut s, id, 1), AppendSubmission::Submitted);
 
@@ -355,4 +392,119 @@ fn into_parts_refuses_while_the_medium_owes_completions() {
     s.into_parts().is_ok(),
     "a quiesced session releases its handles"
   );
+}
+
+/// A `Gc` sweep: the job kind that claims no lane quota.
+fn sweep() -> BlockJobKind<MockSm> {
+  BlockJobKind::Gc {
+    sm_roots: Vec::new(),
+    session_roots: Vec::new(),
+  }
+}
+
+/// A `Serve` answer for `addr` — the counted quota.
+fn serve(addr: BlockAddress) -> BlockJobKind<MockSm> {
+  BlockJobKind::Serve {
+    to: crate::Peer::Replica(crate::ReplicaId::new(0)),
+    addr,
+  }
+}
+
+/// One frontier step over a two-root DAG — the single-slot walk quota.
+fn walk(addr: BlockAddress) -> BlockJobKind<MockSm> {
+  BlockJobKind::Walk {
+    walks: BlockWalks::new(addr, addr),
+    fetched: None,
+    purpose: WalkPurpose::Arq,
+  }
+}
+
+/// The completion of a job whose kind is `tag`, echoing `id`.
+fn done(id: JobId, tag: BlockJobTag, addr: BlockAddress) -> BlockJobDone<MockSm> {
+  let output = match tag {
+    BlockJobTag::Gc => BlockJobOutput::Gced,
+    BlockJobTag::Serve => BlockJobOutput::Served {
+      to: crate::Peer::Replica(crate::ReplicaId::new(0)),
+      addr,
+      block: None,
+    },
+    BlockJobTag::Walk => BlockJobOutput::Walked(crate::block_job::WalkDone {
+      walks: BlockWalks::new(addr, addr),
+      accepted: false,
+      next: Ok(None),
+      purpose: WalkPurpose::Arq,
+    }),
+    other => panic!("no completion fixture for {other}"),
+  };
+  BlockJobDone { id, output }
+}
+
+fn addr() -> BlockAddress {
+  crate::block_address(b"a block the lane front's tests name")
+}
+
+#[test]
+fn a_job_queued_but_never_polled_outlives_the_endpoint_that_issued_it() {
+  // The whole point of the front: an un-polled job is the LANE's, so replacing the endpoint that
+  // issued it takes nothing away. The session cannot be replaced while it holds one either — that
+  // is the same seal the append ledger has.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let queued = JobId::new(1, 1);
+  s.enqueue_block_job(queued, serve(addr()));
+  assert!(s.has_inflight(), "the lane owes the queued job");
+
+  let mut s = match s.into_parts() {
+    Ok(_) => panic!("the handles must not come out while the lane still owes a job"),
+    Err(s) => s,
+  };
+  // A rebuild happens here, and it can do nothing to the queue: the successor polls what the
+  // predecessor queued.
+  let polled = s.poll_block_job().expect("the queued job is still there");
+  assert_eq!(polled.id(), queued);
+  s.settle_block_job(&done(queued, BlockJobTag::Serve, addr()));
+  assert!(!s.has_inflight(), "the delivery retired it");
+  assert!(s.into_parts().is_ok());
+}
+
+#[test]
+fn a_quota_releases_on_the_delivery_of_the_job_that_claimed_it() {
+  // The claim is made at QUEUE time and released at DELIVERY, both on the lane's own books — so the
+  // window in which the claim exists is exactly the window in which the job exists.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let first = JobId::new(1, 1);
+  let second = JobId::new(2, 1); // a SUCCESSOR incarnation's id, aliasing the sequence
+  s.enqueue_block_job(first, serve(addr()));
+  s.enqueue_block_job(second, walk(addr()));
+  assert_eq!(s.serves_outstanding(), 1);
+  assert!(s.walk_owed(), "one frontier step per lane");
+
+  s.settle_block_job(&done(first, BlockJobTag::Serve, addr()));
+  assert_eq!(s.serves_outstanding(), 0, "the serve's cap slot is free");
+  assert!(s.walk_owed(), "the walk is still owed");
+  s.settle_block_job(&done(second, BlockJobTag::Walk, addr()));
+  assert!(!s.walk_owed(), "and its delivery frees the walk slot");
+}
+
+#[test]
+#[should_panic(expected = "a second frontier walk was queued")]
+fn one_lane_admits_one_frontier_walk() {
+  // The walk quota is the lane's, so a transfer abandoned by a rebuild (or a re-pin, or a view
+  // transition) cannot leave its walk queued and admit another behind it.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.enqueue_block_job(JobId::new(1, 1), walk(addr()));
+  s.enqueue_block_job(JobId::new(2, 1), walk(addr()));
+}
+
+#[test]
+#[should_panic(expected = "block job completion out of issue order")]
+fn a_completion_out_of_issue_order_is_refused_by_the_lanes_witness() {
+  // The order witness judges EVERY completion, whichever incarnation minted it: a predecessor's job
+  // and its successor's sit in one queue, so the witness has to span both or the successor's own
+  // completion would find a stale front.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let dead = JobId::new(1, 1);
+  let live = JobId::new(2, 1);
+  s.enqueue_block_job(dead, sweep());
+  s.enqueue_block_job(live, sweep());
+  s.settle_block_job(&done(live, BlockJobTag::Gc, addr()));
 }

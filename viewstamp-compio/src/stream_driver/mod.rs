@@ -122,7 +122,7 @@ pub(crate) type AcceptorFactory<R> = Rc<dyn Fn() -> TransportConn<R>>;
 /// holds, so dropping the `Conn` is the connection's single complete teardown.
 pub struct CompioStreamDriver<S: StateMachine, R, W, B> {
   coord: StreamCoordinator<S, R>,
-  storage: Storage<W, B>,
+  storage: Storage<W, B, S>,
   /// The embedder-provided block-storage lane, the peer of `wal`/`sb` in the node's durable store:
   /// large bodies (state-sync chunks, snapshots) are addressed by content hash there while the
   /// WAL/superblock hold the consensus log and durable root. The lane owns the store; the run loop
@@ -359,15 +359,7 @@ where
     // slot-quiescence fence, the root timeline, the in-flight envelopes — outlive any endpoint
     // built over it.
     let mut storage = Storage::new(wal, sb);
-    let endpoint = build_endpoint(
-      config,
-      membership,
-      state_machine,
-      &mut storage,
-      // The lane's own accounting: what it still holds for a dead predecessor endpoint, if an
-      // embedder handed this driver a surviving lane clone; empty on a fresh lane.
-      blocks.occupancy(),
-    )?;
+    let endpoint = build_endpoint(config, membership, state_machine, &mut storage)?;
     let coord = StreamCoordinator::new(endpoint);
     // Seed the peer_book from the initial (slot -> addr) peers using the coordinator's membership
     // to resolve each slot to its stable MemberId.
@@ -806,7 +798,7 @@ where
     let mut any = false;
     loop {
       let mut moved = false;
-      while let Some(job) = self.coord.poll_block_job() {
+      while let Some(job) = self.storage.poll_block_job() {
         self.block_lane.submit(job);
         moved = true;
       }

@@ -668,16 +668,9 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 2);
   let mut storage = Storage::new(wal, sb);
-  let mut e = Endpoint::recover(
-    cfg,
-    genesis(3),
-    5,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts this store")
-  .expect_active();
+  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
   // Drive past the per-op retry budget so it escalates to a peer fetch (pumping the recover-retry
   // timer each round — the timer owns the read-retry budget).
   drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
@@ -880,7 +873,7 @@ fn a_state_sync_flush_fault_retains_the_checkpoint_and_self_retries_the_local_in
   // The donor is now SILENT — deliver NO further message. Fire ONLY the sync solicit timer past its
   // deadline: the local retry re-flushes (now succeeding) and stages the re-persist with no donor reply.
   let later = now + core::time::Duration::from_millis(150);
-  e.sync_timeouts(later);
+  e.sync_timeouts(later, &mut storage);
   e.storage_step(later, &mut storage, &mut blocks);
   e.storage_step(later, &mut storage, &mut blocks); // drive the now-staged durable re-persist
   // The retry's flush succeeded → the checkpoint installs and the sync completes, with no fresh donor.
@@ -963,7 +956,7 @@ fn a_retained_install_survives_a_block_gc_before_the_flush_retry() {
   // GC fires BEFORE the local flush retry. The retained install's DAG must SURVIVE (it is a live root); the
   // unreferenced garbage block must be FREED (the sweep ran). Were the install not a GC root, its blocks
   // would be swept here and the retry would re-persist a checkpoint naming freed blocks.
-  e.gc_blocks_for_test();
+  e.gc_blocks_for_test(&mut storage);
   e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     blocks.len(),
@@ -974,7 +967,7 @@ fn a_retained_install_survives_a_block_gc_before_the_flush_retry() {
   // The donor is SILENT — fire ONLY the local retry. Its flush now succeeds and stages the re-persist; the
   // SAME verified checkpoint installs (its DAG was never swept) and no committed state is lost.
   let later = now + core::time::Duration::from_millis(150);
-  e.sync_timeouts(later);
+  e.sync_timeouts(later, &mut storage);
   e.storage_step(later, &mut storage, &mut blocks);
   e.storage_step(later, &mut storage, &mut blocks);
   assert!(
@@ -1708,16 +1701,9 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 6);
   let mut storage = Storage::new(wal, sb);
-  let mut e = Endpoint::recover(
-    cfg,
-    genesis(3),
-    5,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts this store")
-  .expect_active();
+  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(e.awaiting_peer_checkpoint_for_test());
@@ -2896,16 +2882,9 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   drop(e); // crash
   // Recover over the same session: the synced checkpoint is the durable root.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let mut recovered = Endpoint::recover(
-    cfg,
-    genesis(3),
-    0,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts this store")
-  .expect_active();
+  let mut recovered = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
   assert_eq!(
     recovered.checkpoint_op(),
     OpNumber::with(4),
@@ -3094,8 +3073,8 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
   // backup applied through the checkpoint boundary): commit_min (5) >= checkpoint_op (0) + checkpoint_ops
   // (5), so this snapshots at commit_min and submits the snapshot write to the async superblock. It is
   // now IN FLIGHT (checkpoint_op is still 0 until the root lands).
-  e.maybe_checkpoint();
   let mut storage = Storage::new(wal, sb);
+  e.maybe_checkpoint(&mut storage);
   e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.pending_checkpoint_is_sync_for_test(),
@@ -3219,7 +3198,7 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
 /// the rest of the outbound queue).
 fn serve_request_sync(
   e: &mut Endpoint<CountSm>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   blocks: &mut InMemoryBlockStore,
 ) -> crate::SyncCheckpoint {
   let now = Instant::ZERO;
@@ -3620,15 +3599,8 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
   // epoch/prev_epoch/membership are unchanged. The laggard's stable id is MemberId 1 (slot 1), retained in
   // E2, so it recovers Active.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let recovered = match Endpoint::recover(
-    cfg,
-    genesis(3),
-    0,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts this store")
+  let recovered = match Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
   {
     Recovered::Active(r) => r,
     Recovered::Retired(_) => panic!("MemberId 1 is retained in E2 → recover Active"),
@@ -3960,7 +3932,7 @@ const SLOT_SHIFT_N: u64 = 4;
 /// `(laggard, storage, successor, predecessor_config_id, nonce)`.
 fn slot_shifted_crossing_laggard() -> (
   Endpoint<CountSm>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   Membership,
   u128,
   u64,
@@ -4658,16 +4630,9 @@ fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds(
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut storage = Storage::new(wal, sb);
-  let mut e = Endpoint::recover(
-    cfg,
-    genesis_mem,
-    9,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts this store")
-  .expect_active();
+  let mut e = Endpoint::recover(cfg, genesis_mem, 9, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
   // Drive the recovery storage to completion (the checkpoint read restores the SM + sessions).
   let now = Instant::ZERO;
   for _ in 0..8 {
@@ -6104,7 +6069,7 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
     blocks.has_block(crossing_sm_root) && blocks.has_block(crossing_sessions_root),
     "the crossing's DAG roots are present before the GC sweep"
   );
-  e.gc_blocks_for_test();
+  e.gc_blocks_for_test(&mut storage);
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
     blocks.has_block(crossing_sm_root) && blocks.has_block(crossing_sessions_root),
@@ -6114,7 +6079,7 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
   // The original crossing still COMPLETES on the local retry (no fresh donor reply): its flush now succeeds,
   // stages the re-persist, and the SAME verified successor membership installs — the laggard crosses to E+1.
   let later = now + core::time::Duration::from_millis(150);
-  e.sync_timeouts(later);
+  e.sync_timeouts(later, &mut storage);
   e.storage_step(later, &mut storage, &mut blocks);
   for _ in 0..6 {
     e.storage_step(later, &mut storage, &mut blocks);
@@ -6257,7 +6222,7 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
     Some((crossing_sm_root, crossing_sessions_root)),
     "the surviving install is the SAME crossing (DAG roots unchanged)"
   );
-  e.gc_blocks_for_test();
+  e.gc_blocks_for_test(&mut storage);
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
     blocks.has_block(crossing_sm_root) && blocks.has_block(crossing_sessions_root),
@@ -6428,7 +6393,7 @@ fn the_donor_serve_is_bounded_and_the_cap_releases_as_the_lane_drains() {
   // request lands while the previous ones are still outstanding.
   const OVER: usize = 4;
   for _ in 0..(super::MAX_OUTSTANDING_BLOCK_SERVES + OVER) {
-    e.on_request_block(primary_peer(), addr);
+    e.on_request_block(&mut storage, primary_peer(), addr);
   }
   // ANTI-VACUITY: the cap was genuinely REACHED — the excess is refused and counted, not merely
   // absent. Without this the assertions below would hold vacuously on an under-filled window.
@@ -6463,7 +6428,7 @@ fn the_donor_serve_is_bounded_and_the_cap_releases_as_the_lane_drains() {
 
   // THE CAP RELEASES. It bounds the outstanding set, not the lifetime total: a request arriving after
   // the lane drained is served normally, so a burst costs the requester one round trip, never a wedge.
-  e.on_request_block(primary_peer(), addr);
+  e.on_request_block(&mut storage, primary_peer(), addr);
   e.block_step(now, &mut storage, &mut blocks);
   assert!(
     core::iter::from_fn(|| e.poll_message())
@@ -6568,7 +6533,7 @@ fn a_restore_fault_arrives_asynchronously_while_the_reconstruct_obligation_gates
   // ANTI-VACUITY: the RESTORE — not some other job — really is outstanding here, the obligation
   // already gates it, and the frontier has already moved to M. Without these the fault below could be
   // landing on an endpoint that never had a reconstruct in flight at all.
-  let restore = e
+  let restore = storage
     .poll_block_job()
     .expect("the durable root issued the reconstruct");
   assert_eq!(
@@ -6903,7 +6868,7 @@ fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older
 /// can re-corrupt or repair it.
 fn laggard_owing_sm_reconstruct_at_m() -> (
   Endpoint<CountSm>,
-  Storage<TestWal, StepSb>,
+  Storage<TestWal, StepSb, CountSm>,
   InMemoryBlockStore,
   BlockAddress,
   u128,
@@ -7049,7 +7014,7 @@ fn laggard_owing_two_leaf_at_m(
   corrupt: BlockAddress,
 ) -> (
   Endpoint<TwoLeafSm>,
-  Storage<TestWal, StepSb>,
+  Storage<TestWal, StepSb, TwoLeafSm>,
   InMemoryBlockStore,
   BlockAddress,
   u128,
@@ -7205,11 +7170,11 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   // Each debtor's owed-state ARQ broadcasts an equal-checkpoint `RequestSync`. Fire the solicit timer.
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   let solicit = |e: &mut Endpoint<TwoLeafSm>,
-                 storage: &mut Storage<TestWal, StepSb>,
+                 storage: &mut Storage<TestWal, StepSb, TwoLeafSm>,
                  blocks: &mut InMemoryBlockStore|
    -> crate::RequestSync {
     while e.poll_message().is_some() {}
-    e.sync_timeouts(later);
+    e.sync_timeouts(later, storage);
     e.storage_step(later, storage, blocks);
     core::iter::from_fn(|| e.poll_message())
       .find_map(|out| match out.msg_ref() {
@@ -7240,7 +7205,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   // the serve before the read, or `sync_serving` stays empty and no SyncCheckpoint is shipped (the wedge
   // two complementary-corruption debtors recover from by serving each other).
   let serve_envelope = |donor: &mut Endpoint<TwoLeafSm>,
-                        dstorage: &mut Storage<TestWal, StepSb>,
+                        dstorage: &mut Storage<TestWal, StepSb, TwoLeafSm>,
                         dblocks: &mut InMemoryBlockStore,
                         to: ReplicaId,
                         sol: &crate::RequestSync|
@@ -7291,7 +7256,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   // Re-pin: deliver each donor's envelope to the OTHER debtor. `refetch_sm_reconstruct` re-points the
   // obligation's block-fetch to the live donor and emits a `RequestBlock` for the locally-faulted leaf.
   let repin = |e: &mut Endpoint<TwoLeafSm>,
-               storage: &mut Storage<TestWal, StepSb>,
+               storage: &mut Storage<TestWal, StepSb, TwoLeafSm>,
                blocks: &mut InMemoryBlockStore,
                donor: ReplicaId,
                env: crate::SyncCheckpoint|
@@ -7320,13 +7285,13 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   // holds (its own un-faulted leaf) via the verified read — and would return ABSENT for the leaf IT
   // faulted on (proven by `a_wants`/`b_wants` being exactly the complementary leaves).
   let serve_block = |donor: &mut Endpoint<TwoLeafSm>,
-                     dstorage: &mut Storage<TestWal, StepSb>,
+                     dstorage: &mut Storage<TestWal, StepSb, TwoLeafSm>,
                      dblocks: &mut InMemoryBlockStore,
                      to: ReplicaId,
                      addr: crate::BlockAddress|
    -> crate::BlockResponse {
     while donor.poll_message().is_some() {}
-    donor.on_request_block(Peer::Replica(to), addr);
+    donor.on_request_block(dstorage, Peer::Replica(to), addr);
     donor.storage_step(later, dstorage, dblocks);
     core::iter::from_fn(|| donor.poll_message())
       .find_map(|out| match out.into_msg() {
@@ -7349,7 +7314,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
 
   // Feed each clean block back: the corrupt leaf is overwritten, the DAG drains, the SM reconstructs.
   let complete = |e: &mut Endpoint<TwoLeafSm>,
-                  storage: &mut Storage<TestWal, StepSb>,
+                  storage: &mut Storage<TestWal, StepSb, TwoLeafSm>,
                   blocks: &mut InMemoryBlockStore,
                   donor: ReplicaId,
                   resp: crate::BlockResponse| {
@@ -7393,7 +7358,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
 
   // Apply/serve resume: a fresh RequestSync now submits a serve-read on both.
   let resumes = |e: &mut Endpoint<TwoLeafSm>,
-                 storage: &mut Storage<TestWal, StepSb>,
+                 storage: &mut Storage<TestWal, StepSb, TwoLeafSm>,
                  _blocks: &mut InMemoryBlockStore,
                  peer: ReplicaId| {
     while e.poll_message().is_some() {}
@@ -7441,7 +7406,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   assert_eq!(c_wants, leaf_x, "C still needs leaf-x");
   // The bad donor cannot serve leaf-x (it faulted it too): `on_request_block` returns an ABSENT response.
   while bad_donor.poll_message().is_some() {}
-  bad_donor.on_request_block(Peer::Replica(a_id), c_wants);
+  bad_donor.on_request_block(&mut bstorage2, Peer::Replica(a_id), c_wants);
   bad_donor.storage_step(later, &mut bstorage2, &mut bdblocks);
   let absent = core::iter::from_fn(|| bad_donor.poll_message())
     .find_map(|out| match out.into_msg() {
@@ -7760,7 +7725,7 @@ fn an_owed_sm_reconstruct_blocks_a_competing_lower_checkpoint_write() {
     !storage.has_inflight(),
     "no superblock write is in flight after the faulted restore"
   );
-  e.maybe_checkpoint();
+  e.maybe_checkpoint(&mut storage);
   e.storage_step(now, &mut storage, &mut blocks);
   assert!(
     !storage.has_inflight(),
@@ -8014,7 +7979,7 @@ fn a_normal_owed_sm_reconstruct_solicits_an_equal_checkpoint_repair_and_fails_ov
   // `sync_solicit` at `ZERO + SYNC_SOLICIT`, so firing it past that deadline re-broadcasts `RequestSync`.
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   while e.poll_message().is_some() {}
-  e.sync_timeouts(later);
+  e.sync_timeouts(later, &mut storage);
   e.storage_step(later, &mut storage, &mut blocks);
   let solicited = core::iter::from_fn(|| e.poll_message())
     .find_map(|out| match out.msg_ref() {
@@ -8111,7 +8076,7 @@ fn a_normal_owed_sm_reconstruct_solicits_an_equal_checkpoint_repair_and_fails_ov
   // clean bytes overwrite our corrupt block, the DAG drains, and `retry_sm_reconstruct` reconstructs M.
   let (mut peer, mut pstorage2) = donor_primary_at_checkpoint(4);
   while peer.poll_message().is_some() {}
-  peer.on_request_block(Peer::Replica(ReplicaId::new(1)), block_req);
+  peer.on_request_block(&mut pstorage2, Peer::Replica(ReplicaId::new(1)), block_req);
   peer.storage_step(later, &mut pstorage2, &mut peer_blocks);
   let block_resp = core::iter::from_fn(|| peer.poll_message())
     .find_map(|out| match out.into_msg() {
@@ -8534,7 +8499,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
   // its absent burst re-solicits ZERO more — the total stays O(distinct roots) = O(round-trips). Drive MANY
   // (8) duplicate checkpoints, each followed by a burst of duplicate absents, and require zero new re-solicits.
   let dup_checkpoint = |e: &mut Endpoint<CountSm>,
-                        storage: &mut Storage<TestWal, TestSb>,
+                        storage: &mut Storage<TestWal, TestSb, CountSm>,
                         blocks: &mut crate::block_store::InMemoryBlockStore,
                         now: Instant| {
     e.handle_message(
@@ -8993,7 +8958,7 @@ fn an_sm_reconstruct_re_pin_replaces_the_fetch_so_a_later_lost_block_is_arq_retr
   // routes to `refetch_sm_reconstruct` → `rearm_sm_reconstruct_retry`, which re-arms the fetch (M's leaf is
   // corrupt locally, so the frontier wants `sm_root_m`) and emits a `RequestBlock`.
   let deliver_repin = |e: &mut Endpoint<CountSm>,
-                       storage: &mut Storage<TestWal, StepSb>,
+                       storage: &mut Storage<TestWal, StepSb, CountSm>,
                        blocks: &mut InMemoryBlockStore| {
     e.handle_message(
       now,
@@ -10166,7 +10131,7 @@ fn a_transfer_drained_under_the_superblock_fence_installs_from_the_local_arq() {
   // `reply` is not called again — so the resumption is purely local.
   e.pending_checkpoint = None;
   let later = now + SYNC_SOLICIT;
-  e.sync_timeouts(later);
+  e.sync_timeouts(later, &mut storage);
   assert!(
     std::iter::from_fn(|| e.poll_message())
       .any(|out| matches!(out.msg_ref(), Message::RequestSync(_))),
@@ -10272,8 +10237,8 @@ fn a_donor_reply_that_always_lands_mid_walk_re_pins_a_dead_donors_transfer() {
   let mut cursor = crate::BlockJobCursor::new();
   for _ in 0..3 {
     now = now + SYNC_SOLICIT;
-    e.sync_timeouts(now);
-    let job = e
+    e.sync_timeouts(now, &mut storage);
+    let job = storage
       .poll_block_job()
       .expect("the solicit tick queued the ARQ walk");
     assert!(
@@ -10310,7 +10275,7 @@ fn a_donor_reply_that_always_lands_mid_walk_re_pins_a_dead_donors_transfer() {
   // that stalls the transfer fails the assertion below rather than hanging the suite.
   for _ in 0..16 {
     now = now + SYNC_SOLICIT;
-    e.sync_timeouts(now);
+    e.sync_timeouts(now, &mut storage);
     e.block_step(now, &mut storage, &mut blocks);
     let mut want = None;
     while let Some(out) = e.poll_message() {

@@ -51,14 +51,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///
   /// The status split mirrors the message dispatch: a `Recovering` peer-fetch owns its own ingress, and
   /// everything else takes the Normal one (which drops the reply unless the status still admits it).
-  pub(super) fn redeliver_deferred_pin(&mut self, now: Instant) {
+  pub(super) fn redeliver_deferred_pin<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     let Some((from, m)) = self.deferred_pin.take() else {
       return;
     };
     if self.status.is_recovering() && self.awaiting_peer_checkpoint() {
-      self.on_recover_sync_checkpoint(now, from, m);
+      self.on_recover_sync_checkpoint(now, storage, from, m);
     } else {
-      self.on_sync_checkpoint(now, from, m);
+      self.on_sync_checkpoint(now, storage, from, m);
     }
   }
 
@@ -69,8 +73,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// inside that job, and a second walk over the same transfer is unrepresentable rather than
   /// merely avoided. The caller's own re-drive (the stop-and-wait ARQ, or the completion's next
   /// pull) is what resumes the transfer.
-  pub(super) fn issue_walk(
+  ///
+  /// Also a no-op while the LANE still owes a walk. The transfer-scoped guard above is per
+  /// `block_fetch`, and every arming site REPLACES that field wholesale — a re-pin, a bound-breach
+  /// abort, a view transition, an endpoint rebuild — so a fresh transfer's walk state reads `Idle`
+  /// while the abandoned transfer's walk is still queued. A walk carries the frontiers of a DAG
+  /// bounded only by the reachable-block cap, so admitting one per abandonment would grow the lane
+  /// by that much each time. One walk per lane is the bound; the stop-and-wait ARQ (or, while
+  /// Recovering, the recover-retry cadence) re-drives this the moment the outstanding walk lands.
+  pub(super) fn issue_walk<W: Wal, B: Superblock>(
     &mut self,
+    storage: &mut Storage<W, B, S>,
     purpose: WalkPurpose,
     fetched: Option<(BlockAddress, Bytes)>,
   ) {
@@ -78,6 +91,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.block_fetch.as_ref().map(|bf| &bf.walks),
       Some(WalkState::Idle(_))
     ) {
+      return;
+    }
+    if storage.walk_owed() {
       return;
     }
     let id = self.mint_job_id();
@@ -88,7 +104,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let WalkState::Idle(walks) = core::mem::replace(&mut bf.walks, WalkState::InFlight(id)) else {
       unreachable!("just matched an idle walk state")
     };
-    self.enqueue_block_job(
+    storage.enqueue_block_job(
       id,
       BlockJobKind::Walk {
         walks,
@@ -334,7 +350,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn maybe_sync_below_ring_window<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
     pop: u64,
     cluster_checkpoint: OpNumber,
   ) -> bool {
@@ -560,7 +576,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// re-broadcast `RequestSync` (dead-donor replacement: a fresh `SyncCheckpoint` from any live holder
   /// re-pins the donor and the block-fetch resumes at the same frontier). Cleared when the synced
   /// checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
-  pub(crate) fn sync_timeouts(&mut self, now: Instant) {
+  pub(crate) fn sync_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     if self.timers.sync_solicit.is_none_or(|d| d > now) {
       return;
     }
@@ -573,12 +593,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // needed. A transient disk fault that dropped the only locally-usable checkpoint thus completes the
     // sync the moment a flush succeeds, even if the donor has since crashed. (A no-op when none is owed,
     // or when a superblock root is in flight — `retry_install_flush` re-defers on that fence.)
-    self.retry_install_flush(now);
+    self.retry_install_flush(now, storage);
     // The controlled retry deadline fired: re-send the one outstanding `RequestBlock` and re-broadcast
     // `RequestSync` (the 100ms ARQ heartbeat — the lost-checkpoint retry, and dead-donor failover). The
     // active-donor-absent per-front re-solicit is bounded ON THE FETCH (`BlockFetch::resolicited_front`), so
     // a dropped re-solicit is retried here without a marker to clear.
-    self.send_request_block(now);
+    self.send_request_block(now, storage);
     self.send_request_sync(now);
   }
 
@@ -677,7 +697,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (nothing missing — the next `BlockResponse` / completion installs). A bound breach in either DAG (a
   /// malformed/foreign DAG) aborts the block-fetch (dropped here) but keeps `sync` armed so the solicit
   /// timer re-solicits a fresh checkpoint.
-  pub(super) fn send_request_block(&mut self, now: Instant) {
+  pub(super) fn send_request_block<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     if self.sync.is_none() {
       return;
     }
@@ -689,7 +713,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // DAG would stop retransmitting once it drains and the sole outstanding block is a SESSION block,
     // stranding the install until a fresh `SyncCheckpoint` re-pinned it. Its completion emits the
     // pull; a walk already in flight makes this a no-op (that walk emits it instead).
-    self.issue_walk(WalkPurpose::Arq, None);
+    self.issue_walk(storage, WalkPurpose::Arq, None);
     if self.status.is_normal() {
       self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
     }
@@ -748,7 +772,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_request_sync<W: Wal, B: Superblock>(
     &mut self,
     _now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     m: crate::RequestSync,
   ) {
@@ -819,7 +843,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// one-read-per-requester bound on `sync_serving`.
   fn submit_or_refresh_serve<W: Wal, B: Superblock>(
     &mut self,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     requester: Peer,
     nonce: u64,
   ) {
@@ -862,7 +886,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// and completion): if we are no longer Normal, or our view is no longer durable, we drop the reply.
   pub(crate) fn serve_sync_checkpoint<W: Wal, B: Superblock>(
     &mut self,
-    storage: &Storage<W, B>,
+    storage: &Storage<W, B, S>,
     cr: crate::CheckpointRead,
   ) {
     // Serve entries are keyed by REQUESTER (one outstanding serve each); match this completion
@@ -984,19 +1008,23 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// answering ABSENT) is what keeps the requester's frontier intact: an absent reply for a block we
   /// actually hold would drive its pruned-front re-solicit path, while a dropped request is simply
   /// re-sent by the requester's stop-and-wait ARQ.
-  pub(crate) fn on_request_block(&mut self, from: Peer, addr: crate::BlockAddress) {
+  pub(crate) fn on_request_block<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B, S>,
+    from: Peer,
+    addr: crate::BlockAddress,
+  ) {
     // The requester is `from` — a current member (`Peer::Replica`) or a quarantined attested member
     // (`Peer::Member`) fetching the SM DAG of the checkpoint it is installing; a client / raw non-peer
     // never reaches here (the binding dropped it).
     if from.is_client() {
       return;
     }
-    if self.block_serves_outstanding >= MAX_OUTSTANDING_BLOCK_SERVES {
+    if storage.serves_outstanding() >= MAX_OUTSTANDING_BLOCK_SERVES {
       self.block_serves_refused = self.block_serves_refused.saturating_add(1);
       return;
     }
-    self.block_serves_outstanding += 1;
-    self.issue_block_job(BlockJobKind::Serve { to: from, addr });
+    self.issue_block_job(storage, BlockJobKind::Serve { to: from, addr });
   }
 
   /// Answer the peer whose `RequestBlock` the completed `Serve` job read for. The bytes are already
@@ -1009,7 +1037,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     addr: crate::BlockAddress,
     block: Option<Bytes>,
   ) {
-    self.block_serves_outstanding = self.block_serves_outstanding.saturating_sub(1);
     self.emit(Outgoing::new(
       Recipient::To(to),
       Message::BlockResponse(crate::BlockResponse::new(addr, block)),
@@ -1023,8 +1050,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// gate — `checkpoint_id(snapshot) == checkpoint_id` — and only then begins fetching the SM
   /// checkpoint DAG (`apply_sync` once the DAG drains). A failed integrity check (a corrupt/forged
   /// snapshot) is REJECTED without touching the SM, leaving `sync` armed so the timer re-solicits.
-  pub(crate) fn on_sync_checkpoint(&mut self, now: Instant, from: Peer, m: crate::SyncCheckpoint) {
-    self.handle_sync_checkpoint(now, from, m);
+  pub(crate) fn on_sync_checkpoint<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    from: Peer,
+    m: crate::SyncCheckpoint,
+  ) {
+    self.handle_sync_checkpoint(now, storage, from, m);
   }
 
   /// The body of [`Self::on_sync_checkpoint`]. Runs the §2.5 guard cascade + integrity gate, then —
@@ -1035,7 +1068,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the transfer underneath them (a target raised mid-fetch aborts a FORCED pin via
   /// [`Self::drop_transfer_below_forced_target`], and keeps an ORDINARY pin — it installs below the
   /// raised floor as strict progress, the next `Commit` chasing the newer checkpoint).
-  fn handle_sync_checkpoint(&mut self, now: Instant, from: Peer, m: crate::SyncCheckpoint) {
+  fn handle_sync_checkpoint<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    from: Peer,
+    m: crate::SyncCheckpoint,
+  ) {
     // Freshness + relevance: we must be a Normal replica with an outstanding sync whose nonce matches.
     if !self.status.is_normal() {
       return;
@@ -1087,7 +1126,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
         return;
       }
-      self.refetch_sm_reconstruct(now, from, &m);
+      self.refetch_sm_reconstruct(now, storage, from, &m);
       return;
     }
     if m.checkpoint_op().get() < s.target.get() && !s.require_cross_epoch {
@@ -1170,7 +1209,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.sync_solicit = None;
       return;
     }
-    self.begin_block_sync(now, from, m);
+    self.begin_block_sync(now, storage, from, m);
   }
 
   /// Carry the re-solicit latch ([`BlockFetch::resolicited_front`]) forward across a re-pin that
@@ -1227,7 +1266,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (nothing staged; `sync` stays armed so the solicit timer re-fetches). The walk is issued
   /// immediately so a DAG the store already holds reports complete on the first step (not only after a
   /// reply).
-  fn begin_block_sync(&mut self, now: Instant, from: Peer, m: crate::SyncCheckpoint) {
+  fn begin_block_sync<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    from: Peer,
+    m: crate::SyncCheckpoint,
+  ) {
     // Decode the envelope to extract BOTH content-addressed DAG roots. The bytes already passed the
     // `checkpoint_id` integrity gate, but a malformed/truncated envelope must not panic — reject it as a
     // fault and leave `sync` armed so the solicit timer re-fetches from another peer.
@@ -1315,7 +1360,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Drain both frontiers once: a DAG the store already holds reports complete on this first walk
     // and installs, otherwise the first pull goes out from the completion. (A root the store holds
     // advances to drained only after a walk, never on seeding alone.)
-    self.issue_walk(WalkPurpose::Arm, None);
+    self.issue_walk(storage, WalkPurpose::Arm, None);
     self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
   }
 
@@ -1327,7 +1372,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// hash mismatch, or a non-frontier address is inert: the frontier's next-missing is re-requested.
   /// A bound breach (a malformed/foreign DAG) aborts the transfer but keeps `sync` armed so the
   /// solicit timer re-solicits a fresh checkpoint.
-  pub(crate) fn on_block_response(&mut self, now: Instant, from: Peer, m: crate::BlockResponse) {
+  pub(crate) fn on_block_response<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    from: Peer,
+    m: crate::BlockResponse,
+  ) {
     let recovering = self.status.is_recovering() && self.awaiting_peer_checkpoint();
     if !self.status.is_normal() && !recovering {
       return;
@@ -1354,6 +1405,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .block()
       .map(|bytes| (m.addr(), Bytes::copy_from_slice(bytes)));
     self.issue_walk(
+      storage,
       WalkPurpose::Response {
         from,
         addr: m.addr(),
@@ -1375,7 +1427,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(super) fn on_walked<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     job: crate::JobId,
     done: crate::block_job::WalkDone<S>,
   ) {
@@ -1388,7 +1440,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // The cold-start LOCAL presence probe owns no transfer: its frontiers are throwaway and only the
     // verdict matters.
     if let WalkPurpose::RecoverProbe(checkpoint) = purpose {
-      self.on_recover_probe_walked(job, checkpoint, next);
+      self.on_recover_probe_walked(storage, job, checkpoint, next);
       return;
     }
     let Some(bf) = self.block_fetch.as_mut() else {
@@ -1455,7 +1507,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         None => {
           self.block_fetch = None;
           if retry {
-            self.retry_sm_reconstruct();
+            self.retry_sm_reconstruct(storage);
           }
         }
         Some(addr) => self.emit(Outgoing::new(
@@ -1476,7 +1528,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn on_response_walked<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     addr: BlockAddress,
     present: bool,
@@ -1564,7 +1616,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Fenced on a free superblock, the same single-writer fence the ingress applies: a root landing
   /// between the walk's issue and its completion must not let a re-persist stage underneath it. The
   /// transfer stays pinned and drained, and the solicit cadence re-drives it once the root lands.
-  fn on_fetch_drained<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
+  fn on_fetch_drained<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return;
     }
@@ -1575,7 +1631,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         .is_some_and(|bf| bf.checkpoint.checkpoint_op() == self.checkpoint_op);
     if same_checkpoint_retry {
       self.block_fetch = None;
-      self.retry_sm_reconstruct();
+      self.retry_sm_reconstruct(storage);
       return;
     }
     let Some(bf) = self.block_fetch.take() else {
@@ -1586,7 +1642,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.status.is_recovering() && self.awaiting_peer_checkpoint() {
       self.complete_recover_peer_fetch(now, storage, donor, checkpoint);
     } else {
-      self.apply_sync(now, donor, &checkpoint);
+      self.apply_sync(now, storage, donor, &checkpoint);
     }
   }
 
@@ -1655,7 +1711,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
   /// `>= sync.target`, itself derived from a committed-cluster message. So we never adopt a snapshot
   /// above the committed frontier.
-  pub(crate) fn apply_sync(&mut self, now: Instant, donor: Peer, m: &crate::SyncCheckpoint) {
+  pub(crate) fn apply_sync<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    donor: Peer,
+    m: &crate::SyncCheckpoint,
+  ) {
     let checkpoint_op = m.checkpoint_op();
     // Release-active safety guard, branched on whether this is a FORCED sync.
     if self.sync.is_some_and(|s| s.forced) {
@@ -1893,7 +1955,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // is invariant-clean: `checkpoint_op` is still M until `install_sync` advances it, so `sm_reconstruct.op
     // == checkpoint_op` holds, and M's DAG stays GC-rooted by the durable checkpoint root regardless.
     self.pending_install = Some(install);
-    self.flush_and_stage_install(now);
+    self.flush_and_stage_install(now, storage);
   }
 
   /// DURABILITY BARRIER + STAGE for the OWED `pending_install`: flush the synced checkpoint's blocks (BOTH
@@ -1914,7 +1976,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Single-writer fenced: while a superblock root is in flight (`pending_sb` / `pending_checkpoint`, the
   /// latter being this install's own SyncRepersist once it stages) the re-persist must not begin, so it is
   /// deferred — the install stays owed and the cadence re-drives it once the root lands.
-  pub(crate) fn flush_and_stage_install(&mut self, now: Instant) {
+  pub(crate) fn flush_and_stage_install<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     let Some(install) = self.pending_install.as_ref() else {
       return; // no owed install — nothing to flush/stage.
     };
@@ -1931,10 +1997,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // leaves `pending_install` owed, and `sync` stays armed so the cadence re-attempts.
     let target_op = install.checkpoint_op;
     let (sm_root, sessions_root) = (install.sm_root, install.sessions_root);
-    let job = self.issue_block_job(BlockJobKind::Flush {
-      sm_root,
-      sessions_root,
-    });
+    let job = self.issue_block_job(
+      storage,
+      BlockJobKind::Flush {
+        sm_root,
+        sessions_root,
+      },
+    );
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
       step: CheckpointStep::FlushingBlocks(job),
@@ -1958,8 +2027,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// install owed for the next cadence; a transient disk fault thus self-heals instead of stalling the sync
   /// forever if the donor crashes after the blocks were fetched. No-op once the install has STAGED (a
   /// SyncRepersist `pending_checkpoint` is in flight — the fence in `flush_and_stage_install` returns).
-  pub(crate) fn retry_install_flush(&mut self, now: Instant) {
-    self.flush_and_stage_install(now);
+  pub(crate) fn retry_install_flush<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    self.flush_and_stage_install(now, storage);
   }
 
   /// INSTALL a staged `SyncCheckpoint` for the synced checkpoint `M` whose re-persist ROOT (step 2) is
@@ -1987,7 +2060,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (`advance_commit` is suppressed while `pending_install`, and `on_prepare` drops while `sync.is_some()`),
   /// so the captured `held_tail` and the monotonic advances below are exactly as they would have been at
   /// STAGE time.
-  pub(crate) fn install_sync(&mut self, now: Instant, install: PendingInstall) {
+  pub(crate) fn install_sync<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    install: PendingInstall,
+  ) {
     let PendingInstall {
       checkpoint_op,
       sessions_root,
@@ -2162,14 +2240,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       donor,
       restore: None,
     });
-    self.issue_sm_restore();
+    self.issue_sm_restore(storage);
   }
 
   /// Issue the reconstruct job for the owed [`SmReconstruct`] obligation, recording its token on the
   /// obligation. A no-op when nothing is owed, or when a reconstruct is ALREADY executing for it —
   /// two concurrent restores of the same obligation would leave the loser's verdict answering a
   /// token it no longer holds, and the second seed capture would be wasted work.
-  pub(crate) fn issue_sm_restore(&mut self) {
+  pub(crate) fn issue_sm_restore<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     let Some(recon) = self.sm_reconstruct.as_ref() else {
       return;
     };
@@ -2181,12 +2259,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // it, and the endpoint swaps it in only on success — so a failed reconstruct can never leave the
     // live SM partially mutated.
     let seed = self.sm.restore_seed();
-    let job = self.issue_block_job(BlockJobKind::Restore {
-      sm_root,
-      sessions_root,
-      seed,
-      purpose: RestorePurpose::SyncedCheckpoint,
-    });
+    let job = self.issue_block_job(
+      storage,
+      BlockJobKind::Restore {
+        sm_root,
+        sessions_root,
+        seed,
+        purpose: RestorePurpose::SyncedCheckpoint,
+      },
+    );
     if let Some(recon) = self.sm_reconstruct.as_mut() {
       recon.restore = Some(job);
     }
@@ -2201,7 +2282,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(super) fn on_sm_restored<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     result: Result<(S, std::collections::BTreeMap<u128, Session>), crate::RestoreError>,
   ) {
     let Some(recon) = self.sm_reconstruct.as_mut() else {
@@ -2213,7 +2294,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // A still-bad block in either DAG: keep the obligation owed and re-pull it from the donor. No
       // immediate re-issue on a complete DAG — that would re-read the same bad block and spin; the
       // re-solicit drives the next attempt.
-      self.rearm_sm_reconstruct_retry(now, false);
+      self.rearm_sm_reconstruct_retry(now, storage, false);
       return;
     };
     // Both DAGs read back clean — install the restored SM and the session table together.
@@ -2267,9 +2348,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// walk resumes against the same DAG. If the DAG is ALREADY complete in the store (the missing block was
   /// repaired out of band, or this donor's reply already carried it), retry the restore IMMEDIATELY — the
   /// re-arm left no block-fetch to drain, so nothing else would drive the completion.
-  pub(crate) fn refetch_sm_reconstruct(
+  pub(crate) fn refetch_sm_reconstruct<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    storage: &mut Storage<W, B, S>,
     from: Peer,
     m: &crate::SyncCheckpoint,
   ) {
@@ -2292,7 +2374,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // A FRESH donor reply is the new evidence, so a DAG that already reads back complete re-issues the
     // reconstruct straight from the walk's verdict — the re-arm would otherwise leave no fetch to drain
     // and nothing to drive it.
-    self.rearm_sm_reconstruct_retry(now, true);
+    self.rearm_sm_reconstruct_retry(now, storage, true);
   }
 
   /// Re-arm the owed SM-reconstruct's block-fetch so the missing/corrupt block of M's DAG is
@@ -2304,7 +2386,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// drive it. A re-arm that followed a FAILED reconstruct leaves it clear: re-issuing against the
   /// same still-faulty block would fail identically and spin, so there the re-solicit drives the next
   /// attempt.
-  pub(crate) fn rearm_sm_reconstruct_retry(&mut self, now: Instant, retry: bool) {
+  pub(crate) fn rearm_sm_reconstruct_retry<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    retry: bool,
+  ) {
     let Some(recon) = self.sm_reconstruct.as_ref() else {
       return; // no obligation owed — nothing to re-arm (defensive; the caller stashed it just above).
     };
@@ -2335,7 +2422,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // possible — M is fixed — so this only ever carries; the `else None` is for uniformity.)
       resolicited_front: self.carry_resolicit_latch(sm_root, sessions_root),
     });
-    self.issue_walk(WalkPurpose::Rearm { retry }, None);
+    self.issue_walk(storage, WalkPurpose::Rearm { retry }, None);
     // Re-arm the serviced ARQ for the node's current status. Done at ISSUE, not on the walk's verdict:
     // the cadence must keep running whatever the walk finds, and while Recovering the peer-fetch flag
     // is what keeps the recovery open and admits the answering `SyncCheckpoint`.
@@ -2362,7 +2449,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Re-issues the reconstruct job; its completion ([`Self::on_sm_restored`]) either installs the
   /// content and runs the success tail, or leaves the obligation owed and re-arms the fetch/ARQ to
   /// pull the still-faulty block again.
-  pub(crate) fn retry_sm_reconstruct(&mut self) {
-    self.issue_sm_restore();
+  pub(crate) fn retry_sm_reconstruct<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    self.issue_sm_restore(storage);
   }
 }

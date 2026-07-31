@@ -278,7 +278,7 @@ impl BlockStore for BenchBlocks {
 
 struct Replica<S: StateMachine> {
   ep: Endpoint<S>,
-  storage: viewstamp_proto::Storage<BenchWal, BenchSb>,
+  storage: viewstamp_proto::Storage<BenchWal, BenchSb, S>,
   blocks: BenchBlocks,
   /// The execution-order witness of this replica's inline storage lane.
   block_lane: viewstamp_proto::BlockJobCursor,
@@ -421,7 +421,7 @@ where
         // queued block job and feed its completion back, until neither side produces work.
         loop {
           r.ep.handle_storage(now, &mut r.storage);
-          let Some(job) = r.ep.poll_block_job() else {
+          let Some(job) = r.storage.poll_block_job() else {
             break;
           };
           let done = viewstamp_proto::execute_block_job(&mut r.block_lane, job, &mut r.blocks);

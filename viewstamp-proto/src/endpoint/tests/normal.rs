@@ -1284,7 +1284,10 @@ fn backup_reorder_buffer_is_bounded_to_the_tail_gap_window() {
 /// COMMIT on a SOLO PRIMARY (quorum 1: each op commits via `commit_op` the moment its append lands) —
 /// the primary-path half of the session-eviction determinism proof. Returns the endpoint with every
 /// op applied.
-fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, Storage<TestWal, TestSb>) {
+fn solo_primary_with_clients(
+  cap: u32,
+  n: u64,
+) -> (Endpoint<EchoSm>, Storage<TestWal, TestSb, EchoSm>) {
   let cfg = Config::try_new(1, MemberId::new(0))
     .unwrap()
     .with_max_client_sessions(cap)
@@ -1313,7 +1316,7 @@ fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, Storage<Tes
 
 /// Drive the SAME op stream (op `c` = client `c`, request 1, body `[c]`) through a BACKUP's
 /// `on_prepare` + `advance_commit` apply path — the backup-path half of the determinism proof.
-fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, Storage<TestWal, TestSb>) {
+fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, Storage<TestWal, TestSb, EchoSm>) {
   let cfg = Config::try_new(1, MemberId::new(1))
     .unwrap()
     .with_max_client_sessions(cap)
@@ -1522,7 +1525,7 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let submit = |e: &mut Endpoint<NoopSm>,
-                storage: &mut Storage<TestWal, TestSb>,
+                storage: &mut Storage<TestWal, TestSb, NoopSm>,
                 blocks: &mut dyn BlockStore,
                 rn: u64| {
     e.handle_message(

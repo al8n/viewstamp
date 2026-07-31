@@ -560,7 +560,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // windows.
   fn assert_strictly_advances<S: StateMachine, W: Wal, B: Superblock>(
     e: &mut Endpoint<S>,
-    storage: &mut Storage<W, B>,
+    storage: &mut Storage<W, B, S>,
     _blocks: &mut dyn BlockStore,
     label: &str,
   ) {
@@ -734,16 +734,9 @@ fn poll_timeout_only_returns_serviceable_timers() {
     wal.script_read_fault(OpNumber::with(2), u8::MAX);
     let mut storage = Storage::new(wal, sb);
     let mut blocks = crate::block_store::InMemoryBlockStore::new();
-    let mut e = Endpoint::recover(
-      cfg,
-      genesis(3),
-      7,
-      NoopSm,
-      &mut storage,
-      crate::BlockLaneOccupancy::empty(),
-    )
-    .expect("recover accepts this store")
-    .expect_active();
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut storage)
+      .expect("recover accepts this store")
+      .expect_active();
     assert!(e.status().is_recovering() || e.status().is_recovering_head());
     e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
@@ -763,16 +756,9 @@ fn poll_timeout_only_returns_serviceable_timers() {
     wal.script_read_fault(OpNumber::with(3), u8::MAX);
     let mut storage = Storage::new(wal, sb);
     let mut blocks = crate::block_store::InMemoryBlockStore::new();
-    let mut e = Endpoint::recover(
-      cfg,
-      genesis(3),
-      7,
-      NoopSm,
-      &mut storage,
-      crate::BlockLaneOccupancy::empty(),
-    )
-    .expect("recover accepts this store")
-    .expect_active();
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut storage)
+      .expect("recover accepts this store")
+      .expect_active();
     // Drain the recover loop to its terminal RecoveringHead (re-submit the faulty head read until the
     // budget exhausts), driving purely via the recover_retry timer.
     for _ in 0..64 {

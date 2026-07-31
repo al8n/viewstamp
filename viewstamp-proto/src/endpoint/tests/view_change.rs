@@ -1018,7 +1018,6 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
     0,
     NoopSm,
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1109,7 +1108,6 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
     0,
     NoopSm,
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1163,7 +1161,6 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     0,
     CountSm::default(),
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -7795,11 +7792,11 @@ fn a_reverted_probe_joins_a_survivors_far_proposal() {
 fn pump_two_live_voters(
   t: Instant,
   a: &mut Endpoint<NoopSm, RestartOnly>,
-  storage_a: &mut Storage<TestWal, TestSb>,
+  storage_a: &mut Storage<TestWal, TestSb, NoopSm>,
   blocks_a: &mut crate::block_store::InMemoryBlockStore,
   a_slot: u16,
   b: &mut Endpoint<NoopSm, RestartOnly>,
-  storage_b: &mut Storage<TestWal, TestSb>,
+  storage_b: &mut Storage<TestWal, TestSb, NoopSm>,
   blocks_b: &mut crate::block_store::InMemoryBlockStore,
   b_slot: u16,
 ) {

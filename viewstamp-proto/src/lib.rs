@@ -41,9 +41,7 @@ pub use batch::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchFull, BatchMalformed, BatchUnits,
   BatchView, EmptyBatch, ReplyBuilder, ReplyPushError, ReplyView,
 };
-pub use block_job::{
-  BlockJob, BlockJobCursor, BlockJobDone, BlockJobTag, BlockLaneOccupancy, execute_block_job,
-};
+pub use block_job::{BlockJob, BlockJobCursor, BlockJobDone, BlockJobTag, execute_block_job};
 pub use block_store::{
   BlockAddress, BlockDagWalk, BlockStore, BlockStoreError, InMemoryBlockStore, VerifiedView,
   block_address,

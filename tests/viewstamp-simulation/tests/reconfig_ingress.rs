@@ -47,7 +47,7 @@ fn genesis(n: u8) -> Membership {
 /// A fresh backup (replica 1 of 3) with its own WAL + superblock — the receiver under test.
 fn backup() -> (
   Endpoint<viewstamp_simulation::sm::LogSm>,
-  Storage<InMemoryWal, InMemorySuperblock>,
+  Storage<InMemoryWal, InMemorySuperblock, viewstamp_simulation::sm::LogSm>,
 ) {
   // The sim's `SimSm` is private; build the plain `LogSm` the cluster wraps. (Re-exported below.)
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid config");
@@ -80,7 +80,7 @@ struct Accumulators {
 
 fn snapshot(
   e: &Endpoint<viewstamp_simulation::sm::LogSm>,
-  storage: &Storage<InMemoryWal, InMemorySuperblock>,
+  storage: &Storage<InMemoryWal, InMemorySuperblock, viewstamp_simulation::sm::LogSm>,
 ) -> Accumulators {
   Accumulators {
     op: e.op().get(),
@@ -112,7 +112,7 @@ fn prepare(op: u64, commit: u64) -> Message {
 /// WAL appends complete and the accumulators settle.
 fn drive_workload(
   e: &mut Endpoint<viewstamp_simulation::sm::LogSm>,
-  storage: &mut Storage<InMemoryWal, InMemorySuperblock>,
+  storage: &mut Storage<InMemoryWal, InMemorySuperblock, viewstamp_simulation::sm::LogSm>,
   _blocks: &mut MemBlockStore,
 ) {
   let now = Instant::ZERO;

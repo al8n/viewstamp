@@ -242,9 +242,10 @@ fn reconfigure_ack_at(
 /// backup `PrepareOk` (2-of-3 quorum) → `try_commit` recognizes the Reconfigure op and stages the
 /// `SwapEpoch` root. With the synchronous `TestSb`, that root write is QUEUED in `sb.done` but only
 /// dispatched by a LATER `handle_storage` — so on return the epoch is NOT yet swapped (the fence).
+#[allow(clippy::type_complexity)]
 fn proposed_and_committed_swap() -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   OpNumber,
   Membership,
   ReconfigurePayload,
@@ -359,7 +360,7 @@ fn single_change_primary_of(n: u8) -> Endpoint<CountSm, SingleChange> {
 /// and a superfluous token on an f-preserving shrink is ignored.
 fn propose_shrink_with_own_vote(
   e: &mut Endpoint<CountSm, SingleChange>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   blocks: &mut crate::block_store::InMemoryBlockStore,
   delta: SingleVoterDelta,
 ) -> (OpNumber, ReconfigurePayload) {
@@ -384,7 +385,7 @@ fn propose_shrink_with_own_vote(
 /// Deliver backup `slot`'s content-addressed `PrepareOk` for the shrink op.
 fn deliver_shrink_ack(
   e: &mut Endpoint<CountSm, SingleChange>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   _blocks: &mut crate::block_store::InMemoryBlockStore,
   op: OpNumber,
   payload: &ReconfigurePayload,
@@ -696,7 +697,6 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
     0,
     CountSm::default(),
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
   let r = match recovered {
@@ -1521,16 +1521,9 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let mut storage = Storage::new(wal, sb);
-  let mut e = Endpoint::<CountSm>::recover(
-    cfg,
-    genesis_mem,
-    9,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts this store")
-  .expect_active();
+  let mut e = Endpoint::<CountSm>::recover(cfg, genesis_mem, 9, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
 
   // The recovered node is in the debt window: at the successor epoch, gate owed.
   assert_eq!(
@@ -1762,8 +1755,10 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
 /// has completed (storage pumped) so only the view write keeps the window open. Mirrors the non-reconfig
 /// `primed_new_primary_in_pending_view_window`, with the `SingleChange` capability so `propose_membership`
 /// is in scope.
-fn single_change_primed_new_primary_pending_view()
--> (Endpoint<CountSm, SingleChange>, Storage<TestWal, StepSb>) {
+fn single_change_primed_new_primary_pending_view() -> (
+  Endpoint<CountSm, SingleChange>,
+  Storage<TestWal, StepSb, CountSm>,
+) {
   let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -2366,7 +2361,7 @@ fn committed_op_then_swapped(
   ack_backup: u16,
 ) -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   u64,
 ) {
   let mut e = single_change_primary();
@@ -2872,7 +2867,7 @@ fn learner_status(replica: u16, durable_commit_min: u64) -> Message {
 /// `self.op` on append.
 fn mint_one_client_op(
   e: &mut Endpoint<CountSm, SingleChange>,
-  storage: &mut Storage<TestWal, TestSb>,
+  storage: &mut Storage<TestWal, TestSb, CountSm>,
   _blocks: &mut dyn BlockStore,
 ) {
   e.handle_message(
@@ -4027,7 +4022,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
 /// Prepare-retransmit/commit-heartbeat timers were armed by the proposal mint.
 fn demoted_self_primary() -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   Membership,
 ) {
   let mut e = single_change_primary();
@@ -4193,7 +4188,7 @@ fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
 /// DEMOTION (`demoted_self_primary`, which keeps the seat and stays Normal-as-learner).
 fn gc_removed_self_learner() -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   Membership,
 ) {
   let cfg = Config::try_new(3, MemberId::new(3)).expect("slot 3 learner of the 3-voter+1 set");
@@ -5432,7 +5427,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 /// Returns `(donor, storage, predecessor_config_id, checkpoint_op)`.
 fn donor_at_e1_with_shifted_member() -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   u128,
   u64,
 ) {
@@ -6069,7 +6064,6 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
     0,
     CountSm::default(),
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
   let mut e = match recovered {
@@ -6886,7 +6880,6 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
     0,
     CountSm::default(),
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
   let mut e = match recovered {
@@ -6938,7 +6931,7 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
       0,
     )),
   );
-  e.force_checkpoint();
+  e.force_checkpoint(&mut storage);
   e.block_step(now, &mut storage, &mut blocks);
   assert!(
     e.pending_checkpoint.is_some(),
@@ -6999,9 +6992,10 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
 /// successor quorum), the durable SwapEpoch root, and the drained post-swap forced checkpoint.
 /// Returns the endpoint at E+1 (voters {0,1} + learner 2), its storage, the demote op, and the
 /// installed successor.
+#[allow(clippy::type_complexity)]
 fn installed_demote_primary() -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   crate::block_store::InMemoryBlockStore,
   OpNumber,
   Membership,
@@ -7058,7 +7052,7 @@ fn installed_demote_primary() -> (
 /// still forces). Returns the demoted endpoint, its storage, and the installed successor.
 fn demoted_self_backup() -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   crate::block_store::InMemoryBlockStore,
   Membership,
 ) {
@@ -7472,16 +7466,9 @@ fn a_demoted_node_cold_recovers_as_a_learner() {
   drop(e); // the crash: only the durable storage survives
 
   let cfg = Config::try_new(2, MemberId::new(2)).expect("the demotee's stable identity");
-  let mut r = Endpoint::recover(
-    cfg,
-    genesis(3),
-    0,
-    CountSm::default(),
-    &mut storage,
-    crate::BlockLaneOccupancy::empty(),
-  )
-  .expect("recover accepts the demoted store")
-  .expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts the demoted store")
+    .expect_active();
   let now = Instant::ZERO;
   for _ in 0..32 {
     r.storage_step(now, &mut storage, &mut blocks);
@@ -7943,13 +7930,14 @@ fn gc_cannot_commit_while_the_successor_quorum_is_dead() {
 /// primary's own append complete — firing the commit on the crashed voter's banked bit. The
 /// SwapEpoch root lands and the smaller voting set INSTALLS with that voter dead. Returns the
 /// endpoint at E+1, its storage, the demote op, and the successor.
+#[allow(clippy::type_complexity)]
 fn banked_ack_demote_installs(
   n: u8,
   demotee: u16,
   bank_acks: &[u16],
 ) -> (
   Endpoint<CountSm, SingleChange>,
-  Storage<TestWal, TestSb>,
+  Storage<TestWal, TestSb, CountSm>,
   crate::block_store::InMemoryBlockStore,
   OpNumber,
   Membership,

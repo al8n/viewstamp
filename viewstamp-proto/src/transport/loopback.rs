@@ -17,7 +17,10 @@ const CLUSTER: u128 = 0x5151;
 
 fn replica<R: StreamTransport>(
   id: u16,
-) -> (StreamCoordinator<CountSm, R>, Storage<TestWal, TestSb>) {
+) -> (
+  StreamCoordinator<CountSm, R>,
+  Storage<TestWal, TestSb, CountSm>,
+) {
   let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
   let coord = StreamCoordinator::new(Endpoint::<_, SingleChange>::genesis_unchecked(
     cfg,
@@ -40,11 +43,11 @@ fn sized_request(body: &[u8]) -> Message {
 #[allow(clippy::too_many_arguments)]
 fn run_until_converged<R: StreamTransport>(
   r0: &mut StreamCoordinator<CountSm, R>,
-  storage0: &mut Storage<TestWal, TestSb>,
+  storage0: &mut Storage<TestWal, TestSb, CountSm>,
   blocks0: &mut crate::block_store::InMemoryBlockStore,
   c0: ConnId,
   r1: &mut StreamCoordinator<CountSm, R>,
-  storage1: &mut Storage<TestWal, TestSb>,
+  storage1: &mut Storage<TestWal, TestSb, CountSm>,
   blocks1: &mut crate::block_store::InMemoryBlockStore,
   c1: ConnId,
 ) -> bool {

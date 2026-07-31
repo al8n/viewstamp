@@ -333,7 +333,7 @@ fn recovering_with_hole_at_epoch(
   head: u64,
   faulty_op: u64,
   epoch: u64,
-) -> (Endpoint<CountSm>, Storage<ScriptedWal, TestSb>) {
+) -> (Endpoint<CountSm>, Storage<ScriptedWal, TestSb, CountSm>) {
   let membership = Membership::from_durable_parts(
     Epoch::new(epoch),
     3,
@@ -356,7 +356,6 @@ fn recovering_with_hole_at_epoch(
     0,
     CountSm::default(),
     &mut storage,
-    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();

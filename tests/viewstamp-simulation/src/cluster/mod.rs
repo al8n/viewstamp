@@ -137,11 +137,13 @@ pub struct Cluster {
   wals: Vec<Shared<InMemoryWal>>,
   /// Per-replica superblocks (persist across crashes; see `crash`). A device handle, like `wals`.
   sbs: Vec<Shared<InMemorySuperblock>>,
-  /// Per-replica storage SESSIONS — one per medium, for the medium's whole life. They carry the
-  /// slot-quiescence fence, the root timeline, and the in-flight envelope ledger, so an endpoint
-  /// rebuilt over the same session ([`restart_in_place`](Self::restart_in_place)) inherits every
-  /// fence, while a `crash` opens a FRESH one (the process died; its in-flight work died with it).
-  storages: Vec<Storage<Shared<InMemoryWal>, Shared<InMemorySuperblock>>>,
+  /// Per-replica storage SESSIONS — one per store, for the store's whole life. They carry the
+  /// slot-quiescence fence, the root timeline, the in-flight envelope ledger, and the block lane's
+  /// front (its queue, its admission quotas, its issue-order witness), so an endpoint rebuilt over
+  /// the same session ([`restart_in_place`](Self::restart_in_place)) inherits every fence and every
+  /// queued job, while a `crash` opens a FRESH one (the process died; its in-flight work died with
+  /// it).
+  storages: Vec<Storage<Shared<InMemoryWal>, Shared<InMemorySuperblock>, SimSm>>,
   /// Per-replica content-addressed block stores holding the SM checkpoint DAGs (persist across
   /// crashes — the SM blocks must survive a restart, exactly like the WAL + superblock, and are
   /// forfeited by a wipe for the same reason).
@@ -1463,13 +1465,16 @@ impl Cluster {
     // The storage SESSION dies with the process too. Its ledgers describe writes the crash just
     // took with it, so carrying them into the restart would fence slots against landings that can
     // never come; a fresh session over the same (now quiet) media is exactly what a new process
-    // opens. This is the one place a session is legitimately replaced over surviving handles — and
-    // the discards above are what make the medium quiet enough for it.
+    // opens. The same call drops the lane's front — jobs the driver had not yet polled, and the
+    // quotas they claimed — which is right for the same reason: they were queued in memory the
+    // crash took. This is the one place a session is legitimately replaced over surviving handles,
+    // and the discards above are what make the medium quiet enough for it.
     self.storages[i] = Storage::new(self.wals[i].clone(), self.sbs[i].clone());
-    // A held block job is work IN FLIGHT on the storage lane; the power went out before it ran, so it
-    // dies with the process exactly as a staged WAL write does. Dropping it also keeps the lane's
-    // execution-order witness sound across the restart: the cursor persists, the successor endpoint
-    // mints strictly-greater ids, and no dead-incarnation job is left to execute after them.
+    // The other half of the lane: jobs already handed over and awaiting execution. The power went
+    // out before they ran, so they die with the process exactly as a staged WAL write does.
+    // Dropping them also keeps the lane's execution-order witness sound across the restart: the
+    // cursor persists, the successor endpoint mints strictly-greater ids, and no dead-incarnation
+    // job is left to execute after them.
     self.block_holds[i].clear();
   }
 
@@ -1493,9 +1498,7 @@ impl Cluster {
   /// `recover` returns `Active`. A `Retired` here — the node absent from its own durable membership — is a
   /// harness bug (a parked node must never be routed a plain restart).
   pub fn restart(&mut self, i: usize) {
-    // The crash cleared this replica's held block jobs with the process, so the lane the successor
-    // recovers over holds nothing — the empty occupancy is the truthful one.
-    match self.recover_in_place(i, viewstamp_proto::BlockLaneOccupancy::empty()) {
+    match self.recover_in_place(i) {
       Ok(None) => self.crashed[i] = false,
       Ok(Some(r)) => {
         panic!("replica {i} recovered Retired (absent from its own durable membership): {r:?}")
@@ -1532,11 +1535,10 @@ impl Cluster {
   /// The replica is never marked crashed — it keeps being ticked across the swap, so the successor
   /// endpoint is live when the predecessor's completions arrive. Correlation ids restart at `1` in the
   /// new endpoint ([`OpId`](viewstamp_proto::OpId) is minted per endpoint), so a retained completion
-  /// carries an id the successor also mints; where the two meet is the lane this exercises. And
-  /// because the block lane's queue survives with everything else, the successor is recovered with
-  /// the outgoing endpoint's [`lane_occupancy`](viewstamp_proto::Endpoint::lane_occupancy): the
-  /// retained jobs still occupy the lane's admission quotas until their (refused) completions
-  /// release them.
+  /// carries an id the successor also mints; where the two meet is the lane this exercises. The block
+  /// lane's front survives with the session, so the successor polls the jobs its predecessor queued
+  /// but never handed over, and every retained job keeps occupying the lane's admission quotas until
+  /// its (refused) completion releases them.
   ///
   /// A restart in place runs over the store the running endpoint just wrote, so recovery always
   /// succeeds; a `Retired` or a recover error here is a harness bug (this is not a path for a parked
@@ -1546,12 +1548,11 @@ impl Cluster {
     // the same reason `crash` does: the ops they record WERE applied, and an uncaptured tail would
     // vanish from every recorded stream and read as a lost op.
     self.record_applied_events(i);
-    // The lane survives this swap — `block_holds` keeps every queued job and the hold pump keeps
-    // delivering their completions — so the successor inherits what the outgoing endpoint still
-    // has outstanding on it. Started empty instead, every incarnation would capture one more
-    // checkpoint image behind its predecessors' un-drained one.
-    let lane = self.replicas[i].lane_occupancy();
-    match self.recover_in_place(i, lane) {
+    // The lane survives this swap — `block_holds` keeps every job already handed over, the hold pump
+    // keeps delivering their completions, and the session keeps every job not yet polled — so the
+    // successor inherits the whole front. Nothing is stated about it at the rebuild, so nothing can
+    // be stated wrong.
+    match self.recover_in_place(i) {
       Ok(None) => self.crashed[i] = false,
       Ok(Some(r)) => {
         panic!("replica {i} recovered Retired across an in-place restart: {r:?}")
@@ -1574,7 +1575,6 @@ impl Cluster {
   fn recover_in_place(
     &mut self,
     i: usize,
-    lane: viewstamp_proto::BlockLaneOccupancy,
   ) -> Result<Option<viewstamp_proto::Retired>, viewstamp_proto::RecoverError> {
     self.incarnations[i] += 1;
     let cfg = self.replica_config(i as u16);
@@ -1594,7 +1594,6 @@ impl Cluster {
       seed,
       self.make_sm(),
       &mut self.storages[i],
-      lane,
     )? {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
@@ -1674,9 +1673,7 @@ impl Cluster {
     // BEFORE the recover so the window is closed at both ends — a rebuild clears it, a fail-stop
     // leaves it standing over the stale handle.
     self.wiped_storage[i] = true;
-    // The crash that preceded this wipe cleared the held block jobs with the process (only a
-    // previously-crashed replica is wiped), so the lane holds nothing for the successor.
-    match self.recover_in_place(i, viewstamp_proto::BlockLaneOccupancy::empty()) {
+    match self.recover_in_place(i) {
       // A wiped LEARNER resumes empty and rejoins (it never votes, so no amnesia risk).
       Ok(None) => {
         self.crashed[i] = false;
@@ -3202,7 +3199,7 @@ impl Cluster {
     self.age_block_hold(i);
     loop {
       self.replicas[i].handle_storage(now, &mut self.storages[i]);
-      if let Some(job) = self.replicas[i].poll_block_job() {
+      if let Some(job) = self.storages[i].poll_block_job() {
         self.hold_block_job(i, job);
       }
       let Some(held) = self.take_ready_block_job(i) else {
