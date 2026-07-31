@@ -10,6 +10,7 @@ use rustls::{
 use viewstamp_proto::{
   BlockAddress, BlockStore, ClusterTls, IdentityConfig, QuicOptions, Superblock, Wal,
 };
+use viewstamp_reactor::BlockLane;
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
@@ -194,7 +195,6 @@ type GateDriver = viewstamp_reactor::ReactorQuicDriver<
   viewstamp_simulation::sm::LogSm,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
-  MemBlocks,
   viewstamp_proto::ProvidedIdentity,
 >;
 
@@ -204,17 +204,41 @@ async fn build_driver(
   bind: SocketAddr,
   peers: Vec<(viewstamp_proto::ReplicaId, SocketAddr)>,
 ) -> (GateDriver, viewstamp_reactor::Handle) {
+  build_driver_with(
+    ca,
+    id,
+    bind,
+    peers,
+    BlockLane::spawn(MemBlocks::default()),
+    viewstamp_proto::DEFAULT_CHECKPOINT_OPS,
+  )
+  .await
+}
+
+/// [`build_driver`] with the node's storage lane and checkpoint interval chosen by the caller — the
+/// two knobs the heartbeat-continuity falsifier needs to give ONE node a deliberately slow store
+/// that checkpoints on its very first commit.
+async fn build_driver_with(
+  ca: &TestCa,
+  id: u8,
+  bind: SocketAddr,
+  peers: Vec<(viewstamp_proto::ReplicaId, SocketAddr)>,
+  blocks: BlockLane<viewstamp_simulation::sm::LogSm>,
+  checkpoint_ops: u64,
+) -> (GateDriver, viewstamp_reactor::Handle) {
   let (chain, key) = ca.issue(id);
   let opts: QuicOptions = ClusterTls::new(ca.roots(), chain, key).build();
-  let config =
-    viewstamp_proto::Config::try_new(CLUSTER, viewstamp_proto::MemberId::new((id as u16) as u128))
-      .unwrap();
+  let config = viewstamp_proto::Config::with_checkpoint_ops(
+    CLUSTER,
+    viewstamp_proto::MemberId::new((id as u16) as u128),
+    checkpoint_ops,
+  )
+  .unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
   viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
-  let blocks = MemBlocks::default();
   GateDriver::new(
     config,
     genesis(3),
@@ -424,6 +448,214 @@ async fn backup_submit_relays_to_the_primary() {
   .expect("a reply");
   assert_eq!(&reply[..], &1u64.to_be_bytes());
 
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
+/// How long the slow store's durability barrier parks waiting for the test's release. Bounded
+/// rather than forever: a lane that regressed back onto the run loop would park that loop right
+/// here, and a BOUNDED park makes the continuity awaits below fail on their own timeouts instead of
+/// hanging the suite.
+const SLOW_FLUSH_MAX_PARK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the falsifier waits for the slow materialize to START. Reaching it means no checkpoint
+/// was ever issued, which would make the continuity assertions vacuous, so it fails loudly.
+const MATERIALIZE_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A block store whose durability barrier PARKS until the test releases it — the deliberately slow
+/// store the heartbeat-continuity falsifier runs one node's checkpoint through.
+///
+/// `entered`/`finished` are the anti-vacuity witnesses: a commit observed while `entered > finished`
+/// landed while a block job was genuinely mid-execution, not after a fast store had already
+/// finished it.
+struct SlowBlocks {
+  blocks: std::collections::HashMap<BlockAddress, Bytes>,
+  entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  finished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BlockStore for SlowBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.blocks.get(&addr).cloned()
+  }
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = viewstamp_proto::block_address(&block);
+    self.blocks.insert(addr, block);
+    addr
+  }
+  fn flush(&mut self) -> Result<(), viewstamp_proto::BlockStoreError> {
+    use std::sync::atomic::Ordering;
+    self.entered.fetch_add(1, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + SLOW_FLUSH_MAX_PARK;
+    while !self.released.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+      std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    self.finished.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.blocks.contains_key(&addr)
+  }
+}
+
+/// The test's side of a [`SlowBlocks`]: observe whether a durability barrier is executing right
+/// now, and let it through once the continuity assertions are done.
+struct FlushGate {
+  entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  finished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FlushGate {
+  fn new() -> (Self, SlowBlocks) {
+    let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (
+      Self {
+        entered: entered.clone(),
+        finished: finished.clone(),
+        released: released.clone(),
+      },
+      SlowBlocks {
+        blocks: std::collections::HashMap::new(),
+        entered,
+        finished,
+        released,
+      },
+    )
+  }
+  fn started(&self) -> usize {
+    self.entered.load(std::sync::atomic::Ordering::SeqCst)
+  }
+  fn finished(&self) -> usize {
+    self.finished.load(std::sync::atomic::Ordering::SeqCst)
+  }
+  fn release(&self) {
+    self
+      .released
+      .store(true, std::sync::atomic::Ordering::SeqCst);
+  }
+}
+
+/// The node given the parked store: a BACKUP in view 0, so its own in-flight checkpoint fences
+/// nothing in the protocol (only a PRIMARY refuses to mint new ops while one is outstanding) and
+/// what the falsifier measures is purely whether its run loop kept running.
+const SLOW_NODE: u8 = 1;
+
+/// A 3-node cluster in which [`SLOW_NODE`] holds a [`SlowBlocks`] lane and checkpoints on its first
+/// commit; the other two keep ordinary stores and the default checkpoint interval, so no node but
+/// the parked one has a block job outstanding while the falsifier runs.
+async fn spawn_cluster_with_a_parked_backup(
+  ca: &TestCa,
+  base_port: u16,
+) -> (Vec<viewstamp_reactor::Handle>, FlushGate) {
+  let (gate, slow) = FlushGate::new();
+  let mut slow = Some(slow);
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+    .collect();
+  let rid = |i: u8| viewstamp_proto::ReplicaId::new(i as u16);
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (rid(p), addrs[p as usize]))
+      .collect();
+    let (blocks, checkpoint_ops) = if id == SLOW_NODE {
+      (
+        BlockLane::spawn(
+          slow
+            .take()
+            .expect("exactly one node takes the parked store"),
+        ),
+        1,
+      )
+    } else {
+      (
+        BlockLane::spawn(MemBlocks::default()),
+        viewstamp_proto::DEFAULT_CHECKPOINT_OPS,
+      )
+    };
+    let (driver, handle) =
+      build_driver_with(ca, id, addrs[id as usize], peers, blocks, checkpoint_ops).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+  (handles, gate)
+}
+
+/// SLOW-STORE HEARTBEAT CONTINUITY — the operational claim of the driver storage lane.
+///
+/// One backup's block store PARKS inside the durability barrier of its checkpoint materialize. That
+/// job runs on the driver's storage lane, not on the run loop, so while it is parked the node must
+/// keep doing consensus. Every submit below is made AT THE PARKED NODE, so resolving it needs that
+/// node's own loop to drain the command, relay the `Request` to the primary, take the `Prepare`,
+/// append, ack, take the `Commit`, apply, and deliver the committed event — a full heartbeat round
+/// trip through the loop, not a liveness ping past it.
+///
+/// ANTI-VACUITY, in two parts. The test does not proceed until the barrier has actually STARTED, and
+/// it asserts after EVERY commit that the barrier had not yet RETURNED — so each commit provably
+/// landed while a block job was mid-execution, not after a fast store had already finished. Without
+/// both halves a store that finished first would pass this trivially.
+///
+/// A lane that regressed back onto the run loop fails the FIRST await here: that loop would be
+/// inside `flush` for [`SLOW_FLUSH_MAX_PARK`], far past the per-commit timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_checkpoint_materialize_does_not_stop_the_node_committing() {
+  let ca = TestCa::new();
+  let (handles, gate) = spawn_cluster_with_a_parked_backup(&ca, 41060).await;
+
+  // Converge the cluster. The parked node's checkpoint interval is 1, so committing this op is what
+  // issues its materialize — and that materialize's durability barrier is what parks.
+  let reply = tokio::time::timeout(
+    std::time::Duration::from_secs(10),
+    handles[0].submit(Bytes::from_static(b"warm")),
+  )
+  .await
+  .expect("the cluster commits within 10s")
+  .expect("a reply");
+  assert_eq!(&reply[..], &1u64.to_be_bytes());
+
+  // ANTI-VACUITY (1/2): do not proceed until the barrier has genuinely started.
+  let start_by = std::time::Instant::now() + MATERIALIZE_START_DEADLINE;
+  while gate.started() == 0 {
+    assert!(
+      std::time::Instant::now() < start_by,
+      "no checkpoint materialize reached the parked node's storage lane within \
+       {MATERIALIZE_START_DEADLINE:?}: the continuity assertions below would be vacuous",
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+  }
+
+  for expected in 2..=4u64 {
+    let reply = tokio::time::timeout(
+      std::time::Duration::from_secs(10),
+      handles[SLOW_NODE as usize].submit(Bytes::from_static(b"during")),
+    )
+    .await
+    .unwrap_or_else(|_| {
+      panic!("the parked node commits op {expected} within 10s while its storage lane executes")
+    })
+    .expect("a reply");
+    assert_eq!(&reply[..], &expected.to_be_bytes());
+    // ANTI-VACUITY (2/2): the barrier had not returned when this commit landed, so the commit is
+    // genuinely concurrent with a block job rather than after a fast store finished first.
+    assert_eq!(
+      gate.finished(),
+      0,
+      "op {expected} committed only after the parked durability barrier returned ({} started, {} \
+       finished): the concurrency this test asserts was never exercised",
+      gate.started(),
+      gate.finished(),
+    );
+  }
+
+  // Let the barrier through, then stop: the teardown drains the lane like any other storage.
+  gate.release();
   for h in &handles {
     let _ = h.shutdown().await;
   }

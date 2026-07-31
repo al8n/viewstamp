@@ -17,6 +17,7 @@ thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 futures-util = { workspace = true }
+viewstamp-simulation = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,6 +9,7 @@
 use std::{cell::RefCell, net::SocketAddr, rc::Rc, time::Duration};
 
 use bytes::Bytes;
+use viewstamp_compio::BlockLane;
 use viewstamp_driver::{BatchConfig, aggregator, aggregator_with_stall};
 use viewstamp_proto::{
   BlockAddress, BlockStore, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
@@ -227,7 +228,7 @@ async fn spawn_cluster() -> (Vec<viewstamp_compio::Handle>, Vec<Rc<RefCell<Batch
     // A real new cluster: FORMAT each store so recovery resumes the designated primary (an
     // unformatted voter would fail-stop — the wipe-amnesia safeguard).
     viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::inline(MemBlocks::default());
     let (sm, recorder) = SharedSm::new();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,

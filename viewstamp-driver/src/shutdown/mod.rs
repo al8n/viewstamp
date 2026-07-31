@@ -57,7 +57,9 @@ impl ShutdownReport {
   /// Whether storage reached a quiet state before the driver released it: `true` iff, within
   /// [`SHUTDOWN_DRAIN_DEADLINE`], every WAL append and superblock write the endpoint owed durability
   /// for completed, together with every checkpoint read it had issued to serve a peer's
-  /// `RequestSync`. In-flight RECOVERY reads are excluded: dropping one loses nothing durable, and a
+  /// `RequestSync` and every block job still on its storage lane (a materialize is the write half of
+  /// the durable checkpoint transaction, so a lane still executing one is storage the endpoint
+  /// owes). In-flight RECOVERY reads are excluded: dropping one loses nothing durable, and a
   /// `Recovering` endpoint is itself the product of `recover()`.
   ///
   /// `false` is a legitimate, SAFE outcome — not a failure the driver papers over, and not

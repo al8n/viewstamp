@@ -68,19 +68,14 @@ fn genesis(n: u8) -> Membership {
 
 /// A type-erased in-flight `submit` future, lifetime-bound to the borrowed `Handle` it ran from.
 type SubmitFut<'a> = dyn std::future::Future<Output = Result<crate::Reply, DriverError>> + 'a;
+use viewstamp_driver::BlockLane;
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 type TestRt = agnostic::tokio::TokioRuntime;
 type TestListener = <<TestRt as Runtime>::Net as Net>::TcpListener;
 type TestStream = <<TestRt as Runtime>::Net as Net>::TcpStream;
-type TestStreamDriver = ReactorStreamDriver<
-  TestRt,
-  LogSm,
-  Labeled<Passthrough>,
-  InMemoryWal,
-  InMemorySuperblock,
-  MemBlocks,
->;
+type TestStreamDriver =
+  ReactorStreamDriver<TestRt, LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>;
 
 #[test]
 fn stream_driver_type_resolves() {
@@ -116,7 +111,7 @@ async fn test_driver_with_storage(wal: InMemoryWal, sb: InMemorySuperblock) -> T
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   });
   let (_ready_tx, ready_rx) = flume::unbounded();
-  let blocks = MemBlocks::default();
+  let blocks = BlockLane::inline(MemBlocks::default());
   let (driver, _handle) = ReactorStreamDriver::new(
     config,
     genesis(3),
@@ -161,7 +156,7 @@ async fn test_driver_with_config(cfg: crate::DriverConfig) -> TestStreamDriver {
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -214,7 +209,7 @@ async fn a_peer_mesh_larger_than_the_conn_cap_is_refused_at_construction() {
       LogSm::default(),
       wal,
       sb,
-      MemBlocks::default(),
+      BlockLane::inline(MemBlocks::default()),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -282,7 +277,7 @@ async fn a_probe_interval_not_below_the_round_lifetime_is_refused_at_constructio
       LogSm::default(),
       wal,
       sb,
-      MemBlocks::default(),
+      BlockLane::inline(MemBlocks::default()),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -362,7 +357,7 @@ async fn test_driver_with_handle_over(wal: InMemoryWal) -> (TestStreamDriver, cr
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -565,13 +560,13 @@ async fn validation_resets_the_redial_backoff_to_base() {
   let mut sb = InMemorySuperblock::new();
   // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
   viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
-  let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _, _>::new(
+  let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
     config,
     genesis(3),
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -773,13 +768,13 @@ async fn run_exits_with_an_in_flight_dial_to_an_unreachable_peer() {
   let mut sb = InMemorySuperblock::new();
   // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
   viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
-  let (driver, handle) = ReactorStreamDriver::<TestRt, _, _, _, _, _>::new(
+  let (driver, handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
     config,
     genesis(3),
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -2004,7 +1999,7 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   viewstamp_driver::format(config, &genesis(1), &wal, &mut sb).expect("format the genesis store");
 
   let flush_attempts = Arc::new(AtomicUsize::new(0));
-  let blocks = FaultingBlocks::new(flush_attempts.clone());
+  let blocks = BlockLane::inline(FaultingBlocks::new(flush_attempts.clone()));
   let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|peer| {
     let opts = LabelOptions::new(CLUSTER, peer);
     Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -2014,7 +2009,7 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   });
   let (_ready_tx, ready_rx) = flume::unbounded();
-  let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _, _>::new(
+  let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
     config,
     genesis(1),
     LogSm::default(),
@@ -2046,7 +2041,8 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
     .submit_client_request(now, &mut driver.wal, &mut driver.sb, request);
   driver
     .coord
-    .handle_storage(now, &mut driver.wal, &mut driver.sb, &mut driver.blocks);
+    .handle_storage_deferred(now, &mut driver.wal, &mut driver.sb);
+  driver.drive_block_lane(now);
 
   assert_eq!(
     driver.coord.endpoint().commit().get(),
@@ -2081,6 +2077,9 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   // never retried.
   for _ in 0..64 {
     driver.service_consensus_timer(now);
+    // The wake's own storage-lane step: a re-drive would queue the flush job here, so the count
+    // below is a real measure of how often the gate let one through.
+    driver.drive_block_lane(now);
   }
   let c1 = flush_attempts.load(Ordering::Relaxed);
   assert_eq!(
@@ -2092,6 +2091,7 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   // A due timer: pass `deadline` itself as `now` (`deadline <= deadline` holds), so the gate must
   // service it — exactly once, matching one due firing per cadence.
   driver.service_consensus_timer(deadline);
+  driver.drive_block_lane(deadline);
   let c2 = flush_attempts.load(Ordering::Relaxed);
   assert_eq!(
     c2,

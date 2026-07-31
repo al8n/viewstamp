@@ -40,6 +40,7 @@ use viewstamp_proto::{
   BlockAddress, BlockStore, ClientId, Config, Conn, LabelOptions, Labeled, MemberId, Membership,
   Passthrough, Peer, ReplicaId, Superblock, Wal,
 };
+use viewstamp_reactor::BlockLane;
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
 /// A throwaway in-memory [`BlockStore`] for the example: the proto's own `MemBlockStore` is
@@ -226,28 +227,27 @@ async fn main() {
     // `first_request`) or use a fresh `ClientId` — this example starts fresh at 0.
     let session = ClientId::new(u128::from(id) + 1);
     // EMBEDDER OBLIGATION — the content-addressed block store for state-machine checkpoints.
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
 
     // The runtime parameter (`TokioRuntime`) is the only type the constructor cannot infer; the
     // construction binds the listener, so it must run inside the runtime that will poll it.
-    let (driver, handle) =
-      viewstamp_reactor::ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::new(
-        config,
-        genesis(3),
-        LogSm::default(), // EMBEDDER OBLIGATION — the deterministic state machine.
-        wal,
-        sb,
-        blocks,
-        session,
-        0, // first_request: fresh session, so the first minted request is 1.
-        addrs[id as usize],
-        peers,
-        mk_dialer,
-        mk_acceptor,
-        ready_rx,
-      )
-      .await
-      .expect("driver builds and binds its listener");
+    let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<TokioRuntime, _, _, _, _>::new(
+      config,
+      genesis(3),
+      LogSm::default(), // EMBEDDER OBLIGATION — the deterministic state machine.
+      wal,
+      sb,
+      blocks,
+      session,
+      0, // first_request: fresh session, so the first minted request is 1.
+      addrs[id as usize],
+      peers,
+      mk_dialer,
+      mk_acceptor,
+      ready_rx,
+    )
+    .await
+    .expect("driver builds and binds its listener");
 
     // One driver task per replica; the returned `Handle` is the application's way in. The dropped
     // `JoinHandle` DETACHES the task (a tokio drop never cancels), so each run loop keeps driving

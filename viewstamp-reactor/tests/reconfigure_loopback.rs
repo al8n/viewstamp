@@ -25,6 +25,7 @@ use viewstamp_proto::{
   AcceptReducedFaultTolerance, BlockAddress, BlockStore, ClusterTls, Event, IdentityConfig,
   MemberId, Membership, MembershipTarget, QuicOptions, ReplicaId, Superblock, Wal,
 };
+use viewstamp_reactor::BlockLane;
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
@@ -206,7 +207,6 @@ type GateDriver = viewstamp_reactor::ReactorQuicDriver<
   viewstamp_simulation::sm::LogSm,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
-  MemBlocks,
   viewstamp_proto::ProvidedIdentity,
 >;
 
@@ -227,7 +227,7 @@ async fn build_driver(
   // A real new cluster: FORMAT the store once (the pinned genesis root) so recovery resumes the
   // designated primary — an unformatted SOLE VOTER would fail-stop (the wipe-amnesia safeguard).
   viewstamp_driver::format(config, &membership, &wal, &mut sb).expect("format the genesis store");
-  let blocks = MemBlocks::default();
+  let blocks = BlockLane::spawn(MemBlocks::default());
   GateDriver::with_config(
     config,
     membership,
@@ -267,7 +267,7 @@ async fn build_cluster_driver(
   // designated view-0 primary as Normal — an unformatted store would abdicate (the wipe-amnesia
   // safeguard), spuriously cold-starting a view change.
   viewstamp_driver::format(config, &membership, &wal, &mut sb).expect("format the genesis store");
-  let blocks = MemBlocks::default();
+  let blocks = BlockLane::spawn(MemBlocks::default());
   GateDriver::new(
     config,
     membership,
@@ -877,14 +877,13 @@ async fn stream_cluster_survives_slot_shift() {
     // A real new cluster: FORMAT each store once so recovery resumes the designated view-0 primary
     // as Normal — an unformatted store would abdicate (the wipe-amnesia safeguard).
     viewstamp_driver::format(config, &genesis(4, 0), &wal, &mut sb).expect("format genesis store");
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
     let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<
       agnostic::tokio::TokioRuntime,
       viewstamp_simulation::sm::LogSm,
       Labeled<Passthrough>,
       Notifying<InMemoryWal>,
       Notifying<InMemorySuperblock>,
-      MemBlocks,
     >::new(
       config,
       genesis(4, 0),
@@ -1050,14 +1049,13 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
       Epoch::new(0),
       "node {id} boots in the genesis epoch"
     );
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
     let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<
       agnostic::tokio::TokioRuntime,
       viewstamp_simulation::sm::LogSm,
       Labeled<Passthrough>,
       Notifying<InMemoryWal>,
       Notifying<InMemorySuperblock>,
-      MemBlocks,
     >::new(
       config,
       membership.clone(),
@@ -1255,14 +1253,13 @@ async fn a_stranded_learner_crosses_an_epoch_over_a_non_primary_link() {
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
     viewstamp_driver::format(config, &genesis(3, 1), &wal, &mut sb).expect("format genesis store");
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
     let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<
       agnostic::tokio::TokioRuntime,
       viewstamp_simulation::sm::LogSm,
       Labeled<Passthrough>,
       Notifying<InMemoryWal>,
       Notifying<InMemorySuperblock>,
-      MemBlocks,
     >::new(
       config,
       genesis(3, 1),
@@ -1361,14 +1358,13 @@ async fn a_stranded_learner_crosses_an_epoch_over_a_non_primary_link() {
     &mut learner_sb,
   )
   .expect("format the stranded learner's genesis (E0) store");
-  let learner_blocks = MemBlocks::default();
+  let learner_blocks = BlockLane::spawn(MemBlocks::default());
   let (learner_driver, learner_handle) = viewstamp_reactor::ReactorStreamDriver::<
     agnostic::tokio::TokioRuntime,
     viewstamp_simulation::sm::LogSm,
     Labeled<Passthrough>,
     Notifying<InMemoryWal>,
     Notifying<InMemorySuperblock>,
-    MemBlocks,
   >::new(
     learner_config,
     genesis(3, 1),
@@ -1526,10 +1522,9 @@ async fn quic_cluster_survives_slot_shift() {
     // A real new cluster: FORMAT each store once so recovery resumes the designated view-0 primary
     // as Normal — an unformatted store would abdicate (the wipe-amnesia safeguard).
     viewstamp_driver::format(config, &genesis(4, 0), &wal, &mut sb).expect("format genesis store");
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
     let (driver, handle) = viewstamp_reactor::ReactorQuicDriver::<
       agnostic::tokio::TokioRuntime,
-      _,
       _,
       _,
       _,

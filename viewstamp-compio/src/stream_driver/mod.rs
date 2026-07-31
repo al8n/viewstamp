@@ -16,15 +16,15 @@ use viewstamp_proto::Instant;
 // The proto's transport `Conn<R>` is aliased `TransportConn` here so the bare name `Conn` belongs to
 // the driver's owned per-connection unit (`crate::bridge::Conn`).
 use viewstamp_proto::{
-  BlockStore, ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership,
-  Peer, ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport,
-  Superblock, Wal,
+  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership, Peer,
+  ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock,
+  Wal,
 };
 
 use viewstamp_driver::{
-  Clock, Command, DriverConfig, DriverError, Handle, InflightBudget, Pending, PendingMap,
-  Retirement, ShutdownReport, StorageQuiescence, build_endpoint, deliver_event, drain_pending,
-  drain_storage, finish_reconfigure_on_retire, gate_command_on_retirement, jittered,
+  BlockLane, Clock, Command, DriverConfig, DriverError, Handle, InflightBudget, Pending,
+  PendingMap, Retirement, ShutdownReport, StorageQuiescence, build_endpoint, deliver_event,
+  drain_pending, drain_storage, finish_reconfigure_on_retire, gate_command_on_retirement, jittered,
   pending_scan_interval, reap_and_collect_retransmits, retire,
 };
 
@@ -120,14 +120,15 @@ pub(crate) type AcceptorFactory<R> = Rc<dyn Fn() -> TransportConn<R>>;
 /// `JoinHandle` by `run()`) feeds it accepted sockets, and each peer connection is one owned `Conn`
 /// unit whose live task(s) (the connect task, then the two independent bridge halves) the driver
 /// holds, so dropping the `Conn` is the connection's single complete teardown.
-pub struct CompioStreamDriver<S: StateMachine, R, W, B, L> {
+pub struct CompioStreamDriver<S: StateMachine, R, W, B> {
   coord: StreamCoordinator<S, R>,
   wal: W,
   sb: B,
-  /// Embedder-provided content-addressed block store, the peer of `wal`/`sb` in the node's durable
-  /// store: large bodies (state-sync chunks, snapshots) are addressed by content hash here while the
-  /// WAL/superblock hold the consensus log and durable root.
-  blocks: L,
+  /// The embedder-provided block-storage lane, the peer of `wal`/`sb` in the node's durable store:
+  /// large bodies (state-sync chunks, snapshots) are addressed by content hash there while the
+  /// WAL/superblock hold the consensus log and durable root. The lane owns the store; the run loop
+  /// only hands it jobs and feeds back completions, so block I/O never runs on this thread.
+  block_lane: BlockLane<S>,
   listener: TcpListener,
   clock: Clock,
   /// The operational tuning this driver was constructed with ([`DriverConfig::new`] via
@@ -220,13 +221,12 @@ pub struct CompioStreamDriver<S: StateMachine, R, W, B, L> {
   next_probe_at: Option<Instant>,
 }
 
-impl<S, R, W, B, L> CompioStreamDriver<S, R, W, B, L>
+impl<S, R, W, B> CompioStreamDriver<S, R, W, B>
 where
   S: StateMachine,
   R: StreamTransport,
   W: Wal,
   B: Superblock,
-  L: BlockStore,
 {
   /// Build the driver: bind the listener, build the coordinator, set up the connection table +
   /// channels, and return a `Handle`. Configured peer dials are issued at `run()` start.
@@ -254,6 +254,13 @@ where
   /// `first_request` (the last request number it used) and restore it on restart. The first request
   /// this driver mints is numbered `first_request + 1`; on a fresh start pass `first_request = 0`.
   ///
+  /// `blocks` is the block-storage lane the embedder built around its block store
+  /// ([`BlockLane::spawn`] for the production placement — a dedicated thread — or
+  /// [`BlockLane::inline`] for a deterministic harness). A lane rather than a bare store because the
+  /// lane owns the store AND the execution-order cursor that must follow it: a driver rebuilt over
+  /// the same store must be handed the SAME lane, since a fresh cursor's first admission is
+  /// unchecked and the cross-incarnation order guarantee would restart blank.
+  ///
   /// # Errors
   /// [`DriverError::Bind`] if the listener cannot bind.
   #[allow(clippy::too_many_arguments)]
@@ -263,7 +270,7 @@ where
     state_machine: S,
     wal: W,
     sb: B,
-    blocks: L,
+    blocks: BlockLane<S>,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -308,7 +315,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
-    blocks: L,
+    blocks: BlockLane<S>,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -379,7 +386,7 @@ where
       coord,
       wal,
       sb,
-      blocks,
+      block_lane: blocks,
       listener,
       clock,
       cfg,
@@ -413,19 +420,19 @@ where
   }
 }
 
-impl<S, R, W, B, L> CompioStreamDriver<S, R, W, B, L>
+impl<S, R, W, B> CompioStreamDriver<S, R, W, B>
 where
   S: StateMachine,
   R: StreamTransport,
   W: Wal,
   B: Superblock,
-  L: BlockStore,
 {
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
   ///
   /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are
   /// STORAGE-QUIESCE and listener-release barriers. The teardown first drains the endpoint's
-  /// in-flight WAL/superblock ops (bounded; see [`Self::quiesce_storage`]) so an orderly stop is
+  /// in-flight storage — WAL, superblock, and the block jobs on its lane (bounded; see
+  /// [`Self::quiesce_storage`]) — so an orderly stop is
   /// distinguishable from a crash, and reports the outcome in the ack's [`ShutdownReport`]. It then
   /// waits for the accept task's listener clone and its in-flight op's fd reference to drop and
   /// CLOSES the listener fd, so an embedder may bind a new driver to the same address the moment
@@ -561,6 +568,7 @@ where
       let mut inbound = None;
       let mut dial_ready = None;
       let mut storage_closed = false;
+      let mut block_done = None;
       {
         let accept_fut = accept_rx.recv_async().fuse();
         let timer_fut = compio::time::sleep_until(deadline).fuse();
@@ -577,12 +585,17 @@ where
           self.storage_ready.recv_async().left_future()
         }
         .fuse();
+        // The storage lane's own wake: a job the lane finished while this loop waited on I/O. Like
+        // the command/inbound/dial arms it CONSUMES its item, so the completion is captured and fed
+        // below — dropping it would lose a materialize's durability verdict.
+        let blocks_fut = self.block_lane.recv().fuse();
         futures_util::pin_mut!(
           accept_fut,
           timer_fut,
           cmd_fut,
           inbound_fut,
           dial_fut,
+          blocks_fut,
           storage_fut
         );
 
@@ -596,6 +609,7 @@ where
           c = cmd_fut => { command = Some(c); }
           i = inbound_fut => { if let Ok(i) = i { inbound = Some(i); } }
           d = dial_fut => { if let Ok(d) = d { dial_ready = Some(d); } }
+          b = blocks_fut => { block_done = Some(b); }
           s = storage_fut => { storage_closed = s.is_err(); }
         }
       }
@@ -606,6 +620,9 @@ where
 
       // Handle the single item the select consumed to wake us (the rest drained at iter-top). These
       // run the same shared helpers as the iter-top drain, so there is no behavior divergence.
+      if let Some(done) = block_done {
+        self.feed_block_completion(now, done);
+      }
       if let Some(inb) = inbound {
         self.handle_inbound(now, inb);
       }
@@ -680,7 +697,8 @@ where
     // close-then-drain below, its guard with it.
     drain_pending(&mut self.pending);
     // The durability barrier, before anything is released: the run loop has exited, so nothing
-    // further enters consensus, and the endpoint's outstanding WAL/superblock ops are drained to
+    // further enters consensus, and the endpoint's outstanding storage — WAL, superblock, and the
+    // block jobs on its lane — is drained to
     // quiescence (or to the bounded deadline) while its storage handles are still owned here. It
     // runs AFTER `drain_pending` so a caller awaiting a submit is released immediately rather than
     // being held for the drain window — the entries dropped there are driver-side bookkeeping and
@@ -738,22 +756,68 @@ where
   /// Drain the endpoint's in-flight storage at teardown, bounded by
   /// [`SHUTDOWN_DRAIN_DEADLINE`](viewstamp_driver::SHUTDOWN_DRAIN_DEADLINE).
   ///
-  /// Each pass feeds the backend's ready completions through the endpoint — the same
-  /// `handle_storage` the run loop pumps — and stops as soon as the endpoint owes none. Only the
-  /// storage half is pumped: outputs a completion produces (peer frames, events) belong to a driver
-  /// that is still running, and this one is cancelling its connections next.
+  /// Each pass feeds the backend's ready completions through the endpoint and drives the block
+  /// lane — the same two steps the run loop pumps — and stops as soon as the endpoint owes none.
+  /// The lane is part of the drain because a block job in flight IS durability work the endpoint
+  /// owes (`has_inflight_storage` counts it): a materialize is the write half of the durable
+  /// checkpoint transaction. Only the storage half is pumped: outputs a completion produces (peer
+  /// frames, events) belong to a driver that is still running, and this one is cancelling its
+  /// connections next.
   async fn quiesce_storage(&mut self) -> StorageQuiescence {
     drain_storage(
       || {
         let now = self.clock.now();
         self
           .coord
-          .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+          .handle_storage_deferred(now, &mut self.wal, &mut self.sb);
+        self.drive_block_lane(now);
         !self.coord.endpoint().has_inflight_storage()
       },
       compio::time::sleep,
     )
     .await
+  }
+
+  /// Hand every queued block job to the storage lane, then feed back every completion the lane has
+  /// ready, until neither moves. Returns whether anything moved.
+  ///
+  /// The pair is one step because they feed each other: a completion can queue the next job (a
+  /// materialize's durable root releasing the sweep), and an inline lane resolves each job within
+  /// this call, so the loop is what settles a deterministic harness in one pass. On a spawned lane
+  /// the submit half returns immediately and the completions arrive on later passes — which is
+  /// exactly the point: the jobs execute on the lane's thread while this one keeps pumping
+  /// consensus.
+  ///
+  /// Order is preserved end to end: jobs are submitted in the order the endpoint issued them, the
+  /// lane executes and answers them in that same order, and they are fed back in the order the lane
+  /// returns them.
+  fn drive_block_lane(&mut self, now: Instant) -> bool {
+    let mut any = false;
+    loop {
+      let mut moved = false;
+      while let Some(job) = self.coord.poll_block_job() {
+        self.block_lane.submit(job);
+        moved = true;
+      }
+      while let Some(done) = self.block_lane.try_recv() {
+        self.feed_block_completion(now, done);
+        moved = true;
+      }
+      if !moved {
+        return any;
+      }
+      any = true;
+    }
+  }
+
+  /// Feed one block-job completion back into the endpoint and refresh the dial-map: a completion
+  /// advances the endpoint (a checkpoint publishing its durable root), which can install a new
+  /// membership.
+  fn feed_block_completion(&mut self, now: Instant, done: viewstamp_proto::BlockJobDone<S>) {
+    self
+      .coord
+      .on_block_done(now, &mut self.wal, &mut self.sb, done);
+    self.rekey_if_needed(now);
   }
 
   /// Handle one [`BridgeInbound`]: feed received bytes to the coordinator, or reap the conn on the
@@ -1278,9 +1342,9 @@ where
     loop {
       self
         .coord
-        .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+        .handle_storage_deferred(now, &mut self.wal, &mut self.sb);
       self.rekey_if_needed(now);
-      let mut produced = false;
+      let mut produced = self.drive_block_lane(now);
       let mut to_close: Vec<(ConnId, CloseCause)> = Vec::new();
       while let Some((id, bytes)) = self.coord.poll_conn_transmit() {
         if let Some(conn) = self.conns.get(&id) {
@@ -1413,7 +1477,7 @@ where
 #[cfg(test)]
 mod tests;
 
-impl<S: StateMachine, R, W, B, L> CompioStreamDriver<S, R, W, B, L> {
+impl<S: StateMachine, R, W, B> CompioStreamDriver<S, R, W, B> {
   /// The number of connection closes attributed to `cause` so far — the coordinator's internal
   /// closes plus the driver's own (auth-deadline, out-queue overflow, accept-cap). Test/diagnostic
   /// observability, not a stable embedder API (hence `#[doc(hidden)]`). Reads only the local

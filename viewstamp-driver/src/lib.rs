@@ -2,6 +2,7 @@
 #![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo_72x72.png")]
 
 mod aggregate;
+mod block_lane;
 mod clock;
 mod config;
 mod handle;
@@ -15,6 +16,7 @@ pub use aggregate::{
   DEFAULT_MAX_QUEUED_UNITS, NeverReady, NoStall, OutcomeUnknownReason, RefusedReason,
   ReplyLostReason, aggregator, aggregator_with_stall,
 };
+pub use block_lane::BlockLane;
 pub use clock::Clock;
 pub use config::{DIAL_TIMEOUT, DriverConfig, MAX_CONNS};
 pub use handle::{Command, Handle, Reply};
