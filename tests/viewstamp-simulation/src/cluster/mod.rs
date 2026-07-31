@@ -405,16 +405,19 @@ impl Cluster {
       // IDENTICAL genesis state to the `RestartOnly` path, so the marker changes no runtime byte. The
       // declared WAL capacity is the unbounded default the seeded storage reports; a lane that bounds
       // the rings (`set_wal_capacity`) rebuilds the endpoints with the ring size.
-      let ep = Endpoint::<SimSm, SingleChange>::with_reconfig(
+      // `commit` performs the genesis write and requires it durable before it returns, with no run
+      // loop yet to pump an async completion — so staging is suspended across it.
+      let staging = sbs[i as usize].suspend_async_writes();
+      let committed = Endpoint::<SimSm, SingleChange>::with_reconfig(
         cfg,
         membership.clone(),
         seed ^ (i as u64).wrapping_mul(0x1234_5678),
         SimSm::Plain(LogSm::default()),
         u64::MAX,
       )
-      .commit(&wals[i as usize], &mut sbs[i as usize])
-      .expect("genesis commit formats the seeded store");
-      replica_set.push(ep);
+      .commit(&wals[i as usize], &mut sbs[i as usize]);
+      sbs[i as usize].resume_async_writes(staging);
+      replica_set.push(committed.expect("genesis commit formats the seeded store"));
     }
     // GC-DISABLED: the seeded cluster holds every checkpoint block for the run's lifetime so a
     // mid-run prune never makes a donor answer a `RequestBlock` ABSENT, which would shift the
@@ -1910,16 +1913,18 @@ impl Cluster {
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
       // Declare the capacity the current WALs report (the bounded ring size, or the unbounded default)
       // — it is stamped into every durable root, and recovery fences a mismatch.
-      let ep = Endpoint::<SimSm, SingleChange>::with_reconfig(
+      // Same genesis-write contract as the seeded construction path: suspend staging across `commit`.
+      let staging = self.sbs[i].suspend_async_writes();
+      let committed = Endpoint::<SimSm, SingleChange>::with_reconfig(
         cfg,
         membership.clone(),
         seed,
         self.make_sm(),
         self.wal_capacity.unwrap_or(u64::MAX),
       )
-      .commit(&self.wals[i], &mut self.sbs[i])
-      .expect("genesis commit formats the reseeded store");
-      self.replicas[i] = ep;
+      .commit(&self.wals[i], &mut self.sbs[i]);
+      self.sbs[i].resume_async_writes(staging);
+      self.replicas[i] = committed.expect("genesis commit formats the reseeded store");
       self.incarnations[i] += 1;
     }
   }

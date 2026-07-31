@@ -7967,6 +7967,195 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
 }
 
 #[test]
+fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
+  // A `truncate`/`prune` synchronous-cancellation list is COMPLETION-EQUIVALENT data: after a
+  // restart in place (the storage layer outlives the endpoint), a conforming backend still holds
+  // the DEAD endpoint's staged writes and reports THEIR ids when a truncate trims them. Those ids
+  // name a previous incarnation the successor never minted, so they must be refused at the same
+  // incarnation rule the completion routers enforce — not treated as a backend-contract violation
+  // by the unknown-id assertion, and never keyed into the successor's correlation tables.
+  let cfg = Config::try_new(1, MemberId::new(2)).unwrap(); // member 2: a backup of views 0 and 1
+  let mut wal = ReorderWal::new().cancelling();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+
+  // The predecessor stages an op-1 append (the ReorderWal withholds its completion — the write is
+  // with the device) and is dropped WITHOUT a drain: the restart-in-place shape.
+  let mut dead = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover the formatted store")
+  .expect_active();
+  assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
+  dead.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "the predecessor's append is staged, its completion withheld"
+  );
+  drop(dead);
+
+  // The successor recovers over the SAME live storage: a fresh incarnation, no writes of its own.
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover over the live storage")
+  .expect_active();
+  while r.poll_message().is_some() {}
+
+  // Adopt view 1 at canonical head 0 — BELOW the staged op — so the adoption's truncate
+  // synchronously cancels the dead incarnation's staged write and returns ITS id.
+  r.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(0),
+      OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![],
+    )),
+  );
+  assert_eq!(r.view(), View::with(1), "the adoption completed");
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the dead incarnation's cancelled id was REFUSED at the incarnation choke"
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![] as std::vec::Vec<u64>,
+    "the backend genuinely discarded the dead write — nothing can land late"
+  );
+  // Drain the adoption's durable-view write: with the dead id refused (and its write proven
+  // cancelled by the backend), the successor owes and is owed nothing.
+  r.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !r.has_inflight_storage(),
+    "no bookkeeping exists for the dead incarnation's write"
+  );
+}
+
+#[test]
+fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
+  // The COLLISION shape of the refused-cancellation rule. Sequences restart at 1 in every
+  // incarnation, so a dead incarnation's cancelled id can carry the SAME sequence number as a write
+  // the successor has live at the device. Retiring by sequence alone would remove the SUCCESSOR's
+  // fence witness — the `wal_writes` entry proving its own write is still un-quiesced — so a
+  // conflicting re-append could submit while the old bytes can still land (the reordering the
+  // slot-quiescence fence exists to prevent), and a graceful-shutdown drain would read quiesced
+  // while a write the cluster may act on is still with the device.
+  let cfg = Config::try_new(1, MemberId::new(2)).unwrap(); // member 2: a backup of views 0 and 1
+  let mut wal = ReorderWal::new().cancelling();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover the formatted store")
+  .expect_active();
+  while r.poll_message().is_some() {}
+
+  // The successor's own live write: a view-0 Prepare for op 1 stages an append whose completion
+  // the device still owes.
+  r.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  let own = *wal.staged_ids().first().expect("op 1's append is staged");
+  // The dead incarnation's leftover, still with the device across a restart in place: its id
+  // carries the live write's SEQUENCE under a DIFFERENT incarnation. Staged at op 2 so the
+  // truncate below cancels IT while the live op-1 write survives.
+  let foreign = crate::WriteId::new(own.incarnation().wrapping_add(1), own.seq());
+  wal.stage_predecessor_write(foreign, 2);
+
+  // Adopt view 1 at canonical head 1 (op 1 committed): the truncate above op 1 cancels ONLY the
+  // foreign op-2 write and reports its colliding id; the live op-1 write stays with the device.
+  r.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(&[1]),
+      )],
+    )),
+  );
+  assert_eq!(r.view(), View::with(1), "the adoption completed");
+  r.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // drain the durable-view write
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "the live op-1 write is still with the device"
+  );
+  assert!(
+    r.has_inflight_storage(),
+    "the live write's fence witness is INTACT — the colliding foreign id retired nothing"
+  );
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the foreign cancellation was refused at the incarnation choke"
+  );
+
+  // The kept witness then drains through the write's OWN completion, exactly once: the abandoned
+  // append lands, its completion retires the witness, and the endpoint quiesces.
+  assert!(wal.release_latest_for(1), "the live write lands");
+  r.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !r.has_inflight_storage(),
+    "the witness retires via the write's own completion"
+  );
+}
+
+#[test]
 fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
   // CONSENSUS-SAFETY regression. A solo cluster (replica_count 1) that committed
   // acked ops, then had its only disk WIPED, comes back with an empty UNFORMATTED store. It has no
@@ -8013,11 +8202,12 @@ fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
 
 #[test]
 fn a_second_format_attempt_does_not_confirm_off_the_first_attempts_completion() {
-  // RETRY-SAFETY regression. `format` confirms success by requiring the durable root
-  // to equal EXACTLY the root this call submitted, not merely by seeing a `Wrote` under the shared
-  // FORMAT_OP_ID. So a second attempt whose write is still in flight cannot falsely confirm off a
-  // first attempt's completion. Here `StepSb` holds writes in flight until `flush`, so neither format
-  // attempt sees its root become durable: both must report WriteNotDurable.
+  // RETRY-SAFETY regression. `format` confirms success by requiring the durable root to equal
+  // EXACTLY the root this call submitted: it drains completions without inspecting ids (each
+  // attempt tags its write with a fresh private incarnation), so that root equality is the whole
+  // retry-safety guard. A second attempt whose write is still in flight therefore cannot falsely
+  // confirm off a first attempt's completion. Here `StepSb` holds writes in flight until `flush`,
+  // so neither format attempt sees its root become durable: both must report WriteNotDurable.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
   let wal = ScriptedWal::with_entries(0);
   let mut sb = StepSb::default();
@@ -8028,8 +8218,9 @@ fn a_second_format_attempt_does_not_confirm_off_the_first_attempts_completion() 
     Err(crate::FormatError::WriteNotDurable),
     "attempt A: write not durable yet"
   );
-  // Attempt B over the SAME (still empty) store: A's write is still outstanding under FORMAT_OP_ID.
-  // B must NOT confirm success off A's pending completion — the store's durable root is still empty.
+  // Attempt B over the SAME (still empty) store: A's write is still outstanding, tagged with A's
+  // own private incarnation. B must NOT confirm success off A's pending completion — the store's
+  // durable root is still empty.
   let b = crate::format(&cfg, &genesis(3), &wal, &mut sb);
   assert_eq!(
     b,

@@ -190,7 +190,11 @@ pub const HEADER_ENCODED_LEN: usize = 128;
 /// load-bearing for SAFETY.
 ///
 /// The id never reaches disk or the wire; a backend treats it as an opaque token to echo back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Deliberately UNORDERED (no `Ord`): an incarnation records process-assignment order, not a
+/// meaningful order over ids, so an ordered-by-id collection would smuggle in a process-order
+/// dependence — correlation tables key on the sequence number instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpId {
   incarnation: u64,
   seq: u64,
@@ -234,7 +238,7 @@ impl OpId {
 /// the same incarnation choke when it names a dead endpoint. Write ids and read ids are minted from
 /// ONE sequence counter per incarnation: the correlation tables key on the SEQUENCE alone, so a
 /// second counter would let a read's sequence alias a live write's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WriteId(OpId);
 
 impl WriteId {
@@ -278,7 +282,7 @@ impl WriteId {
 /// Wraps an [`OpId`] on the same terms as [`WriteId`]: same incarnation + sequence pairing, same
 /// incarnation choke, and the SAME per-incarnation sequence counter as write ids — the correlation
 /// tables key on the sequence alone, so read and write sequences must not be able to collide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReadId(OpId);
 
 impl ReadId {
@@ -1525,7 +1529,9 @@ pub trait Wal {
   /// Drop all slots strictly above `above` (view-change tail truncation), returning the `WriteId`s of
   /// any in-flight appends this call CANCELLED — submissions the backend can prove will now neither
   /// land nor complete (e.g. writes still in its own queue, never issued to the device). A returned id
-  /// receives NO further completion; the endpoint retires its bookkeeping on the spot.
+  /// receives NO further completion; the endpoint retires its bookkeeping on the spot. After a restart
+  /// in place the backend may still hold writes a PREVIOUS endpoint incarnation submitted, so the
+  /// returned list may name a previous incarnation's writes; the endpoint ignores those.
   ///
   /// # Contract
   /// Takes effect SYNCHRONOUSLY on the synchronous views ([`Wal::op_head`] / [`Wal::header`]) — Phase-1
@@ -1553,7 +1559,8 @@ pub trait Wal {
   fn truncate(&mut self, above: OpNumber) -> Vec<WriteId>;
   /// Free all slots strictly below `below` (post-checkpoint GC), returning the `WriteId`s of any
   /// in-flight appends this call CANCELLED — same semantics as the [`truncate`](Wal::truncate) return
-  /// value (a returned id receives no further completion).
+  /// value (a returned id receives no further completion, the list may name a previous incarnation's
+  /// writes, and the endpoint ignores those).
   ///
   /// # Contract
   /// Like [`Wal::truncate`]: takes effect SYNCHRONOUSLY on the synchronous views and must not be reordered

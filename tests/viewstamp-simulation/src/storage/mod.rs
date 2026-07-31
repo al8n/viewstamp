@@ -959,6 +959,11 @@ impl InMemorySuperblock {
   /// one call. The backend deliberately does not try to RECOGNIZE that write: it is an ordinary root
   /// write, distinguished only by who submits it and when, which the caller knows and the backend
   /// cannot soundly infer.
+  ///
+  /// EVERY genesis-write path must be wrapped this way — the endpoint builder's `commit` as much as
+  /// the standalone `format`, at seeded construction and at every endpoint rebuild. A path that skips
+  /// it fails with `WriteNotDurable` the moment its store carries an async delay, which no unit test
+  /// reaches: only a lane that arms the async window and then rebuilds endpoints exposes it.
   pub fn suspend_async_writes(&mut self) -> Option<u32> {
     self.async_delay.take()
   }
