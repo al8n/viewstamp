@@ -37,7 +37,10 @@
 //! DIRECTED one-way partitions (`from → to` cut while `to → from` flows — the deaf/mute-primary
 //! shapes the symmetric groups cannot express), and a committed SLOW-REPLICA sweep
 //! ([`vopr_slow_replica_sweep_no_violations`]) force-enables per-replica gray-failure delivery
-//! (messages a few seeded milliseconds late, never dropped). An `#[ignore]`d TORN-HEADER probe
+//! (messages a few seeded milliseconds late, never dropped). A committed WRITE-CHAOS sweep
+//! ([`vopr_wal_write_chaos_sweep_no_violations`]) force-enables the out-of-submission-order,
+//! un-cancellable WAL device model the endpoint's slot-quiescence fence is built for. An `#[ignore]`d
+//! TORN-HEADER probe
 //! ([`vopr_torn_header_sweep_no_violations`])
 //! deliberately violates the `Wal` header-durability contract to measure its blast radius — it is a
 //! contract-violation measurement, never a CI gate. A
@@ -615,26 +618,36 @@ fn vopr_wipe_sweep_no_violations() {
   );
 }
 
-/// The WAL WRITE-CHAOS sweep: [`run_vopr_with_write_chaos`] over `0..VOPR_SEEDS` (default 64, the
-/// [`sweep_seed_count`] override) — the write-chaos axis FORCE-ENABLED programmatically (the
-/// [`run_vopr_with_hold`] pattern). Every replica's WAL then completes appends in a seeded
-/// OUT-OF-SUBMISSION order and CANNOT cancel a truncated/pruned in-flight write — it lands late into
-/// the trimmed region, briefly resurrecting it. That is exactly the device model under which the
-/// endpoint's slot-quiescence fence carries the safety argument: a truncated op re-appended at the
-/// SAME number, or a checkpoint-pruned ring slot REUSED by `op + capacity`, must never end with the
-/// ABANDONED old bytes durably overwriting the value the replica's ack/vote named. The EXISTING
-/// oracles judge the outcome every tick — committed-loss (durability), ring-residency,
-/// applied-divergence (agreement), plus the liveness/final-quiesce gates — so a panic here is a REAL
-/// fence finding, reported with its seed, never masked.
+/// The contiguous seed range for the committed WAL WRITE-CHAOS sweep (same budget rationale as
+/// [`HOLD_SEEDS`]: this lane is ADDITIVE to the default sweep, and every replica's WAL runs the
+/// jittered, un-cancellable device model for the whole run).
+const WRITE_CHAOS_SEEDS: u64 = 16;
+
+/// The committed WAL WRITE-CHAOS sweep: [`run_vopr_with_write_chaos`] over `0..WRITE_CHAOS_SEEDS` —
+/// the write-chaos axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env
+/// var, so it cannot race other tests in this process and cannot be forgotten by a runner). Every
+/// replica's WAL then completes appends in a seeded OUT-OF-SUBMISSION order and CANNOT cancel a
+/// truncated/pruned in-flight write — it lands late into the trimmed region, briefly resurrecting it.
+/// That is exactly the device model under which the endpoint's slot-quiescence fence carries the
+/// safety argument: a truncated op re-appended at the SAME number, or a checkpoint-pruned ring slot
+/// REUSED by `op + capacity`, must never end with the ABANDONED old bytes durably overwriting the
+/// value the replica's ack/vote named. The EXISTING oracles judge the outcome every tick —
+/// committed-loss (durability), ring-residency, applied-divergence (agreement), plus the
+/// liveness/final-quiesce gates — so a panic here is a REAL fence finding, reported with its seed,
+/// never masked.
 ///
-/// Opt-in (`#[ignore]`): the DEFAULT sweep's schedule must stay byte-identical (this axis changes the
-/// WAL completion order, which is its own deterministic baseline). Run with
-/// `cargo test --release -p viewstamp-simulation --test vopr -- --ignored vopr_wal_write_chaos`
-/// (optionally `VOPR_SEEDS=<n>` for a wider range).
+/// The DEFAULT sweep leaves this axis OFF (the reordering IS the axis, so enabling it would change
+/// every default seed's WAL completion order and move every pinned schedule); chaos-enabled runs are
+/// their own deterministic baselines, byte-identical to `VOPR_WRITE_CHAOS=1` runs of the same seeds.
 #[test]
-#[ignore = "opt-in write-chaos sweep: run with --ignored (VOPR_SEEDS widens the range); the default lanes stay on the ordered-WAL baseline"]
 fn vopr_wal_write_chaos_sweep_no_violations() {
-  let seeds = sweep_seed_count();
+  // `VOPR_SEEDS` widens the contiguous count at runtime (the deep lane sets it), else the committed
+  // default `WRITE_CHAOS_SEEDS` — the same override the other axis lanes take, so one env var widens
+  // the whole suite at once.
+  let seeds = std::env::var("VOPR_SEEDS")
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .unwrap_or(WRITE_CHAOS_SEEDS);
   let mut total_reorders = 0u64;
   let mut total_committed = 0usize;
   let mut seeds_with_view_change = 0u64;

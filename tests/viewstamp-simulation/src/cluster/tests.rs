@@ -103,6 +103,193 @@ fn restart_recovers_through_the_recovering_loop_under_faults() {
   );
 }
 
+/// PINS A DEFECT THAT IS STILL UNFIXED. Every assertion below records DAMAGE and asserts that it
+/// happens, so that closing the defect BREAKS this test and forces the rewrite described at the
+/// bottom. Nothing here endorses the behaviour it observes.
+///
+/// # The defect
+///
+/// A storage correlation id ([`OpId`](viewstamp_proto::OpId)) is minted per `Endpoint` and the
+/// sequence RESTARTS at `1` in each new one, so two endpoint incarnations over the same storage
+/// mint the same ids. A completion produced for the PREVIOUS incarnation and delivered to the
+/// CURRENT one therefore aliases onto whatever the current one happens to have in flight under that
+/// id, and is dispatched as though the current one's own write had landed.
+///
+/// [`crash`](Cluster::crash) hides this: it models power loss, so it discards the staged writes and
+/// undelivered completions — exactly the evidence that would alias.
+/// [`restart_in_place`](Cluster::restart_in_place) retains them, which is what a supervised
+/// endpoint rebuild over a still-running storage layer does.
+///
+/// # Why the schedule bends the id map before the swap
+///
+/// Two incarnations collide destructively only when their id → op maps DISAGREE. Recovery spends
+/// one id per durable op in the recover window and then resumes appending, so a successor
+/// recovering a log its predecessor wrote one-id-per-op re-derives the predecessor's own map: every
+/// aliased completion then lands on the op it was already for, and nothing observable happens.
+/// Deposing the view-0 primary bends the map — the view change makes the survivors mint ids that
+/// are not plain head-extending appends (the durable-view root write) and re-append an adopted tail
+/// out of op order — so the predecessor's ids run ahead of its op numbers while the successor's,
+/// derived from the durable log alone, do not. With the constants below the predecessor leaves
+/// eight appends in flight and the successor mints one of those same ids for a LATER op.
+///
+/// # The damage, read off the harness's own oracles
+///
+/// - the replica emits a `PrepareOk` for an op whose WAL slot is still `Dirty`
+///   ([`take_append_before_ack_violation`](Cluster::take_append_before_ack_violation)): it has
+///   voted for an op it does not hold durably, on the strength of a completion that belongs to a
+///   different op of a dead endpoint; and, following from that vote,
+/// - that op COMMITS while only one voter holds it durably
+///   ([`DurableQuorumChecker`](crate::checker::DurableQuorumChecker)): the quorum-durable retention
+///   that VSR recovery rests on is broken, so one further crash loses a committed op.
+///
+/// The control arm runs the IDENTICAL schedule through `crash` + `restart` — the same endpoint
+/// rebuild, differing only in that the in-flight work is discarded — and stays clean on both
+/// oracles. The damage is therefore attributable to the retained completions, not to the schedule.
+///
+/// # What the fix must turn this test into
+///
+/// Once a correlation id is scoped to its incarnation and foreign completions meet a single
+/// rejection choke, the retaining arm must behave like the control: the foreign completion is
+/// rejected wholesale instead of dispatched, a rejection counter is non-zero (proving a foreign
+/// completion really was delivered and refused, so the lane has not silently gone vacuous), and the
+/// replica casts no ack or vote for an op until its OWN incarnation's completion for that op
+/// arrives. Both `expect`s below then become `is_none()` assertions, the rejection-counter
+/// assertion joins them, and the retained-in-flight precondition stays exactly as it is.
+#[test]
+fn unfixed_defect_a_foreign_completion_forges_an_ack_across_an_in_place_restart() {
+  use crate::checker::{CheckResult, DurableQuorumChecker};
+
+  /// How the run replaces replica 2's endpoint — the ONLY difference between the two arms.
+  #[derive(Clone, Copy, Debug)]
+  enum Swap {
+    /// `crash` then `restart`: the crash discards the staged writes and queued completions, so the
+    /// successor endpoint is handed nothing its predecessor left behind.
+    DiscardingInFlight,
+    /// `restart_in_place`: the storage layer keeps everything it still owes, so the predecessor's
+    /// completions are delivered into the successor.
+    RetainingInFlight,
+  }
+
+  /// What one arm observed: how much in-flight work the successor inherited, and the first violation
+  /// of each oracle after the swap.
+  struct Observed {
+    inherited: usize,
+    forged_ack: Option<SmolStr>,
+    lost_durable_quorum: Option<SmolStr>,
+  }
+
+  /// Appends stay in flight for this many WAL polls, holding the in-flight window open long enough
+  /// for the successor to mint an id its predecessor is still using.
+  const WAL_DELAY: u32 = 32;
+  /// Far above anything this run commits, so no checkpoint fires: the successor's recover window is
+  /// then the whole durable log, and the id map it derives is a function of that log alone.
+  const NO_CHECKPOINT: u64 = 32_768;
+  /// Enough closed-loop clients that several appends are outstanding at once — one endpoint
+  /// incarnation must leave more than a single write with the device for an aliased id to exist.
+  const CLIENTS: u32 = 8;
+  /// Ticks of ordinary operation before the primary is deposed, and again before the swap.
+  const PHASE_TICKS: u32 = 60;
+  /// Ticks after the swap, comfortably past both violations (the forged ack lands well inside it, and
+  /// the op it forged a vote for commits a while later).
+  const OBSERVE_TICKS: u32 = 300;
+
+  fn run(swap: Swap) -> Observed {
+    let mut c = Cluster::with_checkpoint_ops(3, CLIENTS, 200, /*seed*/ 0, NO_CHECKPOINT);
+    c.set_async_wal_delay(Some(WAL_DELAY));
+    let mut quorum = DurableQuorumChecker::new();
+    for _ in 0..PHASE_TICKS {
+      c.tick();
+      assert!(
+        c.take_append_before_ack_violation().is_none(),
+        "{swap:?}: the schedule violates append-before-ack before the primary is even deposed"
+      );
+    }
+    // Depose the view-0 primary. The view change is what makes the two incarnations' id maps
+    // disagree; it is not itself the thing under test.
+    c.crash(0);
+    for _ in 0..PHASE_TICKS {
+      c.tick();
+      assert!(
+        c.take_append_before_ack_violation().is_none(),
+        "{swap:?}: the schedule violates append-before-ack before the endpoint swap"
+      );
+    }
+    match swap {
+      Swap::DiscardingInFlight => {
+        c.crash(2);
+        c.restart(2);
+      }
+      Swap::RetainingInFlight => c.restart_in_place(2),
+    }
+    let inherited = c.wal_staged_len_for_test(2);
+    let mut observed = Observed {
+      inherited,
+      forged_ack: None,
+      lost_durable_quorum: None,
+    };
+    for _ in 0..OBSERVE_TICKS {
+      c.tick();
+      if let Some(v) = c.take_append_before_ack_violation() {
+        observed.forged_ack.get_or_insert(v);
+      }
+      if let CheckResult::Violation(v) = quorum.observe(&c) {
+        observed.lost_durable_quorum.get_or_insert(v);
+      }
+    }
+    observed
+  }
+
+  // The control: the same endpoint rebuild with the in-flight work thrown away is clean, so nothing
+  // in the schedule itself breaks either oracle.
+  let control = run(Swap::DiscardingInFlight);
+  assert_eq!(
+    control.inherited, 0,
+    "a crash must leave the successor endpoint nothing in flight — it models the fsync loss"
+  );
+  assert!(
+    control.forged_ack.is_none(),
+    "the discarding lane acked an op it had not durably appended: {:?}",
+    control.forged_ack
+  );
+  assert!(
+    control.lost_durable_quorum.is_none(),
+    "the discarding lane lost a committed op's durable quorum: {:?}",
+    control.lost_durable_quorum
+  );
+
+  let observed = run(Swap::RetainingInFlight);
+  assert!(
+    observed.inherited > 0,
+    "the successor endpoint inherited no in-flight write, so no foreign completion could be \
+     delivered — the lane is vacuous and proves nothing"
+  );
+  // DAMAGE, asserted as present on purpose: a completion minted by the dead endpoint for one of ITS
+  // ops was dispatched as the successor's, and the successor voted for an op still `Dirty` on its
+  // own disk.
+  let forged = observed.forged_ack.expect(
+    "no forged ack: the retained foreign completion no longer reaches the successor's in-flight \
+     table. Either this schedule has drifted off the aliasing window (re-derive it), or correlation \
+     ids are now incarnation-scoped and rejected — in which case flip this test to its green form \
+     described in the doc comment above",
+  );
+  assert!(
+    forged.contains("wal_status=dirty"),
+    "the forged ack must be for a slot whose append is genuinely still in flight, not a slot the \
+     harness merely failed to observe: {forged}"
+  );
+  // The consequence, and the reason the forged ack matters: the op it voted for then committed
+  // without the durable quorum that lets a survivor recover it.
+  let lost = observed.lost_durable_quorum.expect(
+    "the forged ack did not cost a committed op its durable quorum — the run no longer reaches the \
+     consequence this test exists to record; re-derive the schedule before weakening it",
+  );
+  assert!(
+    lost.contains("is durably held on only 1 voters"),
+    "the retention breach must be a committed op held by a single voter (the forged ack standing in \
+     for the second durable copy): {lost}"
+  );
+}
+
 #[test]
 fn crashed_replica_stops_and_is_skipped() {
   let mut c = Cluster::new(3, 1, 1, 7);

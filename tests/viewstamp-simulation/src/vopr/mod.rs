@@ -159,11 +159,12 @@ pub struct VoprReport {
   /// own checkpoint lags below the ring window); the deterministic `bounded_wal.rs` laggard gate covers
   /// it directly, so the committed sweep only NOTES this count rather than forcing a flaky assert.
   below_ring_window_syncs: u64,
-  /// `true` iff this is a BOUNDED seed (`wal_capacity.is_some()`) that committed STRICTLY MORE than `N`
-  /// ops — i.e. its ring genuinely WRAPPED at least once (an op `K + N` reused op `K`'s physical slot).
-  /// This is the strongest single witness that the bounded mode did real work: a seed whose committed
-  /// history never reached `N` would exercise the ring slots but never a wrap. The committed sweep
-  /// asserts SOME bounded seed wrapped (Item 3), proving the wrap path is non-vacuous.
+  /// `true` iff this is a BOUNDED seed (`wal_capacity.is_some()`) whose committed FRONTIER — the
+  /// highest committed op NUMBER — passed the ring size `N`, i.e. its ring genuinely WRAPPED at least
+  /// once (an op `K + N` reused op `K`'s physical slot). This is the strongest single witness that the
+  /// bounded mode did real work: a seed whose committed frontier never reached `N` would exercise the
+  /// ring slots but never a wrap. The committed sweep asserts SOME bounded seed wrapped, proving the
+  /// wrap path is non-vacuous.
   bounded_seed_wrapped: bool,
   /// How many LARGE-bodied client requests were minted this run (summed across clients, high-water).
   /// `> 0` proves the frame-cap axis is NON-VACUOUS: the client genuinely produced large bodies that
@@ -443,9 +444,10 @@ impl VoprReport {
     self.below_ring_window_syncs
   }
 
-  /// `true` iff this is a bounded seed whose ring genuinely WRAPPED — it committed strictly more than
-  /// `N` ops, so an op `K + N` physically reused op `K`'s ring slot. The strongest single witness that
-  /// the bounded mode did real work (the sweep asserts SOME bounded seed wrapped).
+  /// `true` iff this is a bounded seed whose ring genuinely WRAPPED — its committed frontier (the
+  /// highest committed op NUMBER) passed `N`, so an op `K + N` physically reused op `K`'s ring slot.
+  /// The strongest single witness that the bounded mode did real work (the sweep asserts SOME bounded
+  /// seed wrapped).
   pub const fn bounded_seed_wrapped(&self) -> bool {
     self.bounded_seed_wrapped
   }
@@ -3325,13 +3327,23 @@ impl Vopr {
       .map(|i| c.wal_torn_headers_fired(i))
       .sum();
     self.report.torn_headers_fired = self.report.torn_headers_fired.max(th);
-    // Genuine-WRAP witness: a BOUNDED seed whose committed history exceeded its ring size `N` has had an
+    // Genuine-WRAP witness: a BOUNDED seed whose committed FRONTIER passed its ring size `N` has had an
     // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
     // once true. Trivially false on an unbounded seed (`wal_capacity` is `None`).
-    if let Some(n) = self.wal_capacity
-      && (self.report.max_committed as u64) > n
-    {
-      self.report.bounded_seed_wrapped = true;
+    //
+    // The frontier is the highest committed op NUMBER (`commit_min`, which advances past a committed
+    // `Reconfigure` op even though no `sm.apply` runs for it), never the applied-log LENGTH. A
+    // consensus-layer op occupies a ring slot without ever entering an applied stream, so once one has
+    // committed the length sits STRICTLY BELOW the frontier — and a run whose ring genuinely wrapped
+    // could read `false`, leaving the sweep's bounded-ring wrap assertion vacuous.
+    if let Some(n) = self.wal_capacity {
+      let frontier = (0..self.node_count)
+        .map(|i| c.replica_commit(i).get())
+        .max()
+        .unwrap_or(0);
+      if frontier > n {
+        self.report.bounded_seed_wrapped = true;
+      }
     }
     // Frame-cap axis high-waters: how many LARGE bodies the clients have minted (non-vacuity — the cap
     // must be exercised), and how many inter-replica messages the network has oversized-dropped (which

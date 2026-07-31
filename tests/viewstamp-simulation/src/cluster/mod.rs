@@ -1284,6 +1284,44 @@ impl Cluster {
     }
   }
 
+  /// Replace replica `i`'s endpoint over its EXISTING storage fixtures while the storage layer keeps
+  /// running underneath it: staged (not-yet-durable) writes stay staged and queued completions stay
+  /// queued, so everything the backend still owed the OLD endpoint is delivered to the NEW one.
+  ///
+  /// This models a supervised in-place rebuild — a driver-level restart, a recovery retry — where the
+  /// process replaces the endpoint but the submission/completion queues below it (an io_uring ring, a
+  /// thread pool's outstanding writes) are neither drained nor cancelled. It is deliberately NOT
+  /// [`crash`](Self::crash) + [`restart`](Self::restart): `crash` models power loss and so
+  /// `discard_inflight`s both fixtures, destroying exactly the writes and completions that survive
+  /// here. Nor is it [`wipe_and_restart`](Self::wipe_and_restart), which forfeits the durable state.
+  /// The endpoint is rebuilt through the same [`recover_in_place`](Self::recover_in_place) path a
+  /// plain `restart` uses, so the recovery itself is identical; the retained in-flight work is the
+  /// whole difference.
+  ///
+  /// The replica is never marked crashed — it keeps being ticked across the swap, so the successor
+  /// endpoint is live when the predecessor's completions arrive. Correlation ids restart at `1` in the
+  /// new endpoint ([`OpId`](viewstamp_proto::OpId) is minted per endpoint), so a retained completion
+  /// carries an id the successor also mints; where the two meet is the lane this exercises.
+  ///
+  /// A restart in place runs over the store the running endpoint just wrote, so recovery always
+  /// succeeds; a `Retired` or a recover error here is a harness bug (this is not a path for a parked
+  /// or wiped node).
+  pub fn restart_in_place(&mut self, i: usize) {
+    // Capture the application events still queued on the outgoing endpoint before it is dropped, for
+    // the same reason `crash` does: the ops they record WERE applied, and an uncaptured tail would
+    // vanish from every recorded stream and read as a lost op.
+    self.record_applied_events(i);
+    match self.recover_in_place(i) {
+      Ok(None) => self.crashed[i] = false,
+      Ok(Some(r)) => {
+        panic!("replica {i} recovered Retired across an in-place restart: {r:?}")
+      }
+      Err(e) => {
+        panic!("replica {i} in-place restart over its own live store hit a recover error: {e}")
+      }
+    }
+  }
+
   /// Rebuild replica `i` from its durable WAL + superblock via `Endpoint::recover`, drive its
   /// Recovering read loop to completion, and return `None` on [`Recovered::Active`] (the rebuilt
   /// endpoint is installed) or `Some(retired)` on [`Recovered::Retired`] (a node absent from its durable
@@ -1944,6 +1982,15 @@ impl Cluster {
   #[doc(hidden)]
   pub fn wal_head_for_test(&self, i: usize) -> u64 {
     self.wals[i].op_head().get()
+  }
+
+  /// Test-only: the number of staged (not-yet-durable) WAL appends on replica `i` — `> 0` iff the
+  /// async-append WAL is holding a write the backend still owes a completion for. A restart-in-place
+  /// harness reads this to confirm the successor endpoint really was handed outstanding work
+  /// (`restart_in_place` retains it where `crash` discards it), so the lane cannot pass vacuously.
+  #[doc(hidden)]
+  pub fn wal_staged_len_for_test(&self, i: usize) -> usize {
+    self.wals[i].staged_len()
   }
 
   /// Test-only: the number of staged (not-yet-durable) superblock writes on replica `i` — `> 0` iff
