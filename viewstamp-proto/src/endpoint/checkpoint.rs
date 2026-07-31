@@ -250,28 +250,50 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     polled: crate::storage::SbPolled,
   ) {
     let crate::storage::SbPolled { done, landed_root } = polled;
-    // An INHERITED root landing: a dead incarnation's root write just became the durable root. The
-    // session settled the timeline before this router saw the completion, and the landed state
-    // rides alongside it — the refused foreign completion itself carries none. Absorb the landed
-    // facts this endpoint can hold: the known-committed frontier is a monotone learned scalar
-    // (exactly as a `Commit` message teaches it — deferred while recovering, whose canonical-band
-    // bookkeeping was seeded off the pre-landing root and re-learns commit from peers), and a
-    // checkpoint frontier past this endpoint's own becomes the owed catch-up
-    // [`Self::maybe_adopt_inherited_frontier`] adopts once the applied frontier reaches it —
-    // immediately, when it already has. An OWN root landing takes none of this: its advance runs
-    // through its matching `pending_sb`/`pending_checkpoint` arm below.
-    if let Some((id, state)) = &landed_root
-      && id.op_id().incarnation() != self.incarnation
-    {
-      if !self.status.is_recovering() && !self.status.is_recovering_head() {
-        self.commit_max = self.commit_max.max(state.commit());
-      }
-      if state.checkpoint_op() > self.checkpoint_op {
-        let frontier = self
-          .inherited_frontier
-          .map_or(state.checkpoint_op(), |f| f.max(state.checkpoint_op()));
-        self.inherited_frontier = Some(frontier);
-        self.maybe_adopt_inherited_frontier();
+    if let Some((id, state)) = &landed_root {
+      // EVERY root landing — own, inherited, or superseded — advances the durable-view witness:
+      // the medium's durable root now holds `state`, whichever incarnation submitted it and
+      // whether or not a `pending_sb` entry still correlates it, so the view it carries is
+      // durably recoverable from this instant. The lift is what opens the participation gates of
+      // a successor endpoint recovered ABOVE its landed root (its `durable_view` baselined on the
+      // landed root while its `view` baselined on the effective one — the inherited in-flight
+      // root's landing is the witness it was waiting for), and it keeps the witness truthful for
+      // a root whose correlation was superseded by a view transition (the write itself cannot be
+      // superseded; its landing is a medium fact). The monotone max never runs the witness ahead
+      // of the live view: the root queue is view-monotone (asserted at submit), every queued view
+      // is at most the view its submitter held, and both recovery baselines and live transitions
+      // keep `self.view` at or above the timeline's back.
+      self.durable_view = self.durable_view.max(state.view());
+      debug_assert!(
+        self.durable_view <= self.view,
+        "a root landing lifted the durable-view witness past the live view ({} > {})",
+        self.durable_view.get(),
+        self.view.get(),
+      );
+      // An INHERITED root landing: a dead incarnation's root write just became the durable root.
+      // The session settled the timeline before this router saw the completion, and the landed
+      // state rides alongside it — the refused foreign completion itself carries none. Absorb the
+      // remaining landed facts this endpoint can hold: the known-committed frontier is a monotone
+      // learned scalar (exactly as a `Commit` message teaches it — deferred while recovering,
+      // whose canonical-band bookkeeping re-learns commit from peers), and a checkpoint frontier
+      // past this endpoint's own becomes the owed catch-up
+      // [`Self::maybe_adopt_inherited_frontier`] adopts once the applied frontier reaches it —
+      // immediately, when it already has. (A successor recovered over the live session baselines
+      // on the effective root, so an inherited landing at or below that baseline advances
+      // neither scalar — both absorbs are the belt for landings the baseline already covers.) An
+      // OWN root landing takes none of this: its advance runs through its matching
+      // `pending_sb`/`pending_checkpoint` arm below.
+      if id.op_id().incarnation() != self.incarnation {
+        if !self.status.is_recovering() && !self.status.is_recovering_head() {
+          self.commit_max = self.commit_max.max(state.commit());
+        }
+        if state.checkpoint_op() > self.checkpoint_op {
+          let frontier = self
+            .inherited_frontier
+            .map_or(state.checkpoint_op(), |f| f.max(state.checkpoint_op()));
+          self.inherited_frontier = Some(frontier);
+          self.maybe_adopt_inherited_frontier();
+        }
       }
     }
     // THE CHOKE, the superblock twin of the one in `on_wal_done` — the CORRELATION half: a

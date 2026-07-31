@@ -460,10 +460,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// NOT return in `Normal`. The ergonomic [`Self::recover`] is the [`RestartOnly`] entry point and
   /// defers here, so every bare `Endpoint::recover(..)` call resolves unannotated.
   ///
-  /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the superblock
-  /// root via `sb.state()` for `(view, log_view, checkpoint_op, checkpoint_id)` and
-  /// `wal.header(op)` (the durable-header scan that derives the written extent) — and constructs the
-  /// endpoint with:
+  /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the session's
+  /// EFFECTIVE root ([`Storage::effective_root`]: the last root on the timeline, which is the
+  /// durable `sb.state()` whenever no root write is in flight) for `(view, log_view,
+  /// checkpoint_op, checkpoint_id)` and `wal.header(op)` (the durable-header scan that derives the
+  /// written extent) — and constructs the endpoint with:
   /// - `view = state.view()`, `log_view = state.log_view()`, `op` = the scanned written extent floored
   ///   at the durable commit (never the `op_head()` scalar),
   ///   `checkpoint_op = state.checkpoint_op()`, `commit_min = checkpoint_op` (the restored SM already
@@ -502,7 +503,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// nothing; it waits for the primary's `Prepare`/`Commit` to re-announce commit, exactly as before.
   ///
   /// **Durable-view.** The view is persisted before any view-change participation, so `state.view()`
-  /// is trustworthy: a recovered replica resumes the view it was in when it last participated.
+  /// is trustworthy: a recovered replica resumes the view it was in when it last participated. Over
+  /// a LIVE session the two halves of that sentence can name different roots, and the constructor
+  /// keeps them apart: `view` baselines on the EFFECTIVE root (an inherited in-flight root write
+  /// lands in queue order underneath the successor, so any root this endpoint later writes must
+  /// carry a view at least the timeline's — baselining below it would rewind the durable view the
+  /// moment the inherited root landed first), while `durable_view` baselines on the LANDED root
+  /// (only landed state survives a process death; an in-flight root that dies with the process must
+  /// not have licensed participation in its view). The gap closes without any action of this
+  /// endpoint's: the inherited landing is settled by the session and absorbed in `on_sb_done`,
+  /// which lifts the witness — until then every participation gate holds, exactly as it holds for
+  /// an own durable-view write still in flight.
   ///
   /// **`membership` (the EFFECTIVE-membership rule).** The active membership is resolved from the
   /// DURABLE root, not blindly from the param: a membership-bearing root
@@ -570,7 +581,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sm: S,
     storage: &mut Storage<W, B, S>,
   ) -> Result<Recovered<S, R>, RecoverError> {
-    let state = storage.sb().state();
+    // The recovery baseline is the session's EFFECTIVE root — the last root on the timeline, which
+    // an inherited in-flight write may still be carrying to the device. Root completions arrive in
+    // queue order and the last one wins, so this is the state the medium is GUARANTEED to converge
+    // to; baselining on the landed `sb().state()` instead would build a successor BELOW a state
+    // already owed to the medium, whose own root writes would then rewind the durable
+    // view/commit/checkpoint the moment the inherited root landed underneath it. With no root in
+    // flight (every recovery after a real process death — the queue died with the process) the
+    // effective root IS the landed root, and nothing here changes.
+    let state = storage.effective_root();
     // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
     // first (an under-sized ring is unsafe regardless of what the root pinned), then the pinned
     // geometry pair on any NON-virgin store — recorded-ness before value comparison, so the
@@ -766,9 +785,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       config_install_op: state.config_install_op(),
       status: Status::Recovering,
       view: state.view(),
-      // The recovered root IS the durable witness for its view — the exact ground the
-      // durable-view-before-participate gates measure against.
-      durable_view: state.view(),
+      // The durable-view witness measures what a CRASH recovers, so it baselines on the LANDED
+      // root — never the effective one: an inherited in-flight root dies with the process, and a
+      // view licensed off it would be participation a crash rolls back (the cross-crash
+      // double-vote the witness exists to prevent). While the timeline is ahead of the landed
+      // root, `durable_view < view` and every participation gate holds; the inherited landing —
+      // settled by the session, absorbed in `on_sb_done` — lifts the witness without any write of
+      // this endpoint's. With no root in flight this is `state.view()` exactly as before.
+      durable_view: storage.sb().state().view(),
       op: OpNumber::with(op),
       // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those ops
       // are NOT re-applied. commit_max = state.commit() (the DURABLE known-committed frontier),
@@ -1381,13 +1405,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           return;
         }
         // VERIFY before restore: a `CheckpointRead` matching our read id is NOT yet
-        // trustworthy — a corrupted / stale / torn superblock checkpoint could return wrong bytes. The
-        // durable root (`sb.state()`) is the authority for which checkpoint this recovery targets, so
-        // the read must match it on BOTH the op and the content hash, AND parse cleanly. The state-sync
-        // path verifies the id the same way (`on_sync_checkpoint`); the recover path must too, or a bad
-        // read would restore the wrong SM/sessions while `commit_min == checkpoint_op` — silent
-        // committed-prefix loss, exactly what the checkpoint hash exists to prevent.
-        let state = storage.sb().state();
+        // trustworthy — a corrupted / stale / torn superblock checkpoint could return wrong bytes.
+        // The session's EFFECTIVE root is the authority for which checkpoint this recovery
+        // targets — the same value Phase 1 baselined `checkpoint_op` on, and it holds still while
+        // the landings underneath drain (this endpoint submits no new root mid-recovery before
+        // this read resolves) — so the read must match it on BOTH the op and the content hash, AND
+        // parse cleanly. Verifying against a fresh `sb().state()` instead would make the verdict
+        // timing-dependent: an inherited checkpoint root landing mid-recovery flips what the
+        // landed root names, and the read (which serves the landed-root-named generation) would
+        // pass or fail by which side of the landing it raced. The state-sync path verifies the id
+        // the same way (`on_sync_checkpoint`); the recover path must too, or a bad read would
+        // restore the wrong SM/sessions while `commit_min == checkpoint_op` — silent
+        // committed-prefix loss, exactly what the checkpoint hash exists to prevent. (While an
+        // inherited checkpoint root is still in flight the serve-side generation lags this
+        // target; the mismatch reads as a fault and the retry budget rides out the landing.)
+        let state = storage.effective_root();
         let id_ok = crate::checkpoint_id(cr.snapshot()) == state.checkpoint_id();
         let op_ok = cr.op() == state.checkpoint_op();
         let decoded = Self::decode_checkpoint(cr.snapshot());

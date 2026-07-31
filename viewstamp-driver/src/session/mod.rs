@@ -118,8 +118,12 @@ where
 /// completion predating this endpoint INERT on the CORRELATION plane (it lands on nothing rather
 /// than aliasing one of this endpoint's ops), but the refusal cancels no write: the predecessor's
 /// bytes can still land. The slot-quiescence witnesses that defer a conflicting re-append until
-/// those bytes settle therefore live in the session, whose lifetime is the medium's — so an
-/// endpoint rebuilt over the SAME session inherits every fence and needs no pre-rebuild drain for
+/// those bytes settle live in the session, whose lifetime is the medium's, and so does the ROOT
+/// TIMELINE — every in-flight durable-root write with the exact state it will make durable, off
+/// which a rebuilt endpoint baselines its recovery (never below a state the medium is already
+/// guaranteed to reach) and behind which its own root write defers until a predecessor's
+/// outstanding one lands. So an endpoint rebuilt over the SAME session inherits every fence and
+/// needs no pre-rebuild drain for
 /// SAFETY (a drain is then shutdown hygiene, which is all [`crate::drain_storage`] claims), while a
 /// session rebuilt over live handles is unrepresentable: the handles are inside the first session
 /// until it proves the medium quiet. (Distinct from the recovery nonce above: that fences stale

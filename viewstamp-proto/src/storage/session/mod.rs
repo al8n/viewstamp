@@ -150,14 +150,29 @@ pub struct Storage<W, B, S: StateMachine> {
   /// this medium — completion reordering can never let abandoned old bytes land OVER a replacement
   /// some endpoint already acked.
   wal_writes: BTreeMap<SessionKey, u64>,
-  /// EVERY in-flight durable-root write, in submission order, each with the exact [`VsrState`] it
+  /// EVERY in-flight durable-root write, in queue order, each with the exact [`VsrState`] it
   /// will make durable. The single-serialized-writer contract delivers their completions in this
   /// order, so the BACK entry is the root the medium is guaranteed to converge to — the effective
-  /// root — and the FRONT is the next landing. Holding the submitted states here is what makes
-  /// [`Self::effective_checkpoint_pair`] readable off ONE timeline: a root writer that paired an
-  /// in-memory scalar with a freshly-read durable half could mint a pair no checkpoint ever had
-  /// whenever an inherited root landed in between.
+  /// root ([`Self::effective_root`]) — and the FRONT is the next landing. Holding the submitted
+  /// states here is what makes the effective root readable off ONE timeline: a root writer that
+  /// paired an in-memory scalar with a freshly-read durable half could mint a pair no checkpoint
+  /// ever had whenever an inherited root landed in between, and a rebuilt endpoint that baselined
+  /// on the landed root instead of the back of this queue would come up BELOW a state the medium
+  /// is already guaranteed to reach.
+  ///
+  /// The queue's tail may be PARKED rather than submitted ([`Self::roots_submitted`] counts the
+  /// submitted prefix): a root submission is deferred behind a DIFFERENT incarnation's outstanding
+  /// root — the superblock analogue of the append fence — and the session itself submits it, in
+  /// queue order, once every foreign root ahead of it has landed. Parked or submitted, an entry is
+  /// a committed point on the timeline: the effective root includes it, and quiescence
+  /// ([`Self::has_inflight`], [`Self::into_parts`]) waits for it.
   roots: VecDeque<(WriteId, VsrState)>,
+  /// How many entries at the FRONT of [`Self::roots`] have been handed to
+  /// [`Superblock::submit_write`]. Always a prefix: submission order is queue order, so a parked
+  /// entry can never overtake one ahead of it. Entries at/after this index are parked behind a
+  /// foreign outstanding root and are submitted by [`Self::poll_sb`] as the landings ahead of them
+  /// settle.
+  roots_submitted: usize,
   /// EVERY in-flight checkpoint-envelope write: full id → the checkpoint op it stages. Tracked so
   /// quiescence ([`Self::has_inflight`], [`Self::into_parts`]) covers the envelope leg of a
   /// checkpoint exactly as it covers appends and roots. The envelope needs no submission fence:
@@ -183,6 +198,7 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
       sb,
       wal_writes: BTreeMap::new(),
       roots: VecDeque::new(),
+      roots_submitted: 0,
       checkpoints: BTreeMap::new(),
       lane: LaneFront::new(),
     }
@@ -385,13 +401,34 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     Some(WalPolled { done, freed_slot })
   }
 
-  /// The checkpoint pair `(checkpoint_op, checkpoint_id)` of the effective root — the LAST
-  /// SUBMITTED root if any is in flight, else the durable root. Both halves come off ONE root
-  /// value on one timeline, which is the whole point: a root writer pairing an in-memory op with a
-  /// freshly-read durable id can mint a pair no checkpoint ever had the moment an inherited root
-  /// lands between the two reads. By the single-serialized-writer contract every in-flight root
-  /// lands before anything submitted after it, so a new root carrying this pair can never rewind
-  /// the durable checkpoint.
+  /// The EFFECTIVE root: the state of the last root on the timeline — the BACK of the root queue
+  /// if any root is still in flight (submitted or parked), else the durable root. This is the state
+  /// the medium is guaranteed to converge to once the queue drains (root completions arrive in
+  /// submission order and the last-submitted root wins), so it is the ONLY sound recovery baseline
+  /// for an endpoint rebuilt over this live session: a successor that baselined on the landed root
+  /// instead would come up BELOW a state already owed to the medium, and its own root writes would
+  /// then rewind the durable view/commit/checkpoint the moment an inherited root landed under it.
+  /// Invariant during any window in which no new root is submitted: landings drain the queue's
+  /// front without moving the back, and when the queue empties the durable root EQUALS the
+  /// last-submitted one — so this value is stable across the drain, never a snapshot of a moment.
+  ///
+  /// What it deliberately does NOT claim: that this state is durable YET. Across a process death
+  /// the in-flight tail dies with the process, so an endpoint recovering here must keep its
+  /// DURABLE-view witness on the landed root and lift it only as the landings arrive.
+  pub(crate) fn effective_root(&self) -> VsrState {
+    match self.roots.back() {
+      Some((_, state)) => state.clone(),
+      None => self.sb.state(),
+    }
+  }
+
+  /// The checkpoint pair `(checkpoint_op, checkpoint_id)` of the effective root
+  /// ([`Self::effective_root`]), projected without cloning the full state. Both halves come off ONE
+  /// root value on one timeline, which is the whole point: a root writer pairing an in-memory op
+  /// with a freshly-read durable id can mint a pair no checkpoint ever had the moment an inherited
+  /// root lands between the two reads. By the single-serialized-writer contract every in-flight
+  /// root lands before anything submitted after it, so a new root carrying this pair can never
+  /// rewind the durable checkpoint.
   pub(crate) fn effective_checkpoint_pair(&self) -> (OpNumber, u128) {
     match self.roots.back() {
       Some((_, state)) => (state.checkpoint_op(), state.checkpoint_id()),
@@ -404,18 +441,66 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
 
   /// Submit a durable-root write, recording `(id, state)` on the root timeline. The ONLY route to
   /// [`Superblock::submit_write`] past genesis.
+  ///
+  /// While a DIFFERENT incarnation's root is still outstanding, the submission is PARKED — recorded
+  /// on the timeline but not yet handed to the backend — and the session submits it, in queue
+  /// order, once every foreign root ahead of it has landed ([`Self::poll_sb`]). This is the
+  /// superblock analogue of the append fence: a successor endpoint defers its own root write
+  /// behind a dead predecessor's outstanding one, so the two incarnations' writes can never be
+  /// interleaved at the backend. Same-incarnation stacking is NOT parked — an endpoint may have a
+  /// checkpoint root and a view-change root in flight together, relying on ordered delivery and
+  /// last-submitted-wins exactly as before.
   pub(crate) fn submit_root(&mut self, id: WriteId, state: VsrState) {
-    // The no-rewind invariant as a submission-time check: every root writer sources its checkpoint
-    // pair from the effective root (or advances past it), so a root that would rewind the durable
-    // checkpoint pointer is a caller bug caught here, not a state the medium can reach.
+    // The no-rewind invariants as submission-time checks: every root writer baselines on the
+    // effective root (recovery) and sources its checkpoint pair from it (the live writers), so a
+    // root that would rewind the durable view or the checkpoint pointer is a caller bug caught
+    // here, not a state the medium can reach. The view check is the durable-view-monotonicity
+    // invariant at its choke point: landings arrive in queue order, so a view-monotone queue is
+    // exactly a never-regressing durable view.
+    debug_assert!(
+      state.view() >= self.effective_root().view(),
+      "a durable-root write would rewind the durable view ({} below effective {})",
+      state.view().get(),
+      self.effective_root().view().get(),
+    );
     debug_assert!(
       state.checkpoint_op() >= self.effective_checkpoint_pair().0,
       "a durable-root write would rewind the checkpoint pointer ({} below effective {})",
       state.checkpoint_op().get(),
       self.effective_checkpoint_pair().0.get(),
     );
-    self.sb.submit_write(id, state.clone());
+    let parked = self.roots_submitted < self.roots.len()
+      || self
+        .roots
+        .iter()
+        .take(self.roots_submitted)
+        .any(|(qid, _)| qid.incarnation() != id.incarnation());
+    if !parked {
+      self.sb.submit_write(id, state.clone());
+      self.roots_submitted += 1;
+    }
     self.roots.push_back((id, state));
+  }
+
+  /// Hand the longest releasable parked prefix to the backend: each parked root submits, in queue
+  /// order, once nothing of a DIFFERENT incarnation is outstanding ahead of it. Runs after every
+  /// root landing, so the fence releases exactly when its blocking write quiesces — the same
+  /// release discipline as a fence-deferred append.
+  fn release_parked_roots(&mut self) {
+    while self.roots_submitted < self.roots.len() {
+      let next_id = self.roots[self.roots_submitted].0;
+      let blocked = self
+        .roots
+        .iter()
+        .take(self.roots_submitted)
+        .any(|(qid, _)| qid.incarnation() != next_id.incarnation());
+      if blocked {
+        return;
+      }
+      let (id, state) = self.roots[self.roots_submitted].clone();
+      self.sb.submit_write(id, state);
+      self.roots_submitted += 1;
+    }
   }
 
   /// Submit a checkpoint-envelope write at `op`, recording it in the envelope ledger. The ONLY
@@ -435,23 +520,33 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// incarnation's — pops the front of the root timeline and rides alongside the completion with
   /// the exact state it made durable, so a successor endpoint can adopt an inherited landing even
   /// though the completion itself is refused as foreign. An envelope landing leaves the envelope
-  /// ledger the same way.
+  /// ledger the same way. Each root landing also releases any parked roots whose fence it was: a
+  /// successor's deferred root write is handed to the backend the moment the last foreign root
+  /// ahead of it has landed.
   pub(crate) fn poll_sb(&mut self) -> Option<SbPolled> {
     let done = self.sb.poll()?;
     let landed_root = match &done {
       SuperblockDone::Wrote(id) => {
-        if self.roots.front().is_some_and(|(fid, _)| fid == id) {
-          self.roots.pop_front()
+        // Only a SUBMITTED root can land, so the front matches only within the submitted prefix
+        // (a parked front has never been with the backend and no completion can name it).
+        if self.roots_submitted > 0 && self.roots.front().is_some_and(|(fid, _)| fid == id) {
+          self.roots_submitted -= 1;
+          let landed = self.roots.pop_front();
+          self.release_parked_roots();
+          landed
         } else if self.checkpoints.remove(&key(*id)).is_some() {
           None
         } else if let Some(at) = self.roots.iter().position(|(fid, _)| fid == id) {
           // Root completions must arrive in submission order (the single-serialized-writer
-          // contract); an out-of-order landing is a backend violation. Settle it anyway so the
-          // ledger drains, but surface the violation.
+          // contract), and a parked root has no completion to arrive at all; either shape here is
+          // a backend violation. Settle it anyway so the ledger drains, but surface the violation.
           debug_assert!(
             false,
             "a root write completed out of submission order: {id:?} at queue position {at}"
           );
+          if at < self.roots_submitted {
+            self.roots_submitted -= 1;
+          }
           self.roots.remove(at)
         } else {
           debug_assert!(
