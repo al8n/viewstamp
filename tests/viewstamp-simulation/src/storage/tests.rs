@@ -242,9 +242,9 @@ fn torn_write_yields_body_faulty_on_read() {
     1,
   );
   append(&mut w, 1, b"intact");
-  // A torn slot keeps its ORIGINAL header (the tear is latent — only the stored body bytes are
-  // corrupt) and reports Clean. The header is fully durable and readable.
-  assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
+  // A torn slot keeps its ORIGINAL header (only the stored body bytes are corrupt) and reports the
+  // body-level damage as Faulty. The header is fully durable and readable.
+  assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Faulty);
   let stored_header = w
     .header(OpNumber::with(1))
     .expect("torn slot still has its original durable header");
@@ -263,6 +263,162 @@ fn torn_write_yields_body_faulty_on_read() {
     }
     other => panic!("torn write must yield BodyFaulty, got {other:?}"),
   }
+}
+
+#[test]
+fn a_damaged_body_gets_the_same_verdict_from_status_and_from_a_read() {
+  // The `Wal` header-durability contract admits ONE verdict per slot: a body-level fault surfaces as
+  // `SlotStatus::Faulty` from `status()` AND as `WalDone::BodyFaulty` from a read, keeping the
+  // durable header readable either way. Both permanent body-fault classes are checked because they
+  // reach the slot by different routes — bit-rot marks the slot, a torn write corrupts the stored
+  // bytes — and a fixture that answered `Clean` for one of them would tell a caller the durable copy
+  // is good while its own read says it is not.
+  for faults in [
+    StorageFaults {
+      bit_rot_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+    StorageFaults {
+      torn_write_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+  ] {
+    let mut w = InMemoryWal::with_faults(faults, 3);
+    append(&mut w, 1, b"body");
+    let by_status = w.status(OpNumber::with(1));
+    w.submit_read(read_id(1), OpNumber::with(1));
+    let by_read = w.poll();
+    assert_eq!(
+      by_status,
+      SlotStatus::Faulty,
+      "status must report the damage the read reports ({by_read:?})"
+    );
+    assert!(
+      matches!(by_read, Some(WalDone::BodyFaulty(_))),
+      "a damaged body reads back BodyFaulty, got {by_read:?}"
+    );
+    assert!(
+      w.header(OpNumber::with(1)).is_some(),
+      "the header survives a body-level fault"
+    );
+  }
+}
+
+/// `replicas` WALs sharing ONE permanent-fault budget of `tolerance`, each with its own seed and the
+/// given (certain, in these tests) fault plan — the cluster shape the budget exists to bound.
+fn budgeted_wals(
+  replicas: u16,
+  tolerance: usize,
+  faults: StorageFaults,
+) -> (PermanentLossBudget, Vec<InMemoryWal>) {
+  let budget = PermanentLossBudget::new(tolerance);
+  let wals = (0..replicas)
+    .map(|i| {
+      let mut w = InMemoryWal::with_faults(faults, u64::from(i));
+      w.set_loss_budget(budget.clone(), i);
+      w
+    })
+    .collect();
+  (budget, wals)
+}
+
+#[test]
+fn a_unanimous_quorum_admits_no_permanent_body_fault() {
+  // Two replicas: the quorum is 2, so `f` is 0 and destroying even ONE durable copy of a committed op
+  // leaves it recoverable from nowhere. Both replicas roll a certain bit-rot; both must be refused
+  // and both durable copies must still read back.
+  let (budget, mut wals) = budgeted_wals(
+    2,
+    0,
+    StorageFaults {
+      bit_rot_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+  );
+  for w in &mut wals {
+    append(w, 1, b"committed");
+  }
+  assert_eq!(budget.refused(), 2, "one refusal per replica");
+  for (i, w) in wals.iter_mut().enumerate() {
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Clean,
+      "replica {i}'s durable copy must survive"
+    );
+    w.submit_read(read_id(1), OpNumber::with(1));
+    assert!(
+      matches!(w.poll(), Some(WalDone::ReadOk(_))),
+      "replica {i} must still read its copy back"
+    );
+  }
+}
+
+#[test]
+fn a_permanent_body_fault_stops_at_the_last_readable_copies() {
+  // Three replicas: the quorum is 2, so `f` is 1 — exactly one may permanently lose op 1. The
+  // torn-write roll is certain everywhere, so the budget alone decides which copies survive.
+  let (budget, mut wals) = budgeted_wals(
+    3,
+    1,
+    StorageFaults {
+      torn_write_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+  );
+  for w in &mut wals {
+    append(w, 1, b"committed");
+  }
+  assert_eq!(budget.refused(), 2, "two of three rolls refused");
+  let destroyed = wals
+    .iter()
+    .filter(|w| w.status(OpNumber::with(1)) == SlotStatus::Faulty)
+    .count();
+  assert_eq!(destroyed, 1, "exactly f copies destroyed, never more");
+}
+
+#[test]
+fn a_trimmed_slot_returns_its_seat_to_the_budget() {
+  // A seat describes a destroyed copy that still EXISTS. Trimming the slot away destroys nothing that
+  // is still there, so the seat must come back — otherwise one early fault would forbid faults at
+  // that op number for the rest of the run, long after the op was re-minted over it.
+  let (_budget, mut wals) = budgeted_wals(
+    2,
+    1,
+    StorageFaults {
+      bit_rot_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+  );
+  append(&mut wals[0], 1, b"first");
+  assert_eq!(wals[0].status(OpNumber::with(1)), SlotStatus::Faulty);
+  append(&mut wals[1], 1, b"first");
+  assert_eq!(
+    wals[1].status(OpNumber::with(1)),
+    SlotStatus::Clean,
+    "the only seat is taken, so the second copy survives"
+  );
+  wals[0].truncate(OpNumber::with(0));
+  append(&mut wals[1], 1, b"second");
+  assert_eq!(
+    wals[1].status(OpNumber::with(1)),
+    SlotStatus::Faulty,
+    "the released seat is available to another replica"
+  );
+}
+
+#[test]
+fn an_unbudgeted_wal_keeps_its_permanent_verdicts() {
+  // A standalone fixture has no cluster to stay durable for, so it applies its verdicts unbudgeted —
+  // the behaviour every targeted single-WAL gate relies on.
+  let mut w = InMemoryWal::with_faults(
+    StorageFaults {
+      bit_rot_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+    1,
+  );
+  append(&mut w, 1, b"x");
+  assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Faulty);
 }
 
 #[test]
@@ -924,8 +1080,8 @@ fn async_mode_composes_with_a_torn_write() {
   assert_eq!(w.poll(), Some(WalDone::Appended(write_id(1))));
   assert_eq!(
     w.status(OpNumber::with(1)),
-    SlotStatus::Clean,
-    "a torn slot is Clean (latent tear) once durable"
+    SlotStatus::Faulty,
+    "a torn slot is Faulty once durable — its body no longer verifies"
   );
   w.submit_read(read_id(9), OpNumber::with(1));
   match w.poll() {

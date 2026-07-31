@@ -1861,45 +1861,46 @@ const RESTART_IN_PLACE_SEEDS: u64 = 16;
 /// the medium's slot-quiescence witnesses; they are pinned here so the session that carries those
 /// witnesses cannot regress without a failing seed.
 ///
-/// Seed 162 sat in this list too, with a different shape — a calm-window livelock — and it still
-/// fails. It is pinned on its own in [`restart_in_place_livelock_seed`], which states what is
-/// known about it.
+/// Seed 162 sat in this list too, with a different shape, and is pinned on its own in
+/// [`restart_in_place_seed_162_stays_within_the_durability_model`].
 const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 7] = [33, 59, 64, 78, 134, 179, 186];
 
-/// Seed 162 of the restart-in-place axis: a calm-window LIVELOCK — every replica up, the network
-/// healed, no faults, client work outstanding, and the committed high-water stops advancing (at 96,
-/// tick 1697).
+/// Seed 162 of the restart-in-place axis: the seed that used to wedge because the fault injector put
+/// the run outside the durability model, and now runs clean because the injector is bounded by the
+/// cluster's `f`.
 ///
-/// It is neither of the two lifetime defects the sweep above pins. The storage session closed every
-/// applied-history seed and both stale-landing falsifiers; the lane front closed the un-polled
-/// capture wedge. This seed's failure is unchanged by both — same tick, same high-water, a
-/// byte-identical trajectory — and at the wedge the lane owes nothing at all (no image capture, no
-/// serve, no walk, no in-flight storage of any kind on either replica), so no lane-depth quota can
-/// be holding anything closed.
+/// It was never either of the two lifetime defects the sweep above pins. The storage session closed
+/// every applied-history seed and both stale-landing falsifiers; the lane front closed the un-polled
+/// capture wedge. This seed's failure was unchanged by both — same tick, same high-water, a
+/// byte-identical trajectory — and at the wedge the lane owed nothing at all (no image capture, no
+/// serve, no walk, no in-flight storage of any kind on either replica), so no lane-depth quota was
+/// holding anything closed.
 ///
-/// What the wedge actually looks like, at tick 1697 on the two voters:
+/// What the wedge was, at tick 1697 on the two voters:
 ///
-/// - both are `Normal` in view 40 with `op = 209`, `commit_max = 208`, `commit_min = 96`, and 96
-///   applied ops — so both KNOW ops through 208 are committed and neither applies past 96;
-/// - the blocked op is 97, and its durable WAL slot differs between them: replica 0's slot 97 is
-///   `Faulty` (durably written, later corrupt), replica 1's is `Clean`. Every neighbouring slot
-///   (94..=100) is `Clean` on both, and 97 is not wrapped away on either;
-/// - replica 1 therefore holds a good durable copy of the very op it is refusing to apply, in a
-///   healed all-up window with no faults being injected, for the window's whole 800 ticks (over
-///   three seconds of virtual time).
+/// - both `Normal` in view 40 with `op = 209`, `commit_max = 208`, `commit_min = 96`, and 96 applied
+///   ops — so both KNEW ops through 208 were committed and neither applied past 96;
+/// - the blocked op was 97, and BOTH durable copies of it had been permanently destroyed at append
+///   time: replica 0's by bit-rot, replica 1's by a torn write whose stored body fails
+///   `Header::verify`. Both replicas then restarted, so neither retained the body in memory either;
+/// - the cluster has two voters, where the quorum is unanimous and `f` is 0, so op 97's bytes existed
+///   nowhere. Holding the commit at the hole and soliciting forever was the only safe response — no
+///   repair protocol recovers bytes no replica has.
 ///
-/// So this is a repair/apply liveness shape on the committed band, not a storage-lifetime one: the
-/// hole at 97 is never closed even though a quorum member holds it durably. Left pinned and
-/// UNFIXED — it wants its own slice — rather than folded into a lifetime change it is not about.
+/// The seed pinned a harness fault-model gap, not a protocol defect, and it is kept as a live
+/// regression over the cross-replica permanent-fault bound: with the bound in place the injector can
+/// no longer destroy every durable copy of a committed op, and the seed runs to completion under
+/// every standing oracle.
 #[test]
-#[ignore = "pins an open defect that neither lifetime slice closes: a committed-band repair wedge \
-            (replica 0's slot 97 faulty, replica 1's clean, neither applies past 96) surfacing as a \
-            calm-window livelock on the restart-in-place axis"]
-fn restart_in_place_livelock_seed() {
+fn restart_in_place_seed_162_stays_within_the_durability_model() {
   let r = run_vopr_with_restart_in_place(162, DEFAULT_TICKS);
   assert!(
     r.in_place_restarts() > 0,
     "the axis must actually rebuild an endpoint on this seed"
+  );
+  assert!(
+    r.max_committed() > 0,
+    "the seed must do real work, not merely survive by making no progress"
   );
 }
 

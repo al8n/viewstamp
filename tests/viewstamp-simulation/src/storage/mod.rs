@@ -12,6 +12,12 @@
 //! data (`WalDone::Fault`/`Absent`, `SlotStatus::Faulty`) — the WAL never silently fixes a corrupt
 //! body, so the proto's checksum chokepoint always sees it.
 //!
+//! The PERMANENT faults are additionally bounded ACROSS replicas by a shared
+//! [`PermanentLossBudget`]: no single op may be permanently destroyed on more replicas than the
+//! cluster's `f`, so a committed op always keeps a readable copy somewhere for peer repair to find.
+//! Without that bound the injector can destroy every durable copy of a committed op at once, which is
+//! outside the durability model the protocol is proved against.
+//!
 //! A later axis adds a TRANSIENT **misdirected-read** fault (`misdirect_read_per_mille`): a WAL read
 //! for op X occasionally returns a DIFFERENT present, valid, checksum-CORRECT slot's entry
 //! (`header.op() != X`) — TigerBeetle's misdirected-IO hazard, where a read lands on the wrong sector.
@@ -124,12 +130,131 @@ impl Default for StorageFaults {
   }
 }
 
+/// The cluster-wide budget for PERMANENT WAL body faults (bit-rot and torn writes), shared by every
+/// replica's [`InMemoryWal`].
+///
+/// A committed op is durably appended on at least a write quorum, so the fault model may destroy its
+/// durable copy on at most `f = replica_count - quorum(replica_count)` replicas and still leave one
+/// acking replica holding readable bytes for peer repair to find. Rolling the permanent rates
+/// independently per replica carries no such bound: the same op can be destroyed on every replica at
+/// once, which puts the run OUTSIDE the durability model the protocol is proved against — no repair
+/// protocol recovers bytes that exist nowhere, so the wedge that follows measures the fault injector,
+/// not the endpoint. This is the permanent-axis analogue of the argument the transient misdirect axis
+/// makes for itself: a misdirected read never permanently removes a correct copy, so every replica's
+/// own disk eventually reads each slot correctly and the axis is quorum-safe by construction.
+///
+/// Charged per OP and across ALL replicas — learners included, because a learner's durable copy joins
+/// the voting set's durability argument the moment it is promoted, and charging it is the
+/// conservative direction (it can only withhold a fault, never admit one the bound forbids). `f == 0`
+/// (a two-replica cluster, whose quorum is unanimous) therefore admits no permanent body fault at
+/// all; that is the honest consequence of the bound, not a special case.
+///
+/// A seat is bought at the moment a fault would DESTROY a durable copy, never at submission, so a
+/// staged append that is cancelled or crashed away spends nothing. Seats are RELEASED when the copy
+/// they describe stops existing or stops being damaged: a re-append that lands a verifying body, a
+/// truncation, a prune, a ring eviction, or a replaced disk. A bit-rot verdict outlives a rewrite
+/// (the medium is damaged, not the bytes), so its seat is held until the slot leaves the log.
+///
+/// The torn-HEADER verdict ([`StorageFaults::torn_header_per_mille`]) stays OUTSIDE the budget: it is
+/// the opt-in contract violation whose blast radius the probe lane exists to measure, and bounding it
+/// would defeat the measurement.
+///
+/// This is a cloneable HANDLE: every replica's WAL holds a clone of the one ledger. It is
+/// `Arc`/`Mutex`-backed rather than the harness's usual [`Shared`] handle because an [`InMemoryWal`]
+/// is also handed to the real drivers' own test suites, which spawn them onto multi-threaded
+/// runtimes, so the WAL must stay `Send`. The simulation is single-threaded, so the lock is never
+/// contended and the ledger stays a pure function of the seed.
+#[derive(Debug, Clone)]
+pub struct PermanentLossBudget(std::sync::Arc<std::sync::Mutex<LossLedger>>);
+
+/// The ledger behind a [`PermanentLossBudget`] handle.
+#[derive(Debug)]
+struct LossLedger {
+  /// `f`: how many replicas may hold a permanently destroyed copy of any ONE op.
+  tolerance: usize,
+  /// Op → the replicas whose durable copy of that op is permanently unreadable right now. Only
+  /// damaged slots appear, so this stays as small as the faults actually injected.
+  lost: BTreeMap<u64, BTreeSet<u16>>,
+  /// How many permanent-fault verdicts the budget has refused. `> 0` witnesses that the bound is
+  /// LIVE on a run rather than merely armed.
+  refused: u64,
+}
+
+impl PermanentLossBudget {
+  /// A budget admitting at most `tolerance` permanently destroyed copies of any one op. Callers pass
+  /// the cluster's own `f` (`replica_count - quorum()`, read off the [`Membership`] the endpoints
+  /// run on) so the fixture cannot drift from the quorum arithmetic it is modelling.
+  ///
+  /// [`Membership`]: viewstamp_proto::Membership
+  pub fn new(tolerance: usize) -> Self {
+    Self(std::sync::Arc::new(std::sync::Mutex::new(LossLedger {
+      tolerance,
+      lost: BTreeMap::new(),
+      refused: 0,
+    })))
+  }
+
+  /// How many permanent-fault verdicts this budget has refused.
+  pub fn refused(&self) -> u64 {
+    self.ledger().refused
+  }
+
+  /// Whether `replica` may permanently lose its durable copy of `op`: true iff the resulting set of
+  /// replicas holding a destroyed copy still fits within `f`. A replica that already holds a
+  /// destroyed copy of `op` is always admitted — a second fault on an already-lost slot buys no new
+  /// seat. Counts a refusal when it declines.
+  fn admits(&self, op: u64, replica: u16) -> bool {
+    let mut ledger = self.ledger();
+    let holders = ledger.lost.get(&op);
+    let after = holders.map_or(0, BTreeSet::len)
+      + usize::from(!holders.is_some_and(|h| h.contains(&replica)));
+    let admitted = after <= ledger.tolerance;
+    if !admitted {
+      ledger.refused += 1;
+    }
+    admitted
+  }
+
+  /// Records whether `replica`'s durable copy of `op` is destroyed right now, buying or releasing its
+  /// seat accordingly.
+  fn record(&self, op: u64, replica: u16, destroyed: bool) {
+    let mut ledger = self.ledger();
+    if destroyed {
+      ledger.lost.entry(op).or_default().insert(replica);
+    } else if let Some(holders) = ledger.lost.get_mut(&op) {
+      holders.remove(&replica);
+      if holders.is_empty() {
+        ledger.lost.remove(&op);
+      }
+    }
+  }
+
+  /// Releases `replica`'s seat on every op `keep` rejects — the wholesale form of
+  /// [`record`](Self::record), applied wherever a WAL trims slots by the same predicate.
+  fn retain(&self, replica: u16, keep: impl Fn(u64) -> bool) {
+    self.ledger().lost.retain(|&op, holders| {
+      if !keep(op) {
+        holders.remove(&replica);
+      }
+      !holders.is_empty()
+    });
+  }
+
+  fn ledger(&self) -> std::sync::MutexGuard<'_, LossLedger> {
+    self
+      .0
+      .lock()
+      .expect("the simulation is single-threaded, so the budget lock is never poisoned")
+  }
+}
+
 /// A staged, not-yet-durable append (async-append mode only). Submitted via `submit_append`, it
 /// becomes durable — moved into `entries`, with its `Appended` completion offered by `poll` — only
-/// after `remaining` `poll`s have ticked it down to zero. The torn/bit-rot verdict is decided at
-/// SUBMIT time (so the same seed reproduces it whether sync or async) and carried here: `body` is
-/// already the (possibly torn) bytes to store, and `rot` records whether the slot must land in
-/// `rotted` on completion. While staged, the slot is `SlotStatus::Dirty` and reads return `Absent`.
+/// after `remaining` `poll`s have ticked it down to zero. The torn/bit-rot verdicts are DECIDED at
+/// SUBMIT time (so the same seed reproduces the same rolls whether sync or async) and carried here as
+/// flags; they are APPLIED at landing, where the durable copy is actually destroyed and the
+/// cross-replica [`PermanentLossBudget`] gets its say. `body` therefore holds the pristine bytes.
+/// While staged, the slot is `SlotStatus::Dirty` and reads return `Absent`.
 #[derive(Debug, Clone)]
 struct PendingAppend {
   /// Polls remaining before this append becomes durable (counts down in `poll`, releases at 0).
@@ -137,10 +262,13 @@ struct PendingAppend {
   id: WriteId,
   op: u64,
   header: Header,
-  /// The bytes to store on completion (already torn if the torn-write roll fired at submit time).
+  /// The bytes the append carries, untouched by any fault verdict.
   body: Bytes,
   /// Whether to mark `op` permanently bit-rotted on completion (the bit-rot roll fired at submit).
   rot: bool,
+  /// Whether to store `op`'s body TORN on completion (the torn-write roll fired at submit), so
+  /// `Header::verify` fails on read-back.
+  torn: bool,
   /// Whether to mark `op` torn-HEADER on completion (the contract-violation probe roll fired at
   /// submit): the slot then reports no header at all.
   torn_header: bool,
@@ -235,6 +363,12 @@ pub struct InMemoryWal {
   /// over this same live WAL. Trimmed wherever `entries` is (truncate / prune / ring eviction), and
   /// deliberately KEPT across `crash`/`restart` (the durable content it describes survives too).
   landed_by: BTreeMap<u64, u64>,
+  /// The cluster-wide budget this WAL's PERMANENT body faults are charged against, paired with this
+  /// WAL's replica index. `None` (the default) ⇒ a standalone fixture with no cluster to stay durable
+  /// for, so the permanent verdicts apply unbudgeted. Set once per medium by
+  /// [`set_loss_budget`](Self::set_loss_budget); deliberately KEPT across `crash`/`restart` (the
+  /// durable content it accounts for survives too) and replaced with the disk on a wipe.
+  loss_budget: Option<(PermanentLossBudget, u16)>,
   /// The first stale landing observed (see [`InMemoryWal::landed_by`]): the op plus a description of
   /// the eviction — which incarnations collided and what identity each header carried. Held until
   /// drained ([`take_stale_landing`](Self::take_stale_landing)); later stale landings only advance
@@ -277,9 +411,20 @@ impl InMemoryWal {
       write_chaos: None,
       chaos_reorders_fired: 0,
       landed_by: BTreeMap::new(),
+      loss_budget: None,
       stale_landing: None,
       stale_landings_fired: 0,
     }
+  }
+
+  /// Charges this WAL's PERMANENT body faults (bit-rot, torn writes) against the cluster-wide
+  /// `budget` as replica `replica`, so no single op can be destroyed on more replicas than the
+  /// cluster's `f` — see [`PermanentLossBudget`]. Called on a freshly-built or freshly-REPLACED
+  /// medium, which is why it starts by releasing every seat the index still holds: a swapped disk
+  /// holds no destroyed copy of anything, it holds nothing at all.
+  pub fn set_loss_budget(&mut self, budget: PermanentLossBudget, replica: u16) {
+    budget.retain(replica, |_| false);
+    self.loss_budget = Some((budget, replica));
   }
 
   /// Creates an empty, reliable WAL as a **fixed RING of `n` slots**. Op `K`
@@ -517,6 +662,9 @@ impl InMemoryWal {
     self.head_read_faults.retain(|&o| o == op || o % n != slot);
     self.staged.retain(|s| s.op == op || s.op % n != slot);
     self.landed_by.retain(|&o, _| o == op || o % n != slot);
+    // The evicted occupant's bytes are physically gone, so this replica no longer holds a destroyed
+    // copy of it and its budget seat goes with them.
+    self.retain_losses(|o| o == op || o % n != slot);
   }
 
   /// Record a physical landing at `op` by the write `id`, checking it against the slot's current
@@ -558,26 +706,78 @@ impl InMemoryWal {
     self.landed_by.insert(op, id.incarnation());
   }
 
-  /// Land a staged append: the physical write happens NOW — the bounded-ring eviction of the
-  /// wrapped-over slot occupant, the submit-time fault verdicts (bit-rot / torn header), the durable
-  /// `entries` insert, the head raise, and the `Appended` completion. The ONE definition of "a staged
-  /// append becomes durable", shared by the FIFO front release and the write-chaos seeded release,
-  /// so the two release modes cannot drift on what landing does.
+  /// Land an append: the physical write happens NOW — the bounded-ring eviction of the wrapped-over
+  /// slot occupant, the submit-time fault verdicts (bit-rot / torn write / torn header) and the
+  /// cross-replica budget that rules on the permanent ones, the durable `entries` insert, the head
+  /// raise, and the `Appended` completion. The ONE definition of "an append becomes durable", shared
+  /// by the synchronous inline path, the FIFO front release and the write-chaos seeded release, so
+  /// no release mode can drift on what landing does.
   fn land_staged(&mut self, done: PendingAppend) {
     self.evict_wrapped_slot(done.op);
     self.note_landing(done.op, done.id, &done.header);
-    if done.rot {
+    // The permanent BODY faults are charged against the cluster-wide budget HERE, the one moment a
+    // durable copy is actually destroyed: a verdict that would take this op past `f` destroyed copies
+    // is dropped, leaving readable bytes behind for peer repair. The rolls were still DRAWN at submit
+    // — the refusal masks an already-drawn result, it never skips a draw — so the fault PRNG stream
+    // is identical whether or not the budget intervenes.
+    let destroys = done.rot || done.torn;
+    let admitted = !destroys || self.permanent_fault_admitted(done.op);
+    if done.rot && admitted {
       self.rotted.insert(done.op);
     }
     if done.torn_header {
       self.torn_headers.insert(done.op);
       self.torn_headers_fired += 1;
     } else {
+      // Rewriting a slot whose previous occupant (same op, e.g. a repair re-append) lost its header
+      // clears the verdict — the media was rewritten whole.
       self.torn_headers.remove(&done.op);
     }
-    self.entries.insert(done.op, (done.header, done.body));
+    let body = if done.torn && admitted {
+      tear(&done.body)
+    } else {
+      done.body
+    };
+    self.entries.insert(done.op, (done.header, body));
     self.head = self.head.max(done.op);
     self.completions.push_back(WalDone::Appended(done.id));
+    // The slot's verdict AFTER the landing: a rewrite that lands a verifying body releases a torn
+    // seat, while a bit-rot verdict outlives the rewrite and holds its seat.
+    self.publish_loss(done.op);
+  }
+
+  /// Whether a permanent body fault may destroy this replica's durable copy of `op` right now, per
+  /// the cluster-wide [`PermanentLossBudget`]. An unbudgeted (standalone) WAL always admits.
+  fn permanent_fault_admitted(&self, op: u64) -> bool {
+    match &self.loss_budget {
+      Some((budget, replica)) => budget.admits(op, *replica),
+      None => true,
+    }
+  }
+
+  /// Publishes this replica's current verdict for `op` to the cluster-wide budget.
+  fn publish_loss(&self, op: u64) {
+    if let Some((budget, replica)) = &self.loss_budget {
+      budget.record(op, *replica, self.body_destroyed(op));
+    }
+  }
+
+  /// Releases this replica's budget seats on every op a slot trim just removed, mirroring the
+  /// `retain` predicate the caller applied to `entries`.
+  fn retain_losses(&self, keep: impl Fn(u64) -> bool) {
+    if let Some((budget, replica)) = &self.loss_budget {
+      budget.retain(*replica, keep);
+    }
+  }
+
+  /// Whether this replica's DURABLE copy of `op` is permanently unreadable: a bit-rot verdict, or a
+  /// stored body that no longer verifies against its own durable header (a torn write). The ONE
+  /// predicate behind both damage surfaces — the [`SlotStatus::Faulty`] from
+  /// [`status`](Wal::status) and the [`WalDone::BodyFaulty`] a read resolves to — so the two views of
+  /// one slot cannot disagree, which the `Wal` header-durability contract requires. A torn-HEADER
+  /// slot is deliberately NOT covered: it retains nothing to fault over and reports `Empty`/`Absent`.
+  fn body_destroyed(&self, op: u64) -> bool {
+    self.rotted.contains(&op) || matches!(self.entries.get(&op), Some((h, b)) if !h.verify(b))
   }
 }
 
@@ -627,7 +827,10 @@ impl Wal for InMemoryWal {
     // knowledge the lost header was carrying).
     if self.torn_headers.contains(&op.get()) {
       SlotStatus::Empty
-    } else if self.rotted.contains(&op.get()) {
+    } else if self.body_destroyed(op.get()) {
+      // Body-level damage — bit-rot OR a torn write — is `Faulty`, the same verdict a read of this
+      // slot resolves to (`WalDone::BodyFaulty`). A torn slot reported `Clean` here would tell a
+      // caller the durable copy is good while the read says it is not.
       SlotStatus::Faulty
     } else if self.entries.contains_key(&op.get()) {
       SlotStatus::Clean
@@ -642,20 +845,16 @@ impl Wal for InMemoryWal {
 
   fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     // The fault verdict is decided HERE (at submit) in BOTH modes, so the same seed reproduces the
-    // same torn/bit-rot decisions whether appends are synchronous or staged. In async mode the
-    // verdict is merely carried on the staged entry and applied when it becomes durable.
-    // PERMANENT bit-rot: mark the slot so every future read faults (and status/header report it).
+    // same torn/bit-rot decisions whether appends are synchronous or staged. Each verdict is APPLIED
+    // at landing (below, in `land_staged`), the moment it would destroy a durable copy and so the
+    // moment the cross-replica budget can rule on it.
+    // PERMANENT bit-rot: marks the slot so every future read faults (and status/header report it).
     let rot =
       self.faults.bit_rot_per_mille > 0 && self.prng.chance(self.faults.bit_rot_per_mille, 1000);
-    // PERMANENT torn write: persist the ORIGINAL header with a corrupted body so `Header::verify`
-    // fails on read-back. Never silently fix it — the proto's checksum chokepoint must detect it.
-    let stored = if self.faults.torn_write_per_mille > 0
-      && self.prng.chance(self.faults.torn_write_per_mille, 1000)
-    {
-      tear(&body)
-    } else {
-      body
-    };
+    // PERMANENT torn write: persists the ORIGINAL header with a corrupted body so `Header::verify`
+    // fails on read-back. Never silently fixed — the proto's checksum chokepoint must detect it.
+    let torn = self.faults.torn_write_per_mille > 0
+      && self.prng.chance(self.faults.torn_write_per_mille, 1000);
     // TORN-HEADER probe verdict (contract violation, probe lane only): the slot completes its append
     // but loses the header too — it will read back as if never written. Rolled AFTER the other
     // verdicts and only when armed (`per_mille > 0` short-circuits the draw), so every zero-rate run
@@ -674,48 +873,33 @@ impl Wal for InMemoryWal {
         id,
         op: op.get(),
         header,
-        body: stored,
+        body,
         rot,
+        torn,
         torn_header,
       });
       return;
     }
+    let pending = PendingAppend {
+      remaining: self.async_delay.unwrap_or(0),
+      id,
+      op: op.get(),
+      header,
+      body,
+      rot,
+      torn,
+      torn_header,
+    };
     match self.async_delay {
-      // SYNCHRONOUS (default): durable immediately, completion queued in this call.
-      None => {
-        // Bounded ring: writing slot `op mod n` physically evicts the op that last held it.
-        self.evict_wrapped_slot(op.get());
-        // The landing ledger records the synchronous write too (an inline landing can never be
-        // stale — nothing is ever in flight to reorder around — but the holder record must be
-        // current so a later staged landing is compared against the true last writer).
-        self.note_landing(op.get(), id, &header);
-        if rot {
-          self.rotted.insert(op.get());
-        }
-        if torn_header {
-          self.torn_headers.insert(op.get());
-          self.torn_headers_fired += 1;
-        } else {
-          // Rewriting a slot whose previous occupant (same op, e.g. a repair re-append) lost its
-          // header clears the verdict — the media was rewritten whole.
-          self.torn_headers.remove(&op.get());
-        }
-        self.entries.insert(op.get(), (header, stored));
-        self.head = self.head.max(op.get());
-        self.completions.push_back(WalDone::Appended(id));
-      }
+      // SYNCHRONOUS (default): durable immediately, completion queued in this call — the same
+      // landing every other mode performs, just with nothing in flight ahead of it. An inline
+      // landing can never be stale (nothing is in flight to reorder around), but it still records
+      // the slot's holder so a later staged landing is compared against the true last writer.
+      None => self.land_staged(pending),
       // ASYNC: STAGE as not-yet-durable. `self.head`/`entries`/`rotted` are left untouched (so the
       // slot reads `Dirty`/`Absent` and `op_head` does not yet count it) until `poll` releases it
       // after `delay` ticks — opening the in-flight window the synchronous path never had.
-      Some(delay) => self.staged.push_back(PendingAppend {
-        remaining: delay,
-        id,
-        op: op.get(),
-        header,
-        body: stored,
-        rot,
-        torn_header,
-      }),
+      Some(_) => self.staged.push_back(pending),
     }
   }
 
@@ -794,6 +978,9 @@ impl Wal for InMemoryWal {
     self.head_read_faults.retain(|&op| op <= above.get());
     // A truncated slot holds nothing, so it has no holder for a later landing to be stale against.
     self.landed_by.retain(|&op, _| op <= above.get());
+    // A truncated-away slot is no longer a destroyed durable copy either, so its budget seat is
+    // released with it.
+    self.retain_losses(|op| op <= above.get());
     self.head = self.head.min(above.get());
     // WRITE-CHAOS mode: the staged appends are ALREADY AT THE DEVICE — un-cancellable. They stay in
     // flight (each keeps ticking and lands late, briefly resurrecting the trimmed region — the
@@ -828,6 +1015,8 @@ impl Wal for InMemoryWal {
     self.torn_headers.retain(|&op| op >= below.get());
     self.head_read_faults.retain(|&op| op >= below.get());
     self.landed_by.retain(|&op, _| op >= below.get());
+    // A pruned slot is gone from the log, so its budget seat is released with it.
+    self.retain_losses(|op| op >= below.get());
     // WRITE-CHAOS mode: staged appends below the floor stay in flight (un-cancellable device writes;
     // a late landing below the checkpoint is inert — the snapshot owns that prefix), exactly as in
     // `truncate` above.
