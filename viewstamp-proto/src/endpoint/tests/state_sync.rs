@@ -10245,13 +10245,18 @@ fn quarantined_serves_are_capped_independently_of_the_transport() {
 }
 
 #[test]
-fn a_transfer_drained_under_the_superblock_fence_installs_on_the_next_donor_reply() {
+fn a_transfer_drained_under_the_superblock_fence_installs_from_the_local_arq() {
   // THE DEFERRED-TRANSFER RECOVERY PATH. `on_fetch_drained` observes the single-superblock-writer
   // fence: a transfer whose frontier drains while a root is in flight installs NOTHING and stays
-  // pinned. Nothing local then re-drives it — the ARQ walk deliberately emits nothing for a drained
-  // frontier — so the deferred drain is recovered ONLY by a fresh donor reply, which re-pins the
-  // transfer and re-walks it against a now-free fence. This pins both halves: the drop under the
-  // fence is real, and one solicit round with any live donor stages the install.
+  // pinned. The deferred drain must then be recovered LOCALLY — every block the install needs is
+  // already in this store, so making it wait on a donor's fresh `SyncCheckpoint` would strand a
+  // complete transfer behind a peer that may never answer again. The ARQ walk is the local cadence
+  // that owns it: on a drained frontier it re-enters the drain destination instead of emitting
+  // nothing. This pins both halves: the drop under the fence is real, and the freed fence plus one
+  // ARQ tick stages the install with NO donor traffic.
+  //
+  // NEUTER CHECK: make the `WalkPurpose::Arq` arm emit only for `Some(addr)` again and step (3) stages
+  // nothing — the drained transfer sits idle until a donor happens to re-pin it.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
@@ -10302,35 +10307,190 @@ fn a_transfer_drained_under_the_superblock_fence_installs_on_the_next_donor_repl
   );
 
   // (3) The occupying root lands, freeing the fence. The solicit cadence fires and re-drives the
-  // stop-and-wait ARQ, but a drained frontier gives the ARQ walk nothing to emit — so the deferred
-  // drain is still NOT installed. This is the step that makes the fresh reply load-bearing.
+  // stop-and-wait ARQ; its walk re-drains the (still complete) frontier and reaches the drain
+  // destination the fence deferred, staging the install. NO donor reply is delivered in this step —
+  // `reply` is not called again — so the resumption is purely local.
   e.pending_checkpoint = None;
   let later = now + SYNC_SOLICIT;
   e.sync_timeouts(later);
   assert!(
     std::iter::from_fn(|| e.poll_message())
       .any(|out| matches!(out.msg_ref(), Message::RequestSync(_))),
-    "ANTI-VACUITY: the solicit cadence really fired, so the ARQ round below is a live one"
-  );
-  e.block_step(later, &mut wal, &mut sb, &mut blocks);
-  assert!(
-    e.pending_install.is_none(),
-    "the freed fence plus the ARQ alone does not resume the drained transfer — only a fresh donor \
-     reply does"
-  );
-
-  // (4) One fresh donor reply for the SAME root re-pins the transfer; its walk re-drains against the
-  // now-free fence and the install stages. The path self-heals in a single solicit round.
-  e.handle_message(
-    later,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    reply(e.sync_nonce_for_test()),
+    "ANTI-VACUITY: the solicit cadence really fired, so this ARQ round is a live one"
   );
   e.block_step(later, &mut wal, &mut sb, &mut blocks);
   assert!(
     e.pending_install.is_some(),
-    "the fresh donor reply drove the deferred transfer all the way to a STAGED install"
+    "the freed fence plus one ARQ tick resumed the drained transfer to a STAGED install, with no \
+     donor reply"
+  );
+}
+
+#[test]
+fn a_donor_reply_that_always_lands_mid_walk_re_pins_a_dead_donors_transfer() {
+  // THE INVERSE ORDER. Every solicit tick issues the stop-and-wait ARQ walk BEFORE broadcasting
+  // `RequestSync`, so on any schedule where a donor's round trip is shorter than the block lane's
+  // latency the answer arrives while that walk is still outstanding — EVERY round, not occasionally.
+  // The one-pin admission refuses a reply in that window, which is correct (the walk's verdict must
+  // land first) but must not DISCARD it: here the pinned donor is DEAD and the transfer still has a
+  // block to pull, so the ARQ completion re-requests from a donor that will never answer and the only
+  // evidence that could move the transfer — a live donor's reply — is exactly what keeps being thrown
+  // away. Retaining the refused pin and re-delivering it once the walk lands turns the refusal into an
+  // ordering, and the failover completes.
+  //
+  // NEUTER CHECK: drop the retention (increment the counter and return) and the transfer stays pinned
+  // to the dead donor for every round below — `block_fetch_donor()` never moves off slot 0.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let (_op, sm_root, sessions_root) =
+    Endpoint::<CountSm>::decode_checkpoint(&env).expect("the donor envelope decodes");
+
+  // The full DAG, as any donor holds it.
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut donor_blocks, 4);
+
+  // The laggard holds ONLY the SM DAG, so its frontier drains to the session root and STOPS there with
+  // a genuine outstanding pull — the state a drained-frontier resumption cannot rescue.
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  {
+    let mut stack = std::vec![sm_root];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(addr) = stack.pop() {
+      if !seen.insert(addr) {
+        continue;
+      }
+      let block = donor_blocks
+        .read_block(addr)
+        .expect("SM block present in the donor store");
+      for child in CountSm::block_references(&block) {
+        stack.push(child);
+      }
+      blocks.put(block);
+    }
+  }
+  assert!(
+    blocks.has_block(sm_root) && !blocks.has_block(sessions_root),
+    "precondition: the SM DAG is local and the session DAG is not, so the fetch has a real pull \
+     outstanding"
+  );
+
+  let mut e = sync_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut now = Instant::ZERO;
+  // Both donors serve the SAME content-addressed checkpoint; they differ only in which slot answers,
+  // and the pin follows the authenticated sender.
+  let reply = |slot: u16, nonce: u64| {
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(slot),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    ))
+  };
+  let dead_donor = Peer::Replica(ReplicaId::new(0));
+  let live_donor = Peer::Replica(ReplicaId::new(2));
+
+  // Pin the transfer to the donor that is about to go dark.
+  e.arm_forced_sync_for_test(4);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    dead_donor,
+    reply(0, e.sync_nonce_for_test()),
+  );
+  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.block_fetch_donor(),
+    Some(0),
+    "precondition: the transfer is pinned to the donor that now goes dark"
+  );
+
+  // Three rounds, each in the ORDER the schedule forces: the ARQ walk is queued, the live donor's
+  // reply lands while it is outstanding, and only then does the walk complete.
+  let refused_before = e.walk_pins_refused();
+  let mut cursor = crate::BlockJobCursor::new();
+  for _ in 0..3 {
+    now = now + SYNC_SOLICIT;
+    e.sync_timeouts(now);
+    let job = e
+      .poll_block_job()
+      .expect("the solicit tick queued the ARQ walk");
+    assert!(
+      e.transfer_walk_in_flight(),
+      "ANTI-VACUITY: the walk really is outstanding when the reply below is delivered"
+    );
+    let refused = e.walk_pins_refused();
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      live_donor,
+      reply(2, e.sync_nonce_for_test()),
+    );
+    assert_eq!(
+      e.walk_pins_refused(),
+      refused + 1,
+      "ANTI-VACUITY: the reply really was refused by the one-pin admission, not admitted outright"
+    );
+    let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
+    e.on_block_done(now, &mut wal, &mut sb, done);
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.walk_pins_refused() >= refused_before + 3,
+    "ANTI-VACUITY: every round's reply landed mid-walk"
+  );
+  assert_eq!(
+    e.block_fetch_donor(),
+    Some(2),
+    "the deferred pin was re-delivered after each walk, so the transfer failed over to the LIVE donor"
+  );
+
+  // The live donor answers the outstanding pull, and the transfer completes. Bounded so a regression
+  // that stalls the transfer fails the assertion below rather than hanging the suite.
+  for _ in 0..16 {
+    now = now + SYNC_SOLICIT;
+    e.sync_timeouts(now);
+    e.block_step(now, &mut wal, &mut sb, &mut blocks);
+    let mut want = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::RequestBlock(addr) = out.msg_ref() {
+        want = Some(*addr);
+      }
+    }
+    let Some(addr) = want else { break };
+    let block = donor_blocks
+      .read_block(addr)
+      .expect("the live donor serves every requested block");
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      live_donor,
+      Message::BlockResponse(crate::BlockResponse::new(addr, Some(block))),
+    );
+    for _ in 0..4 {
+      e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    }
+    if e.state_syncs_applied() == 1 {
+      break;
+    }
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the transfer installed once the failover reached a donor that answers"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "and the laggard is at the synced checkpoint"
   );
 }

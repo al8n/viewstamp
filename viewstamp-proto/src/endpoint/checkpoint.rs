@@ -728,7 +728,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// its flush returned `Ok`. A failed flush, or a view transition that abandons the checkpoint while
   /// the DAG is being written, therefore advances no pointer at all; the cadence / debt-pay /
   /// commit-advance re-forces the checkpoint next time, exactly as a failed inline flush used to.
+  ///
+  /// AT MOST ONE IMAGE CAPTURE IS EVER OWED TO THE LANE ([`Endpoint::materializing`]). The callers'
+  /// shared `pending_checkpoint.is_none()` fence is the LOGICAL guard, and a view transition CLEARS it
+  /// while the `Materialize` it named is still queued — the job cannot be retracted (the lane executes
+  /// serially in issue order), so the cleared guard would let the cadence capture a second full image
+  /// behind the first, and repeated churn against a slow lane would queue arbitrarily many superseded
+  /// images. Refusing here is exactly a capture whose flush faulted: nothing is captured, nothing is
+  /// staged, no pointer moves, and the sticky cadence re-forces once the lane returns the outstanding
+  /// completion. All three force sites tolerate that — `maybe_checkpoint` re-fires from the commit
+  /// tails and the primary heartbeat, `maybe_pay_checkpoint_debt` is sticky on the durable debt, and
+  /// the `SwapEpoch` arm's deferral leaves that same debt owed.
   pub(crate) fn force_checkpoint(&mut self) {
+    if self.materializing.is_some() {
+      return;
+    }
     // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
     // `commit_min` may have jumped past `boundary` in a batch commit, and the SM has applied through
     // `commit_min` (apply is forward-only) — so the checkpoint reflects state through `commit_min`.
@@ -761,6 +775,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let image = self.sm.checkpoint_image();
     let sessions = SessionImage(self.committed_session_projection());
     let job = self.issue_block_job(BlockJobKind::Materialize { image, sessions });
+    // The PHYSICAL half, recorded independently of the logical `pending_checkpoint` below: a view
+    // transition drops that tracker, but the lane still owes this completion and the image it carries
+    // still occupies the queue until it lands.
+    self.materializing = Some(job);
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
       step: CheckpointStep::FlushingBlocks(job),
@@ -790,6 +808,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sessions_root: BlockAddress,
     flush: Result<(), crate::BlockStoreError>,
   ) {
+    // The lane has returned the image capture it owed, so the capture site is free again — whatever
+    // this completion goes on to publish, supersede, or drop. At most one is ever outstanding
+    // ([`Self::force_checkpoint`]), and completions arrive in issue order, so this completion is that
+    // one.
+    debug_assert_eq!(
+      self.materializing,
+      Some(job),
+      "a materialize completed that the capture site never recorded as owed"
+    );
+    self.materializing = None;
     let Some(pc) = self
       .pending_checkpoint
       .filter(|pc| pc.step == CheckpointStep::FlushingBlocks(job))

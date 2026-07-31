@@ -55,7 +55,7 @@ use bytes::Bytes;
 use core::time::Duration;
 
 use viewstamp_proto::{
-  AcceptReducedFaultTolerance, BlockAddress, Instant, MemberId, Prng, SingleVoterDelta,
+  AcceptReducedFaultTolerance, BlockAddress, Instant, MemberId, OpNumber, Prng, SingleVoterDelta,
 };
 
 use crate::{
@@ -1098,10 +1098,10 @@ pub fn run_vopr_with_hold(seed: u64, ticks: u64) -> VoprReport {
 /// durably held. Its OWN pre-wipe state is forfeit (within the crash-fault model's `<= f` lost-state
 /// budget; the stateful checkers' per-replica baselines are reset accordingly), but every
 /// CLUSTER-level invariant stays at full strength: agreement, no committed op rewritten/lost across
-/// time, quorum-durable retention (relaxed by exactly the wiped count — see the driver's
-/// per-tick structural check), and the end-of-run survival of the whole committed history. A
-/// violation here is a REAL protocol finding (amnesia breaking quorum intersection), not a checker
-/// artifact. A wipe-enabled run is a pure function of `(seed, ticks)` and its own deterministic
+/// time, quorum-durable retention (relaxed only for the ops the emptied disk could have carried — see
+/// the driver's per-tick structural check), and the end-of-run survival of the whole committed
+/// history. A violation here is a REAL protocol finding (amnesia breaking quorum intersection), not a
+/// checker artifact. A wipe-enabled run is a pure function of `(seed, ticks)` and its own deterministic
 /// baseline (the axis consumes extra PRNG draws); this is the entry point for the committed wipe
 /// sweep.
 pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
@@ -1127,9 +1127,10 @@ pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
 /// That is the path this lane exists to keep under test, and
 /// [`VoprReport::wiped_learner_blocks_fetched`] is its witness: blocks the wiped learner accepted from
 /// peers after the swap. The EXISTING oracles judge every tick — agreement, no committed op
-/// rewritten/lost, quorum-durable retention relaxed by exactly the wiped count, the learner
-/// never-primary / no-emit gates, and learner convergence post-quiesce — so a violation here is a REAL
-/// finding, reported with its seed, never masked.
+/// rewritten/lost, quorum-durable retention at FULL voter-quorum strength (a learner's emptied disk
+/// held no voter's copy, so it relaxes nothing), the learner never-primary / no-emit gates, and
+/// learner convergence post-quiesce — so a violation here is a REAL finding, reported with its seed,
+/// never masked.
 ///
 /// A run of this lane is a pure function of `(seed, ticks)` and its own deterministic baseline
 /// (byte-identical to a `VOPR_WIPE=1 VOPR_LEARNER=1` run of the same seed), distinct from both the
@@ -2433,6 +2434,17 @@ impl Vopr {
         if trace {
           eprintln!("tick {tick}: WIPE replica {i} (fresh storage)");
         }
+        // What this disk is holding is evidence that exists only while the disk does, so the
+        // durable-retention obligation is told BEFORE the swap — it concedes exactly the ops the wipe
+        // forfeits, and needs to read them off the medium to know which. The reach is the cluster's
+        // highest assigned op: no medium holds anything above it.
+        let reach = (0..c.replica_count())
+          .map(|r| c.replica_op(r).get())
+          .max()
+          .unwrap_or(0);
+        self
+          .durable_quorum
+          .note_wipe(i, reach, &|op| c.replica_appended_op(i, OpNumber::with(op)));
         // A wiped VOTER fail-stops (`UnformattedVoter`) and stays down; only a non-voting LEARNER
         // rejoins on the empty disk, and only it therefore walks the work an emptied node owes —
         // state-sync plus a re-fetch of the whole checkpoint DAG that went with the block store.
@@ -3116,9 +3128,6 @@ impl Vopr {
       dur.note_wipe(i);
       vm.note_wipe(i);
       self.epoch_view.note_wipe(i);
-      // The wiped replica's durable copies are gone with its disk, so the durable-retention envelope
-      // relaxes by exactly one holder (floored at one) for the rest of the run.
-      self.durable_quorum.note_wipe();
     }
 
     // Append-before-ack, observed during the tick we just ran (PrepareOk for a non-durable op).

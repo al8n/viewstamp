@@ -571,8 +571,9 @@ const WIPE_SEEDS: u64 = 16;
 /// classic VSR amnesia hazard: a replica that voted in view V (and durably held committed ops)
 /// rejoins at genesis with no memory of either. One lost durable state is within the crash-fault
 /// model's `<= f` budget, so the cluster-level invariants MUST hold: agreement + no committed op
-/// rewritten/lost across time + quorum-durable retention (honestly relaxed by exactly the wiped
-/// count, floor 1 — never further) + the post-quiesce survival of the whole committed history. The
+/// rewritten/lost across time + quorum-durable retention (honestly relaxed only for the ops the
+/// emptied disk could have carried — a voter of the owed configuration, committed before the wipe —
+/// floor 1, never further) + the post-quiesce survival of the whole committed history. The
 /// wiped replica is NEVER special-cased (it may be the sole quorum-intersection holder); the
 /// checkers judge the outcome.
 ///
@@ -652,9 +653,9 @@ const WIPE_LEARNER_SEEDS: u64 = 16;
 /// ([`VoprReport::wiped_learner_blocks_fetched`]). A lane that fetched nothing would be green while
 /// covering exactly nothing, which is the failure mode this sweep exists to prevent. Every standing
 /// oracle judges the run meanwhile — agreement, no committed op rewritten or lost, quorum-durable
-/// retention relaxed by exactly the wiped count, the learner never-primary / no-emit gates, and
-/// learner convergence post-quiesce — so a panic here is a REAL finding, reported with its seed, never
-/// masked.
+/// retention at FULL voter-quorum strength (a learner's emptied disk held no voter's copy, so it
+/// relaxes nothing), the learner never-primary / no-emit gates, and learner convergence post-quiesce —
+/// so a panic here is a REAL finding, reported with its seed, never masked.
 ///
 /// The DEFAULT sweep leaves both axes OFF; a run of this lane is its own deterministic baseline,
 /// byte-identical to a `VOPR_WIPE=1 VOPR_LEARNER=1` run of the same seed. `VOPR_SEEDS` widens the
