@@ -6,7 +6,7 @@ use viewstamp_proto::{
 };
 
 use super::MemBlockStore;
-use crate::sm::LogSm;
+use crate::sm::{LogSm, materialize_sm};
 
 /// The reachable set from `root` over a [`LogSm`] checkpoint DAG, every block required present in
 /// `store` (the proto contract that a sync frontier drains before reconstruction). Used by the GC
@@ -37,7 +37,7 @@ fn checkpoint_log(n: u64, store: &mut MemBlockStore) -> BlockAddress {
   for op in 1..=n {
     sm.apply(OpNumber::with(op), format!("body-{op}").as_bytes());
   }
-  sm.checkpoint(store)
+  materialize_sm(&sm, store)
 }
 
 /// The `references` closure the proto hands `BlockStore::gc` (the SM's `block_references`).
@@ -62,7 +62,11 @@ fn roundtrips_and_reports_membership() {
   assert!(!store.has_block(addr));
   assert_eq!(store.read_block(addr), None);
 
-  store.write_verified(block.clone());
+  assert_eq!(
+    store.put(block.clone()),
+    addr,
+    "put returns the content address"
+  );
   assert!(store.has_block(addr));
   assert_eq!(store.read_block(addr), Some(block));
   assert_eq!(store.len(), 1);
@@ -73,18 +77,20 @@ fn roundtrips_and_reports_membership() {
 fn idempotent_rewrite_keeps_one_entry() {
   let mut store = MemBlockStore::new();
   let block = Bytes::from_static(b"same bytes");
-  store.write_verified(block.clone());
-  store.write_verified(block);
+  store.put(block.clone());
+  store.put(block);
   // Re-writing identical content under the same content address does not grow the store.
   assert_eq!(store.len(), 1);
 }
 
 #[test]
-fn write_block_honours_caller_supplied_address() {
+fn insert_raw_honours_caller_supplied_address() {
+  // The fault-injection backdoor stores under exactly the given key (even one the bytes do not
+  // hash to) — the mismatch `put` makes unrepresentable, needed to plant corrupt blocks.
   let mut store = MemBlockStore::new();
   let block = Bytes::from_static(b"explicit");
-  let addr = block_address(&block);
-  store.write_block(addr, block.clone());
+  let addr = block_address(b"a different key");
+  store.insert_raw(addr, block.clone());
   assert_eq!(store.read_block(addr), Some(block));
 }
 
@@ -155,7 +161,7 @@ fn gc_keeps_a_shared_subtree_and_prunes_the_old_only_blocks() {
   // The survivor set still reconstructs the newer checkpoint faithfully (GC freed only dead blocks).
   let mut restored = LogSm::default();
   restored
-    .restore(new_root, &store)
+    .restore(new_root, &viewstamp_proto::VerifiedView::new(&store))
     .expect("all blocks present after GC");
   assert_eq!(
     restored.applied().len(),
@@ -239,7 +245,7 @@ fn gc_does_not_follow_a_corrupt_block_and_does_not_sweep_it() {
   // edges (to the leaves) become unfollowable. The leaves remain present and verified.
   let bogus = Bytes::from_static(b"corrupt index bytes");
   assert_ne!(block_address(&bogus), root);
-  store.write_block(root, bogus); // mis-store under `root`.
+  store.insert_raw(root, bogus); // mis-store under `root`.
 
   store.gc(&sm_walk(&[root]));
 

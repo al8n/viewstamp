@@ -16,6 +16,7 @@ extern crate alloc as std;
 extern crate std;
 
 mod batch;
+mod block_job;
 mod block_store;
 mod codec;
 mod config;
@@ -39,14 +40,18 @@ pub use batch::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchFull, BatchMalformed, BatchUnits,
   BatchView, EmptyBatch, ReplyBuilder, ReplyPushError, ReplyView,
 };
-pub use block_store::{BlockAddress, BlockDagWalk, BlockStore, BlockStoreError, block_address};
+pub use block_job::{BlockJob, BlockJobCursor, BlockJobDone, BlockJobTag, execute_block_job};
+pub use block_store::{
+  BlockAddress, BlockDagWalk, BlockStore, BlockStoreError, InMemoryBlockStore, VerifiedView,
+  block_address,
+};
 pub use codec::CodecError;
 pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
 };
 pub use endpoint::{
   Endpoint, FormatError, Genesis, ProposeMembershipError, Reconfig, ReconfigError, RecoverError,
-  Recovered, RestartOnly, Retired, SingleChange, format, prepare_restart,
+  Recovered, RestartOnly, Retired, SessionImage, SingleChange, format, prepare_restart,
 };
 pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged};
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
@@ -66,8 +71,8 @@ pub use reconfigure_plan::{
 pub use state_machine::{RestoreError, StateMachine};
 pub use status::Status;
 pub use storage::{
-  BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadId, ReadOk,
-  SUPERBLOCK_VERSION, SlotStatus, Superblock, SuperblockDone, VsrState, VsrStateError, Wal,
+  BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, JobId, OpId, ReadId,
+  ReadOk, SUPERBLOCK_VERSION, SlotStatus, Superblock, SuperblockDone, VsrState, VsrStateError, Wal,
   WalDone, WriteId, checkpoint_id,
 };
 pub use time::Instant;

@@ -92,7 +92,7 @@ struct PeerLink {
 /// The compio (proactor) QUIC driver. Owns the coordinator + storage + socket on one task; a
 /// persistent same-thread recv task (holding a clone of the socket, owned via its `JoinHandle` by
 /// `run()`) feeds it inbound datagrams.
-pub struct CompioQuicDriver<S, W, B, L, I> {
+pub struct CompioQuicDriver<S: StateMachine, W, B, L, I> {
   coord: QuicCoordinator<S, I>,
   wal: W,
   sb: B,

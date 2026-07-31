@@ -14,7 +14,7 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   for rn in 1..=4u64 {
     e.handle_message(
@@ -123,7 +123,7 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary());
   // Two peers report checkpoint_op = 8 (a quorum of 2-of-3 incl. neither self) → the primary's
   // own checkpoint (0) lags the quorum checkpoint (8) by 8 >= the bound 4.
@@ -187,7 +187,7 @@ fn a_healthy_primary_never_forfeits() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary());
   // A consistent durable state at the checkpoint (commit_min == op == checkpoint_op == 8): a real
   // checkpoint snapshots the SM at `commit_min`, so `checkpoint_op <= commit_min` always — set them
@@ -228,7 +228,7 @@ fn a_backup_never_forfeits_even_when_behind() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(!ep.is_primary());
   ep.inject_peer_checkpoint_for_test(0, 8);
   ep.inject_peer_checkpoint_for_test(2, 8);
@@ -261,7 +261,7 @@ fn solo_primary_with_a_permanent_repair_hole_stays_normal_and_does_not_view_chan
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary(), "a solo replica is always its own primary");
   // A permanent committed-but-faulty repair hole at op 3 (no peer exists to serve it); head at op 5,
   // commit HELD at 2 below the hole. This is the unrecoverable solo precondition.
@@ -328,7 +328,7 @@ fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary());
   ep.inject_peer_checkpoint_for_test(1, 8);
   ep.inject_peer_checkpoint_for_test(2, 8); // quorum 8, own 0 → lag 8 >= 4 → arms
@@ -377,7 +377,7 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary());
   // Head 10, commit HELD at 1 below a committed hole at op 2, own checkpoint 1 == quorum (no
   // checkpoint-lag). Checkpoint == commit_min (a real checkpoint snapshots the SM at `commit_min`, so
@@ -422,7 +422,7 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary());
   // Head 2, commit 1, a committed hole at op 2, own checkpoint 0 (no checkpoint-lag peers injected).
   ep.force_state_for_test(0, 2, 1, 0, &[2]);
@@ -485,7 +485,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
   // Enter the force-sync strand → the primary flags a deferred forfeit (a committed hole at op 2 a
   // peer has already checkpointed+pruned past).
@@ -599,7 +599,7 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
   // Enter the force-sync strand → the primary flags a deferred forfeit (a committed hole at op 2 a
   // peer has already checkpointed + pruned past), mirroring the sibling persistence test's setup.

@@ -2181,7 +2181,7 @@ impl Cluster {
     // Overwrite the victim with bytes that hash elsewhere (a mis-store under a content-addressed key).
     let corrupt = Bytes::from_static(b"locally rotted checkpoint block");
     debug_assert_ne!(block_address(&corrupt), victim);
-    self.block_stores[i].write_block(victim, corrupt);
+    self.block_stores[i].insert_raw(victim, corrupt);
     Some(victim)
   }
 

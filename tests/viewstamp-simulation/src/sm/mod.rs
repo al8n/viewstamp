@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use viewstamp_proto::{
   BatchView, BlockAddress, BlockStore, OpNumber, ReplyBuilder, RestoreError, StateMachine,
-  block_address,
+  VerifiedView,
 };
 
 /// The number of consecutive `applied` entries packed into one DAG leaf block.
@@ -74,15 +74,9 @@ fn encode_index(leaves: &[BlockAddress]) -> Bytes {
 fn dag_checkpoint(applied: &[(u64, Bytes)], store: &mut dyn BlockStore) -> BlockAddress {
   let mut leaves = Vec::new();
   for chunk in applied.chunks(DAG_LEAF_RUN) {
-    let block = encode_leaf(chunk);
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    leaves.push(addr);
+    leaves.push(store.put(encode_leaf(chunk)));
   }
-  let index = encode_index(&leaves);
-  let root = block_address(&index);
-  store.write_block(root, index);
-  root
+  store.put(encode_index(&leaves))
 }
 
 /// The child addresses a block directly references: an index block yields its leaf addresses in log
@@ -115,7 +109,7 @@ fn dag_block_references(block: &[u8]) -> Vec<BlockAddress> {
 /// unchanged on error.
 fn dag_restore(
   root: BlockAddress,
-  store: &dyn BlockStore,
+  store: &VerifiedView<'_>,
 ) -> Result<Vec<(u64, Bytes)>, RestoreError> {
   let index = store.read_block(root).ok_or(RestoreError::new(root))?;
   let mut applied = Vec::new();
@@ -141,6 +135,12 @@ pub const SIM_UNIT_REPLY_CEILING: usize = 32;
 /// (28 units per body) instead of being dwarfed by the request-byte budget.
 pub const SIM_REPLY_BODY_BUDGET: usize = 1024;
 
+/// Captures `sm`'s image and materializes it into `store` in one step — the two-phase form of the
+/// old synchronous `checkpoint`, for tests and oracles that want a store-backed root directly.
+pub fn materialize_sm<S: StateMachine>(sm: &S, store: &mut dyn BlockStore) -> BlockAddress {
+  S::materialize(&sm.checkpoint_image(), store)
+}
+
 /// A deterministic state machine that records the sequence of applied operations.
 /// The reply is the post-apply length encoded as 8 big-endian bytes — enough for
 /// the linearizability checker to verify ordering and uniqueness.
@@ -157,20 +157,31 @@ impl LogSm {
 }
 
 impl StateMachine for LogSm {
+  type Image = Vec<(u64, Bytes)>;
+
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), Bytes::copy_from_slice(body)));
     Bytes::from((self.applied.len() as u64).to_be_bytes().to_vec())
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    dag_checkpoint(&self.applied, store)
+  fn checkpoint_image(&self) -> Self::Image {
+    // A cheap value snapshot: `Bytes` bodies are refcounted, so this clones handles, not payloads.
+    self.applied.clone()
+  }
+
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    dag_checkpoint(image, store)
   }
 
   fn block_references(block: &[u8]) -> Vec<BlockAddress> {
     dag_block_references(block)
   }
 
-  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
+  fn restore_seed(&self) -> Self {
+    LogSm::default()
+  }
+
+  fn restore(&mut self, root: BlockAddress, store: &VerifiedView<'_>) -> Result<(), RestoreError> {
     self.applied = dag_restore(root, store)?;
     Ok(())
   }
@@ -234,6 +245,8 @@ impl BatchSm {
 }
 
 impl StateMachine for BatchSm {
+  type Image = Vec<(u64, Bytes)>;
+
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), Bytes::copy_from_slice(body)));
     let first = self.units.len();
@@ -250,17 +263,25 @@ impl StateMachine for BatchSm {
       .expect("a parsed batch carries at least one unit")
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    dag_checkpoint(&self.applied, store)
+  fn checkpoint_image(&self) -> Self::Image {
+    // The op-level history alone: the per-unit history is re-derived from the bodies on restore, so
+    // the snapshot stays byte-compatible with `LogSm`'s encoding.
+    self.applied.clone()
+  }
+
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    dag_checkpoint(image, store)
   }
 
   fn block_references(block: &[u8]) -> Vec<BlockAddress> {
     dag_block_references(block)
   }
 
-  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
-    // Reconstruct the whole DAG FIRST (fallible); only on success replace `self`, so a missing/corrupt
-    // block leaves the SM unchanged for the proto to re-fetch and retry.
+  fn restore_seed(&self) -> Self {
+    BatchSm::default()
+  }
+
+  fn restore(&mut self, root: BlockAddress, store: &VerifiedView<'_>) -> Result<(), RestoreError> {
     let applied = dag_restore(root, store)?;
     self.units.clear();
     for (op, body) in &applied {
@@ -305,6 +326,8 @@ impl SimSm {
 }
 
 impl StateMachine for SimSm {
+  type Image = Vec<(u64, Bytes)>;
+
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     match self {
       Self::Plain(sm) => sm.apply(op, body),
@@ -312,11 +335,17 @@ impl StateMachine for SimSm {
     }
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+  fn checkpoint_image(&self) -> Self::Image {
     match self {
-      Self::Plain(sm) => sm.checkpoint(store),
-      Self::Batch(sm) => sm.checkpoint(store),
+      Self::Plain(sm) => sm.checkpoint_image(),
+      Self::Batch(sm) => sm.checkpoint_image(),
     }
+  }
+
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    // Both variants share the same DAG block layout, so the write is variant-independent (matching
+    // `materialize` being an associated fn with no receiver to dispatch on).
+    dag_checkpoint(image, store)
   }
 
   fn block_references(block: &[u8]) -> Vec<BlockAddress> {
@@ -325,7 +354,16 @@ impl StateMachine for SimSm {
     dag_block_references(block)
   }
 
-  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
+  fn restore_seed(&self) -> Self {
+    // The variant is cluster CONFIGURATION, not checkpoint content: the DAG bytes are identical
+    // across variants, so the seed carries the mode forward and `restore` fills the state.
+    match self {
+      Self::Plain(sm) => Self::Plain(sm.restore_seed()),
+      Self::Batch(sm) => Self::Batch(sm.restore_seed()),
+    }
+  }
+
+  fn restore(&mut self, root: BlockAddress, store: &VerifiedView<'_>) -> Result<(), RestoreError> {
     match self {
       Self::Plain(sm) => sm.restore(root, store),
       Self::Batch(sm) => sm.restore(root, store),

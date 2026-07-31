@@ -695,7 +695,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // ordinary commit after it regained primacy, must not linger to admit a stale SyncCheckpoint.
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
-    self.maybe_checkpoint(sb, blocks);
+    self.maybe_checkpoint();
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint (the re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here). No-op when no debt is owed.
@@ -1527,7 +1527,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // SyncCheckpoint for that target never reaches `apply_sync` below the advanced frontier.
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
-    self.maybe_checkpoint(sb, blocks);
+    self.maybe_checkpoint();
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint. The re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here (the loop above already drove commit). No-op when

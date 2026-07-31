@@ -39,12 +39,12 @@ fn run_until_converged<R: StreamTransport>(
   r0: &mut StreamCoordinator<CountSm, R>,
   wal0: &mut TestWal,
   sb0: &mut TestSb,
-  blocks0: &mut crate::block_store::MemBlockStore,
+  blocks0: &mut crate::block_store::InMemoryBlockStore,
   c0: ConnId,
   r1: &mut StreamCoordinator<CountSm, R>,
   wal1: &mut TestWal,
   sb1: &mut TestSb,
-  blocks1: &mut crate::block_store::MemBlockStore,
+  blocks1: &mut crate::block_store::InMemoryBlockStore,
   c1: ConnId,
 ) -> bool {
   let mut now = Instant::ZERO;
@@ -106,8 +106,8 @@ fn two_replicas_commit_over_plain_tcp() {
   }
   let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
   let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
-  let mut blocks0 = crate::block_store::MemBlockStore::new();
-  let mut blocks1 = crate::block_store::MemBlockStore::new();
+  let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
+  let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
   let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.inject_message_for_test(
@@ -149,8 +149,8 @@ fn public_submit_client_request_over_tcp_converges() {
   }
   let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
   let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
-  let mut blocks0 = crate::block_store::MemBlockStore::new();
-  let mut blocks1 = crate::block_store::MemBlockStore::new();
+  let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
+  let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
   let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.submit_client_request(
@@ -194,8 +194,8 @@ fn two_replicas_commit_over_raw_passthrough() {
   }
   let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
   let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
-  let mut blocks0 = crate::block_store::MemBlockStore::new();
-  let mut blocks1 = crate::block_store::MemBlockStore::new();
+  let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
+  let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
   let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.inject_message_for_test(
@@ -259,8 +259,8 @@ mod tls {
     let opts = tls_options();
     let (mut r0, mut wal0, mut sb0) = replica::<Labeled<TlsRecords>>(0);
     let (mut r1, mut wal1, mut sb1) = replica::<Labeled<TlsRecords>>(1);
-    let mut blocks0 = crate::block_store::MemBlockStore::new();
-    let mut blocks1 = crate::block_store::MemBlockStore::new();
+    let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
+    let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
     let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0, &opts));
     let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1, &opts));
     r0.inject_message_for_test(

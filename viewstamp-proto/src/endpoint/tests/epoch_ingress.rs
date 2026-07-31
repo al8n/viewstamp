@@ -29,7 +29,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -113,7 +113,7 @@ fn foreign_config_id_commit_is_not_adopted() {
   // Commit then DOES advance it, proving the drop is the config gate and not some other guard.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold op 1 (so a commit=1 is appliable).
   e.handle_message(
@@ -180,7 +180,7 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
   // lineage. A foreign-config_id request draws NO reply; the same request at our config_id 0 does.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -255,7 +255,7 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
   // in-lineage one (the hole is filled). `RepairBatch` carries `config_id` but no `epoch`, so only the
   // lineage gate applies.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the repair solicitation
   // Learn commit up to 3 → applies op 1, then registers the op-2 hole as it tries to cross it. The
   // commit is in-lineage (config_id 0), so the new gate admits it.
@@ -336,7 +336,7 @@ fn same_config_prepare_happy_path_still_appends_and_acks() {
   // normal-arm path under a matching `(epoch, config_id)`.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // `prepare(1, 0)` carries `Epoch::new(0)` + config_id 0 (the fixture lineage).
   e.handle_message(
@@ -391,7 +391,7 @@ fn recovering_with_hole_at_epoch(
   // A store that RAN at this epoch (its non-head slot faults), not a wipe: a FORMATTED root so this
   // voter recovers rather than empty-fail-stops.
   let mut sb = sb_formatted();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -421,7 +421,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
   // Repair arm (agnostic): a foreign-EPOCH (lower) Prepare for the op-2 hole still fills it — the
   // repair path runs before the normal-arm epoch check.
   let (mut r, mut wal, mut sb) = recovering_with_hole_at_epoch(3, 2, 1);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert_eq!(
     r.membership.epoch(),
     Epoch::new(1),
@@ -474,7 +474,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
 
   // Normal arm (strict): a backup at the head must NOT append a foreign-epoch head-advancing Prepare.
   let (mut e, mut wal2, mut sb2) = recovering_with_hole_at_epoch(3, 2, 1);
-  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   while e.poll_message().is_some() {}
   let head_before = e.op();
   let now = Instant::ZERO;
@@ -533,7 +533,7 @@ fn a_non_normal_laggard_routes_a_higher_epoch_heartbeat_into_the_recovery_peer_f
   // (`awaiting_peer_checkpoint`): it solicits a cross-epoch `SyncCheckpoint` and ends Normal at E+1.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Drive the backup into a ViewChange at the OLD epoch via a higher-view (same-epoch) catch-up.
   e.handle_message(
@@ -620,7 +620,7 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   // must instead retire the witness on the spot — and cast nothing (the action was abandoned).
   let mut e = backup();
   let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A view-0 Prepare stages the backup's append; its completion is HELD (the async in-flight window).
   e.handle_message(
@@ -703,7 +703,7 @@ fn a_pending_durable_view_write_defers_the_cross_epoch_peer_fetch() {
   // higher-epoch heartbeat re-triggers it.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Self-driven view change via SVC quorum (own idle-timeout SVC + one peer SVC), which issues a
   // SendDoViewChange durable-view write. We do NOT pump `handle_storage`, so the write stays in flight
@@ -782,7 +782,7 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
   // dropped at the authority ingress, casting no vote / driving no view change).
   let mut e = settled_voter_at(1);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.status().is_normal() && e.membership.epoch() == Epoch::new(1));
   let from = Peer::Replica(ReplicaId::new(2)); // an active member of our 3-voter config
@@ -870,7 +870,7 @@ fn a_stranded_laggard_triggers_the_cross_epoch_peer_fetch_on_an_epoch_ahead_hint
   // crosses only when the verified crossing checkpoint installs.
   let mut e = backup(); // Normal at epoch 0
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.status().is_normal() && e.membership.epoch() == Epoch::new(0));
 
@@ -914,7 +914,7 @@ fn a_higher_epoch_hint_from_a_non_member_slot_does_not_trigger_catch_up() {
   // pinned by the sibling tests above; a non-member hint is dropped here BEFORE it can poison.
   let mut e = backup(); // Normal at epoch 0, node_count 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(
     e.membership.node_count(),

@@ -232,7 +232,11 @@ impl<R: BlockRefs> BlockSync<R> {
     // Read edges before writing. A later bound breach aborts the sync but harmlessly leaves this valid
     // block written.
     let children = R::references(&bytes);
-    store.write_block(addr, bytes);
+    let stored = store.put(bytes);
+    debug_assert_eq!(
+      stored, addr,
+      "put keys by content, and the bytes verified against addr"
+    );
 
     // The front is now present: drop it, enqueue its children, and resume draining the front.
     self.frontier.pop_front();

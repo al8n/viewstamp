@@ -14,7 +14,7 @@
 use super::{super::*, *};
 use crate::{
   ClientId, Config, Header, OpNumber, Prepare, ReadOk, ReplicaId, Request, RequestNumber,
-  SlotStatus, StartViewChange, View, VsrState, Wal, WalDone, block_store::MemBlockStore,
+  SlotStatus, StartViewChange, View, VsrState, Wal, WalDone, block_store::InMemoryBlockStore,
 };
 use std::collections::VecDeque;
 
@@ -111,7 +111,7 @@ fn stale_checkpoint_commit_triggers_request_sync() {
   // head) means the cluster checkpointed past our entire WAL → we must state-sync.
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -159,7 +159,7 @@ fn stale_checkpoint_prepare_triggers_request_sync() {
   // this commit signal closes the last trigger gap for a backup that only ever hears Prepares.
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -184,7 +184,7 @@ fn in_reach_checkpoint_does_not_trigger_sync() {
   // checkpoint_op == our head (8) and we hold the tail → ordinary catch-up suffices, NO sync.
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   for op in 1..=8 {
     e.handle_message(
@@ -225,7 +225,7 @@ fn already_syncing_does_not_emit_a_second_handshake_per_heartbeat() {
   // RequestSync per heartbeat (only the timer re-solicits).
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -282,7 +282,7 @@ fn primary_answers_request_sync_with_sync_checkpoint() {
   // A donor primary with a durable checkpoint at op 2 answers a lagging replica's RequestSync by
   // shipping a SyncCheckpoint with the right op/id/snapshot/nonce, addressed back to the requester.
   let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   while e.poll_message().is_some() {} // drain prepares/replies from the warm-up
   e.handle_message(
@@ -327,7 +327,7 @@ fn repeat_request_sync_from_one_requester_yields_one_serve_and_one_ship() {
   // single completion ships ONE SyncCheckpoint answering the LATEST solicitation. (A map keyed per
   // minted read id would stack N reads for N solicits, each completion shipping a full snapshot.)
   let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   while e.poll_message().is_some() {} // drain the warm-up
   let solicit = |nonce: u64| {
@@ -426,7 +426,7 @@ fn serve_sync_checkpoint_drops_a_corrupt_checkpoint_read() {
   // Positive control: a GENUINE checkpoint read IS served (with the correct durable id).
   {
     let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     while e.poll_message().is_some() {} // drain the warm-up
     e.handle_message(
       now,
@@ -463,7 +463,7 @@ fn serve_sync_checkpoint_drops_a_corrupt_checkpoint_read() {
   // durable root — the serve path must DROP it (no SyncCheckpoint).
   {
     let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     while e.poll_message().is_some() {} // drain the warm-up
     // Sanity: the genuine snapshot hashes to the durable id (so the corruption is the only difference).
     let (_genuine, durable_id) = donor_envelope(&sb);
@@ -532,7 +532,7 @@ fn peer_without_newer_checkpoint_does_not_answer_request_sync() {
   // A replica whose checkpoint == requester's (or 0) ships nothing (no megabyte for a no-op).
   let mut e = sync_backup(); // checkpoint 0
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -566,7 +566,7 @@ fn a_slot_shifted_member_soliciting_from_a_far_config_is_served() {
   // install — so the donor answers a solicitation whose `config_id` is a far, unrecognized ancestor.
   let now = Instant::ZERO;
   let (mut donor, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while donor.poll_message().is_some() {} // drain warm-up
 
   // A recovery RequestSync at the donor's checkpoint from member slot 2 (its resolved `from`), stamping
@@ -619,7 +619,7 @@ fn recovery_request_sync_is_served_by_a_peer_at_the_same_checkpoint() {
   let now = Instant::ZERO;
   // A donor that is Normal at checkpoint op 2.
   let (mut donor, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while donor.poll_message().is_some() {} // drain warm-up
 
   // (a) A RECOVERY request at the SAME checkpoint (op 2) IS served.
@@ -705,7 +705,7 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
     head: 2, // head == checkpoint_op → empty tail; isolates the checkpoint path
     done: VecDeque::new(),
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 2);
   let mut e = Endpoint::recover(
     cfg,
@@ -740,7 +740,7 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
 
   // A peer that is Normal at the SAME checkpoint op (2) serves this exact request.
   let (mut peer, mut pwal, mut psb) = donor_primary_at_checkpoint(2);
-  let mut pblocks = crate::block_store::MemBlockStore::new();
+  let mut pblocks = crate::block_store::InMemoryBlockStore::new();
   while peer.poll_message().is_some() {}
   peer.handle_message(
     now,
@@ -794,7 +794,7 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
 #[test]
 fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
   // Trigger sync (Commit advertising checkpoint_op=4), capture the nonce it used.
@@ -870,7 +870,7 @@ fn a_state_sync_flush_fault_retains_the_checkpoint_and_self_retries_the_local_in
   // retry obligation, and the sync solicit cadence re-flushes + re-stages LOCALLY — no fresh donor reply
   // is needed, so even if the donor crashed after serving the blocks, the sync still completes.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4); // the laggard already holds M's complete DAG (immediate drain)
   blocks.script_flush_fault(1); // the FIRST durability barrier faults; the next succeeds
   let now = Instant::ZERO;
@@ -931,7 +931,8 @@ fn a_state_sync_flush_fault_retains_the_checkpoint_and_self_retries_the_local_in
   // The donor is now SILENT — deliver NO further message. Fire ONLY the sync solicit timer past its
   // deadline: the local retry re-flushes (now succeeding) and stages the re-persist with no donor reply.
   let later = now + core::time::Duration::from_millis(150);
-  e.sync_timeouts(later, &mut sb, &mut blocks);
+  e.sync_timeouts(later, &mut blocks);
+  e.run_block_lane(later, &mut sb, &mut blocks);
   e.handle_storage(later, &mut wal, &mut sb, &mut blocks); // drive the now-staged durable re-persist
   // The retry's flush succeeded → the checkpoint installs and the sync completes, with no fresh donor.
   assert!(
@@ -967,11 +968,11 @@ fn a_retained_install_survives_a_block_gc_before_the_flush_retry() {
   // the local flush retry) must NOT free the install's drained DAG — otherwise the later retry would advance
   // the durable checkpoint to name blocks GC already freed, losing the just-synced committed state.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4); // the laggard already holds M's complete DAG (immediate drain)
   // A block reachable from NOTHING — neither a durable checkpoint (the laggard has none yet) nor the
   // retained install's DAG. The GC sweep below must free it, proving the sweep actually ran (not a no-op).
-  blocks.write_verified(Bytes::from_static(b"unreferenced-garbage-block"));
+  blocks.put(Bytes::from_static(b"unreferenced-garbage-block"));
   blocks.script_flush_fault(1); // the FIRST durability barrier faults; the next succeeds
   let now = Instant::ZERO;
   e.handle_message(
@@ -1017,7 +1018,8 @@ fn a_retained_install_survives_a_block_gc_before_the_flush_retry() {
   // GC fires BEFORE the local flush retry. The retained install's DAG must SURVIVE (it is a live root); the
   // unreferenced garbage block must be FREED (the sweep ran). Were the install not a GC root, its blocks
   // would be swept here and the retry would re-persist a checkpoint naming freed blocks.
-  e.gc_blocks_for_test(&mut blocks);
+  e.gc_blocks_for_test();
+  e.run_block_lane(now, &mut sb, &mut blocks);
   assert_eq!(
     blocks.len(),
     held_before - 1,
@@ -1027,7 +1029,8 @@ fn a_retained_install_survives_a_block_gc_before_the_flush_retry() {
   // The donor is SILENT — fire ONLY the local retry. Its flush now succeeds and stages the re-persist; the
   // SAME verified checkpoint installs (its DAG was never swept) and no committed state is lost.
   let later = now + core::time::Duration::from_millis(150);
-  e.sync_timeouts(later, &mut sb, &mut blocks);
+  e.sync_timeouts(later, &mut blocks);
+  e.run_block_lane(later, &mut sb, &mut blocks);
   e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.install_flush_retry_owed(),
@@ -1072,7 +1075,7 @@ fn the_block_fetch_arq_retransmits_a_missing_session_block_after_the_sm_dag_drai
     Endpoint::<CountSm>::decode_checkpoint(&env).expect("the donor envelope decodes");
 
   // The donor's full block store (BOTH DAGs) — the source the donor serves `RequestBlock`s from.
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
   assert!(
     donor_blocks.has_block(sessions_root),
@@ -1081,7 +1084,7 @@ fn the_block_fetch_arq_retransmits_a_missing_session_block_after_the_sm_dag_drai
 
   // The laggard's store: seed ONLY the SM DAG (walk it from `sm_root` in the donor store), so the SM
   // frontier drains locally; the session DAG is deliberately ABSENT.
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   {
     let mut stack = std::vec![sm_root];
     let mut seen = std::collections::BTreeSet::new();
@@ -1095,7 +1098,7 @@ fn the_block_fetch_arq_retransmits_a_missing_session_block_after_the_sm_dag_drai
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
   assert!(
@@ -1232,7 +1235,7 @@ fn the_block_fetch_arq_retransmits_a_missing_session_block_after_the_sm_dag_drai
     let block = donor_blocks
       .read_block(addr)
       .expect("the donor serves every requested session block");
-    blocks.write_block(addr, block.clone());
+    blocks.put(block.clone());
     e.handle_message(
       now,
       &mut wal,
@@ -1279,7 +1282,7 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
   // Give the laggard a small live WAL band (ops 1,2) below the synced point so the prune is OBSERVABLE.
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
   for op in 1..=2u64 {
@@ -1442,7 +1445,7 @@ fn state_sync_view_change_defers_while_a_re_persist_root_is_staged() {
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
   // The laggard (replica 1 of 3) holds a live WAL band {1,2} below the synced point.
@@ -1587,7 +1590,7 @@ fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_cl
   // discriminator the ordinary checkpoint advances `checkpoint_op` and LEAVES the solicited sync armed.
   let mut e = sync_backup(); // replica 1 of 3, CountSm, checkpoint_ops = 2
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold a live band {1,2} (durable).
   for op in 1..=2u64 {
@@ -1666,7 +1669,7 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Drive the primary to op 4, commit 4 (no checkpoint — interval is huge).
   for rn in 1..=4u64 {
@@ -1790,7 +1793,7 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
     head: 2,
     done: VecDeque::new(),
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 6);
   let mut e = Endpoint::recover(
     cfg,
@@ -1881,7 +1884,7 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
 fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
   // A corrupt/forged snapshot whose bytes don't hash to the advertised id MUST NOT be restored.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -1947,7 +1950,7 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
   // committed ops in (A, B] = (2, 4]. With the fix, the op bound INSIDE the envelope (2) is compared
   // to the advertised op (4) and the mismatch REJECTS the snapshot: no restore, no commit advance.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Trigger a sync targeting op 4 (the overstated op).
   e.handle_message(
@@ -1977,7 +1980,7 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
   let real_id = crate::checkpoint_id(&stale_env); // the id IS consistent with these (op-2) bytes
   // Seed the named SM leaf so the reply reaches `apply_sync`'s op-bind check (the load-bearing rejection)
   // rather than deferring into a block-fetch.
-  blocks.write_verified(stale_sm.snapshot());
+  blocks.put(stale_sm.snapshot());
   // Deliver it advertising the OVERSTATED op B=4 but the bytes' REAL id → the hash gate passes, the
   // op-binding gate must reject (bound op 2 != advertised op 4).
   e.handle_message(
@@ -2034,7 +2037,7 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
 #[test]
 fn stale_nonce_sync_checkpoint_is_ignored() {
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -2086,7 +2089,7 @@ fn sync_checkpoint_below_target_is_ignored() {
   // advance us past the committed frontier. (Target 6; a reply at op 4 is dropped.)
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let (_d, _dw, dsb) = donor_primary_at_checkpoint(4);
   let (env4, id4) = donor_envelope(&dsb);
   let now = Instant::ZERO;
@@ -2144,7 +2147,7 @@ fn sync_checkpoint_without_an_outstanding_sync_is_ignored() {
   // first apply clears `sync`, so a re-delivery finds no outstanding sync).
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let (_d, _dw, dsb) = donor_primary_at_checkpoint(4);
   let (env, id) = donor_envelope(&dsb);
   let now = Instant::ZERO;
@@ -2181,7 +2184,7 @@ fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
   // Monotonicity: after syncing to checkpoint 4, a later SyncCheckpoint advertising a LOWER
   // checkpoint must never regress us. (We forge a stale reply at the same nonce/below our point.)
   let (mut e, mut wal, mut sb, env4, id4) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let (_d2, _dw2, dsb2) = donor_primary_at_checkpoint(2);
   let (env2, id2) = donor_envelope(&dsb2);
@@ -2259,7 +2262,7 @@ fn sync_checkpoint_clears_a_pending_repair_hole_below_the_synced_point() {
   let (env, id) = donor_envelope(&dsb);
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 6);
   let now = Instant::ZERO;
   // Manufacture a pending-repair hole at op 2 (as the recover loop would).
@@ -2320,7 +2323,7 @@ fn a_pruned_committed_hole_forces_a_state_sync() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Normal-backup state: head op 4, commit held at 1, own checkpoint 0, a committed hole at op 2.
   ep.force_state_for_test(0, 4, 1, 0, &[2]);
   assert!(!ep.is_primary());
@@ -2402,7 +2405,7 @@ fn force_sync_does_not_fire_when_the_op_is_still_peer_repairable() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Head op 6, commit held at 3, own checkpoint 0, a committed hole at op 4.
   ep.force_state_for_test(0, 6, 3, 0, &[4]);
   // The primary (replica 0) reports a checkpoint of 3 — BELOW the hole at 4. The max-peer floor is
@@ -2454,7 +2457,7 @@ fn force_sync_fires_on_a_backup_that_only_hears_the_primary() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Head op 10 (ABOVE the cluster checkpoint, so the ORDINARY `> self.op` sync stays FALSE — this is
   // the precise force-sync regime), commit held at 1, own checkpoint 0, a committed hole at op 2.
   ep.force_state_for_test(0, 10, 1, 0, &[2]);
@@ -2533,7 +2536,7 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
   let mut ep =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 3);
   // A backup holding a tail at op 5, commit at 1, a committed hole at 2, own checkpoint 0. Seed the
   // in-memory tail entries (4, 5) it holds above the synced checkpoint (force_state_for_test leaves
@@ -2612,7 +2615,7 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
   let mut ep =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Head op 4, commit HELD at 1, own checkpoint 0, a committed hole at op 2. The above-hole committed
   // band (ops 3, 4) is held in the log cache so that — once the hole at 2 fills — `advance_commit` can
@@ -2749,7 +2752,7 @@ fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() 
   let mut ep =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 2);
   let now = Instant::ZERO;
   // Head op 4, applied frontier already at 4, own checkpoint 0 (no hole — the band is fully applied).
@@ -2818,7 +2821,7 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
   // The primary holds a head at op 10 with a committed-op hole at op 2 (commit held at 1 below it).
   // (A recovered primary with a rotted committed slot the cluster long since checkpointed+pruned.)
@@ -2925,7 +2928,7 @@ fn a_primary_in_the_force_sync_strand_never_reuses_an_op_number() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   ep.force_state_for_test(0, 10, 1, 0, &[2]);
   let head_at_strand = ep.op().get();
   assert_eq!(head_at_strand, 10);
@@ -2996,7 +2999,7 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   // Durability-before-resume: after a sync goes durable, a crash + recover() must come back at the
   // synced checkpoint (the durable root names it), not the stale one.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
   e.handle_message(
@@ -3088,7 +3091,7 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
   e.handle_message(
@@ -3215,7 +3218,7 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let mut wal = RingWal::new(N);
   let mut sb = StepSb::default(); // async: the ordinary checkpoint root lands on a later flush
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Pre-overflow state: a sub-quorum laggard with head 5, applied frontier (commit_min) 5, own
@@ -3241,7 +3244,8 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
   // backup applied through the checkpoint boundary): commit_min (5) >= checkpoint_op (0) + checkpoint_ops
   // (5), so this snapshots at commit_min and submits the snapshot write to the async superblock. It is
   // now IN FLIGHT (checkpoint_op is still 0 until the root lands).
-  e.maybe_checkpoint(&mut sb, &mut blocks);
+  e.maybe_checkpoint();
+  e.run_block_lane(now, &mut sb, &mut blocks);
   assert_eq!(
     e.pending_checkpoint_is_sync_for_test(),
     Some(false),
@@ -3382,7 +3386,7 @@ fn serve_request_sync(
   e: &mut Endpoint<CountSm>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut MemBlockStore,
+  blocks: &mut InMemoryBlockStore,
 ) -> crate::SyncCheckpoint {
   let now = Instant::ZERO;
   while e.poll_message().is_some() {} // drain warm-up / membership-change emissions
@@ -3419,7 +3423,7 @@ fn a_swapped_donor_below_its_reconfigure_op_withholds_the_cross_epoch_membership
   // committed prefix through the reconfigure op, and could vote in E+1 unsafely. The donor instead serves
   // an EMPTY membership; once its checkpoint advances PAST N it serves the real E+1 membership.
   let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // SWAP to E+1 exactly as a commit-first swap does (AddLearner keeps the voter set, so replica 0 stays
   // the primary), naming reconfigure op N = 5 — ABOVE the donor's durable checkpoint (op 2). This is the
   // commit-first window: the swap is in memory (epoch = E+1) but the checkpoint does not yet reflect it.
@@ -3496,7 +3500,7 @@ fn a_laggard_keeps_its_membership_when_a_below_n_donor_withholds_then_swaps_once
 
   // --- Phase 1: the WITHHELD (empty) cross-epoch answer keeps the laggard's membership. ---
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let laggard_config_id = e.membership.config_id();
   assert_eq!(
@@ -3559,7 +3563,7 @@ fn a_laggard_keeps_its_membership_when_a_below_n_donor_withholds_then_swaps_once
 
   // --- Phase 2: a cross-epoch answer that CARRIES the membership installs the successor. ---
   let (mut e2, mut wal2, mut sb2, env2, id2) = sync_apply_harness(4);
-  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks2, 4);
   e2.handle_message(
     now,
@@ -3650,7 +3654,7 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
 
   // The laggard starts at E0 (MemberId 1, slot 1 — retained in E2, so it can later re-serve).
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   assert_eq!(
     e.membership.config_id(),
@@ -3871,7 +3875,7 @@ fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
 
   // The laggard starts at E0 (MemberId 1, slot 1).
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   assert_eq!(
     e.membership.config_id(),
@@ -3995,7 +3999,7 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Append ops 1..=N with commit 0 (the laggard appended the reconfigure op N but never saw its commit).
   for op in 1..=n {
@@ -4087,7 +4091,7 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   let id = crate::checkpoint_id(&env);
   // The envelope names the SM leaf by content address; seed the leaf so the crossing install's block-fetch
   // frontier drains locally and applies without a RequestBlock round trip.
-  blocks.write_verified(snap.clone());
+  blocks.put(snap.clone());
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
       .encode_body();
@@ -4157,7 +4161,7 @@ fn slot_shifted_crossing_laggard() -> (Endpoint<CountSm>, TestWal, TestSb, Membe
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let predecessor = genesis(4);
   let predecessor_config_id = e.membership.config_id();
   // The E+1 successor a LOW-INDEX DemoteVoter derives: demoting MemberId 1 from [m0,m1,m2,m3] leaves
@@ -4215,7 +4219,7 @@ fn slot_shift_crossing_envelope(
     crate::block_address(&snap),
     super::super::session_blocks::encode_sessions(
       &std::collections::BTreeMap::new(),
-      &mut crate::block_store::MemBlockStore::new(),
+      &mut crate::block_store::InMemoryBlockStore::new(),
     ),
   );
   let id = crate::checkpoint_id(&env);
@@ -4236,13 +4240,13 @@ fn a_slot_shifted_donor_whole_sync_checkpoint_reply_is_admitted_and_crosses() {
   // successor membership), so the crossing installs.
   let (mut e, mut wal, mut sb, successor, predecessor_config_id, nonce) =
     slot_shifted_crossing_laggard();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let (env, id, membership_body) = slot_shift_crossing_envelope(&successor, predecessor_config_id);
   // `slot_shift_crossing_envelope` names the SM leaf (a default-SM snapshot) by content address; seed it
   // so the crossing install's block-fetch frontier drains locally and applies without a round trip. Seed
   // the (empty) session-table DAG too so the session frontier likewise drains locally.
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
 
   // The slot-shifted donor MemberId 2: `from` = its OLD slot 2 (what the laggard's E transport resolves),
@@ -4297,7 +4301,7 @@ fn a_slot_shifted_donor_whole_sync_checkpoint_reply_is_admitted_and_crosses() {
   // config_id is the laggard's CURRENT (predecessor) config — i.e. NOT a cross-epoch answer, just a
   // mismatched self-id forge — is DROPPED even with a sync outstanding.
   let (mut e2, mut w2, mut s2, succ2, pred2, nonce2) = slot_shifted_crossing_laggard();
-  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   let (env2, id2, body2) = slot_shift_crossing_envelope(&succ2, pred2);
   e2.handle_message(
     now,
@@ -4341,7 +4345,7 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let predecessor = genesis(3);
   let successor = predecessor
@@ -4390,7 +4394,7 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
   // Both replies name the same default-SM leaf by content address; seed it so each reaches `apply_sync`
   // (where the crossing-membership check rejects the below-N empty reply and accepts the M >= N one)
   // rather than deferring into a futile block-fetch.
-  blocks.write_verified(below_snap.clone());
+  blocks.put(below_snap.clone());
   e.handle_message(
     now,
     &mut wal,
@@ -4498,7 +4502,7 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let predecessor = genesis(3);
   let successor = predecessor
@@ -4544,7 +4548,7 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
   let below_id = crate::checkpoint_id(&below_env);
   // Both replies name the same default-SM leaf by content address; seed it so each reaches `apply_sync`
   // (the successor-verification gate) instead of deferring into a futile block-fetch.
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   e.handle_message(
     now,
     &mut wal,
@@ -4662,7 +4666,7 @@ fn a_stranded_learner_crosses_an_epoch_via_the_pulled_epoch_ahead_hint() {
     u64::MAX,
   );
   let (mut lwal, mut lsb) = (TestWal::default(), TestSb::default());
-  let mut lblocks = crate::block_store::MemBlockStore::new();
+  let mut lblocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(
     learner.is_learner() && learner.membership.epoch() == crate::Epoch::new(0),
@@ -4694,7 +4698,7 @@ fn a_stranded_learner_crosses_an_epoch_via_the_pulled_epoch_ahead_hint() {
     u64::MAX,
   );
   let (mut mwal, mut msb) = (TestWal::default(), TestSb::default());
-  let mut mblocks = crate::block_store::MemBlockStore::new();
+  let mut mblocks = crate::block_store::InMemoryBlockStore::new();
   member.force_state_for_test(0, n, n, n, &[]);
   assert!(
     member.status().is_normal()
@@ -4773,7 +4777,7 @@ fn a_stranded_learner_crosses_an_epoch_via_the_pulled_epoch_ahead_hint() {
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
       .encode_body();
-  lblocks.write_verified(CountSm::default().snapshot());
+  lblocks.put(CountSm::default().snapshot());
   learner.handle_message(
     t1,
     &mut lwal,
@@ -4868,7 +4872,7 @@ fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds(
     done: VecDeque::new(),
     checkpoint: Some((OpNumber::with(2), env)),
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut e = Endpoint::recover(
     cfg,
     genesis_mem,
@@ -4907,7 +4911,7 @@ fn a_stale_cross_epoch_hint_does_not_poison_ordinary_same_epoch_state_sync() {
   // The fix: a same-epoch admissible message CANCELS the stale crossing at the ingress, and the node
   // re-arms a fresh ordinary same-config sync (new nonce) that installs.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -4995,7 +4999,7 @@ fn a_stale_high_target_cross_epoch_hint_does_not_poison_ordinary_same_epoch_stat
   // ordinary same-config sync at the reachable checkpoint — so the bogus-high target is gone and the
   // below-bogus reply is no longer dropped at the freshness gate.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -5078,7 +5082,7 @@ fn a_stale_high_target_cross_epoch_hint_does_not_poison_ordinary_same_epoch_stat
   // GUARD: a GENUINE crossing is NOT stranded — the cross-epoch trigger RE-ARMS afresh. After the
   // downgrade+install above, a real higher-epoch heartbeat re-establishes the crossing requirement.
   let (mut e2, mut wal2, mut sb2, _env2, _id2) = sync_apply_harness(4);
-  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   e2.arm_cross_epoch_sync_for_test(1000);
   e2.handle_message(
     now,
@@ -5128,7 +5132,7 @@ fn a_stale_cross_epoch_hint_is_cancelled_by_same_epoch_evidence_at_or_below_the_
   // same-epoch Commit at/below the head CANCELS the stale crossing outright (we are already caught up
   // in-epoch — no re-arm, since `maybe_request_sync` early-returns).
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.arm_cross_epoch_sync_for_test(1000);
   assert!(
@@ -5169,7 +5173,7 @@ fn a_higher_epoch_trigger_upgrades_an_ordinary_sync_to_crossing_even_when_the_ta
   // another higher-epoch trigger happens to arrive. `maybe_request_cross_epoch_catchup` now upgrades any
   // outstanding sync to forced + require_cross_epoch regardless of target monotonicity.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // An ORDINARY same-epoch sync already armed at a HIGH target (10), ABOVE the real crossing checkpoint.
   e.maybe_request_sync(now, OpNumber::with(10));
@@ -5222,7 +5226,7 @@ fn a_staged_same_epoch_install_re_arms_the_crossing_from_the_intent_after_it_com
   // MUTATION CHECK: remove the `on_sb_done` re-arm (step 3) and the final assertion FAILS — the node
   // settles old-epoch with `sync == None`, exactly the defect this intent closes.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -5328,7 +5332,7 @@ fn a_successful_cross_clears_the_intent_so_on_sb_done_never_re_arms_forever() {
   // has already crossed. Here a Normal speculative crossing armed from a hint installs a genuine E+1
   // successor; afterwards the intent is None and no crossing sync is left armed.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint
   let successor_e1 = genesis(3)
@@ -5349,7 +5353,7 @@ fn a_successful_cross_clears_the_intent_so_on_sb_done_never_re_arms_forever() {
   let cross_id = crate::checkpoint_id(&cross_env);
   // The envelope names the SM leaf by content address; seed it so the crossing reaches `apply_sync` and
   // STAGES the install locally (the `pending_install` assertion below) instead of arming a block-fetch.
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
       .encode_body();
@@ -5400,7 +5404,7 @@ fn the_trigger_level_downgrade_clears_the_persistent_intent_so_on_sb_done_never_
   // too, else after the downgraded now-ordinary sync installs, `on_sb_done` would re-arm a crossing from
   // the still-set intent — re-introducing the stale-hint poison the intent refactor exists to remove.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A REAL higher-epoch trigger sets the intent AND arms a crossing sync (NOT the `_for_test` helper).
   e.handle_message(
@@ -5447,7 +5451,7 @@ fn a_same_epoch_message_clears_an_orphaned_cross_epoch_intent() {
   // crossing from it — re-introducing the stale-hint poison. The ingress cancel now clears an orphaned
   // intent on same-epoch evidence even when NO sync remains.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // An ORPHANED intent: the persistent crossing goal survives with NO outstanding sync (the post-reset
   // state a view transition leaves behind for a bare stale hint).
@@ -5491,7 +5495,7 @@ fn an_ordinary_staged_install_does_not_shield_a_stale_intent_from_a_same_epoch_c
   // therefore admits a staged install, while the narrower sync-teardown gate
   // (`crossing_is_pre_answer_speculative`) excludes it.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -5575,9 +5579,9 @@ fn a_same_config_live_fetch_does_not_shield_a_stale_cross_epoch_intent_from_same
 
   // Laggard store: SM DAG present (drains locally), session DAG absent — so the same-config checkpoint arms
   // a LIVE block-fetch (active address = `sessions_root`) rather than installing or staging.
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   {
     let mut stack = std::vec![sm_root];
     let mut seen = std::collections::BTreeSet::new();
@@ -5591,7 +5595,7 @@ fn a_same_config_live_fetch_does_not_shield_a_stale_cross_epoch_intent_from_same
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
   assert!(
@@ -5684,7 +5688,7 @@ fn after_an_ordinary_install_completes_on_sb_done_does_not_re_arm_a_crossing() {
   // SURVIVES and `on_sb_done` legitimately re-arms.) This closes the loop: a stale intent shielded by a
   // mis-scoped predicate would re-poison HERE; a correctly-cleared one cannot.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -5782,7 +5786,7 @@ fn a_staged_install_upgraded_to_crossing_is_not_orphaned_by_same_epoch_authority
   // `crossing_is_pre_answer_speculative` staged-install exclusion) and `handle_message` panics on the
   // orphaned `pending_install` at its exit-time `assert_invariants`.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -5907,7 +5911,7 @@ fn a_bare_speculative_crossing_with_no_staged_install_is_still_downgradable() {
   // down by stale same-epoch authority — the fix must not OVER-suppress. The ingress cancel drops the bare
   // crossing sync AND clears the intent, exactly as before the staged-install carve-out.
   let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // A REAL higher-epoch trigger arms a bare crossing-required sync + the persistent intent (no SyncCheckpoint
@@ -5980,7 +5984,7 @@ fn a_verified_staged_crossing_keeps_its_intent_against_stale_same_epoch_authorit
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint op
   let successor_e1 = genesis(3)
@@ -6001,7 +6005,7 @@ fn a_verified_staged_crossing_keeps_its_intent_against_stale_same_epoch_authorit
     super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
   let cross_id = crate::checkpoint_id(&cross_env);
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
       .encode_body();
@@ -6116,7 +6120,7 @@ fn a_verified_crossing_retained_across_a_flush_fault_keeps_its_intent_against_st
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint op
   let successor_e1 = genesis(3)
@@ -6137,7 +6141,7 @@ fn a_verified_crossing_retained_across_a_flush_fault_keeps_its_intent_against_st
     super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
   let cross_id = crate::checkpoint_id(&cross_env);
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   blocks.script_flush_fault(1); // the install's durability barrier faults — the crossing is RETAINED
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
@@ -6258,7 +6262,7 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint op
   let successor_e1 = genesis(3)
@@ -6278,7 +6282,7 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
     super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
   let cross_id = crate::checkpoint_id(&cross_env);
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   blocks.script_flush_fault(1); // the crossing's durability barrier faults — it is RETAINED
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
@@ -6374,7 +6378,8 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
     blocks.has_block(crossing_sm_root) && blocks.has_block(crossing_sessions_root),
     "the crossing's DAG roots are present before the GC sweep"
   );
-  e.gc_blocks_for_test(&mut blocks);
+  e.gc_blocks_for_test();
+  e.run_block_lane(now, &mut sb, &mut blocks);
   assert!(
     blocks.has_block(crossing_sm_root) && blocks.has_block(crossing_sessions_root),
     "the crossing's DAG roots SURVIVED GC — the retained crossing is a live root despite the stale reply"
@@ -6383,7 +6388,8 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
   // The original crossing still COMPLETES on the local retry (no fresh donor reply): its flush now succeeds,
   // stages the re-persist, and the SAME verified successor membership installs — the laggard crosses to E+1.
   let later = now + core::time::Duration::from_millis(150);
-  e.sync_timeouts(later, &mut sb, &mut blocks);
+  e.sync_timeouts(later, &mut blocks);
+  e.run_block_lane(later, &mut sb, &mut blocks);
   for _ in 0..6 {
     e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
   }
@@ -6418,7 +6424,7 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let m = 4u64;
   let successor_e1 = genesis(3)
@@ -6443,7 +6449,7 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
     super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
   let cross_id = crate::checkpoint_id(&cross_env);
-  blocks.write_verified(CountSm::default().snapshot());
+  blocks.put(CountSm::default().snapshot());
   blocks.script_flush_fault(1);
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
@@ -6527,7 +6533,8 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
     Some((crossing_sm_root, crossing_sessions_root)),
     "the surviving install is the SAME crossing (DAG roots unchanged)"
   );
-  e.gc_blocks_for_test(&mut blocks);
+  e.gc_blocks_for_test();
+  e.run_block_lane(now, &mut sb, &mut blocks);
   assert!(
     blocks.has_block(crossing_sm_root) && blocks.has_block(crossing_sessions_root),
     "the crossing's DAG roots SURVIVED GC despite the rejected stale recovery reply (a live GC root)"
@@ -6571,7 +6578,7 @@ fn a_stale_below_commit_min_reply_does_not_tear_down_a_cross_epoch_forced_sync()
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Drive the backup to commit_min = 4, checkpoint_op = 0 (no checkpoint — interval is huge).
@@ -6713,7 +6720,7 @@ fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Seed C's block so a C reply (if not rejected) would drain its block-fetch immediately —
   // this is the adversarial block that would rewind M's durable root without the monotone reject.
   let snap_c = {
@@ -6723,7 +6730,7 @@ fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older
     }
     donor_sm.snapshot()
   };
-  blocks.write_verified(snap_c.clone());
+  blocks.put(snap_c.clone());
   // Seed M's block so the SyncCheckpoint can drain and reach apply_sync.
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
@@ -6771,7 +6778,7 @@ fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older
 
   // CORRUPT M's block AFTER staging. The corrupt bytes do not hash to sm_root_m, so the
   // verify-on-read in install_sync returns an error.
-  blocks.write_block(sm_root_m, Bytes::copy_from_slice(b"post-stage-corruption"));
+  blocks.insert_raw(sm_root_m, Bytes::copy_from_slice(b"post-stage-corruption"));
 
   // Drive the two-write re-persist to completion (step 1: snapshot; step 2: root).
   // `install_sync` advances the frontier to M, then FAILS the SM restore on the corrupt block.
@@ -6904,7 +6911,7 @@ fn laggard_owing_sm_reconstruct_at_m() -> (
   Endpoint<CountSm>,
   TestWal,
   StepSb,
-  MemBlockStore,
+  InMemoryBlockStore,
   BlockAddress,
   u128,
 ) {
@@ -6922,7 +6929,7 @@ fn laggard_owing_sm_reconstruct_at_m() -> (
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 4);
   let now = Instant::ZERO;
 
@@ -6965,7 +6972,7 @@ fn laggard_owing_sm_reconstruct_at_m() -> (
   assert!(e.pending_install.is_some(), "M staged");
 
   // CORRUPT M's block, then drive the two-write re-persist: install_sync fails on the root completion.
-  blocks.write_block(sm_root_m, Bytes::copy_from_slice(b"post-stage-corruption"));
+  blocks.insert_raw(sm_root_m, Bytes::copy_from_slice(b"post-stage-corruption"));
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   sb.flush();
@@ -7012,7 +7019,7 @@ fn two_leaf_dag(
   BlockAddress,
   BlockAddress,
   BlockAddress,
-  MemBlockStore,
+  InMemoryBlockStore,
 ) {
   let mut donor_sm = TwoLeafSm::default();
   for rn in 1..=ckpt {
@@ -7021,13 +7028,14 @@ fn two_leaf_dag(
   let (leaf_x, leaf_y) = donor_sm.leaves();
   let xa = block_address(&leaf_x);
   let ya = block_address(&leaf_y);
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let sm_root = {
     let mut sm = TwoLeafSm::default();
     for rn in 1..=ckpt {
       sm.apply(OpNumber::with(rn), &[rn as u8]);
     }
-    sm.checkpoint(&mut store) // writes root + both leaves CLEAN into `store`, returns the root addr
+    // writes root + both leaves CLEAN into `store`, returns the root addr
+    TwoLeafSm::materialize(&sm.checkpoint_image(), &mut store)
   };
   // Encode the (empty) session table into the SAME donor store so its DAG block is part of the returned
   // store the laggard seeds from — both DAGs must be present for the install frontier to drain.
@@ -7050,7 +7058,7 @@ fn laggard_owing_two_leaf_at_m(
   Endpoint<TwoLeafSm>,
   TestWal,
   StepSb,
-  MemBlockStore,
+  InMemoryBlockStore,
   BlockAddress,
   u128,
 ) {
@@ -7069,12 +7077,12 @@ fn laggard_owing_two_leaf_at_m(
   let mut sb = StepSb::default();
   // Seed the laggard's store with the WHOLE clean DAG so the block-fetch drains locally at stage; the
   // targeted leaf is corrupted AFTER staging (mirroring the single-block helper).
-  let mut blocks = MemBlockStore::new();
+  let mut blocks = InMemoryBlockStore::new();
   {
     let (_e2, _id2, _root2, _x2, _y2, donor_store) = two_leaf_dag(4);
     for addr in [sm_root_m, _x2, _y2] {
       if let Some(b) = donor_store.read_block(addr) {
-        blocks.write_block(addr, b);
+        blocks.put(b);
       }
     }
     // Also seed the (empty) session-table DAG so the install frontier drains both DAGs locally.
@@ -7129,7 +7137,7 @@ fn laggard_owing_two_leaf_at_m(
   assert!(e.pending_install.is_some(), "M staged");
 
   // Corrupt the TARGETED leaf, then drive the two-write re-persist: install_sync's restore faults on it.
-  blocks.write_block(corrupt, Bytes::copy_from_slice(b"post-stage-corruption"));
+  blocks.insert_raw(corrupt, Bytes::copy_from_slice(b"post-stage-corruption"));
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   sb.flush();
@@ -7208,10 +7216,11 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   let solicit = |e: &mut Endpoint<TwoLeafSm>,
                  sb: &mut StepSb,
-                 blocks: &mut MemBlockStore|
+                 blocks: &mut InMemoryBlockStore|
    -> crate::RequestSync {
     while e.poll_message().is_some() {}
-    e.sync_timeouts(later, sb, blocks);
+    e.sync_timeouts(later, blocks);
+    e.run_block_lane(later, sb, blocks);
     core::iter::from_fn(|| e.poll_message())
       .find_map(|out| match out.msg_ref() {
         Message::RequestSync(r) => Some(*r),
@@ -7243,7 +7252,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   let serve_envelope = |donor: &mut Endpoint<TwoLeafSm>,
                         dwal: &mut TestWal,
                         dsb: &mut StepSb,
-                        dblocks: &mut MemBlockStore,
+                        dblocks: &mut InMemoryBlockStore,
                         to: ReplicaId,
                         sol: &crate::RequestSync|
    -> Option<crate::SyncCheckpoint> {
@@ -7295,7 +7304,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   let repin = |e: &mut Endpoint<TwoLeafSm>,
                wal: &mut TestWal,
                sb: &mut StepSb,
-               blocks: &mut MemBlockStore,
+               blocks: &mut InMemoryBlockStore,
                donor: ReplicaId,
                env: crate::SyncCheckpoint|
    -> crate::BlockAddress {
@@ -7324,7 +7333,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   // holds (its own un-faulted leaf) via the verified read — and would return ABSENT for the leaf IT
   // faulted on (proven by `a_wants`/`b_wants` being exactly the complementary leaves).
   let serve_block = |donor: &mut Endpoint<TwoLeafSm>,
-                     dblocks: &MemBlockStore,
+                     dblocks: &InMemoryBlockStore,
                      to: ReplicaId,
                      addr: crate::BlockAddress|
    -> crate::BlockResponse {
@@ -7353,7 +7362,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   let complete = |e: &mut Endpoint<TwoLeafSm>,
                   wal: &mut TestWal,
                   sb: &mut StepSb,
-                  blocks: &mut MemBlockStore,
+                  blocks: &mut InMemoryBlockStore,
                   donor: ReplicaId,
                   resp: crate::BlockResponse| {
     while e.poll_message().is_some() {}
@@ -7399,7 +7408,7 @@ fn two_complementary_debtors_donate_each_others_blocks_and_both_reconstruct() {
   let resumes = |e: &mut Endpoint<TwoLeafSm>,
                  wal: &mut TestWal,
                  sb: &mut StepSb,
-                 blocks: &mut MemBlockStore,
+                 blocks: &mut InMemoryBlockStore,
                  peer: ReplicaId| {
     while e.poll_message().is_some() {}
     e.handle_message(
@@ -7777,7 +7786,8 @@ fn an_owed_sm_reconstruct_blocks_a_competing_lower_checkpoint_write() {
     !sb.has_inflight(),
     "no superblock write is in flight after the faulted restore"
   );
-  e.maybe_checkpoint(&mut sb, &mut blocks);
+  e.maybe_checkpoint();
+  e.run_block_lane(now, &mut sb, &mut blocks);
   assert!(
     !sb.has_inflight(),
     "maybe_checkpoint started NO new checkpoint write while the SM-reconstruct obligation is owed"
@@ -8031,14 +8041,15 @@ fn a_normal_owed_sm_reconstruct_solicits_an_equal_checkpoint_repair_and_fails_ov
   let (_donor_m, _dwal_m, dsb_m) = donor_primary_at_checkpoint(4);
   let (env_m, env_id_m) = donor_envelope(&dsb_m);
   assert_eq!(env_id_m, id_m, "the equal-M peer's checkpoint id matches M");
-  let mut peer_blocks = crate::block_store::MemBlockStore::new();
+  let mut peer_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut peer_blocks, 4); // the equal-M peer has M's CLEAN block
 
   // The ORIGINAL donor (replica 0) is silent: drive the solicit ARQ. The block-fetch re-armed
   // `sync_solicit` at `ZERO + SYNC_SOLICIT`, so firing it past that deadline re-broadcasts `RequestSync`.
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   while e.poll_message().is_some() {}
-  e.sync_timeouts(later, &mut sb, &mut blocks);
+  e.sync_timeouts(later, &mut blocks);
+  e.run_block_lane(later, &mut sb, &mut blocks);
   let solicited = core::iter::from_fn(|| e.poll_message())
     .find_map(|out| match out.msg_ref() {
       Message::RequestSync(r) => Some(*r),
@@ -8063,7 +8074,7 @@ fn a_normal_owed_sm_reconstruct_solicits_an_equal_checkpoint_repair_and_fails_ov
   // SyncCheckpoint. The requester `from` is replica 1 (a configured backup, distinct from the peer at 0).
   let serves = |recovery: bool| -> bool {
     let (mut peer, mut pwal, mut psb) = donor_primary_at_checkpoint(4);
-    let mut pblocks = crate::block_store::MemBlockStore::new();
+    let mut pblocks = crate::block_store::InMemoryBlockStore::new();
     seed_donor_blocks(&mut pblocks, 4);
     while peer.poll_message().is_some() {}
     peer.on_request_sync(
@@ -8209,11 +8220,11 @@ fn absent_block_response_only_re_solicits_for_pinned_donor_and_active_address() 
   let (_op, sm_root, sessions_root) =
     Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
 
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
 
   // Laggard store: SM DAG present, session DAG absent.
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   {
     let mut stack = std::vec![sm_root];
     let mut seen = std::collections::BTreeSet::new();
@@ -8227,7 +8238,7 @@ fn absent_block_response_only_re_solicits_for_pinned_donor_and_active_address() 
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
   assert!(blocks.has_block(sm_root), "laggard holds the SM DAG");
@@ -8383,7 +8394,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
 
   // The donor's full block store (BOTH DAGs) — the source the donor serves `RequestBlock`s from once the
   // fresh checkpoint re-pins the fetch.
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
   assert!(
     donor_blocks.has_block(sessions_root),
@@ -8392,7 +8403,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
 
   // Laggard store: SM DAG present (the SM frontier drains locally), session DAG absent (the active
   // outstanding address is `sessions_root`).
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   {
     let mut stack = std::vec![sm_root];
     let mut seen = std::collections::BTreeSet::new();
@@ -8406,7 +8417,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
   assert!(blocks.has_block(sm_root), "laggard holds the SM DAG");
@@ -8429,7 +8440,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
     new_sessions_root, sessions_root,
     "the op-8 checkpoint is a genuinely new root (front actually changes)"
   );
-  let mut donor8_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor8_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor8_blocks, 8);
   // Seed the laggard's op-8 SM DAG locally (mirroring the op-4 setup) so only the op-8 SESSION frontier needs
   // a pull — making the op-8 re-pin's outstanding front a single absent-able address.
@@ -8446,7 +8457,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
 
@@ -8572,7 +8583,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
   let dup_checkpoint = |e: &mut Endpoint<CountSm>,
                         wal: &mut TestWal,
                         sb: &mut TestSb,
-                        blocks: &mut crate::block_store::MemBlockStore,
+                        blocks: &mut crate::block_store::InMemoryBlockStore,
                         now: Instant| {
     e.handle_message(
       now,
@@ -8765,7 +8776,7 @@ fn the_active_donor_absent_keeps_the_fetch_live_and_re_solicits_each_round_trip(
     let block = donor8_blocks
       .read_block(addr)
       .expect("the op-8 donor serves every requested session block");
-    blocks.write_block(addr, block.clone());
+    blocks.put(block.clone());
     e.handle_message(
       now,
       &mut wal,
@@ -8811,12 +8822,12 @@ fn the_active_donor_absent_keeps_a_crossing_fetch_live_and_does_not_downgrade_it
   let (_op, sm_root, sessions_root) =
     Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
 
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
 
   // Laggard store: SM DAG present (drains locally), session DAG absent (the active outstanding address is
   // `sessions_root`).
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   {
     let mut stack = std::vec![sm_root];
     let mut seen = std::collections::BTreeSet::new();
@@ -8830,7 +8841,7 @@ fn the_active_donor_absent_keeps_a_crossing_fetch_live_and_does_not_downgrade_it
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
   assert!(blocks.has_block(sm_root), "laggard holds the SM DAG");
@@ -9044,27 +9055,29 @@ fn an_sm_reconstruct_re_pin_replaces_the_fetch_so_a_later_lost_block_is_arq_retr
   // Helper: deliver a fresh `SyncCheckpoint` at M from the pinned donor (slot 0). For an owed laggard this
   // routes to `refetch_sm_reconstruct` → `rearm_sm_reconstruct_retry`, which re-arms the fetch (M's leaf is
   // corrupt locally, so the frontier wants `sm_root_m`) and emits a `RequestBlock`.
-  let deliver_repin =
-    |e: &mut Endpoint<CountSm>, wal: &mut TestWal, sb: &mut StepSb, blocks: &mut MemBlockStore| {
-      e.handle_message(
-        now,
-        wal,
-        sb,
-        blocks,
-        primary_peer(),
-        Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-          View::new(),
-          OpNumber::with(4),
-          id_m,
-          crate::Epoch::new(0),
-          0,
-          ReplicaId::new(0),
-          nonce,
-          env_m.clone(),
-          Bytes::new(),
-        )),
-      );
-    };
+  let deliver_repin = |e: &mut Endpoint<CountSm>,
+                       wal: &mut TestWal,
+                       sb: &mut StepSb,
+                       blocks: &mut InMemoryBlockStore| {
+    e.handle_message(
+      now,
+      wal,
+      sb,
+      blocks,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id_m,
+        crate::Epoch::new(0),
+        0,
+        ReplicaId::new(0),
+        nonce,
+        env_m.clone(),
+        Bytes::new(),
+      )),
+    );
+  };
 
   // (1) FIRST re-pin: the obligation re-pulls M's DAG. `Fetching`, requesting `sm_root_m`.
   deliver_repin(&mut e, &mut wal, &mut sb, &mut blocks);
@@ -9142,12 +9155,12 @@ fn an_ordinary_fetch_does_not_shield_the_crossing_an_upgrade_makes_from_a_same_e
   let (_op, sm_root, sessions_root) =
     Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
 
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
 
   // Laggard store: SM DAG present (drains locally), session DAG absent (the active outstanding address is
   // `sessions_root`) — the same construction the one-shot tests use to pin a fetch then quarantine it.
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   {
     let mut stack = std::vec![sm_root];
     let mut seen = std::collections::BTreeSet::new();
@@ -9159,7 +9172,7 @@ fn an_ordinary_fetch_does_not_shield_the_crossing_an_upgrade_makes_from_a_same_e
       for child in CountSm::block_references(&block) {
         stack.push(child);
       }
-      blocks.write_block(addr, block);
+      blocks.put(block);
     }
   }
 
@@ -9292,7 +9305,7 @@ fn a_quarantined_member_reaches_no_authority_path() {
   // quarantined `from` and asserts nothing moves.
   let mut e = backup(); // a view-0 backup of {0,1,2}
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let q = quarantined();
 
@@ -9414,7 +9427,7 @@ fn a_quarantined_member_is_served_the_state_sync_checkpoint() {
   // stranded member learn the current configuration to rejoin or discover its own retirement.
   let now = Instant::ZERO;
   let (mut donor, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while donor.poll_message().is_some() {}
   donor.handle_message(
     now,
@@ -9456,7 +9469,7 @@ fn a_quarantined_higher_epoch_hint_arms_a_bounded_probe_that_disarms() {
   // rather than wedging forever on a possibly-corrupted hint no donor can answer.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // A quarantined higher-epoch Commit (epoch 5 > our 0) arms the crossing probe.
@@ -9545,7 +9558,7 @@ fn a_crossing_that_presents_but_never_delivers_a_block_disarms() {
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the crossing DAG must be fetched
+  let mut blocks = crate::block_store::InMemoryBlockStore::new(); // EMPTY — the crossing DAG must be fetched
   let now = Instant::ZERO;
 
   // Arm a crossing sync and deliver the crossing `SyncCheckpoint` → a block-fetch armed with
@@ -9593,13 +9606,13 @@ fn a_progressing_crossing_survives_the_probe_then_a_stall_disarms() {
   let (env, id) = donor_envelope(&dsb);
   let (_op, sm_root, _sessions_root) =
     Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
 
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the whole DAG must be fetched
+  let mut blocks = crate::block_store::InMemoryBlockStore::new(); // EMPTY — the whole DAG must be fetched
   let now = Instant::ZERO;
 
   e.arm_cross_epoch_sync_for_test(4);
@@ -9632,7 +9645,7 @@ fn a_progressing_crossing_survives_the_probe_then_a_stall_disarms() {
   let block = donor_blocks
     .read_block(sm_root)
     .expect("donor holds the SM root");
-  blocks.write_block(sm_root, block.clone());
+  blocks.put(block.clone());
   e.handle_message(
     t1,
     &mut wal,
@@ -9694,13 +9707,13 @@ fn non_crossing_block_progress_does_not_refresh_a_stalled_crossing_probe() {
   let (env, id) = donor_envelope(&dsb);
   let (_op, sm_root, _sessions_root) =
     Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
 
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the DAG must be fetched
+  let mut blocks = crate::block_store::InMemoryBlockStore::new(); // EMPTY — the DAG must be fetched
   let now = Instant::ZERO;
 
   // Arm a crossing sync, then deliver a NON-crossing reply (same config, empty membership) → a live fetch
@@ -9747,7 +9760,7 @@ fn non_crossing_block_progress_does_not_refresh_a_stalled_crossing_probe() {
   let block = donor_blocks
     .read_block(req)
     .expect("donor holds the requested block");
-  blocks.write_block(req, block.clone());
+  blocks.put(block.clone());
   e.handle_message(
     now,
     &mut wal,
@@ -9807,13 +9820,13 @@ fn a_crossing_fetch_survives_interleaved_non_crossing_replies_and_completes() {
   // crossing fetch — the install never happens, `state_syncs_applied` stays 0, and the epoch stays 0.
   let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
   let (env, id) = donor_envelope(&dsb);
-  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  let mut donor_blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut donor_blocks, 4);
 
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let non_crossing = |nonce: u64| {
@@ -9881,7 +9894,7 @@ fn a_crossing_fetch_survives_interleaved_non_crossing_replies_and_completes() {
     let block = donor_blocks
       .read_block(addr)
       .expect("donor holds the requested block");
-    blocks.write_block(addr, block.clone());
+    blocks.put(block.clone());
     e.handle_message(
       now,
       &mut wal,
@@ -9925,7 +9938,7 @@ fn a_non_crossing_reply_does_not_shield_the_quarantine_probe() {
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the DAG must be fetched
+  let mut blocks = crate::block_store::InMemoryBlockStore::new(); // EMPTY — the DAG must be fetched
   let now = Instant::ZERO;
 
   // Arm a crossing sync and deliver a SAME-CONFIG `SyncCheckpoint` (config_id == ours, empty membership)
@@ -9988,7 +10001,7 @@ fn a_quarantine_armed_crossing_in_recovery_disarms_and_escalates() {
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Enter the Recovering cross-epoch peer-fetch with a quarantined donor recorded — what a `Peer::Member`
@@ -10045,7 +10058,7 @@ fn a_non_crossing_reply_in_recovery_does_not_shield_the_probe() {
   let mut e = sync_backup();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the DAG must be fetched
+  let mut blocks = crate::block_store::InMemoryBlockStore::new(); // EMPTY — the DAG must be fetched
   let now = Instant::ZERO;
 
   e.seed_quarantined_donor_for_test(now, quarantined());
@@ -10112,7 +10125,7 @@ fn sustained_higher_epoch_heartbeats_do_not_postpone_probe_expiry() {
   // the deadline is pushed forward by every 50ms heartbeat — it never fires, `ever_disarmed` stays false.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let heartbeat = Message::Commit(Commit::new(
     View::new(),
     OpNumber::with(4),
@@ -10180,7 +10193,7 @@ fn quarantined_serves_are_capped_independently_of_the_transport() {
   // NEUTER CHECK: drop the QUARANTINE_SERVE_LIMIT gate and the member-serve count grows to the number of
   // distinct ids that solicited (here 32) — the unbounded growth R4-F2 flags.
   let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   while e.poll_message().is_some() {} // drain warm-up
 

@@ -25,7 +25,7 @@ fn backup_transitions_on_svc_quorum_and_sends_dvc() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(now, &mut wal, &mut sb, &mut blocks); // status=Normal backup → bootstraps primary_idle; not yet due
   let later = now + core::time::Duration::from_millis(300);
@@ -71,7 +71,7 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // drive it into ViewChange(view 1) first (reuse the SVC path):
   e.handle_timeout(
@@ -165,7 +165,7 @@ fn a_poisoned_commit_max_neither_halts_view_formation_nor_over_vouches_the_start
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // POISON: a corrupt learned `commit` drove commit_max far above the head (op is still 0).
   e.commit_max = OpNumber::with(u64::MAX / 2);
@@ -272,7 +272,7 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Drive replica 1 into ViewChange(view 1) as the prospective primary (reuse the SVC path).
   e.handle_timeout(
@@ -430,7 +430,7 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -632,7 +632,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     u64::MAX,
   );
   let (mut wal1, mut sb1) = (TestWal::default(), TestSb::default());
-  let mut blocks1 = crate::block_store::MemBlockStore::new();
+  let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   r1.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal1,
@@ -732,7 +732,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   r2.handle_message(
     now,
     &mut wal,
@@ -882,7 +882,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -1017,7 +1017,7 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -1128,7 +1128,7 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let sv = StartView::new(
     View::with(1),
@@ -1227,7 +1227,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
   // `try_commit` (strictly in order) wedged at op 2 — no fresh client op above it could ever commit, and
   // no peer can supply the unique uncommitted op. The fix truncates the head at the first gap above
   // commit* BEFORE seeding, dropping the uncommitted suffix `{2, 3}`.
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let mut wal = ScriptedWal::with_entries(3);
   wal.remove_entry_for_test(OpNumber::with(2)); // op 2 header-less: a genuine interior gap
@@ -1412,7 +1412,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
   // and a peer-supplied (committed-vouching) Prepare fills it and resumes the held commit. This guards
   // the truncation from over-reaching into a committed op (which would silently drop it).
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let now = Instant::ZERO;
   r.handle_message(
@@ -1517,7 +1517,7 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -1818,7 +1818,7 @@ fn stalled_view_change_escalates_to_the_next_view() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let t = Instant::ZERO + core::time::Duration::from_millis(300);
   e.handle_timeout(t, &mut wal, &mut sb, &mut blocks); // primary_idle → propose view 1 (own bit, 1/3)
   e.handle_message(
@@ -1895,7 +1895,7 @@ fn backup_adopts_start_view() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let sv = StartView::new(
     View::with(1),
@@ -1981,7 +1981,7 @@ fn backup_adopts_start_view() {
 #[test]
 fn no_old_generation_state_survives_a_view_transition() {
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // (1) enter_view_change (the self-driven entry, reached here via the recovery wrapper that shares
@@ -2061,7 +2061,7 @@ fn higher_view_prepare_triggers_get_view_catch_up() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -2147,7 +2147,7 @@ fn normal_primary_answers_get_view_with_start_view() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert_eq!(e.header_only_carriers_emitted(), 0, "no carrier built yet");
   e.handle_message(
     Instant::ZERO,
@@ -2191,7 +2191,7 @@ fn lone_high_svc_is_ignored_not_driven() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_message(
     Instant::ZERO,
     &mut wal,
@@ -2226,7 +2226,7 @@ fn on_start_view_rewind_below_commit_panics() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_message(
     Instant::ZERO,
     &mut wal,
@@ -2297,7 +2297,7 @@ fn adopting_a_canonical_head_truncates_the_wal_above_it() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Seed the WAL with a stale uncommitted tail op 3 (as if appended in an earlier generation).
   let stale = Header::new(
@@ -2387,7 +2387,7 @@ fn adoption_does_not_append_ops_that_would_wrap_the_ring() {
   let mut wal = ScriptedWal::with_entries(6);
   wal.capacity = 8; // a BOUNDED ring — window top = checkpoint 0 + 8
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
     .map(|op| {
@@ -2475,7 +2475,7 @@ fn a_checkpoint_advance_re_drives_a_backups_over_window_adoption_appends() {
   let mut wal = ScriptedWal::with_entries(6);
   wal.capacity = 8;
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
     .map(|op| {
@@ -2582,7 +2582,7 @@ fn a_checkpoint_completing_before_the_adopted_view_root_does_not_leak_early_acks
   let mut wal = ScriptedWal::with_entries(0);
   wal.capacity = 8;
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   for op in 1..=6u64 {
     e.handle_message(
@@ -2737,7 +2737,7 @@ fn the_new_primary_re_drives_skipped_adoptions_when_its_view_root_lands() {
   let mut wal = ScriptedWal::with_entries(0);
   wal.capacity = 8;
   let mut sb = StepSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   for op in 1..=8u64 {
     e.handle_message(
@@ -2920,7 +2920,7 @@ fn an_interior_reappend_does_not_wrap_the_ring() {
   let mut wal = ScriptedWal::with_entries(6);
   wal.capacity = 8;
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
     .filter(|op| *op != 10)
@@ -3011,7 +3011,7 @@ fn a_checkpoint_advance_re_drives_a_new_primarys_over_window_adopt_votes() {
   let mut wal = ScriptedWal::with_entries(0);
   wal.capacity = 8;
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -3151,7 +3151,7 @@ fn dvc_is_deferred_until_view_is_durable() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
   e.handle_message(
@@ -3219,7 +3219,7 @@ fn dvc_retransmit_waits_for_the_durable_view_write() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut now = Instant::ZERO;
   // Drive replica 0 into ViewChange(view 1) as a DRIVER (primary(1) = replica 1, a peer): its own
   // idle-SVC + replica 2's SVC meet the SVC quorum (2), so `enter_view_change` fires.
@@ -3310,7 +3310,7 @@ fn superseded_view_write_is_ignored() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let t = Instant::ZERO + core::time::Duration::from_millis(300);
   e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
   e.handle_message(
@@ -3398,7 +3398,7 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let sv = StartView::new(
     View::with(1),
@@ -3477,7 +3477,7 @@ fn new_prepare_not_acked_while_view_write_pending() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Adopt a StartView for view 1 with op 1 fully committed (no held re-acks to muddy the assertion).
   let sv = StartView::new(
@@ -3572,7 +3572,7 @@ fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
   // window. PASS-AFTER: silent in the window; the deferred `StartView` fires once the view is
   // durable, and a later `GetView` is then answered.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A peer solicits the canonical head for view 1 — delivered WHILE the view write is pending.
   e.handle_message(
@@ -3651,7 +3651,7 @@ fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
   // the not-yet-durable view. FAIL-BEFORE: a `RecoveryResponse` appears in the window. PASS-AFTER:
   // silent in the window; once the view is durable a Recovery is answered normally.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -3714,7 +3714,7 @@ fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending(
   // yet durable. FAIL-BEFORE: a `Commit`/`Prepare` appears when `primary_timeouts` fires in the
   // window. PASS-AFTER: silent in the window; heartbeats resume once the view is durable.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Tick the primary TWICE while the view write is still pending: the first tick would BOOTSTRAP the
   // commit/prepare timers (the deferred `start_view_participate` has not armed them yet), the second
   // — well past those deadlines — would FIRE the heartbeat/retransmit if the gate were absent. Both
@@ -3771,7 +3771,7 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
   // `Prepare` appears in the window. PASS-AFTER: silent in the window; once the view is durable the same
   // `RequestPrepare` IS answered with a `Prepare` carrying the now-durable view.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(
     e.commit(),
@@ -3863,7 +3863,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   // PASS-AFTER: silent in the window; once the view is durable the same `RequestSync` IS answered with
   // a `SyncCheckpoint` carrying the now-durable view.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Give this primed primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op it
   // holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
@@ -4036,7 +4036,7 @@ fn view_change_abandons_an_outstanding_sync() {
   // behind.
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Trigger a sync (in view 0).
   e.handle_message(
@@ -4424,7 +4424,7 @@ fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_sync
     );
   }
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The floored canonical StartView from view 1's primary: floor 600, band 601..=605 (head 605,
   // commit 605). The adopter's whole world (1..=6) is below the floor.
@@ -4578,7 +4578,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
     );
   }
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The canonical StartView for view 1 from primary 1: an OFFSET log starting at op 9 (head 10),
   // commit 8. It does NOT carry ops 5..=8.
@@ -4717,7 +4717,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   // op 7,8 are also in the (commit_min .. commit] band and OMITTED below; they ride the same repair
   // path. Give the adopter NO held copy for them, so they are pure holes filled only from the peer.
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The canonical offset StartView for view 1 (head 10, commit 8) starts at op 9 — it OMITS 5,6,7,8.
   let sv = StartView::new(
@@ -4845,7 +4845,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -5073,7 +5073,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -5295,7 +5295,7 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
@@ -5420,7 +5420,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -5595,7 +5595,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -5744,7 +5744,7 @@ fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -5867,7 +5867,7 @@ fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_on_the_nack_quoru
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -6016,7 +6016,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -6238,7 +6238,7 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -6461,7 +6461,7 @@ fn a_below_head_committed_hole_does_not_nack() {
   // toward truncating a COMMITTED op. The `op > self.op` emit gate makes only an ABOVE-head op nackable.
   let mut e = backup(); // replica 1 of 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Head at op 3, commit 1, a below-head repair hole at op 2 (log.get(2) == None, 2 < head 3).
   e.force_state_for_test(0, 3, 1, 0, &[2]);
@@ -7057,7 +7057,7 @@ fn new_primary_session_backfill_over_a_floored_log_matches_the_dense_scan() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Into ViewChange for view 1 (replica 1 is its primary): the idle timeout proposes, r0's SVC
   // completes the quorum.
@@ -7182,7 +7182,7 @@ fn implausible_view_claims_are_ignored_and_the_replica_stays_serviceable() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let absurd = View::with(u64::MAX);
   e.handle_message(
@@ -7275,7 +7275,7 @@ fn view_jump_clamp_accepts_the_bound_and_rejects_just_above_it() {
   // view 0; primary(2^32) = replica 1 and primary(2^32 + 1) = replica 2 (2^32 ≡ 1 mod 3), so both
   // claims pass the Commit sender binding and the difference below is the clamp alone.
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // One past the bound: rejected (stays Normal at view 0).
@@ -7352,7 +7352,7 @@ fn svc_and_get_view_at_view_max_neither_panic_nor_wrap() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.view = View::with(u64::MAX);
   e.durable_view = View::with(u64::MAX);
   e.log_view = View::with(u64::MAX);
@@ -7465,7 +7465,7 @@ fn adoption_reappend_defers_until_the_abandoned_same_slot_write_quiesces() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // (1) A view-0 Prepare for op 1 with body A (client 7 / request 1 / body [1]) → the backup STAGES A's
@@ -7598,7 +7598,7 @@ fn synchronous_truncate_cancellation_opens_no_deferral_window() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (ReorderWal::new().cancelling(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Op 1 = A staged in flight (completion held).
@@ -7722,7 +7722,7 @@ fn a_catch_up_escalation_casts_no_vote_for_an_undurable_view() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A Commit stamped view 5 from view 5's primary (replica 2 = 5 mod 3) — the higher-view rule.
   e.handle_message(
@@ -7796,7 +7796,7 @@ fn a_stranded_catch_up_reverts_and_readopts_the_real_view() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A Commit whose view field is corrupted to v + 2^20 (its claimed primary is replica 1 =
   // 1048576 mod 3, so sender-binding passes — the scalar itself is the corruption).
@@ -7880,7 +7880,7 @@ fn a_learner_catch_up_never_arms_the_escalation_window() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -7941,7 +7941,7 @@ fn the_dvc_retransmit_waits_for_the_durable_view_witness() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Two peer SVCs for view 1 form the quorum; entering the view SUBMITS the durable-view write,
   // which the stepped superblock HOLDS in flight.
@@ -8015,7 +8015,7 @@ fn a_reverted_primary_steps_down_and_a_retried_request_applies_once() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The primary of view 0 accepts request R (rn 1) at op 1; no backup acks — uncommitted.
   e.handle_message(
@@ -8159,7 +8159,7 @@ fn a_reverted_probe_joins_a_survivors_far_proposal() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -8245,12 +8245,12 @@ fn pump_two_live_voters(
   a: &mut Endpoint<NoopSm, RestartOnly>,
   wal_a: &mut TestWal,
   sb_a: &mut TestSb,
-  blocks_a: &mut crate::block_store::MemBlockStore,
+  blocks_a: &mut crate::block_store::InMemoryBlockStore,
   a_slot: u16,
   b: &mut Endpoint<NoopSm, RestartOnly>,
   wal_b: &mut TestWal,
   sb_b: &mut TestSb,
-  blocks_b: &mut crate::block_store::MemBlockStore,
+  blocks_b: &mut crate::block_store::InMemoryBlockStore,
   b_slot: u16,
 ) {
   for _ in 0..16 {
@@ -8362,8 +8362,8 @@ fn forked_normal_views_converge_and_resume_committing() {
   );
   let (mut wal0, mut sb0) = (TestWal::default(), TestSb::default());
   let (mut wal1, mut sb1) = (TestWal::default(), TestSb::default());
-  let mut blocks0 = crate::block_store::MemBlockStore::new();
-  let mut blocks1 = crate::block_store::MemBlockStore::new();
+  let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
+  let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Voter 0 adopted view 2 from its primary (replica 2 — now dead); voter 1 adopted view 3 from
   // its primary (replica 0 — which itself never reached view 3, the fork).

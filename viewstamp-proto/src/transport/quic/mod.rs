@@ -89,7 +89,7 @@ fn sni_for(peer: Peer, cluster: u128) -> String {
 /// The coordinator owns the viewstamp↔std clock adapter — its surface speaks the viewstamp
 /// [`Instant`] (matching the consensus endpoint), converting to [`std::time::Instant`] at every
 /// quinn boundary.
-pub struct QuicCoordinator<S, I> {
+pub struct QuicCoordinator<S: StateMachine, I> {
   endpoint: Endpoint<S, SingleChange>,
   bridge: Bridge,
   /// The identity source: extracts the candidate peer the coordinator's binding policy then checks.
@@ -128,7 +128,7 @@ pub struct QuicCoordinator<S, I> {
   consensus_frames_delivered: u64,
 }
 
-impl<S, I> core::fmt::Debug for QuicCoordinator<S, I> {
+impl<S: StateMachine, I> core::fmt::Debug for QuicCoordinator<S, I> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("QuicCoordinator").finish_non_exhaustive()
   }

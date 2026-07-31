@@ -120,7 +120,7 @@ pub(crate) type AcceptorFactory<R> = Rc<dyn Fn() -> TransportConn<R>>;
 /// `JoinHandle` by `run()`) feeds it accepted sockets, and each peer connection is one owned `Conn`
 /// unit whose live task(s) (the connect task, then the two independent bridge halves) the driver
 /// holds, so dropping the `Conn` is the connection's single complete teardown.
-pub struct CompioStreamDriver<S, R, W, B, L> {
+pub struct CompioStreamDriver<S: StateMachine, R, W, B, L> {
   coord: StreamCoordinator<S, R>,
   wal: W,
   sb: B,
@@ -1438,7 +1438,7 @@ where
 #[cfg(test)]
 mod tests;
 
-impl<S, R, W, B, L> CompioStreamDriver<S, R, W, B, L> {
+impl<S: StateMachine, R, W, B, L> CompioStreamDriver<S, R, W, B, L> {
   /// The number of connection closes attributed to `cause` so far — the coordinator's internal
   /// closes plus the driver's own (auth-deadline, out-queue overflow, accept-cap). Test/diagnostic
   /// observability, not a stable embedder API (hence `#[doc(hidden)]`). Reads only the local

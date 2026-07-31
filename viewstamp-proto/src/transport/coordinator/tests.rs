@@ -38,7 +38,7 @@ fn register_and_validate_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::MemBlockStore,
+  blocks: &mut crate::block_store::InMemoryBlockStore,
   member_idx: u128,
 ) -> ConnId {
   let member = MemberId::new(member_idx);
@@ -55,7 +55,7 @@ fn inbound_request_produces_outbound_to_a_backup() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // replica 0 = primary of view 0
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -109,7 +109,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -208,7 +208,7 @@ fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -269,7 +269,7 @@ fn wrong_cluster_conn_is_reaped() {
   let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -316,7 +316,7 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -373,7 +373,7 @@ fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -416,7 +416,7 @@ fn a_redial_is_registered_but_not_authoritative_until_validated() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -464,7 +464,7 @@ fn route_skips_a_handshaking_conn() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -516,7 +516,7 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -951,7 +951,7 @@ fn a_settling_client_handshake_is_validated_through_try_note_established_member(
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -1006,7 +1006,7 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1044,14 +1044,14 @@ fn commit_and_install_a_voter_departure(
   StreamCoordinator<CountSm, MockRecords>,
   TestWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
   ConnId,
   ConnId,
 ) {
   let cfg = Config::try_new(0xABCD, MemberId::new(local)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1078,7 +1078,7 @@ fn drive_voter_departure_to_installed(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::MemBlockStore,
+  blocks: &mut crate::block_store::InMemoryBlockStore,
   local: u128,
   who: u128,
 ) {
@@ -1236,7 +1236,7 @@ fn register_and_quarantine_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::MemBlockStore,
+  blocks: &mut crate::block_store::InMemoryBlockStore,
   out_idx: u128,
 ) -> ConnId {
   let member = MemberId::new(out_idx);
@@ -1314,7 +1314,7 @@ fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1366,7 +1366,7 @@ fn the_quarantine_population_is_capped_evicting_the_oldest_for_a_newcomer() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1431,7 +1431,7 @@ fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,

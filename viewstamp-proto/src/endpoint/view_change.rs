@@ -397,19 +397,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // never committed — a silent permanent drop). APPLIED rows (and restored snapshot rows) persist:
     // they are the consensus table.
     self.clients.retain(|_, s| s.last_op.get() > 0);
-    // KEEP an in-flight ORDINARY checkpoint across the transition: once its durable root write is staged
-    // it advances the durable checkpoint pointer, and `submit_durable_view` COPY-FORWARDS that checkpoint
-    // into the view-change root (persisting its target + id verbatim), so the view write CARRIES it
-    // forward rather than rewinding the durable checkpoint to the stale pre-checkpoint pointer. The two
-    // writes then complete independently (distinct `OpId`s) in FIFO order, both naming the same checkpoint.
-    // A state-sync re-persist is dropped here (its `pending_install` + `sync` are cleared above, so a kept
-    // one would be orphaned + incoherent); it re-solicits, its committed prefix recovered from the
-    // canonical log.
-    if self
-      .pending_checkpoint
-      .as_ref()
-      .is_some_and(|pc| matches!(pc.kind, CheckpointKind::SyncRepersist))
-    {
+    // KEEP an in-flight ORDINARY checkpoint whose SUPERBLOCK half has begun: once its durable root
+    // write is staged it advances the durable checkpoint pointer, and `submit_durable_view`
+    // COPY-FORWARDS that checkpoint into the view-change root (persisting its target + id verbatim),
+    // so the view write CARRIES it forward rather than rewinding the durable checkpoint to the stale
+    // pre-checkpoint pointer. The two writes then complete independently (distinct `OpId`s) in FIFO
+    // order, both naming the same checkpoint.
+    //
+    // DROP one still at `FlushingBlocks` — its block job is being executed off the pump, nothing of it is
+    // durable, and no superblock write exists to carry forward. Dropping it here is what makes a
+    // materialize that crosses a view transition unable to publish: its completion finds no matching
+    // token, counts as superseded, and the blocks it wrote are unreferenced garbage the next sweep
+    // frees. The cadence re-forces the checkpoint once Normal resumes, exactly as it does for a
+    // checkpoint the cadence never started. (This is also why the abandoned DAG costs nothing: block
+    // addresses are content-derived, so a re-forced checkpoint over the same applied state re-writes
+    // byte-identical blocks.)
+    //
+    // A state-sync re-persist is dropped at EVERY step (its `pending_install` + `sync` are cleared
+    // above, so a kept one would be orphaned + incoherent); it re-solicits, its committed prefix
+    // recovered from the canonical log.
+    if self.pending_checkpoint.as_ref().is_some_and(|pc| {
+      matches!(pc.kind, CheckpointKind::SyncRepersist)
+        || matches!(pc.step, CheckpointStep::FlushingBlocks(_))
+    }) {
       self.pending_checkpoint = None;
     }
     // Release the PROPOSAL latch: an uncommitted `Reconfigure` op this primary proposed belongs to the

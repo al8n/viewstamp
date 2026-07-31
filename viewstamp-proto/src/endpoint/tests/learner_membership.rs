@@ -188,7 +188,7 @@ fn on_request_prepare_serves_a_learner_requester() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold ops 1 + 2 (apply 1 via the piggybacked commit), discard the resulting acks.
   e.handle_message(
@@ -253,7 +253,7 @@ fn on_recovery_serves_a_learner_requester() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.is_primary(), "voter 0 is the primary of view 0");
   let learner = ReplicaId::new(LEARNER);
@@ -349,7 +349,7 @@ fn a_learner_never_acks_a_prepare_or_proposes_a_view_change_on_idle() {
   // PRIMARY_IDLE and fire timers: nothing is acked, nothing is proposed, and it stays Normal.
   let mut e = learner_self();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -407,7 +407,7 @@ fn a_quorum_of_voter_svcs_does_not_activate_a_learner() {
   // whose `1 << id` would overflow for a high learner id — is never reached and no panic occurs.
   let mut e = learner_self();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // quorum_view_change for 3 voters is 2: deliver StartViewChange(view 1) from voters 0 and 1.
   for v in [0u16, 1] {
@@ -455,7 +455,7 @@ fn a_learner_catch_up_does_not_escalate_to_active_view_change() {
   // GetView (never flips catching_up to false, never emits SVC/DVC) until it adopts a StartView.
   let mut e = learner_self();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A higher-view Commit from view 1's primary (`primary(1) == Replica(1)`) triggers catch_up_to_view(1).
   e.handle_message(
@@ -526,7 +526,7 @@ fn a_learner_recovered_mid_view_change_catches_up_and_never_emits_a_dvc() {
   let mut wal = wal_in_view(2, 0); // ops 1..=2 stamped view 0 (the not-yet-installed log)
   let mut sb = sb_with_view(1, 0); // durable root: view 1, log_view 0 → log_view < view
   let now = Instant::ZERO;
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // self = learner id 3 (slot 3 of a 3-voter set with 2 learners) — a NON-VOTER.
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
@@ -584,7 +584,7 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -647,7 +647,7 @@ fn a_learner_emits_learner_status_carrying_its_contiguous_applied_frontier_not_c
     state: durable_root,
     ..Default::default()
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut wal = TestWal {
     head: 6,
     ..Default::default()
@@ -711,7 +711,7 @@ fn a_voter_never_emits_learner_status() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
   let later = now + core::time::Duration::from_millis(10_000);
@@ -788,7 +788,7 @@ fn a_learner_answers_a_proof_challenge_with_its_fresh_contiguous_applied_frontie
   // frontier.
   let mut e = learner_self(); // self = learner slot 3, 3 voters + 2 learners, voter 0 = primary
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Model a learner whose head/commit_max cover op 5 but whose contiguous applied frontier is 2 (a
   // repair hole at op 3 holds apply) — `commit()` returns the hole-free frontier (2), not the head.
   e.force_state_for_test(0, 5, 2, 0, &[3, 5]);
@@ -853,7 +853,7 @@ fn a_learner_drops_a_cross_epoch_proof_challenge() {
   // under that stale config could consume.
   let mut e = learner_self();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.force_state_for_test(0, 5, 5, 0, &[]);
 
   // A foreign-epoch challenge (epoch 1 ≠ this config's epoch 0).

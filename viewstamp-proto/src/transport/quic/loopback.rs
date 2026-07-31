@@ -47,7 +47,7 @@ pub(super) type Replica = (
   QuicCoordinator<CountSm, ProvidedIdentity>,
   TestWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
 );
 
 /// The identity scheme a cluster-private mTLS link establishes its peer with, on top of the shared
@@ -103,7 +103,7 @@ pub(super) fn replica(
     coord,
     TestWal::default(),
     TestSb::default(),
-    crate::block_store::MemBlockStore::new(),
+    crate::block_store::InMemoryBlockStore::new(),
   )
 }
 
@@ -317,7 +317,7 @@ fn converges_with_foreign_ca() -> bool {
     ),
     TestWal::default(),
     TestSb::default(),
-    crate::block_store::MemBlockStore::new(),
+    crate::block_store::InMemoryBlockStore::new(),
   );
 
   // r1 (the foreign replica): cert from CA-B, but trusts only CA-A.
@@ -339,7 +339,7 @@ fn converges_with_foreign_ca() -> bool {
     ),
     TestWal::default(),
     TestSb::default(),
-    crate::block_store::MemBlockStore::new(),
+    crate::block_store::InMemoryBlockStore::new(),
   );
 
   dial_and_seed(&mut r0, addr0, &mut r1, addr1, Bytes::from_static(b"x"));
@@ -598,7 +598,7 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
     QuicCoordinator<CountSm, WrongClusterSource>,
     TestWal,
     TestSb,
-    crate::block_store::MemBlockStore,
+    crate::block_store::InMemoryBlockStore,
   ) {
     let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
     let endpoint = Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -618,7 +618,7 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
       coord,
       TestWal::default(),
       TestSb::default(),
-      crate::block_store::MemBlockStore::new(),
+      crate::block_store::InMemoryBlockStore::new(),
     )
   };
   let mut r0 = build(0, [0u8; 32]);
@@ -733,7 +733,7 @@ fn replica_in_cluster_of(
     coord,
     TestWal::default(),
     TestSb::default(),
-    crate::block_store::MemBlockStore::new(),
+    crate::block_store::InMemoryBlockStore::new(),
   )
 }
 

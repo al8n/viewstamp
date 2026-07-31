@@ -87,7 +87,7 @@ pub(crate) type AcceptorFactory<T> = Arc<dyn Fn() -> TransportConn<T> + Send + S
 /// listener clone exists. Each peer connection is one owned `Conn` unit whose live task(s) (the
 /// dial task, then the two independent bridge halves) the driver holds as abort-on-drop handles,
 /// so dropping the `Conn` is the connection's single complete teardown on every runtime.
-pub struct ReactorStreamDriver<R: Runtime, S, T, W, B, L> {
+pub struct ReactorStreamDriver<R: Runtime, S: StateMachine, T, W, B, L> {
   coord: StreamCoordinator<S, T>,
   wal: W,
   sb: B,
@@ -1428,7 +1428,7 @@ where
 #[cfg(test)]
 mod tests;
 
-impl<R: Runtime, S, T, W, B, L> ReactorStreamDriver<R, S, T, W, B, L> {
+impl<R: Runtime, S: StateMachine, T, W, B, L> ReactorStreamDriver<R, S, T, W, B, L> {
   /// The number of connection closes attributed to `cause` so far — the coordinator's internal
   /// closes plus the driver's own (auth-deadline, out-queue overflow, dead-bridge send failure,
   /// accept-cap). Test/diagnostic observability, not a stable embedder API (hence

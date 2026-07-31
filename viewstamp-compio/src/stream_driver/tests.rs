@@ -31,8 +31,13 @@ impl BlockStore for MemBlocks {
   fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
     self.0.get(&addr).cloned()
   }
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = viewstamp_proto::block_address(&block);
     self.0.insert(addr, block);
+    addr
+  }
+  fn flush(&mut self) -> Result<(), viewstamp_proto::BlockStoreError> {
+    Ok(())
   }
   fn has_block(&self, addr: BlockAddress) -> bool {
     self.0.contains_key(&addr)
@@ -2039,8 +2044,10 @@ impl BlockStore for FaultingBlocks {
   fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
     self.blocks.get(&addr).cloned()
   }
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = viewstamp_proto::block_address(&block);
     self.blocks.insert(addr, block);
+    addr
   }
   fn has_block(&self, addr: BlockAddress) -> bool {
     self.blocks.contains_key(&addr)

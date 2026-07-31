@@ -8,7 +8,7 @@ fn on_request_prepare_holder_replies_with_the_prepare() {
   // carrying that op's body — the peer-fault-repair *server* side.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold ops 1 + 2 (apply 1 via the piggybacked commit).
   e.handle_message(
@@ -142,7 +142,7 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
   let mut b = backup();
   b.force_state_for_test(0, 5, 5, 5, &[]); // op/commit/checkpoint all 5 (a self-consistent snapshot)
   let (mut wal2, mut sb2) = (TestWal::default(), TestSb::default());
-  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   b.handle_message(
     now,
     &mut wal2,
@@ -171,7 +171,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
   //     op's body from a peer that holds it.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold ops 1 + 2 but COMMIT only op 1 (prepare(2,1) piggybacks commit=1 → commit_min == 1, op == 2).
   e.handle_message(
@@ -295,7 +295,7 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
   // (checksum + placement), fills the cache, and resumes applying the committed prefix in order —
   // the committed op is restored, NOT lost.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the solicitation
   let now = Instant::ZERO;
   // Learn commit up to 3 → applies op 1, holds at the op-2 hole.
@@ -359,7 +359,7 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
   // reply): a Prepare for an op that is NOT our hole must NOT fill it. The hole stays open, the
   // commit stays HELD, and no wrong op's body is applied to the held slot.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let now = Instant::ZERO;
   r.handle_message(
@@ -423,7 +423,7 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
   // the quorum that committed the real body. The hole stays open + the commit stays HELD until a
   // Prepare that vouches commit >= op arrives.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the solicitation
   let now = Instant::ZERO;
   // Learn commit up to 3 → applies op 1, holds at the op-2 hole.
@@ -513,7 +513,7 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
   // before the hole is filled (strict in-order apply). Then a single repair fills it and the whole
   // suffix applies at once.
   let (mut r, mut wal, mut sb) = recovering_with_hole(4, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   while r.poll_event().is_some() {}
   let now = Instant::ZERO;
@@ -617,7 +617,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   };
   let mut wal = ScriptedWal::with_entries(3);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot read permanently faults → Repairing
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(

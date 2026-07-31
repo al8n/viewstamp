@@ -1,3 +1,4 @@
+use super::materialize_sm;
 use super::*;
 use crate::block_store::MemBlockStore;
 
@@ -21,10 +22,10 @@ fn snapshot_round_trips() {
   sm.apply(OpNumber::with(1), b"a");
   sm.apply(OpNumber::with(2), b"bb");
   let mut store = MemBlockStore::new();
-  let root = sm.checkpoint(&mut store);
+  let root = materialize_sm(&sm, &mut store);
   let mut restored = LogSm::default();
   restored
-    .restore(root, &store)
+    .restore(root, &viewstamp_proto::VerifiedView::new(&store))
     .expect("the whole DAG is present");
   assert_eq!(restored.applied(), sm.applied());
 }
@@ -73,10 +74,10 @@ fn batch_sm_snapshot_round_trips_the_unit_history() {
   sm.apply(OpNumber::with(1), &batch_body(&[b"a", b"bb"]));
   sm.apply(OpNumber::with(2), &batch_body(&[b"c"]));
   let mut store = MemBlockStore::new();
-  let root = sm.checkpoint(&mut store);
+  let root = materialize_sm(&sm, &mut store);
   let mut restored = BatchSm::default();
   restored
-    .restore(root, &store)
+    .restore(root, &viewstamp_proto::VerifiedView::new(&store))
     .expect("the whole DAG is present");
   assert_eq!(restored.applied(), sm.applied());
   assert_eq!(
@@ -135,14 +136,14 @@ fn incremental_checkpoint_rewrites_only_changed_blocks() {
   );
 
   let mut store = MemBlockStore::new();
-  let root1 = sm.checkpoint(&mut store);
+  let root1 = materialize_sm(&sm, &mut store);
   let set1 = reachable::<LogSm>(root1, &store);
   // 5 leaves + 1 index root.
   assert_eq!(set1.len(), 6, "5 full leaves plus the index root");
 
   // One more op: a new partial leaf (1 entry) plus a new index root that names six leaves.
   sm.apply(OpNumber::with(21), b"body-21");
-  let root2 = sm.checkpoint(&mut store);
+  let root2 = materialize_sm(&sm, &mut store);
   let set2 = reachable::<LogSm>(root2, &store);
 
   assert_ne!(
@@ -176,7 +177,7 @@ fn incremental_checkpoint_rewrites_only_changed_blocks() {
   // Faithful reconstruction: a fresh SM rebuilt from root2 reproduces the applied history.
   let mut fresh = LogSm::default();
   fresh
-    .restore(root2, &store)
+    .restore(root2, &viewstamp_proto::VerifiedView::new(&store))
     .expect("the whole DAG is present");
   assert_eq!(fresh.applied(), sm.applied());
 }
@@ -190,10 +191,10 @@ fn dag_checkpoint_round_trips_partial_and_empty_logs() {
       sm.apply(OpNumber::with(op), format!("x{op}").as_bytes());
     }
     let mut store = MemBlockStore::new();
-    let root = sm.checkpoint(&mut store);
+    let root = materialize_sm(&sm, &mut store);
     let mut fresh = LogSm::default();
     fresh
-      .restore(root, &store)
+      .restore(root, &viewstamp_proto::VerifiedView::new(&store))
       .expect("all blocks present after checkpoint");
     assert_eq!(fresh.applied(), sm.applied(), "round-trip with {n} ops");
   }
@@ -206,10 +207,10 @@ fn dag_checkpoint_and_restore_carry_batch_units() {
     sm.apply(OpNumber::with(op), &batch_body(&[b"a", b"bb"]));
   }
   let mut store = MemBlockStore::new();
-  let root = sm.checkpoint(&mut store);
+  let root = materialize_sm(&sm, &mut store);
   let mut fresh = BatchSm::default();
   fresh
-    .restore(root, &store)
+    .restore(root, &viewstamp_proto::VerifiedView::new(&store))
     .expect("all blocks present after checkpoint");
   assert_eq!(fresh.applied(), sm.applied());
   assert_eq!(
@@ -227,10 +228,10 @@ fn sim_sm_delegates_dag_per_variant() {
     plain.apply(OpNumber::with(op), format!("p{op}").as_bytes());
   }
   let mut store = MemBlockStore::new();
-  let root = plain.checkpoint(&mut store);
+  let root = materialize_sm(&plain, &mut store);
   let mut fresh = SimSm::Plain(LogSm::default());
   fresh
-    .restore(root, &store)
+    .restore(root, &viewstamp_proto::VerifiedView::new(&store))
     .expect("all blocks present after checkpoint");
   assert_eq!(fresh.applied(), plain.applied());
 
@@ -239,10 +240,10 @@ fn sim_sm_delegates_dag_per_variant() {
     batch.apply(OpNumber::with(op), &batch_body(&[b"u"]));
   }
   let mut bstore = MemBlockStore::new();
-  let broot = batch.checkpoint(&mut bstore);
+  let broot = materialize_sm(&batch, &mut bstore);
   let mut bfresh = SimSm::Batch(BatchSm::default());
   bfresh
-    .restore(broot, &bstore)
+    .restore(broot, &viewstamp_proto::VerifiedView::new(&bstore))
     .expect("all blocks present after checkpoint");
   assert_eq!(bfresh.applied(), batch.applied());
   assert_eq!(bfresh.units(), batch.units());
@@ -265,8 +266,8 @@ fn sim_sm_delegates_per_variant() {
   let mut plain_store = MemBlockStore::new();
   let mut log_store = MemBlockStore::new();
   assert_eq!(
-    plain.checkpoint(&mut plain_store),
-    log.checkpoint(&mut log_store)
+    materialize_sm(&plain, &mut plain_store),
+    materialize_sm(&log, &mut log_store)
   );
 
   let mut batch = SimSm::Batch(BatchSm::default());
@@ -274,10 +275,10 @@ fn sim_sm_delegates_per_variant() {
   assert_eq!(batch.applied().len(), 1);
   assert_eq!(batch.units().len(), 2);
   let mut store = MemBlockStore::new();
-  let root = batch.checkpoint(&mut store);
+  let root = materialize_sm(&batch, &mut store);
   let mut restored = SimSm::Batch(BatchSm::default());
   restored
-    .restore(root, &store)
+    .restore(root, &viewstamp_proto::VerifiedView::new(&store))
     .expect("all blocks present after checkpoint");
   assert_eq!(restored.units(), batch.units());
 }

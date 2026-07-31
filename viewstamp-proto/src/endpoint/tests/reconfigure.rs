@@ -252,7 +252,7 @@ fn proposed_and_committed_swap() -> (
 ) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -363,7 +363,7 @@ fn propose_shrink_with_own_vote(
   e: &mut Endpoint<CountSm, SingleChange>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::MemBlockStore,
+  blocks: &mut crate::block_store::InMemoryBlockStore,
   delta: SingleVoterDelta,
 ) -> (OpNumber, ReconfigurePayload) {
   let successor = e
@@ -389,7 +389,7 @@ fn deliver_shrink_ack(
   e: &mut Endpoint<CountSm, SingleChange>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::MemBlockStore,
+  blocks: &mut crate::block_store::InMemoryBlockStore,
   op: OpNumber,
   payload: &ReconfigurePayload,
   slot: u16,
@@ -445,7 +445,7 @@ fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() 
   // voter never acked.
   let mut e = single_change_primary_of(4);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let (op, payload) = propose_shrink_with_own_vote(
     &mut e,
     &mut wal,
@@ -469,7 +469,7 @@ fn a_five_to_four_shrink_needs_a_successor_quorum_beyond_the_predecessor_one() {
   // for a third retained voter even though the uniform threshold was already met.
   let mut e = single_change_primary_of(5);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let (op, payload) = propose_shrink_with_own_vote(
     &mut e,
     &mut wal,
@@ -497,7 +497,7 @@ fn a_three_to_two_demote_holds_until_both_successor_voters_ack() {
   // majority has processed the demote: held. It commits the moment retained voter 1 acks.
   let mut e = single_change_primary_of(3);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let (op, payload) = propose_shrink_with_own_vote(
     &mut e,
     &mut wal,
@@ -695,7 +695,7 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
   let (_e, wal, sb, op, _successor, _payload) = proposed_and_committed_swap();
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let (mut rwal, mut rsb) = (wal, sb);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
     cfg,
     genesis(3),
@@ -723,7 +723,7 @@ fn the_reconfigure_op_is_never_delivered_to_the_state_machine() {
   // A Reconfigure op is consensus-layer: it must NOT reach `S::apply`. Drive it to commit AND make
   // the SwapEpoch root durable, then assert the CountSm applied NOTHING for it.
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
   assert!(
     e.sm_for_test().applied().is_empty(),
@@ -741,7 +741,7 @@ fn e_epoch_ops_sit_at_or_below_commit_max_after_a_swap_so_are_never_nack_candida
   // candidate re-check drops any nack for it regardless of the successor voter set / quorum. This pins the
   // invariant that keeps the counting-proof truncation safe across any epoch swap.
   let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install E+1
   assert_eq!(
     e.membership.epoch(),
@@ -770,7 +770,7 @@ fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
   // Once the SwapEpoch root lands, `install_membership` runs: epoch == old+1, prev_epoch == old, the
   // successor membership is active, and a `MembershipChanged` event is emitted.
   let (mut e, mut wal, mut sb, op, successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Drain any pre-swap events (the committed-op band, etc.) so the swap event is observable cleanly.
   while e.poll_event().is_some() {}
 
@@ -836,7 +836,7 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
   // makes the cross-epoch state-sync serve gate `checkpoint_op (M) >= config_install_op (N)` true BY
   // CONSTRUCTION — a quiescent donor can never withhold the E+1 membership from a cross-epoch laggard.
   let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // No checkpoint precedes the swap: the lone reconfigure op (op 1) sits far below the default cadence
@@ -882,7 +882,7 @@ fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat
   // the debt-pay path is armed from the primary timer, and once the flush recovers it re-forces the owed
   // checkpoint, opening the cross-epoch serve gate — with NO subsequent client commit or restart.
   let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // The SwapEpoch arm's forced checkpoint hits a flush fault (1 fault, then durable).
   blocks.script_flush_fault(1);
   let now = Instant::ZERO;
@@ -976,7 +976,7 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
 
@@ -1011,7 +1011,7 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   );
   // Seed the crossing checkpoint's single leaf so the install frontier drains with no RequestBlock round
   // trip (the small envelope now names the SM root by address, not inline bytes).
-  blocks.write_verified(cross_snap.clone());
+  blocks.put(cross_snap.clone());
   let cross_id = crate::checkpoint_id(&cross_env);
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e2, successor_e1.config_id()).encode_body();
@@ -1150,7 +1150,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
 
@@ -1201,7 +1201,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   );
   // Seed the crossing checkpoint's single leaf so the install frontier drains with no RequestBlock round
   // trip (the small envelope names the SM root by address, not inline bytes).
-  blocks.write_verified(cross_snap.clone());
+  blocks.put(cross_snap.clone());
   let cross_id = crate::checkpoint_id(&cross_env);
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
@@ -1323,7 +1323,7 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
   e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
@@ -1347,7 +1347,7 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
     sm_root_addr,
     super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
-  blocks.write_verified(cross_snap.clone());
+  blocks.put(cross_snap.clone());
   let cross_id = crate::checkpoint_id(&cross_env);
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
@@ -1380,7 +1380,7 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   // --- CORRUPT the SM-root block in the window AFTER the drain, BEFORE the destructive install. ---
   // Write garbage under the root address: it no longer hashes to `sm_root_addr`, so the verify-on-read
   // restore view reports it ABSENT and `install_sync`'s restore returns an error (nothing mutated).
-  blocks.write_block(sm_root_addr, Bytes::copy_from_slice(b"corrupt-root-bytes"));
+  blocks.insert_raw(sm_root_addr, Bytes::copy_from_slice(b"corrupt-root-bytes"));
 
   // Drive the two-write re-persist → durable root → `install_sync` (which fails on the corrupt block).
   // `handle_storage` runs `assert_invariants` at exit — a `pending_install` held without an in-flight
@@ -1419,7 +1419,7 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
 
   // --- The recovery cadence re-solicits; the donor re-pulls the CLEAN block (overwriting the corrupt
   // bytes), and the re-served SyncCheckpoint re-stages + completes the install. ---
-  blocks.write_verified(cross_snap.clone()); // the re-fetched clean block overwrites the corrupt bytes
+  blocks.put(cross_snap.clone()); // the re-fetched clean block overwrites the corrupt bytes
   // The recovery cadence (`recover_timeouts`, driven by `recover_retry`) is the SERVICED ARQ while
   // Recovering — fire it to confirm it re-broadcasts the solicitation (it would be a no-op / spin if the
   // retry had stranded on `sync_solicit`).
@@ -1521,7 +1521,7 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
     done: std::collections::VecDeque::new(),
     checkpoint: None, // checkpoint_op == 0 → no snapshot; recover restores the genesis SM
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let mut e = Endpoint::<CountSm>::recover(
     cfg,
@@ -1577,7 +1577,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   // overwrite the first's staged successor and the first `on_sb_done` would clear the second — losing
   // the second committed swap across the epoch boundary.
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // The first change committed + staged its swap; the proposal latch is already clear, but the
@@ -1645,7 +1645,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // The carried op's successor membership, chained off the genesis config (config_id 0 in the fixture) —
@@ -1783,7 +1783,7 @@ fn single_change_primed_new_primary_pending_view()
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -1858,7 +1858,7 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   // rejection. (Op 2 is an uncommitted plain client op here, NOT a reconfiguration, so the refusal is the
   // admission fence — not `AlreadyInFlight`.)
   let (mut e, mut wal, mut sb) = single_change_primed_new_primary_pending_view();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let head_before = e.op();
 
@@ -1933,7 +1933,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // hazard, not a malformed-body short-circuit.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // A decodable reconfigure body (the AddLearner(3) successor, chained off the current config — exactly
@@ -2135,7 +2135,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
   // its OWN durable root — convergence, since every replica chains from the identical OLD membership.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -2222,7 +2222,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // decoupled from the SwapEpoch, that heartbeat was suppressed — the backup never learned the op
   // committed, and a later failover re-minted its op number as a client op: op-number reuse.)
   let (mut primary, mut pwal, mut psb, op, successor, payload) = proposed_and_committed_swap();
-  let mut pblocks = crate::block_store::MemBlockStore::new();
+  let mut pblocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // The primary committed the Reconfigure op and is now in the SwapEpoch window: a SwapEpoch root is in
@@ -2276,7 +2276,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // receives that exact `Commit` — and converges: it commits the op and stages its OWN SwapEpoch.
   let mut backup = single_change_backup();
   let (mut bwal, mut bsb) = (TestWal::default(), TestSb::default());
-  let mut bblocks = crate::block_store::MemBlockStore::new();
+  let mut bblocks = crate::block_store::InMemoryBlockStore::new();
   backup.handle_message(
     now,
     &mut bwal,
@@ -2406,7 +2406,7 @@ fn committed_op_then_swapped(
 ) -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, u64) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let o = 1u64;
 
@@ -2644,7 +2644,7 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   // prefix `<= o`.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let learner = MemberId::new(3);
   assert_eq!(
@@ -2988,7 +2988,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
   // this test pins the accumulation + the no-vote-state property, not any gating decision.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
 
   assert!(
@@ -3063,7 +3063,7 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
   // the entire E-committed prefix.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
 
   // Advance the head to op 1 so the gate's threshold (`>= self.op`) is a non-trivial 1.
@@ -3143,7 +3143,7 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
   // (reused) nonce then mints.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
   mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
@@ -3216,7 +3216,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   // gate refuses to mint.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
 
   // Advance the head to op 2 so the regressed frontier (1) is strictly below it.
@@ -3329,7 +3329,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // The promote op `N == 2` promotes member 3 (this learner). Build its successor membership exactly as
@@ -3582,7 +3582,7 @@ fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
   // (a fresh nonce); it never silently promotes.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
   mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
 
@@ -3619,7 +3619,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   // still returns `ProofPending` and never mints. Only the exactly-matching fresh proof validates.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
   mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
 
@@ -3752,7 +3752,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   // re-challenge against the new head — a fresh proof covering the NEW head then mints.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
   mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "head at op 1");
@@ -3850,7 +3850,7 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
   // reply minted against the OLD challenge cannot satisfy the new one.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
   mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
 
@@ -3916,7 +3916,7 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   // Arm an outstanding promote challenge under the CURRENT configuration (any target/nonce — the swap
   // clears it regardless; the `(epoch, config_id)` reply binding is the structural backstop).
@@ -3994,7 +3994,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let newcomer = MemberId::new(1);
 
   // (1) AddLearner is admitted (no voter-count change, no catch-up gate) and mints the op.
@@ -4108,7 +4108,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
 fn demoted_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -4232,7 +4232,7 @@ fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   // It starts Normal as a backup; its idle timer has not yet fired.
   assert_eq!(survivor.status(), Status::Normal);
@@ -4280,7 +4280,7 @@ fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestS
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // GC member 3 — the local node's own learner seat. The voters {0,1,2} keep their slots; the
@@ -4347,7 +4347,7 @@ fn a_gc_removed_learner_retires_and_stays_fully_silent() {
   // to the structural `Retired` state — it arms/services no timer, proposes nothing, and must NOT
   // panic on a `local_slot()` that no longer exists.
   let (mut e, mut wal, mut sb, successor) = gc_removed_self_learner();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   // The swap installed the 2-voter successor in which member 2 (this node) is absent.
   assert_eq!(
@@ -4433,7 +4433,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
   // config_ids. `in_lineage` admits the current id AND the retained prior ids; a forked/unknown id is
   // rejected (config_id is the lineage discriminator).
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let genesis_config_id = 0u128; // the fixture genesis carries config_id 0 (see the `genesis` helper)
   e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land swap #1 → E=1 install
   let config_1 = e.membership.config_id();
@@ -4527,7 +4527,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   // change. The same SVC at the survivor's CURRENT epoch DOES register (proving the drop is the epoch
   // gate, not some other guard).
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the swap → the survivor is now at E=1
   assert_eq!(
     e.membership.epoch(),
@@ -4616,7 +4616,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
 fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.reconfigure_inflight, None, "no change in flight at rest");
 
@@ -4717,7 +4717,7 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
   // clears the latch) only runs at COMMIT, so the release must come from `reset_for_view_transition`.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Propose on the view-0 primary → the latch is set on the uncommitted op (it is NOT driven to commit).
@@ -4791,7 +4791,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Seed an uncommitted Reconfigure op at op 1 (a RECONFIGURATION-client Prepare from the view-0
@@ -4899,7 +4899,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = genesis(3)
@@ -5069,7 +5069,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = genesis(3)
@@ -5242,7 +5242,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
   // successor membership, so a backup replaying it through `on_prepare` rebuilds a typed `Body::Reconfigure`.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -5357,7 +5357,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -5566,7 +5566,7 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let predecessor_config_id = e.membership.config_id();
 
@@ -5632,7 +5632,7 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // checkpoint), and the donor serves the reply ADDRESSED TO `from`'s CURRENT slot so it routes back.
   let (mut donor, mut wal, mut sb, predecessor_config_id, checkpoint_op) =
     donor_at_e1_with_shifted_member();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_ne!(
     predecessor_config_id,
@@ -5701,7 +5701,7 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // DISAGREES with `from` AND whose config_id is the donor's CURRENT (E+1) config — i.e. NOT a cross-epoch
   // ancestor solicitation, just a mismatched self-id — is DROPPED (no relaxation).
   let (mut d2, mut w2, mut s2, _pred, _ck) = donor_at_e1_with_shifted_member();
-  let mut s2blocks = crate::block_store::MemBlockStore::new();
+  let mut s2blocks = crate::block_store::InMemoryBlockStore::new();
   let current_config = d2.membership.config_id();
   d2.handle_message(
     now,
@@ -5746,7 +5746,7 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, 0, 0, 0, &[]);
 
@@ -5827,7 +5827,7 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
 
   // Drive the fetch+crossing to completion: the donor (at `from`'s slot) answers the RequestBlock with the
   // crossing block; the frontier drains and the crossing install completes.
-  blocks.write_verified(cross_snap.clone()); // the donor's BlockResponse lands the block
+  blocks.put(cross_snap.clone()); // the donor's BlockResponse lands the block
   e.handle_message(
     now,
     &mut wal,
@@ -5864,7 +5864,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
   // `a_slot_shifted_cross_epoch_chunk_pull_is_served_and_the_chunk_routes_to_the_current_slot`.)
   let (mut donor, mut wal, mut sb, predecessor_config_id, _checkpoint_op) =
     donor_at_e1_with_shifted_member();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from` binds to in the E+1 [0,2,3]).
   let old_claimed_slot = ReplicaId::new(2);
@@ -5963,7 +5963,7 @@ fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
   // cluster.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6030,7 +6030,7 @@ fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
   // commit-time fence refuses BEFORE any swap is staged or made durable.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let successor = e
     .membership
@@ -6101,7 +6101,7 @@ fn committing_a_direct_voter_add_panics_on_the_backup_recommit_lane() {
   // `commit_reconfigure`) hits the fence the moment a Commit advances past the op.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let successor = e
     .membership
@@ -6197,7 +6197,7 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
@@ -6295,7 +6295,7 @@ fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
       u64::MAX,
     );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     let now = Instant::ZERO;
 
     let successor = pred
@@ -6386,7 +6386,7 @@ fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
   // screen — the `send_prepare_ok` mint screen is what refuses the vouch.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6459,7 +6459,7 @@ fn a_matching_durable_legitimate_reconfigure_prepare_is_re_acked() {
   // admission, never a legitimate reconfiguration.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6525,7 +6525,7 @@ fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
   // the vouch, so an ack assertion alone could not witness this screen.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6608,7 +6608,7 @@ fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6691,7 +6691,7 @@ fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6747,7 +6747,7 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
   // fail-stopping.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -6862,7 +6862,7 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   // required 2 votes: never committed, no swap, no fail-stop.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -7047,7 +7047,7 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
@@ -7090,7 +7090,7 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
   // ruled on it) and the report's identity stamp matches no live inflight entry.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   e.handle_message(
@@ -7117,8 +7117,10 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
       0,
     )),
   );
+  e.force_checkpoint();
+  e.run_block_lane(now, &mut sb, &mut blocks);
   assert!(
-    e.force_checkpoint(&mut sb, &mut blocks),
+    e.pending_checkpoint.is_some(),
     "the committed+applied boundary is checkpointable"
   );
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
@@ -7182,13 +7184,13 @@ fn installed_demote_primary() -> (
   Endpoint<CountSm, SingleChange>,
   TestWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
   OpNumber,
   Membership,
 ) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -7241,7 +7243,7 @@ fn demoted_self_backup() -> (
   Endpoint<CountSm, SingleChange>,
   TestWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
   Membership,
 ) {
   let cfg = Config::try_new(2, MemberId::new(2)).expect("slot 2 backup of the 3-voter set");
@@ -7253,7 +7255,7 @@ fn demoted_self_backup() -> (
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -7324,7 +7326,7 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Sole-owner regression: poke a STALE learner-status deadline onto the still-VOTER backup (as if
@@ -7479,7 +7481,7 @@ fn a_learner_observer_installs_a_demote_of_another_member_and_keeps_its_role() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -7714,7 +7716,7 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, 0, 0, 0, &[]);
 
@@ -7730,7 +7732,7 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
   // The crossing checkpoint's SM root, pre-seeded locally so the install frontier drains without a
   // block-fetch round trip.
   let cross_snap = CountSm::default().snapshot();
-  blocks.write_verified(cross_snap.clone());
+  blocks.put(cross_snap.clone());
   let cross_env = Endpoint::<CountSm>::encode_checkpoint(
     OpNumber::with(m),
     crate::block_address(&cross_snap),
@@ -7818,7 +7820,7 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   // Walked as one lifecycle: never-demoted → proposed → committed-but-not-installed → installed.
   let mut e = single_change_primary_of(3);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // (1) x is a VOTER: the GC is structurally invalid — the vocabulary leg, independent of any latch.
@@ -7923,7 +7925,7 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = genesis(3)
@@ -8166,14 +8168,14 @@ fn banked_ack_demote_installs(
   Endpoint<CountSm, SingleChange>,
   TestWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
   OpNumber,
   Membership,
 ) {
   let mut e = single_change_primary_of(n);
   let mut sb = TestSb::default();
   let mut wal = TestWal::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e

@@ -3,13 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use bytes::Bytes;
 
 use crate::{
-  BlockAddress, BlockStore, ClientId, Commit, Config, DoViewChange, Epoch, Event, Header, Instant,
-  MemberId, Membership, Message, OpNumber, Outgoing, Peer, Prepare, PrepareOk, Prng, Recipient,
-  ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status, Superblock, SuperblockDone,
-  View, Wal, WalDone,
+  BlockAddress, BlockJob, BlockJobDone, BlockStore, ClientId, Commit, Config, DoViewChange, Epoch,
+  Event, Header, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Prepare,
+  PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status,
+  Superblock, SuperblockDone, View, Wal, WalDone,
+  block_job::{BlockJobKind, BlockJobOutput},
 };
 
-mod block_sync;
+pub(crate) mod block_sync;
 mod checkpoint;
 mod forfeit;
 mod normal;
@@ -17,7 +18,7 @@ mod reconfig;
 mod reconfigure;
 mod recovery;
 mod repair;
-mod session_blocks;
+pub(crate) mod session_blocks;
 mod state_sync;
 mod view_change;
 
@@ -176,10 +177,44 @@ impl EpochSwap {
 /// (`on_sb_done`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointStep {
+  /// The BLOCK-store half is in flight, off the pump — the job that ends in this checkpoint's
+  /// durability barrier: an ordinary checkpoint's `Materialize` (write both DAGs, then flush) or a
+  /// state-sync re-persist's bare `Flush` over the DAGs its transfer already drained. No superblock
+  /// write exists yet and NO root is named — for the ordinary case the DAG addresses are not even
+  /// known — which is what makes "the durable pointer never names an un-flushed block" structural
+  /// rather than sequenced.
+  FlushingBlocks(crate::JobId),
   /// The snapshot write is in flight; on its completion, write the new `VsrState` root.
-  AwaitSnapshot(crate::WriteId),
+  AwaitSnapshot(crate::WriteId, CheckpointDag),
   /// The `VsrState` root write is in flight; on its completion, the checkpoint is durable.
-  AwaitRoot(crate::WriteId),
+  AwaitRoot(crate::WriteId, CheckpointDag),
+}
+
+impl CheckpointStep {
+  /// The outstanding SUPERBLOCK write id, or `None` while the block half is in flight.
+  const fn write_id(&self) -> Option<crate::WriteId> {
+    match self {
+      Self::FlushingBlocks(_) => None,
+      Self::AwaitSnapshot(id, _) | Self::AwaitRoot(id, _) => Some(*id),
+    }
+  }
+}
+
+/// The flushed-durable block DAG a checkpoint's superblock writes name: the content id of the
+/// envelope binding both roots, and the two roots themselves. Only constructible from a COMPLETED
+/// block job (an ordinary checkpoint's `Materialize` output, or the drained transfer a state-sync
+/// re-persist's `Flush` made durable), so a checkpoint write can never name blocks whose durability
+/// barrier has not returned `Ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointDag {
+  /// The FNV-1a-128 content id of the snapshot envelope (stored in the durable `VsrState` root).
+  checkpoint_id: u128,
+  /// The SM checkpoint DAG root this checkpoint's envelope names. Carried so the root completion
+  /// can record it as the new `checkpoint_sm_root` (the live root the block GC marks from).
+  sm_root: BlockAddress,
+  /// The session-table DAG root this checkpoint's envelope names. Carried so the root completion
+  /// can record it as the new `checkpoint_sessions_root` (the second live GC root).
+  sessions_root: BlockAddress,
 }
 
 /// Why an in-flight checkpoint root is being written — the typed completion discriminator the
@@ -212,15 +247,8 @@ enum CheckpointKind {
 struct PendingCheckpoint {
   /// The op the snapshot reflects (`commit_min` at trigger time): the new `checkpoint_op` once durable.
   target_op: OpNumber,
-  /// The FNV-1a-128 content id of the snapshot envelope (stored in the durable `VsrState` root).
-  checkpoint_id: u128,
-  /// The SM checkpoint DAG root this checkpoint's envelope names. Carried so the root completion can
-  /// record it as the new `checkpoint_sm_root` (the live root the block GC marks from).
-  sm_root: BlockAddress,
-  /// The session-table DAG root this checkpoint's envelope names. Carried so the root completion can
-  /// record it as the new `checkpoint_sessions_root` (the second live root the block GC marks from).
-  sessions_root: BlockAddress,
-  /// Which superblock write is currently outstanding.
+  /// Which half of the checkpoint is currently outstanding — the off-pump block job, or one of the
+  /// two superblock writes (which carry the flushed-durable [`CheckpointDag`] they name).
   step: CheckpointStep,
   /// Why this checkpoint root is being written (the typed completion discriminator). The `on_sb_done`
   /// root-completion arm `match`es on this to route the now-durable checkpoint — see [`CheckpointKind`].
@@ -986,6 +1014,26 @@ pub(crate) struct Session {
   last_op: OpNumber,
 }
 
+/// An opaque snapshot of a client-session table riding a block job: the COMMITTED projection
+/// captured on the pump and written into the session DAG by the executor. Public because it is a
+/// [`BlockJob`](crate::BlockJob) payload; its contents stay crate-internal.
+pub struct SessionImage(pub(crate) BTreeMap<u128, Session>);
+
+impl SessionImage {
+  /// The captured table, for the executor's encode.
+  pub(crate) const fn as_map(&self) -> &BTreeMap<u128, Session> {
+    &self.0
+  }
+}
+
+impl core::fmt::Debug for SessionImage {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SessionImage")
+      .field("sessions", &self.0.len())
+      .finish()
+  }
+}
+
 /// Absolute timer deadlines, armed per role by `arm_timers`.
 #[derive(Debug, Clone, Default)]
 struct Timers {
@@ -1148,7 +1196,7 @@ impl TimerKind {
 /// The exit-time `assert_invariants` backstops the `(status × sub-state-flag)` coupling that these
 /// members assume, so any future drift trips deterministically across the suite + the VOPR sweep.
 #[derive(Debug)]
-pub struct Endpoint<S, R = RestartOnly> {
+pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   config: Config,
   /// The slot capacity of this node's WAL backend ([`Wal::capacity`]; `u64::MAX` = unbounded) —
   /// observed from the backend at recovery, or DECLARED by the caller at genesis construction
@@ -1300,6 +1348,26 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// landing into this one after a restart in place. Observability only: the refusal itself is the
   /// safety property. Stays `0` on a process that never rebuilds an endpoint over live storage.
   foreign_completions_rejected: u64,
+  /// Block-storage jobs the endpoint has ISSUED and the driver has not yet drained
+  /// ([`Self::poll_block_job`]), in issue order. The pump never executes these: it appends here and
+  /// reacts to the completion, so no block I/O runs on the consensus path.
+  block_jobs: VecDeque<BlockJob<S>>,
+  /// The ids of every issued block job whose completion is still owed — queued-but-undrained AND
+  /// executing — in ISSUE order. Two duties: it is the durability-drain witness
+  /// ([`Self::has_inflight_storage`]), and its front is the ONLY completion
+  /// [`Self::on_block_done`] accepts, which is how a driver that executes or delivers out of issue
+  /// order is CAUGHT rather than silently tolerated (see the [job seam docs](crate::BlockJob)).
+  block_jobs_outstanding: VecDeque<crate::JobId>,
+  /// How many block-job completions were dropped because the state they answered had been
+  /// SUPERSEDED (a checkpoint a view transition abandoned while its DAG was being written). The
+  /// drop is the safety property — a superseded materialize must never publish a root — and this is
+  /// the non-vacuity witness that the supersession path is genuinely exercised.
+  block_jobs_superseded: u64,
+  /// The execution-order witness of the endpoint's OWN inline storage lane — the lane the `handle_*`
+  /// entry points still run block jobs on while the remaining block-I/O paths are moved behind the
+  /// seam. It is the same [`BlockJobCursor`](crate::BlockJobCursor) a driver owns for its lane, held
+  /// here only because the endpoint is that lane for now.
+  block_job_cursor: crate::BlockJobCursor,
   /// Outstanding storage submissions awaiting completion.
   pending: BTreeMap<u64, Pending>,
   /// EVERY in-flight physical WAL append (write-id sequence → op), entered at submit and removed ONLY
@@ -1744,7 +1812,7 @@ pub struct Endpoint<S, R = RestartOnly> {
 /// change and lets a committed op number be re-decided, which [`Endpoint::recover`] fails-stops.
 #[derive(Debug)]
 #[must_use = "a Genesis is inert; call `commit` to write its durable genesis root and get the runnable Endpoint"]
-pub struct Genesis<S, R = RestartOnly> {
+pub struct Genesis<S: StateMachine, R = RestartOnly> {
   config: Config,
   membership: Membership,
   seed: u64,
@@ -1756,7 +1824,7 @@ pub struct Genesis<S, R = RestartOnly> {
   _reconfig: core::marker::PhantomData<fn() -> R>,
 }
 
-impl<S, R: Reconfig> Genesis<S, R> {
+impl<S: StateMachine, R: Reconfig> Genesis<S, R> {
   /// Commit this genesis to durable storage and return the runnable [`Endpoint`]. Writes the durable
   /// GENESIS ROOT — empty consensus state (view 0, op 0, no checkpoint) carrying the genesis membership
   /// and the WAL-GEOMETRY pair — via [`format`](crate::format), confirms it landed SYNCHRONOUSLY, then
@@ -1816,7 +1884,7 @@ impl<S, R: Reconfig> Genesis<S, R> {
   }
 }
 
-impl<S> Endpoint<S, RestartOnly> {
+impl<S: StateMachine> Endpoint<S, RestartOnly> {
   /// Begins genesis for a brand-new cluster member: returns the inert [`Genesis`] state that
   /// [`Genesis::commit`] turns into a runnable [`Endpoint`] (view 0, `Status::Normal`) by writing the
   /// durable genesis root. The ergonomic [`RestartOnly`] entry point (the DEFAULT capability), so a
@@ -1841,7 +1909,7 @@ impl<S> Endpoint<S, RestartOnly> {
   }
 }
 
-impl<S, R> Endpoint<S, R> {
+impl<S: StateMachine, R> Endpoint<S, R> {
   /// Begins genesis under an EXPLICIT reconfiguration capability marker `R`: returns the inert
   /// [`Genesis`] state that [`Genesis::commit`] turns into a runnable [`Endpoint`]`<S, R>` (view 0,
   /// `Status::Normal`) by writing the durable genesis root.
@@ -1981,6 +2049,10 @@ impl<S, R> Endpoint<S, R> {
       incarnation: next_incarnation(),
       next_op_id: 1,
       foreign_completions_rejected: 0,
+      block_jobs: VecDeque::new(),
+      block_jobs_outstanding: VecDeque::new(),
+      block_jobs_superseded: 0,
+      block_job_cursor: crate::BlockJobCursor::new(),
       pending: BTreeMap::new(),
       wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
@@ -3414,7 +3486,7 @@ impl<S, R> Endpoint<S, R> {
       self.pending_checkpoint,
       Some(PendingCheckpoint {
         kind: CheckpointKind::SyncRepersist,
-        step: CheckpointStep::AwaitRoot(_),
+        step: CheckpointStep::AwaitRoot(..),
         ..
       })
     )
@@ -3600,6 +3672,11 @@ impl<S, R> Endpoint<S, R> {
       || self.pending_checkpoint.is_some()
       || self.pending_install.is_some()
       || !self.sync_serving.is_empty()
+      // Block-storage jobs issued and not yet completed — queued for the driver or executing on its
+      // storage lane. A materialize in flight is durability work exactly as a superblock write is
+      // (it is the write half of the durable checkpoint transaction), so a drain that ignored it
+      // would call an endpoint quiesced while its checkpoint DAG was still being written.
+      || !self.block_jobs_outstanding.is_empty()
   }
 
   /// The number of entries in this replica's in-memory `log` cache (the per-op tail cache).
@@ -3763,10 +3840,14 @@ impl<S, R> Endpoint<S, R> {
     let id = self.mint_write_id();
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
-      checkpoint_id: 0,
-      sm_root: crate::block_address(&[]),
-      sessions_root: crate::block_address(&[]),
-      step: CheckpointStep::AwaitSnapshot(id),
+      step: CheckpointStep::AwaitSnapshot(
+        id,
+        CheckpointDag {
+          checkpoint_id: 0,
+          sm_root: crate::block_address(&[]),
+          sessions_root: crate::block_address(&[]),
+        },
+      ),
       kind: CheckpointKind::Ordinary, // models an ordinary checkpoint-persist in flight
     });
   }
@@ -3974,12 +4055,11 @@ impl<S, R> Endpoint<S, R> {
   /// the live-root set (the durable checkpoint, an in-flight `block_fetch`, AND a RETAINED `pending_install`)
   /// shields the right blocks without needing an ordinary checkpoint to complete on the cadence.
   #[cfg(test)]
-  fn gc_blocks_for_test(&mut self, blocks: &mut dyn BlockStore)
+  fn gc_blocks_for_test(&mut self)
   where
-    S: StateMachine,
     R: Reconfig,
   {
-    self.gc_blocks(blocks);
+    self.gc_blocks();
   }
 
   /// Test/observability counter: how many state-syncs have fully applied + become durable on
@@ -4196,10 +4276,14 @@ impl<S, R> Endpoint<S, R> {
     let sentinel_root = crate::block_address(&[]);
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
-      checkpoint_id: 0,
-      sm_root: sentinel_root,
-      sessions_root: sentinel_root,
-      step: CheckpointStep::AwaitSnapshot(crate::WriteId::new(self.incarnation, 999)),
+      step: CheckpointStep::AwaitSnapshot(
+        crate::WriteId::new(self.incarnation, 999),
+        CheckpointDag {
+          checkpoint_id: 0,
+          sm_root: sentinel_root,
+          sessions_root: sentinel_root,
+        },
+      ),
       kind: CheckpointKind::SyncRepersist,
     });
     self.sync = Some(SyncState {
@@ -4373,6 +4457,50 @@ impl<S, R> Endpoint<S, R> {
   fn mint_read_id(&mut self) -> crate::ReadId {
     let seq = self.next_op_seq();
     crate::ReadId::new(self.incarnation, seq)
+  }
+
+  /// Mint a fresh correlation id for a BLOCK JOB, from the SAME per-incarnation sequence counter as
+  /// the write/read ids — so a job's sequence can never alias a live write's or read's, and the
+  /// incarnation choke that refuses a dead endpoint's storage completions covers it unchanged.
+  fn mint_job_id(&mut self) -> crate::JobId {
+    let seq = self.next_op_seq();
+    crate::JobId::new(self.incarnation, seq)
+  }
+
+  /// Queue a block-storage job for the driver to execute OFF the pump, returning the `JobId` the
+  /// completion will echo. The single place a block job enters the seam: it mints the id, records
+  /// the completion as owed (both the drain witness and the issue-order witness), and appends to the
+  /// queue — so no job can be issued without being ordered and accounted.
+  fn issue_block_job(&mut self, kind: BlockJobKind<S>) -> crate::JobId {
+    let id = self.mint_job_id();
+    self.block_jobs.push_back(BlockJob { id, kind });
+    self.block_jobs_outstanding.push_back(id);
+    id
+  }
+
+  /// Takes the next block-storage job the endpoint has issued, or `None` when none is queued.
+  ///
+  /// The driver executes it with [`execute_block_job`](crate::execute_block_job) on its storage lane
+  /// and feeds the result back through [`Self::on_block_done`]. Jobs MUST be executed, and their
+  /// completions delivered, SERIALLY IN THE ORDER THEY ARE POLLED — see the
+  /// [job seam contract](crate::BlockJob) for why that order is a storage-safety obligation and how
+  /// a violation is caught.
+  ///
+  /// A typed accessor rather than an [`Event`]: a job carries the state machine's captured image,
+  /// whose type is an associated type of `S`, so it cannot ride the untyped event stream.
+  pub fn poll_block_job(&mut self) -> Option<BlockJob<S>> {
+    self.block_jobs.pop_front()
+  }
+
+  /// How many block-job completions this endpoint dropped as SUPERSEDED: the work was still
+  /// executing when the state it answered was abandoned (a checkpoint a view transition dropped), so
+  /// its result must not be published.
+  ///
+  /// Observability only — the drop is the safety property. A non-zero value is the non-vacuity
+  /// witness that a test actually reached the supersession window.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn block_jobs_superseded(&self) -> u64 {
+    self.block_jobs_superseded
   }
 
   /// This endpoint instance's incarnation — the value every id it mints carries.
@@ -5306,6 +5434,7 @@ where
     msg: Message,
   ) {
     self.handle_message_inner(now, wal, sb, blocks, from, msg);
+    self.run_block_lane(now, sb, blocks);
     #[cfg(debug_assertions)]
     self.assert_invariants();
   }
@@ -5866,7 +5995,7 @@ where
         // flush fault would defer the checkpoint (and its WAL prune) until fresh client traffic. The cadence
         // self-gates on the boundary (`commit_min >= checkpoint_op + checkpoint_ops`) + a free superblock, so
         // it is a no-op unless a checkpoint is genuinely due, leaving the steady-state heartbeat unchanged.
-        self.maybe_checkpoint(sb, blocks);
+        self.maybe_checkpoint();
       }
       Status::Normal => {
         // backup: bootstrap + fire primary_idle, then re-arm THIS timer only so we
@@ -5917,11 +6046,12 @@ where
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one), re-drive the one
       // outstanding block pull of an in-progress block-fetch transfer, AND self-heal an owed local
       // flush-retry install (re-flush + re-stage locally, no donor reply needed).
-      self.sync_timeouts(now, sb, blocks);
+      self.sync_timeouts(now, blocks);
       // Learner progress report likewise runs only in Normal, and only for a non-voting learner — it
       // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
       self.learner_status_timeouts(now, wal);
     }
+    self.run_block_lane(now, sb, blocks);
     // No-orphan-due invariant: after dispatch, NO serviceable timer may remain armed-and-due
     // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so
     // every such timer either was just serviced (re-armed strictly forward, or cleared) or was never
@@ -5954,11 +6084,20 @@ where
     sb: &mut B,
     blocks: &mut dyn BlockStore,
   ) {
-    while let Some(done) = wal.poll() {
-      self.on_wal_done(now, wal, sb, blocks, done);
-    }
-    while let Some(done) = sb.poll() {
-      self.on_sb_done(now, wal, sb, blocks, done);
+    loop {
+      while let Some(done) = wal.poll() {
+        self.on_wal_done(now, wal, sb, blocks, done);
+      }
+      while let Some(done) = sb.poll() {
+        self.on_sb_done(now, wal, sb, blocks, done);
+      }
+      // A block job's completion can submit the superblock write it gates (a materialized checkpoint
+      // publishing its snapshot), so re-poll after running the lane; the loop settles once neither
+      // side produces work.
+      if self.block_jobs.is_empty() {
+        break;
+      }
+      self.run_block_lane(now, sb, blocks);
     }
     // Re-check the (status × sub-state-flag) coupling at every storage-drain exit (see
     // `assert_invariants`) — the async superblock/WAL completions are where the flag transitions land.
@@ -5982,6 +6121,71 @@ where
         sb.state().checkpoint_op().get(),
       );
     }
+  }
+
+  /// Runs every queued block job to completion on the endpoint's OWN inline storage lane.
+  ///
+  /// The `handle_*` entry points call this at their tail while the remaining block-I/O paths are
+  /// still executed on the pump: it drains [`Self::poll_block_job`], executes each job with
+  /// [`execute_block_job`](crate::execute_block_job) against the store the entry point was handed,
+  /// and feeds each completion back through [`Self::on_block_done`] — the same sequence a driver's
+  /// storage lane performs, run inline. It executes strictly in poll order, so it satisfies the
+  /// lane's serial-in-issue-order obligation by construction.
+  fn run_block_lane<B: Superblock>(
+    &mut self,
+    now: Instant,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    while let Some(job) = self.poll_block_job() {
+      let done = crate::execute_block_job(&mut self.block_job_cursor, job, blocks);
+      self.on_block_done(now, sb, done);
+    }
+  }
+
+  /// Consumes the completion of a block-storage job the driver executed off the pump.
+  ///
+  /// The block-storage twin of [`Self::on_wal_done`] / [`Self::on_sb_done`], and gated the same two
+  /// ways before any correlation state is read:
+  ///
+  /// 1. **THE INCARNATION CHOKE.** A [`JobId`](crate::JobId) carries the incarnation of the endpoint
+  ///    that minted it, so a completion naming another one belongs to a DEAD endpoint over this same
+  ///    storage (a restart in place, whose lane still owed jobs). It is refused wholesale and
+  ///    counted, exactly as a foreign WAL/superblock completion is — the sequence numbers restart at
+  ///    1 in every incarnation, so letting one reach the dispatch below could publish a dead
+  ///    endpoint's checkpoint DAG under THIS endpoint's in-flight checkpoint token.
+  /// 2. **THE ISSUE-ORDER WITNESS.** Only the FRONT of the outstanding queue may complete: block
+  ///    jobs must execute serially in issue order (a `Gc` carrying generation N's roots reordered
+  ///    after generation N+1's `Materialize` frees the very blocks the next durable root names), and
+  ///    a driver that violates it is caught HERE rather than corrupting the store silently.
+  ///
+  /// Only then does the outcome dispatch, and each arm re-validates its own correlation token: a
+  /// completion whose state was superseded while it executed is dropped and counted
+  /// ([`Self::block_jobs_superseded`]), never published.
+  pub fn on_block_done<B: Superblock>(&mut self, now: Instant, sb: &mut B, done: BlockJobDone<S>) {
+    if self.is_foreign_completion(done.id.op_id()) {
+      return;
+    }
+    let expected = self.block_jobs_outstanding.pop_front();
+    assert_eq!(
+      expected,
+      Some(done.id),
+      "block job completion out of issue order (expected {expected:?}) — the storage lane must \
+       execute jobs serially in issue order and deliver completions in that same order",
+    );
+    match done.output {
+      BlockJobOutput::Materialized {
+        sm_root,
+        sessions_root,
+        flush,
+      } => self.on_checkpoint_materialized(done.id, sb, sm_root, sessions_root, flush),
+      BlockJobOutput::Flushed(flush) => self.on_checkpoint_blocks_flushed(now, done.id, sb, flush),
+      // The sweep reports nothing: retention is the store's obligation, and the roots it was handed
+      // were already durable when the job was issued.
+      BlockJobOutput::Gced => {}
+    }
+    #[cfg(debug_assertions)]
+    self.assert_invariants();
   }
 
   /// Arms the `primary_idle` deadline — but never for a non-voting learner, which has no view-change

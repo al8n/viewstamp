@@ -37,7 +37,7 @@ use bytes::Bytes;
 
 use crate::{
   RequestNumber,
-  block_store::{BlockAddress, BlockStore, block_address, read_verified_block},
+  block_store::{BlockAddress, BlockStore, read_verified_block},
 };
 
 use super::Session;
@@ -230,9 +230,7 @@ fn write_body_chunks(body: &[u8], store: &mut dyn BlockStore) -> std::vec::Vec<B
     block.push(TAG_BODY);
     block.extend_from_slice(chunk);
     let bytes = Bytes::from(block);
-    let addr = block_address(&bytes);
-    store.write_block(addr, bytes);
-    out.push(addr);
+    out.push(store.put(bytes));
   }
   out
 }
@@ -265,9 +263,7 @@ pub(crate) fn encode_sessions(
     block.push(TAG_LEAF);
     block.extend_from_slice(&payload);
     let bytes = Bytes::from(block);
-    let addr = block_address(&bytes);
-    store.write_block(addr, bytes);
-    leaves.push(addr);
+    leaves.push(store.put(bytes));
   };
 
   for (&client, session) in sessions {
@@ -313,9 +309,7 @@ fn write_index(children: &[BlockAddress], store: &mut dyn BlockStore) -> BlockAd
     block.extend_from_slice(addr.as_bytes());
   }
   let bytes = Bytes::from(block);
-  let addr = block_address(&bytes);
-  store.write_block(addr, bytes);
-  addr
+  store.put(bytes)
 }
 
 /// Builds a balanced index tree over `leaves` and returns the single root address. A level that fits one

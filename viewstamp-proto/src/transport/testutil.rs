@@ -9,7 +9,7 @@ use bytes::Bytes;
 use crate::{
   BlockAddress, BlockStore, CheckpointRead, Header, Instant, MemberId, Membership, OpNumber, Peer,
   ReadId, ReadOk, SlotStatus, StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone,
-  WriteId, block_address,
+  WriteId,
   transport::stream::{Intake, RecordIo},
 };
 
@@ -150,20 +150,25 @@ impl CountSm {
   }
 }
 impl StateMachine for CountSm {
+  type Image = Bytes;
+
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), body.to_vec()));
     Bytes::copy_from_slice(body)
   }
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = self.snapshot();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {
+    self.snapshot()
+  }
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(image.clone())
+  }
+  fn restore_seed(&self) -> Self {
+    CountSm::default()
   }
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     let block = store
       .read_block(root)
