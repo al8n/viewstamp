@@ -73,6 +73,32 @@ fn duplicate_delivery_is_deterministic() {
 }
 
 #[test]
+fn the_durability_budget_bounds_permanent_faults_a_unanimous_quorum_cannot_absorb() {
+  // Two voters: the quorum is unanimous, so `f` is 0 and destroying even ONE durable copy of a
+  // committed op leaves it recoverable from nowhere — outside the model the protocol is proved
+  // against, and a wedge there measures the injector rather than the endpoint. With a CERTAIN
+  // torn-write and bit-rot roll on every append the cluster-wide budget is the only thing standing
+  // between the run and that state, so it must refuse and the cluster must still commit.
+  let mut c = Cluster::new(2, 2, 4, /*seed*/ 11);
+  c.set_storage_faults(StorageFaults {
+    torn_write_per_mille: 1000,
+    bit_rot_per_mille: 1000,
+    ..StorageFaults::none()
+  });
+  for _ in 0..5_000 {
+    c.tick();
+  }
+  assert!(
+    c.permanent_faults_refused() > 0,
+    "the bound never engaged, so this lane proves nothing"
+  );
+  assert!(
+    c.replica_commit(0).get() > 0,
+    "with every permanent fault refused the cluster commits normally"
+  );
+}
+
+#[test]
 fn restart_recovers_through_the_recovering_loop_under_faults() {
   let mut c = Cluster::new(3, 1, 3, 5);
   // TRANSIENT read faults on every replica's WAL (no permanent corruption); the recover loop must

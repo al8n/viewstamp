@@ -18,7 +18,7 @@ use crate::{
   clock::Clock,
   network::{Faults, InFlight, Network, SlowProfile, Target},
   sm::{BatchSm, LogSm, SimSm},
-  storage::{InMemorySuperblock, InMemoryWal, Shared, StorageFaults},
+  storage::{InMemorySuperblock, InMemoryWal, PermanentLossBudget, Shared, StorageFaults},
 };
 
 /// Mixed into the per-replica storage-fault seed so a replica's WAL/SB fault PRNG is independent of
@@ -213,6 +213,11 @@ pub struct Cluster {
   /// WAL/SB structs persist across crash/restart, so permanent verdicts (torn / bit-rot) and the
   /// fault PRNG survive a restart unchanged — recovery faces the same durable medium it crashed on.
   storage_faults: StorageFaults,
+  /// The cluster-wide budget every replica's PERMANENT WAL body faults are charged against: no
+  /// single op may be permanently destroyed on more than `f = replica_count - quorum()` replicas, so
+  /// a committed op always keeps a readable copy for peer repair. Shared by all the WALs seeded
+  /// together and replaced with them whenever the media are reseeded.
+  loss_budget: PermanentLossBudget,
   /// The VOTING-replica count: the size of the set that drives every quorum and against which the
   /// fault budget is charged. Voting replicas occupy ids `0..replica_count`.
   replica_count: u8,
@@ -523,8 +528,8 @@ impl Cluster {
       .collect();
     let n = node_count as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, mut sbs) =
-      Self::seed_storage(node_count, seed, storage_faults, None, None, None, None);
+    let (wals, mut sbs, loss_budget) =
+      Self::seed_storage(&membership, seed, storage_faults, None, None, None, None);
     // GENESIS: commit each replica over its freshly-seeded (virgin) store. `commit` writes the durable
     // genesis root a later restart recovers over — a voter with no durable root fail-stops — and builds
     // the same in-memory genesis state the bare constructor produced.
@@ -589,6 +594,7 @@ impl Cluster {
       seed,
       faults: Faults::none(),
       storage_faults,
+      loss_budget,
       replica_count,
       learner_count,
       checkpoint_ops,
@@ -628,7 +634,8 @@ impl Cluster {
     }
   }
 
-  /// Builds the per-replica seeded WAL + superblock vectors. Each replica's storage gets a distinct
+  /// Builds the per-replica seeded WAL + superblock vectors for the cluster shape `membership`
+  /// describes. Each replica's storage gets a distinct
   /// seed derived from the base `seed`, its index, and [`STORAGE_SEED_MAGIC`], so fault decisions are
   /// reproducible per (seed, replica) yet independent across replicas. When `async_wal_delay` is
   /// `Some`, every WAL is built in async-append mode (the in-flight window); when `async_sb_delay` is
@@ -637,15 +644,29 @@ impl Cluster {
   /// slots, composed with the fault/async modes. When `write_chaos` is `Some(base)`, every WAL runs in
   /// write-chaos mode with its own [`Self::write_chaos_storage_seed`]-derived seed, composed with all
   /// of the above.
+  ///
+  /// Every WAL seeded together shares ONE [`PermanentLossBudget`], sized by the `f` this membership's
+  /// quorum implies and returned alongside them: fresh media hold no destroyed copy of anything, so a
+  /// reseed legitimately starts the budget empty.
   fn seed_storage(
-    nodes: u16,
+    membership: &Membership,
     seed: u64,
     faults: StorageFaults,
     async_wal_delay: Option<u32>,
     async_sb_delay: Option<u32>,
     wal_capacity: Option<u64>,
     write_chaos: Option<u64>,
-  ) -> (Vec<Shared<InMemoryWal>>, Vec<Shared<InMemorySuperblock>>) {
+  ) -> (
+    Vec<Shared<InMemoryWal>>,
+    Vec<Shared<InMemorySuperblock>>,
+    PermanentLossBudget,
+  ) {
+    let nodes = membership.node_count();
+    // `f`: how many replicas may permanently lose their durable copy of one op and still leave it
+    // recoverable. Read off the very `Membership` the endpoints run on, so the harness cannot drift
+    // from the quorum arithmetic it models; at two voters the quorum is unanimous, so `f` is 0.
+    let tolerance = membership.replica_count() as usize - membership.quorum();
+    let budget = PermanentLossBudget::new(tolerance);
     let wals = (0..nodes)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
@@ -661,6 +682,9 @@ impl Cluster {
         if let Some(base) = write_chaos {
           w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i)));
         }
+        // Every replica's permanent body faults are charged against the one shared budget, so the
+        // rolls can no longer destroy the same op everywhere at once.
+        w.set_loss_budget(budget.clone(), i);
         Shared::new(w)
       })
       .collect();
@@ -673,7 +697,7 @@ impl Cluster {
         })
       })
       .collect();
-    (wals, sbs)
+    (wals, sbs, budget)
   }
 
   /// The per-replica storage-fault seed.
@@ -699,8 +723,8 @@ impl Cluster {
   /// `crash` + `restart` unchanged — a restarted replica recovers from the same faulty medium.
   pub fn set_storage_faults(&mut self, faults: StorageFaults) {
     self.storage_faults = faults;
-    let (wals, sbs) = Self::seed_storage(
-      self.replicas.len() as u16,
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
       self.seed,
       faults,
       self.async_wal_delay,
@@ -710,6 +734,7 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    self.loss_budget = loss_budget;
     // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
     // handles went with the media they described.
     self.storages = (0..self.wals.len())
@@ -729,8 +754,8 @@ impl Cluster {
   /// [`set_storage_faults`](Self::set_storage_faults).
   pub fn set_async_wal_delay(&mut self, delay: Option<u32>) {
     self.async_wal_delay = delay;
-    let (wals, sbs) = Self::seed_storage(
-      self.replicas.len() as u16,
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
       self.seed,
       self.storage_faults,
       delay,
@@ -740,6 +765,7 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    self.loss_budget = loss_budget;
     // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
     // handles went with the media they described.
     self.storages = (0..self.wals.len())
@@ -761,8 +787,8 @@ impl Cluster {
   /// superblocks, like [`set_async_wal_delay`](Self::set_async_wal_delay).
   pub fn set_async_superblock_delay(&mut self, delay: Option<u32>) {
     self.async_sb_delay = delay;
-    let (wals, sbs) = Self::seed_storage(
-      self.replicas.len() as u16,
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
       self.seed,
       self.storage_faults,
       self.async_wal_delay,
@@ -772,6 +798,7 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    self.loss_budget = loss_budget;
     // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
     // handles went with the media they described.
     self.storages = (0..self.wals.len())
@@ -795,8 +822,8 @@ impl Cluster {
   /// [`set_async_wal_delay`](Self::set_async_wal_delay).
   pub fn set_wal_write_chaos(&mut self, seed: Option<u64>) {
     self.write_chaos_seed = seed;
-    let (wals, sbs) = Self::seed_storage(
-      self.replicas.len() as u16,
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
       self.seed,
       self.storage_faults,
       self.async_wal_delay,
@@ -806,6 +833,7 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    self.loss_budget = loss_budget;
     // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
     // handles went with the media they described.
     self.storages = (0..self.wals.len())
@@ -1385,6 +1413,14 @@ impl Cluster {
     self.replica_count as usize
   }
 
+  /// How many PERMANENT WAL body-fault verdicts the cluster-wide durability budget has REFUSED:
+  /// rolls that would have destroyed one op's durable copy on more than `f` replicas, putting the
+  /// op beyond any repair protocol's reach. `> 0` witnesses that the bound is live on this run
+  /// rather than merely armed.
+  pub fn permanent_faults_refused(&self) -> u64 {
+    self.loss_budget.refused()
+  }
+
   /// Number of clients.
   pub fn client_count(&self) -> usize {
     self.clients.len()
@@ -1656,6 +1692,9 @@ impl Cluster {
     if let Some(base) = self.write_chaos_seed {
       w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i as u16)));
     }
+    // The replacement disk joins the same cluster-wide permanent-fault budget, and joining releases
+    // every seat the replaced disk held: an empty medium holds no destroyed copy of anything.
+    w.set_loss_budget(self.loss_budget.clone(), i as u16);
     self.wals[i] = Shared::new(w);
     self.sbs[i] = Shared::new(match self.async_sb_delay {
       Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
@@ -2141,8 +2180,8 @@ impl Cluster {
     // the store held no committed state, so reseeding loses nothing, and committing keeps each
     // endpoint's declared WAL geometry and its durable genesis root in lockstep (so a later restart
     // recovers rather than fail-stopping a voter over an empty root).
-    let (wals, sbs) = Self::seed_storage(
-      self.replicas.len() as u16,
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
       self.seed,
       self.storage_faults,
       self.async_wal_delay,
@@ -2152,6 +2191,7 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    self.loss_budget = loss_budget;
     // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
     // handles went with the media they described.
     self.storages = (0..self.wals.len())
