@@ -1,7 +1,8 @@
 use bytes::Bytes;
 
 use super::*;
-use crate::block_store::MemBlockStore;
+use crate::block_store::InMemoryBlockStore;
+use crate::block_store::block_address;
 
 /// Builds a session record with the given fields. `reply` is the cached `(request_number, body)` or
 /// `None`.
@@ -16,18 +17,18 @@ fn session(request: u64, last_op: u64, reply: Option<(u64, Bytes)>) -> Session {
 /// Encodes `table` into a fresh store, decodes it back through the verified path, and asserts the
 /// round-trip is exact AND the root is deterministic across two encodes.
 fn assert_round_trip(table: &std::collections::BTreeMap<u128, Session>) -> BlockAddress {
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let root = encode_sessions(table, &mut store);
   // Determinism: a second encode of the same table yields the same root (idempotent writes).
-  let mut store2 = MemBlockStore::new();
+  let mut store2 = InMemoryBlockStore::new();
   let root2 = encode_sessions(table, &mut store2);
   assert_eq!(
     root, root2,
     "same table must produce the same sessions_root"
   );
   // The verified decode reconstructs the exact table.
-  let verified = crate::block_store::VerifiedBlocks::new(&store);
-  let decoded = decode_sessions(root, &verified).expect("the whole DAG is present");
+
+  let decoded = decode_sessions(root, &store).expect("the whole DAG is present");
   assert_eq!(&decoded, table, "round-trip must be exact");
   root
 }
@@ -37,7 +38,7 @@ fn empty_table_round_trips_to_a_valid_root() {
   let table = std::collections::BTreeMap::new();
   let root = assert_round_trip(&table);
   // The empty table still produces a real (empty index) root, so the GC/sync walk can seed from it.
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let encoded = encode_sessions(&table, &mut store);
   assert_eq!(encoded, root);
   assert!(store.has_block(root), "the empty root block is written");
@@ -78,7 +79,7 @@ fn a_single_large_cached_reply_is_externalized_and_round_trips() {
   let root = assert_round_trip(&table);
 
   // The body chunks are genuinely reachable from the DAG (so the sync frontier + GC see them).
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let _ = encode_sessions(&table, &mut store);
   let mut seen = std::collections::BTreeSet::new();
   let mut stack = std::vec![root];
@@ -117,7 +118,7 @@ fn a_table_too_large_for_one_leaf_builds_multiple_leaves() {
   let root = assert_round_trip(&table);
 
   // The root indexes more than one leaf.
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let _ = encode_sessions(&table, &mut store);
   let root_block = store.read_block(root).expect("root present");
   assert_eq!(
@@ -148,7 +149,7 @@ fn a_corrupt_session_block_is_rejected_by_the_verified_decode() {
       ),
     );
   }
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let root = encode_sessions(&table, &mut store);
   // Find a leaf (non-root) descendant and corrupt it.
   let root_block = store.read_block(root).expect("root present");
@@ -157,11 +158,10 @@ fn a_corrupt_session_block_is_rejected_by_the_verified_decode() {
     .expect("the table has at least one leaf");
   let corrupt = Bytes::from_static(b"corrupted session block bytes that hash elsewhere");
   assert_ne!(block_address(&corrupt), leaf_addr);
-  store.write_block(leaf_addr, corrupt);
+  store.insert_raw(leaf_addr, corrupt);
 
-  let verified = crate::block_store::VerifiedBlocks::new(&store);
   assert!(
-    decode_sessions(root, &verified).is_none(),
+    decode_sessions(root, &store).is_none(),
     "a corrupt session block must abort the decode (no partial install)"
   );
 }
@@ -188,7 +188,7 @@ fn an_embedder_sm_block_is_not_parsed_as_a_session_block() {
 
   // A real session block with the SAME tag byte at position 0 (under the magic) is still recognized: the
   // discriminator is the magic, not the tag's byte offset.
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let mut table = std::collections::BTreeMap::new();
   table.insert(1u128, session(1, 1, Some((1, Bytes::from_static(b"x")))));
   let root = encode_sessions(&table, &mut store);
@@ -250,7 +250,7 @@ fn references_expose_index_children_and_leaf_body_chunks() {
   let big = Bytes::from(std::vec![0x11u8; SESSION_BLOCK_BUDGET + 1]);
   let mut table = std::collections::BTreeMap::new();
   table.insert(7u128, session(1, 1, Some((1, big))));
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let root = encode_sessions(&table, &mut store);
 
   let root_block = store.read_block(root).expect("root present");
@@ -307,7 +307,7 @@ fn index_children_rejects_a_truncated_count_field() {
 fn build_index_tree_splits_into_a_second_level_past_the_fanout() {
   // One more leaf address than a single index block's fanout forces a second tree level: the root
   // then names two second-level index blocks instead of the raw leaves directly.
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let leaves: std::vec::Vec<BlockAddress> = (0u64..=INDEX_FANOUT as u64)
     .map(|i| {
       let mut b = [0u8; 16];
@@ -362,7 +362,7 @@ fn leaf_body_refs_skips_inline_replies_and_collects_only_externalized_chunk_addr
   let big = Bytes::from(std::vec![0x42u8; SESSION_BLOCK_BUDGET + 1]);
   table.insert(2u128, session(2, 2, Some((2, big))));
 
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let root = encode_sessions(&table, &mut store);
   let root_block = store.read_block(root).expect("root present");
   let leaf_addrs = index_children(&root_block);
@@ -417,7 +417,7 @@ fn leaf_body_refs_stops_at_a_malformed_record_and_keeps_prior_references() {
 
 #[test]
 fn decode_record_rejects_a_wrong_kind_chunk_and_an_invalid_reply_kind_byte() {
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   // A real stored block that is NOT a body chunk (an empty index block) — used as the address an
   // external-reply record's chunk list points at.
   let not_a_chunk = {
@@ -427,8 +427,7 @@ fn decode_record_rejects_a_wrong_kind_chunk_and_an_invalid_reply_kind_byte() {
     b.extend_from_slice(&0u32.to_be_bytes());
     Bytes::from(b)
   };
-  let not_a_chunk_addr = block_address(&not_a_chunk);
-  store.write_block(not_a_chunk_addr, not_a_chunk);
+  let not_a_chunk_addr = store.put(not_a_chunk);
 
   // client=1, request=1, last_op=1, kind=2 (external), rn=1, count=1, the wrong-kind address.
   let mut payload = std::vec::Vec::new();
@@ -458,15 +457,14 @@ fn decode_record_rejects_a_wrong_kind_chunk_and_an_invalid_reply_kind_byte() {
 
 #[test]
 fn ordered_leaves_visits_a_duplicated_child_only_once() {
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let leaf = {
     let mut b = std::vec::Vec::new();
     b.extend_from_slice(&MAGIC);
     b.push(TAG_LEAF);
     Bytes::from(b)
   };
-  let leaf_addr = block_address(&leaf);
-  store.write_block(leaf_addr, leaf);
+  let leaf_addr = store.put(leaf);
 
   // An index naming the SAME leaf address twice.
   let index = {
@@ -478,8 +476,7 @@ fn ordered_leaves_visits_a_duplicated_child_only_once() {
     b.extend_from_slice(leaf_addr.as_bytes());
     Bytes::from(b)
   };
-  let root = block_address(&index);
-  store.write_block(root, index);
+  let root = store.put(index);
 
   assert_eq!(
     ordered_leaves(root, &store).unwrap(),
@@ -490,7 +487,7 @@ fn ordered_leaves_visits_a_duplicated_child_only_once() {
 
 #[test]
 fn ordered_leaves_rejects_a_root_that_is_neither_index_nor_leaf() {
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let body_chunk = {
     let mut b = std::vec::Vec::new();
     b.extend_from_slice(&MAGIC);
@@ -498,7 +495,6 @@ fn ordered_leaves_rejects_a_root_that_is_neither_index_nor_leaf() {
     b.extend_from_slice(b"chunk-bytes");
     Bytes::from(b)
   };
-  let addr = block_address(&body_chunk);
-  store.write_block(addr, body_chunk);
+  let addr = store.put(body_chunk);
   assert_eq!(ordered_leaves(addr, &store), None);
 }

@@ -6,8 +6,8 @@
 //! property lets the state-sync layer deduplicate and verify blocks without additional metadata.
 //!
 //! [`BlockStore`] is the embedder-supplied backing store for named blocks. It is content-addressed
-//! by construction: the caller derives the key with [`block_address`] before writing, so the store
-//! itself need not recompute or verify hashes.
+//! by construction: [`BlockStore::put`] derives the key from the content INSIDE the store, so a
+//! block can never be recorded under an address its bytes do not hash to.
 
 use bytes::Bytes;
 
@@ -117,80 +117,77 @@ impl<'a> BlockDagWalk<'a> {
 ///
 /// This is the SINGLE verified-read predicate: every consumer that trusts a locally-read block (the
 /// sync frontier's local fast path, the GC mark phase, the donor serve path, the SM-restore view
-/// [`VerifiedBlocks`]) reads THROUGH it, so a corrupt local block can never be trusted as a checkpoint
+/// [`VerifiedView`]) reads THROUGH it, so a corrupt local block can never be trusted as a checkpoint
 /// block, have its garbage edges followed, or be handed to `restore`.
 pub(crate) fn read_verified_block(store: &dyn BlockStore, addr: BlockAddress) -> Option<Bytes> {
   let bytes = store.read_block(addr)?;
   (block_address(&bytes) == addr).then_some(bytes)
 }
 
-/// A read-only verify-on-read view over a [`BlockStore`], passed to [`StateMachine::restore`] in place
-/// of the raw store so EVERY block the SM reads is checked against its content address by construction.
+/// A read-only verify-on-read view over a [`BlockStore`], passed to
+/// [`StateMachine::restore`](crate::StateMachine::restore) in place of the raw store so EVERY block
+/// the SM reads is checked against its content address by construction.
 ///
-/// The frontier walk verified each block as it drained but does not PIN the bytes, and the destructive
-/// `restore` runs later; a bit-rot or misdirected read in that window would otherwise hand corrupt
+/// The frontier walk verified each block as it drained but does not PIN the bytes, and the
+/// restore runs later; a bit-rot or misdirected read in that window would otherwise hand corrupt
 /// bytes to the SM under a valid checkpoint id. Through this view [`read_block`](Self::read_block)
 /// returns `None` for a corrupt block (reads as absent), so the SM's missing-block handling surfaces a
 /// [`RestoreError`](crate::state_machine::RestoreError) and the proto re-fetches the clean replacement.
 ///
-/// Read-only: `restore` takes `&dyn BlockStore`, so the mutating methods are never reachable through it.
-pub(crate) struct VerifiedBlocks<'a> {
+/// Read-only BY TYPE: the view exposes only the verified read methods, so a restore cannot write,
+/// flush, or GC through it.
+pub struct VerifiedView<'a> {
   inner: &'a dyn BlockStore,
 }
 
-impl<'a> VerifiedBlocks<'a> {
-  /// Wraps `inner` in a verify-on-read view for the duration of one `restore`.
-  pub(crate) fn new(inner: &'a dyn BlockStore) -> Self {
+impl<'a> VerifiedView<'a> {
+  /// Wraps `inner` in a verify-on-read view.
+  pub fn new(inner: &'a dyn BlockStore) -> Self {
     Self { inner }
   }
-}
 
-impl BlockStore for VerifiedBlocks<'_> {
-  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+  /// Returns the block at `addr` ONLY if its stored bytes hash back to `addr`; a missing OR corrupt
+  /// block reads as `None`.
+  pub fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
     read_verified_block(self.inner, addr)
   }
 
-  fn has_block(&self, addr: BlockAddress) -> bool {
-    // Present means present-AND-verified: a corrupt block is reported absent, consistent with
-    // `read_block` returning `None` for it.
+  /// Whether a block is present AND verified at `addr`: a corrupt block is reported absent,
+  /// consistent with [`read_block`](Self::read_block) returning `None` for it.
+  pub fn has_block(&self, addr: BlockAddress) -> bool {
     read_verified_block(self.inner, addr).is_some()
-  }
-
-  fn write_block(&mut self, _addr: BlockAddress, _block: Bytes) {
-    // `restore` receives the view as `&dyn BlockStore`, so no `&mut` method is callable.
-    unreachable!(
-      "VerifiedBlocks is a read-only restore view; write_block is not reachable through it"
-    );
   }
 }
 
 /// Embedder-supplied content-addressed block store.
 ///
-/// The store maps [`BlockAddress`] keys to opaque byte payloads. Callers derive the key with
-/// [`block_address`] before writing, so the store is a pure key-value lookup with no internal
-/// hashing; idempotent writes (same address, same bytes) are always safe.
+/// The store maps [`BlockAddress`] keys to opaque byte payloads. The store itself derives every
+/// key from the content it is handed ([`put`](Self::put)), so a block can never be recorded under
+/// an address its bytes do not hash to — the mis-addressed-write class is closed at the trait
+/// boundary rather than policed at every call site.
 ///
-/// The trait is intentionally object-safe (`&mut dyn BlockStore` is valid) so the sync engine can
+/// The trait is intentionally object-safe (`&mut dyn BlockStore` is valid) so the job executor can
 /// hold it without a generic parameter.
 pub trait BlockStore {
   /// Returns the block at `addr`, or `None` if it has never been written.
   fn read_block(&self, addr: BlockAddress) -> Option<Bytes>;
 
-  /// Stores `block` under `addr`.
+  /// Stores `block` under its content address and returns that address.
   ///
-  /// Callers MUST supply `addr == block_address(&block)`. Writing the same address twice with
-  /// byte-identical content is idempotent; a different payload under an existing address is a caller
-  /// contract violation.
+  /// The implementation MUST key the block by [`block_address`]`(&block)` and return exactly that
+  /// value — the address is derived INSIDE the store, so a caller cannot record bytes under a key
+  /// they do not hash to. Storing byte-identical content twice is idempotent (same address, same
+  /// bytes).
   ///
-  /// `write_block` is INFALLIBLE and carries NO durability guarantee on its own — it only records the
-  /// bytes (a real backend may buffer them). Durability is established by [`flush`](Self::flush): the
-  /// proto writes a checkpoint's whole block DAG with `write_block`, then `flush`es before it submits
-  /// the superblock pointer that names those blocks.
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes);
+  /// `put` is INFALLIBLE and carries NO durability guarantee on its own — it only records the
+  /// bytes (a real backend may buffer them). Durability is established by [`flush`](Self::flush):
+  /// the job executor writes a checkpoint's whole block DAG with `put`, then `flush`es, and only a
+  /// successful flush lets the endpoint submit the superblock pointer that names those blocks.
+  fn put(&mut self, block: Bytes) -> BlockAddress;
 
-  /// Durability barrier: when this returns `Ok(())`, EVERY block written by an earlier
-  /// [`write_block`](Self::write_block) (since the last `flush`) is durable — it will survive a crash
-  /// and is readable on restart, by this node, by a peer GC pass, and after the WAL below it is pruned.
+  /// Durability barrier: when this returns `Ok(())`, EVERY block recorded by an earlier
+  /// [`put`](Self::put) (since the last `flush`) is durable — it will survive a crash and is
+  /// readable on restart, by this node, by a peer GC pass, and after the WAL below it is pruned.
   ///
   /// **The proto orders a `flush` BEFORE the superblock checkpoint pointer that names its blocks**, so
   /// a durable checkpoint pointer can never reference a block that is not yet durable. This is the
@@ -203,13 +200,12 @@ pub trait BlockStore {
   /// then does NOT advance the checkpoint pointer (no torn checkpoint that names un-flushed blocks) and
   /// retries the checkpoint on the next cadence — mirroring how a faulted read is treated as data.
   ///
-  /// The default is `Ok(())`: an in-memory store IS durable for the lifetime it models (correct for
-  /// tests and a never-crashing process), and a backend that writes durably on every `write_block`
-  /// need not override it. A PRODUCTION store backed by real media MUST override it to flush its
-  /// pending writes to stable storage and report a flush failure as `Err`.
-  fn flush(&mut self) -> Result<(), BlockStoreError> {
-    Ok(())
-  }
+  /// REQUIRED deliberately (no default body): the barrier is the load-bearing half of the durable
+  /// checkpoint transaction, and a backend that inherited a silent `Ok(())` while buffering writes
+  /// would publish checkpoint roots naming blocks a crash discards. An in-memory store is durable
+  /// for the lifetime it models and returns `Ok(())` explicitly ([`InMemoryBlockStore`] does); a
+  /// store backed by real media implements its `fsync`/barrier here.
+  fn flush(&mut self) -> Result<(), BlockStoreError>;
 
   /// Returns `true` if a block has been written at `addr`.
   fn has_block(&self, addr: BlockAddress) -> bool;
@@ -246,57 +242,66 @@ pub trait BlockStore {
   }
 }
 
-/// In-memory [`BlockStore`] for use in tests.
+/// A volatile in-memory [`BlockStore`] backed by a `BTreeMap`.
 ///
-/// Backed by a `BTreeMap`; all writes are synchronous and never faulted.
-#[cfg(test)]
-pub(crate) struct MemBlockStore {
+/// Every `put` is recorded immediately and `flush` succeeds (in-memory content is durable for the
+/// process lifetime it models), so it is a correct store for tests, simulations, and embedders
+/// whose checkpoint content is reconstructible. Iteration order is deterministic (`BTreeMap` keyed
+/// by address), which seeded harnesses rely on.
+///
+/// Fault injection for tests rides on the same type: [`script_flush_fault`](Self::script_flush_fault)
+/// makes the next flushes fail so a harness can prove the checkpoint pointer is not advanced over
+/// an unflushed DAG, and [`insert_raw`](Self::insert_raw) plants bytes under an arbitrary address
+/// so verify-on-read paths can be exercised against corrupt blocks.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryBlockStore {
   blocks: std::collections::BTreeMap<BlockAddress, Bytes>,
   /// The next `flush_faults` calls to [`flush`](BlockStore::flush) return `Err` (the rest `Ok`),
-  /// modelling a backend whose durability barrier fails so a test can prove the checkpoint pointer is
-  /// NOT advanced. In-memory is otherwise always durable.
+  /// modelling a backend whose durability barrier fails. In-memory is otherwise always durable.
   flush_faults: u8,
 }
 
-#[cfg(test)]
-impl MemBlockStore {
+impl InMemoryBlockStore {
   /// Creates an empty store.
-  pub(crate) fn new() -> Self {
-    Self {
-      blocks: std::collections::BTreeMap::new(),
-      flush_faults: 0,
-    }
+  pub fn new() -> Self {
+    Self::default()
   }
 
-  /// Script the next `times` flushes to fail (return `Err(BlockStoreError)`), so a test can prove a
-  /// flush fault holds the checkpoint pointer back.
-  pub(crate) fn script_flush_fault(&mut self, times: u8) {
+  /// Scripts the next `times` flushes to fail (return `Err(`[`BlockStoreError`]`)`), so a test can
+  /// prove a flush fault holds the checkpoint pointer back.
+  pub fn script_flush_fault(&mut self, times: u8) {
     self.flush_faults = times;
   }
 
-  /// Writes `block` keyed by its content address, so the caller need not supply the address.
-  pub(crate) fn write_verified(&mut self, block: Bytes) {
-    let addr = block_address(&block);
+  /// Plants `block` under `addr` WITHOUT deriving the address from the content — the
+  /// fault-injection backdoor for tests that need a block whose bytes do NOT hash to its key
+  /// (bit-rot, a misdirected write). Production writes go through [`BlockStore::put`], which makes
+  /// this mismatch unrepresentable; a store poisoned through here exercises the verify-on-read
+  /// paths that treat such a block as absent.
+  pub fn insert_raw(&mut self, addr: BlockAddress, block: Bytes) {
     self.blocks.insert(addr, block);
   }
-}
 
-#[cfg(test)]
-impl MemBlockStore {
-  /// The number of distinct blocks currently held (test introspection for the GC sweep).
-  pub(crate) fn len(&self) -> usize {
+  /// The number of distinct blocks currently held (introspection for GC assertions).
+  pub fn len(&self) -> usize {
     self.blocks.len()
+  }
+
+  /// Whether the store holds no blocks.
+  pub fn is_empty(&self) -> bool {
+    self.blocks.is_empty()
   }
 }
 
-#[cfg(test)]
-impl BlockStore for MemBlockStore {
+impl BlockStore for InMemoryBlockStore {
   fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
     self.blocks.get(&addr).cloned()
   }
 
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = block_address(&block);
     self.blocks.insert(addr, block);
+    addr
   }
 
   fn flush(&mut self) -> Result<(), BlockStoreError> {

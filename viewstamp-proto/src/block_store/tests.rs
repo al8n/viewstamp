@@ -36,7 +36,7 @@ fn block_dag_walk_exposes_its_roots_and_reference_resolver() {
 
 #[test]
 fn mem_store_roundtrips_and_reports_membership() {
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   let block = bytes::Bytes::from_static(b"hello block");
   let addr = block_address(&block);
 
@@ -45,7 +45,7 @@ fn mem_store_roundtrips_and_reports_membership() {
   assert_eq!(store.read_block(addr), None);
 
   // write_verified keys by content hash and the block becomes retrievable.
-  store.write_verified(block.clone());
+  store.put(block.clone());
   assert!(store.has_block(addr));
   assert_eq!(store.read_block(addr), Some(block));
 
@@ -56,6 +56,7 @@ fn mem_store_roundtrips_and_reports_membership() {
 }
 
 // A minimal StateMachine whose full state is a u64 counter.
+#[derive(Default)]
 struct TrivialSm {
   count: u64,
 }
@@ -67,22 +68,29 @@ impl TrivialSm {
 }
 
 impl StateMachine for TrivialSm {
+  type Image = bytes::Bytes;
+
   fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> bytes::Bytes {
     self.count += 1;
     bytes::Bytes::new()
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = self.snapshot();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {
+    self.snapshot()
+  }
+
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(image.clone())
+  }
+
+  fn restore_seed(&self) -> Self {
+    TrivialSm::default()
   }
 
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     let block = store
       .read_block(root)
@@ -126,7 +134,7 @@ fn test_refs(block: &[u8]) -> std::vec::Vec<BlockAddress> {
 
 #[test]
 fn gc_marks_from_live_roots_keeps_shared_subtree_and_sweeps_the_rest() {
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   // A shared leaf, plus two roots that both reference it. The OLD root also references an
   // old-only leaf; the NEW root references a new-only leaf. The shared leaf is the subtree both
   // DAGs hold by identical content address (incremental checkpointing's defining property).
@@ -138,15 +146,13 @@ fn gc_marks_from_live_roots_keeps_shared_subtree_and_sweeps_the_rest() {
     block_address(&old_only),
     block_address(&new_only),
   );
-  store.write_verified(shared.clone());
-  store.write_verified(old_only);
-  store.write_verified(new_only.clone());
+  store.put(shared.clone());
+  store.put(old_only);
+  store.put(new_only.clone());
 
   let old_index = index_block(&[shared_a, old_a]);
   let new_index = index_block(&[shared_a, new_a]);
-  let (old_root, new_root) = (block_address(&old_index), block_address(&new_index));
-  store.write_block(old_root, old_index);
-  store.write_block(new_root, new_index);
+  let (old_root, new_root) = (store.put(old_index), store.put(new_index));
   assert_eq!(store.len(), 5, "two indexes + three leaves");
 
   // GC with ONLY the newer root live (one DAG → one typed walk).
@@ -173,9 +179,9 @@ fn gc_marks_from_live_roots_keeps_shared_subtree_and_sweeps_the_rest() {
 
 #[test]
 fn gc_with_no_live_roots_frees_every_block() {
-  let mut store = MemBlockStore::new();
-  store.write_verified(bytes::Bytes::from_static(b"a"));
-  store.write_verified(bytes::Bytes::from_static(b"b"));
+  let mut store = InMemoryBlockStore::new();
+  store.put(bytes::Bytes::from_static(b"a"));
+  store.put(bytes::Bytes::from_static(b"b"));
   assert_eq!(store.len(), 2);
   store.gc(&[BlockDagWalk::new(&[], &test_refs)]);
   assert_eq!(store.len(), 0, "an empty live set prunes every block");
@@ -188,7 +194,7 @@ fn gc_runs_each_dag_with_only_its_own_resolver_and_unions_the_marked_sets() {
   // handed a foreign block could panic in a strict parser — so this models that exactly: each
   // resolver PANICS if it is ever called on a block belonging to the OTHER DAG. GC must still mark
   // (the union of) both reachable sets and sweep only the genuinely-unreferenced block.
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   // DAG A: index `a_root` → leaf `a_leaf`. DAG B: index `b_root` → leaf `b_leaf`. The two index
   // blocks are byte-distinct (different children), so they have distinct addresses; a `dead` leaf is
   // reachable from NEITHER and must be swept.
@@ -200,14 +206,12 @@ fn gc_runs_each_dag_with_only_its_own_resolver_and_unions_the_marked_sets() {
     block_address(&b_leaf),
     block_address(&dead),
   );
-  store.write_verified(a_leaf.clone());
-  store.write_verified(b_leaf.clone());
-  store.write_verified(dead);
+  store.put(a_leaf.clone());
+  store.put(b_leaf.clone());
+  store.put(dead);
   let a_index = index_block(&[a_leaf_a]);
   let b_index = index_block(&[b_leaf_a]);
-  let (a_root, b_root) = (block_address(&a_index), block_address(&b_index));
-  store.write_block(a_root, a_index);
-  store.write_block(b_root, b_index);
+  let (a_root, b_root) = (store.put(a_index), store.put(b_index));
   assert_eq!(
     store.len(),
     5,
@@ -268,17 +272,16 @@ fn gc_retains_session_only_children_of_a_block_also_reachable_from_the_sm_dag() 
   // session walk then treats it as visited and SKIPS its own resolver, the session-only child is never
   // marked and gets wrongly swept even though it is live under the durable checkpoint. With a per-walk
   // visited set the session walk runs its OWN resolver on the shared address, so its child is marked.
-  let mut store = MemBlockStore::new();
+  let mut store = InMemoryBlockStore::new();
   // The session-only leaf, reachable ONLY through the session resolver's view of the shared block.
   let session_child = bytes::Bytes::from_static(b"session-only-child-leaf");
   let session_child_a = block_address(&session_child);
-  store.write_verified(session_child.clone());
+  store.put(session_child.clone());
   // The SHARED block: under `test_refs` (an index whose tag byte is 0x01) it is a session INDEX listing
   // `session_child`; the SM resolver below deliberately reads the SAME bytes as a leaf (returns nothing),
   // modelling two parsers that disagree on opaque bytes. It is the SM root AND the session root at once.
   let shared_index = index_block(&[session_child_a]);
-  let shared_root = block_address(&shared_index);
-  store.write_block(shared_root, shared_index);
+  let shared_root = store.put(shared_index);
   assert_eq!(
     store.len(),
     2,
@@ -311,13 +314,14 @@ fn gc_retains_session_only_children_of_a_block_also_reachable_from_the_sm_dag() 
 
 #[test]
 fn checkpoint_produces_snapshot_address_and_restore_reconstructs() {
-  let mut sm = TrivialSm { count: 42 };
-  let mut store = MemBlockStore::new();
+  let sm = TrivialSm { count: 42 };
+  let mut store = InMemoryBlockStore::new();
 
   // checkpoint writes the snapshot as a single leaf block; the returned root equals
   // block_address(snapshot()).
   let expected_root = block_address(&sm.snapshot());
-  let root = sm.checkpoint(&mut store);
+  let image = sm.checkpoint_image();
+  let root = TrivialSm::materialize(&image, &mut store);
   assert_eq!(root, expected_root);
 
   // The block is retrievable from the store.
@@ -326,7 +330,7 @@ fn checkpoint_produces_snapshot_address_and_restore_reconstructs() {
   // A fresh SM reconstructed from the checkpoint root reaches the same state.
   let mut fresh = TrivialSm { count: 0 };
   fresh
-    .restore(root, &store)
+    .restore(root, &VerifiedView::new(&store))
     .expect("the whole DAG is present");
   assert_eq!(fresh.count, 42);
 
@@ -338,7 +342,7 @@ fn checkpoint_produces_snapshot_address_and_restore_reconstructs() {
 
 #[test]
 fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
-  // VerifiedBlocks wraps a store and makes read_block return Some only when the block's bytes
+  // VerifiedView wraps a store and makes read_block return Some only when the block's bytes
   // hash back to the requested address. A block whose stored bytes do not hash to its key is
   // corrupt (bit-rot or a misdirected write); reading it through the view returns None, so
   // StateMachine::restore surfaces a RestoreError rather than feeding corrupt bytes to the SM.
@@ -347,9 +351,9 @@ fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
   // --- Part A: a corrupt block returns RestoreError; SM is left unchanged. ---
 
   // Build and checkpoint the SM (count = 7).
-  let mut sm = TrivialSm { count: 7 };
-  let mut store = MemBlockStore::new();
-  let root = sm.checkpoint(&mut store);
+  let sm = TrivialSm { count: 7 };
+  let mut store = InMemoryBlockStore::new();
+  let root = TrivialSm::materialize(&sm.checkpoint_image(), &mut store);
 
   // Overwrite the root address with bytes that do NOT hash to root — simulating bit-rot.
   let garbage = bytes::Bytes::from_static(b"garbage-that-does-not-hash-to-root");
@@ -358,7 +362,7 @@ fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
     root,
     "sanity: garbage hashes elsewhere"
   );
-  store.write_block(root, garbage);
+  store.insert_raw(root, garbage);
   assert!(
     store.has_block(root),
     "the corrupt block is present in the raw store"
@@ -369,12 +373,12 @@ fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
     block_address(b"garbage-that-does-not-hash-to-root")
   );
 
-  // Restore through VerifiedBlocks: the corrupt block reads as None, so the SM returns Err.
+  // Restore through VerifiedView: the corrupt block reads as None, so the SM returns Err.
   let mut fresh = TrivialSm { count: 0 };
-  let verified = VerifiedBlocks::new(&store);
+  let verified = VerifiedView::new(&store);
   let err = fresh
     .restore(root, &verified)
-    .expect_err("corrupt block through VerifiedBlocks must surface RestoreError");
+    .expect_err("corrupt block through VerifiedView must surface RestoreError");
   assert_eq!(err, RestoreError::new(root));
   // SM is left unchanged: count stays 0, not 7.
   assert_eq!(
@@ -384,9 +388,9 @@ fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
 
   // --- Part B: a clean block reads through and restore succeeds. ---
 
-  let mut sm2 = TrivialSm { count: 99 };
-  let mut store2 = MemBlockStore::new();
-  let root2 = sm2.checkpoint(&mut store2);
+  let sm2 = TrivialSm { count: 99 };
+  let mut store2 = InMemoryBlockStore::new();
+  let root2 = TrivialSm::materialize(&sm2.checkpoint_image(), &mut store2);
   // The block IS correctly keyed: block_address(bytes) == root2.
   let good_bytes = store2.read_block(root2).unwrap();
   assert_eq!(
@@ -396,10 +400,10 @@ fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
   );
 
   let mut fresh2 = TrivialSm { count: 0 };
-  let verified2 = VerifiedBlocks::new(&store2);
+  let verified2 = VerifiedView::new(&store2);
   fresh2
     .restore(root2, &verified2)
-    .expect("clean block through VerifiedBlocks must restore successfully");
+    .expect("clean block through VerifiedView must restore successfully");
   assert_eq!(
     fresh2.count, 99,
     "restored SM reaches the checkpointed state"
@@ -413,15 +417,15 @@ fn verified_blocks_has_block_agrees_with_verified_read_block() {
   // store still holds it.
   let good = bytes::Bytes::from_static(b"a genuine block");
   let good_addr = block_address(&good);
-  let mut store = MemBlockStore::new();
-  store.write_verified(good.clone());
+  let mut store = InMemoryBlockStore::new();
+  store.put(good.clone());
 
   let corrupt_addr = block_address(b"never written under this address");
   let garbage = bytes::Bytes::from_static(b"garbage bytes stored under a foreign address");
   assert_ne!(block_address(&garbage), corrupt_addr, "sanity: mis-stored");
-  store.write_block(corrupt_addr, garbage);
+  store.insert_raw(corrupt_addr, garbage);
 
-  let verified = VerifiedBlocks::new(&store);
+  let verified = VerifiedView::new(&store);
   assert!(verified.has_block(good_addr), "a genuine block is present");
   assert!(
     !verified.has_block(corrupt_addr),
@@ -430,19 +434,16 @@ fn verified_blocks_has_block_agrees_with_verified_read_block() {
 }
 
 #[test]
-fn verified_blocks_flush_and_gc_use_the_trait_defaults() {
-  // VerifiedBlocks overrides only read_block/has_block/write_block; flush and gc fall through to
-  // the BlockStore trait's default implementations (an infallible Ok(()) and a no-op sweep).
+fn verified_view_exposes_only_the_read_surface() {
+  // The view is read-only BY TYPE: it exposes exactly the verified read methods, so a restore
+  // holding one cannot write, flush, or GC the underlying store. This test pins the read surface
+  // itself; the type-level absence of the mutating methods is enforced by the compiler.
   let block = bytes::Bytes::from_static(b"retained");
   let addr = block_address(&block);
-  let mut store = MemBlockStore::new();
-  store.write_verified(block);
+  let mut store = InMemoryBlockStore::new();
+  store.put(block.clone());
 
-  let mut verified = VerifiedBlocks::new(&store);
-  assert_eq!(verified.flush(), Ok(()), "the default flush is infallible");
-  verified.gc(&[]); // the default gc is a no-op regardless of the walks supplied.
-  assert!(
-    verified.has_block(addr),
-    "the no-op default gc must not remove anything reachable through the view"
-  );
+  let verified = VerifiedView::new(&store);
+  assert_eq!(verified.read_block(addr), Some(block));
+  assert!(verified.has_block(addr));
 }

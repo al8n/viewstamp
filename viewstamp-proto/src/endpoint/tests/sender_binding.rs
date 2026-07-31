@@ -18,7 +18,7 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The primary assigns op 1 to a client request and durably appends it (its OWN vote: bit 0).
   e.handle_message(
@@ -108,7 +108,7 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Idle → propose SVC(view 1); a peer SVC completes the SVC quorum → enter ViewChange(1).
   e.handle_timeout(
@@ -193,7 +193,7 @@ fn forged_start_view_change_from_a_different_sender_is_dropped() {
   // replica 2 is forged: it must NOT contribute, so the backup does not reach the SVC quorum.
   let mut e = backup(); // replica 1 of 3 — a backup of view 0
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.status(), Status::Normal);
 
@@ -252,7 +252,7 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
   // works; see `sender_matches` and the `forged_prepare_from_a_non_primary_replica_is_dropped` test.)
   let mut e = backup(); // replica 1 of 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The real primary (replica 0) prepares op 1; the backup appends + acks it.
   e.handle_message(
@@ -318,7 +318,7 @@ fn forged_prepare_from_a_client_is_dropped_by_the_sender_binding() {
   // The honest primary-originated `Prepare` is unaffected.
   let mut e = backup(); // replica 1 of 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Forged: a Prepare for op 1, but `from` is a client (not a replica).
   e.handle_message(
@@ -363,7 +363,7 @@ fn forged_prepare_from_a_non_primary_replica_is_dropped() {
   // `self.repair.contains(op)`, exercised by the peer-repair tests).
   let mut e = backup(); // replica 1 of 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Forged: a current-view (view 0) Prepare for op 1 from replica 2 (NOT the view-0 primary), op 1
   // is not a repair hole.
@@ -412,7 +412,7 @@ fn forged_prepare_batch_from_a_non_primary_is_dropped_by_the_sender_binding() {
   // (which the primary would otherwise count toward a commit quorum).
   let mut e = backup(); // replica 1 of 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let batch = || {
     Message::PrepareBatch(crate::PrepareBatch::new(
@@ -480,7 +480,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The primary assigns op 1 and durably appends it (its own vote: bit 0).
   e.handle_message(
@@ -560,7 +560,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
   // self-consistent checkpoint hash, must NOT reach apply_sync — that would restore SM/session state
   // from a non-member. The centralized membership check drops it at ingress; the sync stays outstanding.
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Seed the SM checkpoint DAG so the genuine-member positive control installs (its block-fetch
   // frontier drains locally); the out-of-range reject happens BEFORE any block fetch, so it is
   // unaffected by the seeding.
@@ -649,7 +649,7 @@ fn repair_hole_prepare_from_a_client_is_dropped() {
   // `commit >= op` + `Header::verify` self-consistency before any role check — so a buggy/misrouting
   // driver could fill a committed hole from a NON-replica peer. The hole must stay open.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the recovery solicitation
   let now = Instant::ZERO;
   // Learn commit up to 3 → applies op 1, registers + holds at the op-2 hole.
@@ -720,7 +720,7 @@ fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
   // cluster, so a `Prepare` it sends for one of our holes is misrouted/forged and must be dropped at
   // ingress, never reaching `fill_repair`. The hole stays open until a valid holder answers.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the recovery solicitation
   let now = Instant::ZERO;
   // Learn commit up to 3 → applies op 1, registers + holds at the op-2 hole.
@@ -793,7 +793,7 @@ fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
   // repair-hole ingress escape) would yank the replica into a spurious view change off a body it
   // explicitly rejected. The replica must stay in its current view/status and keep the hole open.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the recovery solicitation
   let now = Instant::ZERO;
   // Learn commit up to 3 → applies op 1, registers + holds at the op-2 hole. (View stays 0.)

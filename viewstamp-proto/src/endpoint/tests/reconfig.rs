@@ -53,7 +53,7 @@ fn recover_resolves_self_by_member_id_and_returns_active() {
   let state = v4_root(membership, 0);
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(state);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // The Config's local member is MemberId::new(7) (the `1` is the legacy ctor index, irrelevant to
   // membership resolution now).
   let cfg = Config::try_new(1, MemberId::new(7)).unwrap();
@@ -81,7 +81,7 @@ fn recover_returns_retired_when_self_absent() {
   let state = v4_root(membership, 0);
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(state);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Local member 99 is absent from the durable membership.
   let cfg = Config::try_new(1, MemberId::new(99)).unwrap();
 
@@ -134,7 +134,7 @@ fn recover_bridges_a_legacy_root_to_the_passed_genesis() {
   );
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(legacy);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
 
   let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -160,7 +160,7 @@ fn recover_prefers_the_root_membership_over_the_passed_param() {
   let state = v4_root(durable, 0);
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(state);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
 
   // Pass a DIFFERENT genesis (the standard `genesis(3)`, MemberId(i) at slot i → MemberId(1) at slot
@@ -184,7 +184,7 @@ fn recover_resolves_a_learner_self_to_active() {
   let state = v4_root(membership, 0);
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(state);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap();
 
   let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -256,7 +256,7 @@ fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() 
 
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(succ_state);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // The local member (MemberId 3) is the newly-added voter in the successor — present → Active.
   let cfg = Config::try_new(2, MemberId::new(3)).unwrap();
   let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -342,7 +342,7 @@ fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Ep
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // head read never clears → permanently faulty
   let mut sb = sb_with_state(succ_state);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // local = MemberId 1 → slot 1 (a voter)
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -381,7 +381,7 @@ fn recovering_head_tally_of_a_peer_recovery_emits_nothing_but_sets_the_bit() {
   // voter slot in `peers_recovering` with ZERO egress (it has no canonical head to hand out, and the
   // tally must be byte-identity-safe — off the `emit` chokepoint).
   let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the entry-time solicitation
   let now = Instant::ZERO;
   let (from, msg) = peer_recovery(0, epoch, config_id); // replica 0 is a co-recovering voter
@@ -410,7 +410,7 @@ fn over_fire_guard_no_co_recovering_peers_never_escalates() {
   // matured, but NO co-recovering peers (`peers_recovering` stays 0 every window), must NOT escalate —
   // the gate stays false because the co-recovering-quorum evidence (G2) is absent. Many ticks, no SVC.
   let (mut r, mut wal, mut sb, _epoch, _config_id) = recovering_head_post_reconfig();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let mut now = Instant::ZERO;
   // Tick far past RECOVER_HEAD_REFORM_ATTEMPTS windows; never feed a peer Recovery.
@@ -463,7 +463,7 @@ fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // head read never clears → permanently faulty
   let mut sb = sb_with_state(succ);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(0, MemberId::new(0)).unwrap(); // local = MemberId 0 → slot 0 (the only voter)
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(1), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -516,7 +516,7 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
   let mut sb = sb_with_state(succ);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap(); // local = the LEARNER at slot 2
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -560,7 +560,7 @@ fn a_self_looped_recovery_does_not_count_toward_g2() {
   // where `quorum - 1 == 1`). Feed a `RecoveringHead` voter its OWN `Recovery`; `peers_recovering`
   // stays 0. A DIFFERENT voter's `Recovery` then sets its bit, confirming the tally still works.
   let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig(); // 3v, local slot 1
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let (from_self, msg_self) = peer_recovery(1, epoch, config_id); // slot 1 == the local slot — a self-loop
   r.handle_message(now, &mut wal, &mut sb, &mut blocks, from_self, msg_self);
@@ -585,7 +585,7 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   // escalates into a view change at `view + 1` and (on the next solicitation window) broadcasts a
   // StartViewChange. Every wedged voter recovered the same durable view, so all converge on view+1.
   let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let start_view = r.view();
   let start_log_view = r.log_view();
@@ -675,7 +675,7 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   let mut wal2 = ScriptedWal::with_entries(2);
   wal2.script_read_fault(OpNumber::with(2), u8::MAX);
   let mut sb2 = sb_with_state(succ_state);
-  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now2 = Instant::ZERO;
   let mut r2 = Endpoint::recover(
@@ -740,7 +740,7 @@ fn a_single_window_stale_recovery_does_not_escalate() {
   // dropped and never reaches the co-recovering quorum. With the OLD single-window snapshot this would
   // escalate (G1 matured + the quorum present this window); the intersection makes it inert.
   let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let mut now = Instant::ZERO;
   // Mature G1 well past the bound with EMPTY windows — so only the missing two-window evidence can hold
@@ -782,7 +782,7 @@ fn a_since_recovered_peer_drops_out_of_the_two_window_intersection() {
   // stopped broadcasting) is dropped by the intersection — the prev-window bit ALONE is insufficient.
   // This confirms G2 is an AND of two windows, not an OR-accumulator, and models the exact R5 timeline.
   let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let mut now = Instant::ZERO;
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 1) {
@@ -846,7 +846,7 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // committed interior → kept as Repairing
   wal.script_read_fault(OpNumber::with(3), u8::MAX); // uncommitted head → RecoveringHead
   let mut sb = sb_with_state(successor);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -934,7 +934,7 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // head → RecoveringHead
   let mut sb = sb_with_state(successor);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
@@ -1070,7 +1070,7 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
   // root (`TestSb::default()` → `VsrState::new()`) still names the STALE commit C0 == 0 — the lag.
   e.force_state_for_test(0, k, k, 0, &[]);
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert_eq!(
     sb.state().commit(),
     OpNumber::new(),
@@ -1150,7 +1150,7 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
   // full sealed band back. A large checkpoint interval matches the regime in which the hazard is reachable.
   let mut wal = ScriptedWal::with_entries(k);
   let mut sb = sb_with_state(successor);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
@@ -1246,7 +1246,7 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
   // bounds the read.
   let mut wal = ScriptedWal::with_entries(k);
   let mut sb = sb_with_state(successor);
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
@@ -1654,7 +1654,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.is_primary(), "MemberId 0 at slot 0 is the view-0 primary");
   assert_eq!(e.membership.quorum(), 3, "4 voters → old commit quorum 3");

@@ -263,10 +263,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (routed by the TYPED `pc.kind`) to install + complete recovery — NOT the recover loop, whose `Wrote`
     // arm is a defensive no-op. Peel that staged-write case off here so it reaches the typed handler.
     if self.status.is_recovering() || self.status.is_recovering_head() {
-      let staged_step = self.pending_checkpoint.map(|pc| match pc.step {
-        CheckpointStep::AwaitSnapshot(sid) => sid,
-        CheckpointStep::AwaitRoot(rid) => rid,
-      });
+      let staged_step = self.pending_checkpoint.and_then(|pc| pc.step.write_id());
       let is_staged_repersist_write =
         matches!(done, SuperblockDone::Wrote(id) if staged_step == Some(id));
       if !is_staged_repersist_write {
@@ -364,13 +361,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               "SwapEpoch-completion force_checkpoint would snapshot a stale / about-to-be-replaced SM at M",
             );
             if !self.sm_reconstruct_owed() && self.pending_install.is_none() {
-              // A `false` return (block-store flush failed) — OR a deferral by the guard above — leaves the
-              // self-describing debt (`config_install_op = N > checkpoint_op`) owed. That debt is durable in
-              // the just-landed SwapEpoch root, so `maybe_pay_checkpoint_debt` (sticky from every
-              // commit-advance tail and from recovery, under the same SM guard) re-forces it once the SM is
-              // ready + a flush succeeds; the cross-epoch serve gate stays correctly withheld until then.
-              // Ignored deliberately.
-              let _ = self.force_checkpoint(sb, blocks);
+              // A deferral by the guard above — or a flush fault reported by the materialize
+              // completion — leaves the self-describing debt (`config_install_op = N > checkpoint_op`)
+              // owed. That debt is durable in the just-landed SwapEpoch root, so
+              // `maybe_pay_checkpoint_debt` (sticky from every commit-advance tail and from recovery,
+              // under the same SM guard) re-forces it once the SM is ready + a flush succeeds; the
+              // cross-epoch serve gate stays correctly withheld until then.
+              self.force_checkpoint();
             }
           }
         }
@@ -384,7 +381,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Checkpoint write? Distinguish the two steps by their own minted OpIds.
     if let Some(pc) = self.pending_checkpoint {
       match pc.step {
-        CheckpointStep::AwaitSnapshot(sid) if sid == id => {
+        CheckpointStep::AwaitSnapshot(sid, dag) if sid == id => {
           // The snapshot is durable → advance the durable root to name the new checkpoint.
           let root_id = self.mint_write_id();
           // The committed band the NEW root names shrinks to `(target_op .. commit]` (the just-
@@ -431,7 +428,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               self.log_view,
               root_commit,
               pc.target_op,
-              pc.checkpoint_id,
+              dag.checkpoint_id,
               headers,
               successor,
               *successor_prev_config_id,
@@ -441,7 +438,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               self.log_view,
               root_commit,
               pc.target_op,
-              pc.checkpoint_id,
+              dag.checkpoint_id,
               // SPARSE band headers over `(target_op .. min(commit_max, op)]` — bounded by the ACTUAL
               // known-committed frontier `commit_max` (NOT the lifted `root_commit`), so for a sync
               // re-persist (where `commit_max <= target_op`) the band is empty: every op `<= target_op`
@@ -452,11 +449,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           };
           sb.submit_write(root_id, state);
           self.pending_checkpoint = Some(PendingCheckpoint {
-            step: CheckpointStep::AwaitRoot(root_id),
+            step: CheckpointStep::AwaitRoot(root_id, dag),
             ..pc
           });
         }
-        CheckpointStep::AwaitRoot(rid) if rid == id => {
+        CheckpointStep::AwaitRoot(rid, dag) if rid == id => {
           // The root is durable → the checkpoint is COMPLETE. Route by the TYPED `pc.kind` — whether
           // THIS root is a state-sync re-persist or an ordinary checkpoint. Matching on the kind carried
           // in the completion token (NOT `self.sync.is_some()`) makes the routing footgun structurally
@@ -470,8 +467,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // The new checkpoint root is durable — record its SM DAG root AND its session-table DAG root as
           // the live roots the block GC marks from (both kinds: an ordinary produce and a synced
           // re-persist name a real `sm_root` + `sessions_root`).
-          self.checkpoint_sm_root = Some(pc.sm_root);
-          self.checkpoint_sessions_root = Some(pc.sessions_root);
+          self.checkpoint_sm_root = Some(dag.sm_root);
+          self.checkpoint_sessions_root = Some(dag.sessions_root);
           match pc.kind {
             CheckpointKind::SyncRepersist => {
               // SYNC re-persist. The synced checkpoint root is now durable (the COMMIT POINT), so INSTALL
@@ -523,7 +520,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               // Prune SM checkpoint blocks unreachable from the now-durable checkpoint root (mark-and-
               // sweep from the live roots). Runs AFTER the durable root, so a freed block is provably
               // unreferenced by any live checkpoint.
-              self.gc_blocks(blocks);
+              self.gc_blocks();
               // `checkpoint_op` advanced (the ring window slid forward): re-drive any adopted-tail
               // append that was skipped over the old window.
               self.retry_unappended_adopted_tail(wal);
@@ -555,7 +552,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
     // checkpoint root (the old checkpoint's no-longer-referenced blocks). The sync's own block-fetch
     // already drained + cleared, so no in-flight sync-target root is live.
-    self.gc_blocks(blocks);
+    self.gc_blocks();
     // Observability: the synced checkpoint is installed AND durable — the sync is complete (covers both the
     // deferred Normal install and the deferred recovery install). `self.checkpoint_op` is M (advanced by
     // the install). Scalar copy only.
@@ -644,11 +641,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `commit_min`. The snapshot reflects the SM state at `commit_min` exactly (all ops `<= commit_min`
   /// applied, none above), so the checkpoint covers a committed+applied prefix; `target_op = commit_min`
   /// keeps the snapshot↔op correspondence exact even when a batch commit jumps past the boundary.
-  pub(crate) fn maybe_checkpoint<B: Superblock>(
-    &mut self,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub(crate) fn maybe_checkpoint(&mut self) {
     // Only checkpoint once the view is settled and durable-consistent: Normal status AND
     // `log_view == view`. `advance_commit` is also called mid-view-change (in
     // `start_view_as_new_primary` / `on_start_view`, applying prior-view committed ops) — there
@@ -688,10 +681,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.commit_min.get() < boundary {
       return;
     }
-    // A `false` return means the block-store flush failed → no checkpoint was submitted. The cadence
+    // The materialize runs off the pump; a flush fault there simply publishes nothing. The cadence
     // re-evaluates on the next commit-advance (`commit_min` only grows), so the checkpoint is simply
-    // re-attempted; there is nothing to roll back. Ignored deliberately.
-    let _ = self.force_checkpoint(sb, blocks);
+    // re-attempted; there is nothing to roll back.
+    self.force_checkpoint();
   }
 
   /// The COMMITTED dedup projection of the live session table, for a checkpoint. The live `self.clients`
@@ -740,17 +733,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// recovery drives the band to `>= N` then forces the owed checkpoint). The ordinary cadence path is
   /// byte-identical to the prior inline body.
   ///
-  /// Returns whether a checkpoint was SUBMITTED. It is `false` ONLY when the block-store durability
-  /// barrier ([`BlockStore::flush`]) failed: the checkpoint names blocks that are not durable, so no
-  /// pointer is advanced (no torn checkpoint) and the caller leaves the durable state unchanged; the
-  /// cadence / debt-pay / commit-advance re-forces it next time. On success it is `true`.
-  #[must_use = "a force_checkpoint that returns false did not submit (block-store flush failed); the \
-                caller must not assume a checkpoint is in flight"]
-  pub(crate) fn force_checkpoint<B: Superblock>(
-    &mut self,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) -> bool {
+  /// Nothing durable is written HERE: the checkpoint's block DAGs are written and flushed by a
+  /// [`BlockJob`](crate::BlockJob) the driver executes off the pump, and only that job's completion
+  /// ([`Self::on_checkpoint_materialized`]) submits the superblock write naming them — and only when
+  /// its flush returned `Ok`. A failed flush, or a view transition that abandons the checkpoint while
+  /// the DAG is being written, therefore advances no pointer at all; the cadence / debt-pay /
+  /// commit-advance re-forces the checkpoint next time, exactly as a failed inline flush used to.
+  pub(crate) fn force_checkpoint(&mut self) {
     // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
     // `commit_min` may have jumped past `boundary` in a batch commit, and the SM has applied through
     // `commit_min` (apply is forward-only) — so the checkpoint reflects state through `commit_min`.
@@ -766,59 +755,139 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.commit_min.get(),
     );
     let target_op = self.commit_min;
-    // Write the SM checkpoint as a content-addressed block DAG into the block store and bind its
-    // root into the envelope so `checkpoint_id` covers it: the written op and the op hashed alongside
-    // the root are the SAME, so a later restore can prove they agree. The envelope is now frame-bounded
-    // (op + sessions + a 16-byte root); a laggard state-syncs the SM state by fetching only the blocks
-    // it is missing from the DAG rooted here.
-    let sm_root = self.sm.checkpoint(blocks);
-    // Write the proto-owned CLIENT SESSION TABLE into the same block store as its own content-addressed
-    // DAG and bind its root into the envelope: the table is no longer inline, so the envelope is always
-    // frame-bounded (op + two 16-byte roots) regardless of session count or cached-reply size. A laggard
-    // state-syncs the table by fetching only the session blocks it is missing from the DAG rooted here.
-    // Project the live table to its COMMITTED dedup state before encoding: drop provisional rows (no
-    // committed reply) and lower each accept-ahead `request` watermark to the applied request (`reply.0`).
-    // A checkpoint is committed state, so it must not persist a watermark for an op above `target_op` that
-    // a later view change may TRUNCATE — restoring such a row on recovery / state-sync would dedup the
-    // client's retry as an in-flight duplicate with no cached reply (a permanent hang). The live table
-    // self-corrects (a view transition purges provisionals, a repair-timeout rolls accept-ahead watermarks
-    // back), but a checkpoint captured before those corrections must not outlive them. See
+    // Capture the SM's applied-state image ON the pump (a pure, storage-free snapshot) and project
+    // the live client-session table to its COMMITTED dedup state, then hand BOTH to a block job that
+    // writes them as content-addressed DAGs off the pump. Capturing here — at the boundary, before
+    // the endpoint returns to applying ops — is what makes the image reflect `target_op` exactly,
+    // even though the DAG is written later while the live SM keeps advancing.
+    //
+    // The session projection drops provisional rows (no committed reply) and lowers each
+    // accept-ahead `request` watermark to the applied request (`reply.0`). A checkpoint is committed
+    // state, so it must not persist a watermark for an op above `target_op` that a later view change
+    // may TRUNCATE — restoring such a row on recovery / state-sync would dedup the client's retry as
+    // an in-flight duplicate with no cached reply (a permanent hang). The live table self-corrects (a
+    // view transition purges provisionals, a repair-timeout rolls accept-ahead watermarks back), but
+    // a checkpoint captured before those corrections must not outlive them. See
     // [`Self::committed_session_projection`].
-    let sessions_root =
-      super::session_blocks::encode_sessions(&self.committed_session_projection(), blocks);
-    // DURABILITY BARRIER: the blocks this checkpoint NAMES must be durable BEFORE the superblock pointer
-    // that references them. `write_block` is infallible with no durability guarantee, so `flush` is what
-    // makes the SM + session DAGs durable; ordering it here — strictly before `submit_write_checkpoint`
-    // — closes the strand where a crash after the durable checkpoint pointer but before the block
-    // contents would leave the pointer naming MISSING blocks (committed state lost on restart / after a
-    // peer GC). On a flush fault DO NOT advance: submit no checkpoint write and return, leaving
-    // `pending_checkpoint` clear so no torn checkpoint exists; the cadence (or the debt-pay / commit-advance
-    // tail) re-forces it next time, exactly like a lost WAL prune. Treated as data, mirroring a faulted read.
-    if self.blocks_flush_failed(blocks) {
-      return false;
-    }
-    let envelope = Self::encode_checkpoint(target_op, sm_root, sessions_root);
-    let checkpoint_id = crate::checkpoint_id(&envelope);
-    let id = self.mint_write_id();
-    sb.submit_write_checkpoint(id, target_op, envelope);
+    let image = self.sm.checkpoint_image();
+    let sessions = SessionImage(self.committed_session_projection());
+    let job = self.issue_block_job(BlockJobKind::Materialize { image, sessions });
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
-      checkpoint_id,
-      sm_root,
-      sessions_root,
-      step: CheckpointStep::AwaitSnapshot(id),
+      step: CheckpointStep::FlushingBlocks(job),
       kind: CheckpointKind::Ordinary, // not a state-sync re-persist
     });
-    true
   }
 
-  /// Flush the block store's pending writes to durability and report whether the barrier FAILED. A
-  /// `true` return means the just-written checkpoint blocks are NOT durable, so the caller must NOT
-  /// advance the checkpoint pointer (no torn checkpoint that names un-flushed blocks). Centralises the
-  /// barrier so the ordinary-checkpoint path and the state-sync re-persist path treat a flush fault
-  /// identically. (`flush` is `Ok(())` for an in-memory store, so this is a no-op there.)
-  pub(crate) fn blocks_flush_failed(&self, blocks: &mut dyn BlockStore) -> bool {
-    blocks.flush().is_err()
+  /// The ORDINARY checkpoint's block half completed: both DAGs are written and the durability
+  /// barrier has returned its verdict. THE PUBLICATION GATE — the one place an ordinary checkpoint's
+  /// superblock write is submitted, and it fires only when BOTH hold:
+  ///
+  /// - the completion's [`JobId`](crate::JobId) still matches the in-flight checkpoint's
+  ///   `FlushingBlocks` token (a view transition that abandoned the checkpoint while its DAG was being
+  ///   written leaves the completion with nothing to publish — the written blocks are then
+  ///   unreferenced garbage the next sweep frees); and
+  /// - the flush returned `Ok` — the blocks this checkpoint NAMES are durable.
+  ///
+  /// A failed flush means the named blocks are NOT durable, so NO pointer is advanced (no torn
+  /// checkpoint naming un-flushed blocks) and the checkpoint is dropped whole; the cadence (or the
+  /// debt-pay / commit-advance tail) re-forces it, exactly like a lost WAL prune. Treated as data,
+  /// mirroring a faulted read.
+  pub(super) fn on_checkpoint_materialized<B: Superblock>(
+    &mut self,
+    job: crate::JobId,
+    sb: &mut B,
+    sm_root: BlockAddress,
+    sessions_root: BlockAddress,
+    flush: Result<(), crate::BlockStoreError>,
+  ) {
+    let Some(pc) = self
+      .pending_checkpoint
+      .filter(|pc| pc.step == CheckpointStep::FlushingBlocks(job))
+    else {
+      self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+      return;
+    };
+    if flush.is_err() {
+      self.pending_checkpoint = None;
+      return;
+    }
+    // Bind BOTH roots into the envelope so `checkpoint_id` covers them: the written op and the op
+    // hashed alongside the roots are the SAME, so a later restore can prove they agree. The envelope
+    // is frame-bounded (op + two 16-byte roots) regardless of session count or cached-reply size; a
+    // laggard state-syncs by fetching only the blocks it is missing from the DAGs rooted here.
+    let envelope = Self::encode_checkpoint(pc.target_op, sm_root, sessions_root);
+    let dag = CheckpointDag {
+      checkpoint_id: crate::checkpoint_id(&envelope),
+      sm_root,
+      sessions_root,
+    };
+    let id = self.mint_write_id();
+    sb.submit_write_checkpoint(id, pc.target_op, envelope);
+    self.pending_checkpoint = Some(PendingCheckpoint {
+      step: CheckpointStep::AwaitSnapshot(id, dag),
+      ..pc
+    });
+  }
+
+  /// The STATE-SYNC re-persist's block half completed: the durability barrier over the DAGs the
+  /// transfer already drained into this store has returned its verdict. The publication gate for the
+  /// sync path, symmetric with [`Self::on_checkpoint_materialized`] — the synced checkpoint's
+  /// snapshot write is submitted only on a matching token AND an `Ok` barrier.
+  ///
+  /// On a FAULT nothing is staged and `pending_install` stays OWED (the install stays retained, its
+  /// drained DAG GC-protected as a live root) with the solicit cadence re-armed, so a transient disk
+  /// fault self-heals locally via [`Self::retry_install_flush`] instead of stalling the sync forever
+  /// once the donor goes dark — the same outcome the inline barrier's fault arm produced.
+  pub(super) fn on_checkpoint_blocks_flushed<B: Superblock>(
+    &mut self,
+    now: Instant,
+    job: crate::JobId,
+    sb: &mut B,
+    flush: Result<(), crate::BlockStoreError>,
+  ) {
+    let Some(pc) = self
+      .pending_checkpoint
+      .filter(|pc| pc.step == CheckpointStep::FlushingBlocks(job))
+    else {
+      self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+      return;
+    };
+    // The install this barrier was issued for is gone (a view transition cancelled the pre-root
+    // staging with its sync): there is nothing to persist, and the drained blocks survive for a fresh
+    // sync exactly as the reset intends.
+    let Some(install) = self.pending_install.as_ref() else {
+      self.pending_checkpoint = None;
+      self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+      return;
+    };
+    if flush.is_err() {
+      self.pending_checkpoint = None;
+      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+      return;
+    }
+    let dag = CheckpointDag {
+      checkpoint_id: install.checkpoint.checkpoint_id(),
+      sm_root: install.sm_root,
+      sessions_root: install.sessions_root,
+    };
+    let snapshot = install.checkpoint.snapshot_bytes();
+    let id = self.mint_write_id();
+    sb.submit_write_checkpoint(id, pc.target_op, snapshot);
+    self.pending_checkpoint = Some(PendingCheckpoint {
+      step: CheckpointStep::AwaitSnapshot(id, dag),
+      ..pc
+    });
+    // Keep re-soliciting until the persist's root write completes (defends a fault mid-persist).
+    self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+    // THE RECOVERY peer-fetch lane. Staging is the point its READ phase is done — the node now waits
+    // on the root completion, not a timer — so retire the recovery bookkeeping here, the single place
+    // BOTH staging lanes (a fresh `SyncCheckpoint` escape and the local flush retry) pass through.
+    // Reaching it only from the staging keeps a FAULTED barrier from retiring anything, which is what
+    // leaves the peer-fetch armed for the retry.
+    if self.status.is_recovering() || self.status.is_recovering_head() {
+      self.retire_recover_for_staged_sync();
+    }
   }
 
   /// Pay down the self-describing CHECKPOINT DEBT a crash in the swap-checkpoint window leaves.
@@ -895,11 +964,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `pending_checkpoint.is_none()`: a nested debt-pay (reached via the proactive `advance_commit`'s own
     // tail) may have already forced it — never submit a second concurrent checkpoint.
     if self.commit_min.get() >= self.config_install_op.get() && self.pending_checkpoint.is_none() {
-      // A `false` return means the block-store flush failed → the owed checkpoint was NOT submitted, so
-      // the debt (`config_install_op > checkpoint_op`) STAYS owed. This routine is sticky — it re-runs
-      // from every commit-advance tail and from `complete_recovery` — so it re-forces the moment a later
+      // A flush fault reported by the materialize completion publishes nothing, so the debt
+      // (`config_install_op > checkpoint_op`) STAYS owed. This routine is sticky — it re-runs from
+      // every commit-advance tail and from `complete_recovery` — so it re-forces the moment a later
       // flush succeeds; nothing is advanced now and the cross-epoch serve gate stays correctly withheld.
-      let _ = self.force_checkpoint(sb, blocks);
+      self.force_checkpoint();
     }
   }
 
@@ -1075,7 +1144,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// two MARKED SETS: a block reachable from EITHER DAG survives, and because each kind's true children
   /// are always included by its own resolver, no reachable block is ever freed (over-marking only ever
   /// retains an extra block; under-marking is impossible).
-  pub(crate) fn gc_blocks(&mut self, blocks: &mut dyn BlockStore) {
+  ///
+  /// Issued as a block job, so the sweep itself runs OFF the pump. The roots are captured HERE, at
+  /// the moment the durable root that justifies them landed; the job's serial-in-issue-order
+  /// execution is what keeps those roots valid when the sweep finally runs — a later `Materialize`
+  /// queued behind this sweep cannot have its fresh blocks freed by it.
+  pub(crate) fn gc_blocks(&mut self) {
     // TYPED roots: an SM set and a session set, each followed by its own resolver. The in-flight
     // `block_fetch` roots are split the SAME typed way (its `sm_root` into the SM set, `sessions_root`
     // into the session set) — a sync target's partially-fetched blocks of either kind survive until
@@ -1104,13 +1178,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if sm_roots.is_empty() && session_roots.is_empty() {
       return; // no durable root established yet — nothing is safely prunable.
     }
-    blocks.gc(&[
-      crate::block_store::BlockDagWalk::new(&sm_roots, &|block| S::block_references(block)),
-      crate::block_store::BlockDagWalk::new(
-        &session_roots,
-        &super::session_blocks::session_block_references,
-      ),
-    ]);
+    self.issue_block_job(BlockJobKind::Gc {
+      sm_roots,
+      session_roots,
+    });
   }
 
   /// Free the in-memory `log`-cache entries a durable checkpoint snapshot subsumes: drop every op
@@ -1257,12 +1328,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `self.checkpoint_op` paired with the durable `checkpoint_id`. The persisted `checkpoint_op` is thus
     // monotone non-decreasing across the two concurrent writers; `commit` + the band below derive from it.
     let (checkpoint_op, checkpoint_id) = match &self.pending_checkpoint {
-      Some(pc)
-        if matches!(pc.kind, CheckpointKind::Ordinary)
-          && matches!(pc.step, CheckpointStep::AwaitRoot(_)) =>
-      {
-        (pc.target_op, pc.checkpoint_id)
-      }
+      Some(pc) if matches!(pc.kind, CheckpointKind::Ordinary) => match pc.step {
+        CheckpointStep::AwaitRoot(_, dag) => (pc.target_op, dag.checkpoint_id),
+        _ => (self.checkpoint_op, sb.state().checkpoint_id()),
+      },
       _ => (self.checkpoint_op, sb.state().checkpoint_id()),
     };
     let commit = OpNumber::with(self.commit_max.get().max(checkpoint_op.get()));

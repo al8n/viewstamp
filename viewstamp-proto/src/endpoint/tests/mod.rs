@@ -71,21 +71,26 @@ mod view_change;
 
 struct NoopSm;
 impl StateMachine for NoopSm {
+  type Image = ();
+
   fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
     Bytes::new()
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = Bytes::new();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {}
+
+  fn materialize(_image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(Bytes::new())
+  }
+
+  fn restore_seed(&self) -> Self {
+    NoopSm
   }
 
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     store
       .read_block(root)
@@ -98,21 +103,26 @@ impl StateMachine for NoopSm {
 /// (used to prove `recover` restores real bodies — an empty-body regression echoes empty bytes).
 struct EchoSm;
 impl StateMachine for EchoSm {
+  type Image = ();
+
   fn apply(&mut self, _op: OpNumber, body: &[u8]) -> Bytes {
     Bytes::copy_from_slice(body)
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = Bytes::new();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {}
+
+  fn materialize(_image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(Bytes::new())
+  }
+
+  fn restore_seed(&self) -> Self {
+    EchoSm
   }
 
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     store
       .read_block(root)
@@ -162,22 +172,29 @@ impl CountSm {
   }
 }
 impl StateMachine for CountSm {
+  type Image = Bytes;
+
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), body.to_vec()));
     Bytes::copy_from_slice(body)
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = self.snapshot();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {
+    self.snapshot()
+  }
+
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(image.clone())
+  }
+
+  fn restore_seed(&self) -> Self {
+    CountSm::default()
   }
 
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     let block = store
       .read_block(root)
@@ -240,31 +257,36 @@ impl TwoLeafSm {
   }
 }
 impl StateMachine for TwoLeafSm {
+  type Image = std::vec::Vec<(u64, std::vec::Vec<u8>)>;
+
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), body.to_vec()));
     Bytes::copy_from_slice(body)
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let (leaf_x, leaf_y) = self.leaves();
-    let xa = block_address(&leaf_x);
-    let ya = block_address(&leaf_y);
-    store.write_block(xa, leaf_x);
-    store.write_block(ya, leaf_y);
+  fn checkpoint_image(&self) -> Self::Image {
+    self.applied.clone()
+  }
+
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    let mid = image.len() / 2;
+    let xa = store.put(Self::leaf_bytes(b'x', &image[..mid]));
+    let ya = store.put(Self::leaf_bytes(b'y', &image[mid..]));
     let mut root = std::vec::Vec::new();
     root.push(b'R');
     root.extend_from_slice(xa.as_bytes());
     root.extend_from_slice(ya.as_bytes());
-    let root = Bytes::from(root);
-    let roota = block_address(&root);
-    store.write_block(roota, root);
-    roota
+    store.put(Bytes::from(root))
+  }
+
+  fn restore_seed(&self) -> Self {
+    TwoLeafSm::default()
   }
 
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     let root_block = store
       .read_block(root)
@@ -937,7 +959,7 @@ fn new_primary_with_op2_candidate(
   Endpoint<NoopSm>,
   TestWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
 ) {
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -947,7 +969,7 @@ fn new_primary_with_op2_candidate(
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
@@ -1015,7 +1037,7 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
   // A store that RAN (its op_head/body faulted), not a wipe: a FORMATTED root so recovery of this voter
   // exercises the read mechanics rather than the empty-voter fail-stop.
   let mut sb = sb_formatted();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -1076,7 +1098,7 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
   // A store that RAN (its head read faults), not a wipe: a FORMATTED root so recovery of this voter
   // reaches RecoveringHead rather than the empty-voter fail-stop.
   let mut sb = sb_formatted();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -1200,7 +1222,7 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Drive into ViewChange(view 1) (replica 1 is primary of view 1): own SVC + replica 0's SVC.
   e.handle_timeout(
@@ -1369,7 +1391,7 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -1473,7 +1495,7 @@ fn sync_apply_harness(checkpoint_op: u64) -> (Endpoint<CountSm>, TestWal, TestSb
 /// exact checkpoint sequence into `blocks`, so every block its `force_checkpoint` wrote (the SM leaf
 /// plus the session-table DAG, whose root the envelope names) lands under the exact content addresses the
 /// envelope references.
-fn seed_donor_blocks(blocks: &mut crate::block_store::MemBlockStore, ckpt: u64) {
+fn seed_donor_blocks(blocks: &mut crate::block_store::InMemoryBlockStore, ckpt: u64) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);

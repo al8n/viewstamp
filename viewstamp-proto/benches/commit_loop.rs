@@ -169,20 +169,25 @@ impl CounterSm {
 }
 
 impl StateMachine for CounterSm {
+  type Image = Bytes;
+
   fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
     self.applied += 1;
     Bytes::new()
   }
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = self.snapshot();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {
+    self.snapshot()
+  }
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(image.clone())
+  }
+  fn restore_seed(&self) -> Self {
+    CounterSm::default()
   }
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &viewstamp_proto::VerifiedView<'_>,
   ) -> Result<(), viewstamp_proto::RestoreError> {
     let block = store
       .read_block(root)
@@ -203,6 +208,8 @@ struct BatchCounterSm {
 }
 
 impl StateMachine for BatchCounterSm {
+  type Image = Bytes;
+
   fn apply(&mut self, _op: OpNumber, body: &[u8]) -> Bytes {
     let view = BatchView::parse(body).expect("the bench clients mint codec-built batch bodies");
     let mut reply = ReplyBuilder::new(max_reply_body_len(), UNIT_LEN);
@@ -216,16 +223,19 @@ impl StateMachine for BatchCounterSm {
       .finish()
       .expect("a parsed batch carries at least one unit")
   }
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = self.snapshot();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {
+    self.snapshot()
+  }
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(image.clone())
+  }
+  fn restore_seed(&self) -> Self {
+    BatchCounterSm::default()
   }
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &viewstamp_proto::VerifiedView<'_>,
   ) -> Result<(), viewstamp_proto::RestoreError> {
     let block = store
       .read_block(root)
@@ -253,15 +263,20 @@ impl BlockStore for BenchBlocks {
   fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
     self.blocks.get(&addr).cloned()
   }
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = block_address(&block);
     self.blocks.insert(addr, block);
+    addr
+  }
+  fn flush(&mut self) -> Result<(), viewstamp_proto::BlockStoreError> {
+    Ok(())
   }
   fn has_block(&self, addr: BlockAddress) -> bool {
     self.blocks.contains_key(&addr)
   }
 }
 
-struct Replica<S> {
+struct Replica<S: StateMachine> {
   ep: Endpoint<S>,
   wal: BenchWal,
   sb: BenchSb,

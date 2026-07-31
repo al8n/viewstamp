@@ -483,12 +483,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// re-broadcast `RequestSync` (dead-donor replacement: a fresh `SyncCheckpoint` from any live holder
   /// re-pins the donor and the block-fetch resumes at the same frontier). Cleared when the synced
   /// checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
-  pub(crate) fn sync_timeouts<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub(crate) fn sync_timeouts(&mut self, now: Instant, blocks: &mut dyn BlockStore) {
     if self.timers.sync_solicit.is_none_or(|d| d > now) {
       return;
     }
@@ -501,7 +496,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // needed. A transient disk fault that dropped the only locally-usable checkpoint thus completes the
     // sync the moment a flush succeeds, even if the donor has since crashed. (A no-op when none is owed,
     // or when a superblock root is in flight — `retry_install_flush` re-defers on that fence.)
-    self.retry_install_flush(now, sb, blocks);
+    self.retry_install_flush(now);
     // The controlled retry deadline fired: re-send the one outstanding `RequestBlock` and re-broadcast
     // `RequestSync` (the 100ms ARQ heartbeat — the lost-checkpoint retry, and dead-donor failover). The
     // active-donor-absent per-front re-solicit is bounded ON THE FETCH (`BlockFetch::resolicited_front`), so
@@ -1105,7 +1100,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.sync_solicit = None;
       return;
     }
-    self.begin_block_sync(now, sb, blocks, from, m);
+    self.begin_block_sync(now, blocks, from, m);
   }
 
   /// Carry the re-solicit latch ([`BlockFetch::resolicited_front`]) forward across a re-pin that
@@ -1159,10 +1154,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (nothing staged; `sync` stays armed so the solicit timer re-fetches). `next_request` is pumped
   /// immediately so a root the store already holds reports complete on the first pump (not only after a
   /// reply).
-  fn begin_block_sync<B: Superblock>(
+  fn begin_block_sync(
     &mut self,
     now: Instant,
-    sb: &mut B,
     blocks: &mut dyn BlockStore,
     from: Peer,
     m: crate::SyncCheckpoint,
@@ -1266,7 +1260,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // BOTH DAGs are already present — install now (no fetch needed). Drop any prior fetch (a
         // superseding checkpoint replaced it) before staging.
         self.block_fetch = None;
-        self.apply_sync(now, sb, blocks, donor, &m);
+        self.apply_sync(now, donor, &m);
       }
       Some(addr) => {
         // Arm the block-fetch and send the first pull. Supersedes any prior fetch (a strictly newer
@@ -1477,7 +1471,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         if recovering {
           self.on_recover_sync_checkpoint(now, wal, sb, blocks, donor, checkpoint);
         } else {
-          self.apply_sync(now, sb, blocks, donor, &checkpoint);
+          self.apply_sync(now, donor, &checkpoint);
         }
       }
     }
@@ -1548,14 +1542,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
   /// `>= sync.target`, itself derived from a committed-cluster message. So we never adopt a snapshot
   /// above the committed frontier.
-  pub(crate) fn apply_sync<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    donor: Peer,
-    m: &crate::SyncCheckpoint,
-  ) {
+  pub(crate) fn apply_sync(&mut self, now: Instant, donor: Peer, m: &crate::SyncCheckpoint) {
     let checkpoint_op = m.checkpoint_op();
     // Release-active safety guard, branched on whether this is a FORCED sync.
     if self.sync.is_some_and(|s| s.forced) {
@@ -1793,7 +1780,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // is invariant-clean: `checkpoint_op` is still M until `install_sync` advances it, so `sm_reconstruct.op
     // == checkpoint_op` holds, and M's DAG stays GC-rooted by the durable checkpoint root regardless.
     self.pending_install = Some(install);
-    self.flush_and_stage_install(now, sb, blocks);
+    self.flush_and_stage_install(now);
   }
 
   /// DURABILITY BARRIER + STAGE for the OWED `pending_install`: flush the synced checkpoint's blocks (BOTH
@@ -1814,55 +1801,31 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Single-writer fenced: while a superblock root is in flight (`pending_sb` / `pending_checkpoint`, the
   /// latter being this install's own SyncRepersist once it stages) the re-persist must not begin, so it is
   /// deferred — the install stays owed and the cadence re-drives it once the root lands.
-  pub(crate) fn flush_and_stage_install<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
-    if self.pending_install.is_none() {
+  pub(crate) fn flush_and_stage_install(&mut self, now: Instant) {
+    let Some(install) = self.pending_install.as_ref() else {
       return; // no owed install — nothing to flush/stage.
-    }
+    };
     // The same single-superblock-writer fence the rest of the install path observes: a staged re-persist
     // must not begin while a root is outstanding. The install stays owed; the cadence re-drives it. (On the
     // clean first attempt `apply_sync`'s ingress gate already guarantees both are `None`.)
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return;
     }
-    // Retry the durability barrier over the (still-present) drained blocks. Only on a CLEAN flush do we
-    // stage — a fault leaves `pending_install` owed, and `sync` stays armed so the cadence re-attempts.
-    if self.blocks_flush_failed(blocks) {
-      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
-      return;
-    }
-    // Read the staged values out of the owed install. `pending_install` is a LIVE GC root, so its blocks are
-    // guaranteed present — assert the SM + session DAG roots survived as a cheap structural backstop before
-    // naming them in the durable checkpoint.
-    let install = self.pending_install.as_ref().expect("just checked Some");
+    // Issue the durability barrier over the (still-present) drained blocks as a block job. Only its
+    // CLEAN completion stages the two-write re-persist ([`Self::on_checkpoint_blocks_flushed`]) — a
+    // fault leaves `pending_install` owed, and `sync` stays armed so the cadence re-attempts.
     let target_op = install.checkpoint_op;
-    let checkpoint_id = install.checkpoint.checkpoint_id();
-    let sm_root = install.sm_root;
-    let sessions_root = install.sessions_root;
-    let snapshot = install.checkpoint.snapshot_bytes();
-    debug_assert!(
-      blocks.read_block(sm_root).is_some() && blocks.read_block(sessions_root).is_some(),
-      "the owed install's DAG roots must still be present (a live GC root) before submit_write_checkpoint"
-    );
-    let id = self.mint_write_id();
-    sb.submit_write_checkpoint(id, target_op, snapshot);
+    let job = self.issue_block_job(BlockJobKind::Flush);
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
-      checkpoint_id,
-      sm_root,
-      sessions_root,
-      step: CheckpointStep::AwaitSnapshot(id),
+      step: CheckpointStep::FlushingBlocks(job),
       // a STATE-SYNC re-persist: the root completion routes to the install
       kind: CheckpointKind::SyncRepersist,
     });
     // A checkpoint is chosen and persisting: the block-fetch that pulled its DAG is done (the frontier
     // drained before `apply_sync` retained the install). `pending_checkpoint` now blocks any new
     // block-fetch until the persist resolves; the still-owed `pending_install` is applied atomically by
-    // `install_sync` when the root is durable.
+    // `install_sync` when the root is durable, and it keeps the drained DAG GC-rooted meanwhile.
     self.block_fetch = None;
     // Keep re-soliciting until the persist's root write completes (defends a fault mid-persist).
     self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
@@ -1876,13 +1839,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// install owed for the next cadence; a transient disk fault thus self-heals instead of stalling the sync
   /// forever if the donor crashes after the blocks were fetched. No-op once the install has STAGED (a
   /// SyncRepersist `pending_checkpoint` is in flight — the fence in `flush_and_stage_install` returns).
-  pub(crate) fn retry_install_flush<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
-    self.flush_and_stage_install(now, sb, blocks);
+  pub(crate) fn retry_install_flush(&mut self, now: Instant) {
+    self.flush_and_stage_install(now);
   }
 
   /// INSTALL a staged `SyncCheckpoint` for the synced checkpoint `M` whose re-persist ROOT (step 2) is
@@ -2079,8 +2037,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // re-pull both DAGs' bad blocks, which `write_block` overwrites, and retries the reconstruct against
     // the unchanged M pointer) and leaves the WAL untouched. This is the warm analogue of cold-start
     // `recover()`'s lazy reconstruct under a fixed pointer.
-    let verified = crate::block_store::VerifiedBlocks::new(blocks);
-    let Some(sessions) = super::session_blocks::decode_sessions(sessions_root, &verified) else {
+    let Some(sessions) = super::session_blocks::decode_sessions(sessions_root, blocks) else {
       self.sm_reconstruct = Some(SmReconstruct {
         checkpoint_op,
         sm_root,
@@ -2090,7 +2047,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       });
       return Err(crate::RestoreError::new(sessions_root));
     };
-    if let Err(e) = self.sm.restore(sm_root, &verified) {
+    // Restore into a DETACHED seed (the live SM's configuration with empty logical state) and swap
+    // it in only on success, so a fault leaves the live SM untouched — partial mutation is
+    // structurally unrepresentable.
+    let verified = crate::block_store::VerifiedView::new(blocks);
+    let mut seed = self.sm.restore_seed();
+    if let Err(e) = seed.restore(sm_root, &verified) {
       self.sm_reconstruct = Some(SmReconstruct {
         checkpoint_op,
         sm_root,
@@ -2100,8 +2062,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       });
       return Err(e);
     }
-    // Both DAGs read back clean — install the session table now (the SM was already committed by
-    // `restore` on success).
+    // Both DAGs read back clean — install the restored SM and the session table together.
+    self.sm = seed;
     self.clients = sessions;
     self.note_sm_restored(checkpoint_op);
     // The SM now holds this checkpoint's content — clear any owed reconstruction (this install is either the
@@ -2247,21 +2209,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let sm_root = recon.sm_root;
     let sessions_root = recon.sessions_root;
     let checkpoint_op = recon.checkpoint_op;
-    let verified = crate::block_store::VerifiedBlocks::new(&*blocks);
-    // Re-attempt BOTH reconstructs (the session table FIRST into a local value, then the SM): a block
-    // still bit-rotted/missing in EITHER DAG keeps the obligation owed and re-pulls. (The DAG drained per
-    // the content-addressed store but a leaf still fails the verify-on-read; the re-armed fetch
-    // re-requests it from the donor, whose reply overwrites the bad bytes.)
-    let sessions = super::session_blocks::decode_sessions(sessions_root, &verified);
+    // Re-attempt BOTH reconstructs (the session table FIRST into a local value, then the SM into a
+    // detached seed): a block still bit-rotted/missing in EITHER DAG keeps the obligation owed and
+    // re-pulls. (The DAG drained per the content-addressed store but a leaf still fails the
+    // verify-on-read; the re-armed fetch re-requests it from the donor, whose reply overwrites the
+    // bad bytes.)
+    let sessions = super::session_blocks::decode_sessions(sessions_root, &*blocks);
     let Some(sessions) = sessions else {
       self.rearm_sm_reconstruct_retry(now, blocks);
       return false;
     };
-    if self.sm.restore(sm_root, &verified).is_err() {
+    let verified = crate::block_store::VerifiedView::new(&*blocks);
+    let mut seed = self.sm.restore_seed();
+    if seed.restore(sm_root, &verified).is_err() {
       self.rearm_sm_reconstruct_retry(now, blocks);
       return false;
     }
-    // Both DAGs read back clean — install the session table (the SM was committed by `restore`).
+    // Both DAGs read back clean — install the restored SM and the session table together.
+    self.sm = seed;
     self.clients = sessions;
     self.note_sm_restored(checkpoint_op);
     // The SM now holds M's content. The obligation is met: clear it and run the success effects the

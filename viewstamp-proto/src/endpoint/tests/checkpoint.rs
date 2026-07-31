@@ -84,7 +84,7 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -179,7 +179,7 @@ fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -256,7 +256,7 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -364,7 +364,7 @@ fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -403,7 +403,7 @@ fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -477,7 +477,7 @@ fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The backup has heard from no peers → its quorum_checkpoint_op is 0 (conservative).
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::with(0));
@@ -556,7 +556,7 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -665,7 +665,7 @@ fn primary_tracks_quorum_checkpoint_op() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A fresh primary in Normal view 0 with no peers heard from has quorum_checkpoint_op == 0.
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::new());
@@ -718,7 +718,7 @@ fn quorum_checkpoint_op_single_replica_is_self() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::new());
   let req = |rn: u64| {
@@ -757,7 +757,7 @@ fn peer_checkpoint_is_monotone_under_reordering() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary(), "replica 0 is the view-0 primary");
   // A PrepareOk from replica 1 reporting checkpoint_op = 8.
   ep.handle_message(
@@ -807,7 +807,7 @@ fn on_commit_records_the_primary_checkpoint_monotonically() {
   // the primary must not lower the recorded primary checkpoint.
   let mut e = sync_backup(); // replica 1 of 3, primary is replica 0
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
@@ -907,7 +907,7 @@ fn adoption_rolls_back_an_orphaned_accept_ahead_watermark() {
   // canonical head is op 1 — op 2 is dropped, and the watermark must roll back to the reply-backed 1.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, 2, 1, 0, &[]);
   e.log.insert(
@@ -1022,12 +1022,12 @@ fn primary_with_op1_write_held_across_checkpoint_gc() -> (
   Endpoint<NoopSm>,
   ReorderWal,
   TestSb,
-  crate::block_store::MemBlockStore,
+  crate::block_store::InMemoryBlockStore,
 ) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, 4);
   let (mut wal, mut sb) = (ReorderWal::bounded(4), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Op 1 = body `[1]` staged (completion HELD). Both backups vote → op 1 commits WITHOUT the
@@ -1400,7 +1400,7 @@ fn async_cancellation_of_a_live_ops_write_degrades_to_a_resubmit() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   e.handle_message(

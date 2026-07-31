@@ -31,8 +31,13 @@ impl BlockStore for MemBlocks {
   fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
     self.0.get(&addr).cloned()
   }
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = viewstamp_proto::block_address(&block);
     self.0.insert(addr, block);
+    addr
+  }
+  fn flush(&mut self) -> Result<(), viewstamp_proto::BlockStoreError> {
+    Ok(())
   }
   fn has_block(&self, addr: BlockAddress) -> bool {
     self.0.contains_key(&addr)
@@ -146,21 +151,34 @@ impl SharedSm {
 }
 
 impl StateMachine for SharedSm {
+  type Image = <BatchSm as StateMachine>::Image;
+
   fn apply(&mut self, op: viewstamp_proto::OpNumber, body: &[u8]) -> Bytes {
     self.0.borrow_mut().apply(op, body)
   }
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    self.0.borrow_mut().checkpoint(store)
+  fn checkpoint_image(&self) -> Self::Image {
+    self.0.borrow().checkpoint_image()
+  }
+  fn materialize(image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    BatchSm::materialize(image, store)
   }
   fn block_references(block: &[u8]) -> std::vec::Vec<BlockAddress> {
     BatchSm::block_references(block)
   }
+  fn restore_seed(&self) -> Self {
+    // Share the SAME recorder: the test's clone must keep observing the (restored) history. The
+    // inner swap below commits only on success, so a failed restore leaves the live state intact.
+    SharedSm(self.0.clone())
+  }
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &viewstamp_proto::VerifiedView<'_>,
   ) -> Result<(), viewstamp_proto::RestoreError> {
-    self.0.borrow_mut().restore(root, store)
+    let mut seed = self.0.borrow().restore_seed();
+    seed.restore(root, store)?;
+    *self.0.borrow_mut() = seed;
+    Ok(())
   }
 }
 

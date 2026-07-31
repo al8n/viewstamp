@@ -25,7 +25,7 @@ use super::{
 /// Owns the consensus endpoint, the per-peer conns, and the router; pumps inbound transport data
 /// through the endpoint and routes the endpoint's outgoing messages back out. Transport (`R`) and
 /// storage (`W`/`B`, external) are independent axes.
-pub struct StreamCoordinator<S, R> {
+pub struct StreamCoordinator<S: StateMachine, R> {
   endpoint: Endpoint<S, SingleChange>,
   router: PeerRouter<R>,
   /// The `config_id` the routing table was last reconciled against — the cheap scalar gate on
@@ -34,13 +34,13 @@ pub struct StreamCoordinator<S, R> {
   last_reconciled_config_id: u128,
 }
 
-impl<S, R> core::fmt::Debug for StreamCoordinator<S, R> {
+impl<S: StateMachine, R> core::fmt::Debug for StreamCoordinator<S, R> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("StreamCoordinator").finish_non_exhaustive()
   }
 }
 
-impl<S, R> StreamCoordinator<S, R> {
+impl<S: StateMachine, R> StreamCoordinator<S, R> {
   /// The maximum live QUARANTINED (`Peer::Member`) conns — attested members the active membership
   /// does not resolve, riding the no-authority learn lane. Sized generously above the legitimate
   /// transient population (a member offline across a rolling replacement; a node awaiting its own

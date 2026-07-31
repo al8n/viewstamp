@@ -313,6 +313,46 @@ impl ReadId {
   }
 }
 
+/// The correlation id of an issued BLOCK JOB (a [`BlockJob`](crate::BlockJob) drained via
+/// `Endpoint::poll_block_job` and answered via `Endpoint::on_block_done`).
+///
+/// The third id namespace beside [`WriteId`] and [`ReadId`]: block jobs are neither WAL/superblock
+/// writes nor reads, and giving them their own type keeps a job completion from ever naming a
+/// storage submission (or vice versa). Wraps an [`OpId`] on the same terms — the same incarnation +
+/// sequence pairing, the same single incarnation choke refusing a dead endpoint's completions, and
+/// the SAME per-incarnation sequence counter, so a job's sequence can never alias a live write's or
+/// read's in any table keyed by sequence alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JobId(OpId);
+
+impl JobId {
+  /// Creates a `JobId` from the minting endpoint's incarnation and a sequence number unique within
+  /// it. Endpoints mint their own; an executor echoes what it was handed rather than building one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(incarnation: u64, seq: u64) -> Self {
+    Self(OpId::new(incarnation, seq))
+  }
+
+  /// The underlying untyped [`OpId`] — what the incarnation choke reads, so every completion's id
+  /// flows through one path regardless of its kind.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op_id(self) -> OpId {
+    self.0
+  }
+
+  /// The incarnation of the `Endpoint` instance that minted this id (see [`OpId::incarnation`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn incarnation(self) -> u64 {
+    self.0.incarnation()
+  }
+
+  /// The sequence number, unique within the minting incarnation (see [`OpId::seq`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn seq(self) -> u64 {
+    self.0.seq()
+  }
+}
+
 /// Per-WAL-slot status (the present/nack tracking, derived by the impl).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant, derive_more::Display)]
 #[display("{}", self.as_str())]

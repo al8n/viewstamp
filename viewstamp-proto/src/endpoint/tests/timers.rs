@@ -18,7 +18,7 @@ fn new_primary_in_pending_view_window_does_not_spin_a_poll_timeout_driver() {
   // (the cluster never gets a primary for the new view). The fix RETIRES those stale timers in the
   // `pending_sb` branch (the window is driven purely by the superblock completion, not a timer).
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.is_primary() && e.status().is_normal() && e.pending_sb_for_test());
   // FAIL-BEFORE: the first `handle_timeout` at the stale deadline does not advance/clear it, so the
@@ -90,7 +90,7 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // A Normal backup holding a committed-op repair hole at op 2 (commit held at 1 below it).
   e.force_state_for_test(0, 10, 1, 0, &[2]);
   assert!(!e.is_primary());
@@ -179,7 +179,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Commit a tail (head == commit == 4) the real way: client requests → own append durable → a peer's
   // PrepareOk commits each. No repair hole, commit_max == commit_min (a clean, healthy primary).
@@ -342,7 +342,7 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(!e.is_primary());
   // Bootstrap the idle timer: the first Normal-backup tick only ARMS `primary_idle` (= now + 200ms), it
   // does not fire (the deadline is in the future). Tick at ZERO to arm it.
@@ -445,7 +445,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // A Normal PRIMARY (replica 0, view 0) holding a committed `repair` hole at op 2 (commit held at 1
   // below it, head 10). `force_state_for_test` arms `repair_retry` and leaves commit_max > commit_min.
   e.force_state_for_test(0, 10, 1, 0, &[2]);
@@ -601,7 +601,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
       u64::MAX,
     );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     // Commit a tail so prepare would also be relevant, then tick to arm the heartbeat.
     for rn in 1..=3u64 {
       e.handle_message(
@@ -655,7 +655,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
       u64::MAX,
     );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     e.force_state_for_test(0, 10, 1, 0, &[2]); // committed repair hole → grace arms on the next tick
     e.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
@@ -699,7 +699,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
     let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     e.handle_timeout(
       Instant::ZERO + core::time::Duration::from_millis(200),
       &mut wal,
@@ -718,7 +718,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
     let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     // Drive into ViewChange(1) via an SVC quorum (replica 0 + our own bit).
     e.handle_timeout(
       Instant::ZERO + core::time::Duration::from_millis(200),
@@ -756,7 +756,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     // A WAL whose tail read faults forever on a non-head slot → the recover loop keeps retrying.
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(2), u8::MAX);
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks)
       .expect("recover accepts this store")
       .expect_active();
@@ -777,7 +777,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     // The HEAD slot reads back permanently faulty → RecoveringHead.
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(3), u8::MAX);
-    let mut blocks = crate::block_store::MemBlockStore::new();
+    let mut blocks = crate::block_store::InMemoryBlockStore::new();
     let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks)
       .expect("recover accepts this store")
       .expect_active();
@@ -822,7 +822,7 @@ fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
     u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let t0 = Instant::ZERO;
 
   // T0: accept request 1 → op 1, own append durable (own vote only — no quorum, stays uncommitted);

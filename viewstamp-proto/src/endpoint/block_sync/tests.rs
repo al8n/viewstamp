@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::{
   OpNumber,
-  block_store::{MemBlockStore, block_address},
+  block_store::{InMemoryBlockStore, block_address},
   state_machine::StateMachine,
 };
 
@@ -29,21 +29,26 @@ fn leaf(tag: u8) -> Bytes {
 struct DagSm;
 
 impl StateMachine for DagSm {
+  type Image = ();
+
   fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
     Bytes::new()
   }
 
-  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
-    let block = Bytes::new();
-    let addr = block_address(&block);
-    store.write_block(addr, block);
-    addr
+  fn checkpoint_image(&self) -> Self::Image {}
+
+  fn materialize(_image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(Bytes::new())
+  }
+
+  fn restore_seed(&self) -> Self {
+    DagSm
   }
 
   fn restore(
     &mut self,
     root: BlockAddress,
-    store: &dyn BlockStore,
+    store: &crate::VerifiedView<'_>,
   ) -> Result<(), crate::RestoreError> {
     store
       .read_block(root)
@@ -75,8 +80,8 @@ impl StateMachine for DagSm {
 // block. Returns the ordered list of requested addresses.
 fn drive(
   sync: &mut BlockSync<SmRefs<DagSm>>,
-  donor: &MemBlockStore,
-  laggard: &mut MemBlockStore,
+  donor: &InMemoryBlockStore,
+  laggard: &mut InMemoryBlockStore,
 ) -> std::vec::Vec<BlockAddress> {
   let mut requested = std::vec::Vec::new();
   while let Some(addr) = sync
@@ -101,7 +106,7 @@ fn drive(
 //          └─────── b(L)
 //
 // `a` is an internal node over two leaves; `b` is a leaf. Both hang off the root.
-fn build_dag(store: &mut MemBlockStore) -> (BlockAddress, [BlockAddress; 5]) {
+fn build_dag(store: &mut InMemoryBlockStore) -> (BlockAddress, [BlockAddress; 5]) {
   let x = leaf(b'x');
   let y = leaf(b'y');
   let xa = block_address(&x);
@@ -116,25 +121,25 @@ fn build_dag(store: &mut MemBlockStore) -> (BlockAddress, [BlockAddress; 5]) {
   let root = block(b'R', &[aa, ba]);
   let roota = block_address(&root);
 
-  store.write_verified(x);
-  store.write_verified(y);
-  store.write_verified(a);
-  store.write_verified(b);
-  store.write_verified(root);
+  store.put(x);
+  store.put(y);
+  store.put(a);
+  store.put(b);
+  store.put(root);
 
   (roota, [roota, aa, ba, xa, ya])
 }
 
 #[test]
 fn frontier_walks_dag_fetching_only_missing() {
-  let mut donor = MemBlockStore::new();
+  let mut donor = InMemoryBlockStore::new();
   let (root, [roota, aa, ba, xa, ya]) = build_dag(&mut donor);
 
   // The laggard already holds the `a` subtree unchanged: a, x, y. It is missing only root and b.
-  let mut laggard = MemBlockStore::new();
-  laggard.write_verified(donor.read_block(aa).unwrap());
-  laggard.write_verified(donor.read_block(xa).unwrap());
-  laggard.write_verified(donor.read_block(ya).unwrap());
+  let mut laggard = InMemoryBlockStore::new();
+  laggard.put(donor.read_block(aa).unwrap());
+  laggard.put(donor.read_block(xa).unwrap());
+  laggard.put(donor.read_block(ya).unwrap());
 
   let mut sync = BlockSync::<SmRefs<DagSm>>::new(root);
   assert!(!sync.is_complete());
@@ -161,10 +166,10 @@ fn frontier_walks_dag_fetching_only_missing() {
 
 #[test]
 fn corrupted_block_is_rejected_and_re_requested() {
-  let mut donor = MemBlockStore::new();
+  let mut donor = InMemoryBlockStore::new();
   let (root, _all) = build_dag(&mut donor);
 
-  let mut laggard = MemBlockStore::new();
+  let mut laggard = InMemoryBlockStore::new();
   let mut sync = BlockSync::<SmRefs<DagSm>>::new(root);
 
   // The first requested block is the root (the only thing the empty laggard can ask for first).
@@ -213,20 +218,20 @@ fn locally_corrupt_block_is_treated_as_missing_and_re_fetched() {
   // sync re-fetches it from a peer and `on_block`'s verified write overwrites the corrupt bytes. This
   // is the state-sync / recovery local-DAG drain, which restores SM state directly from the store.
 
-  let mut donor = MemBlockStore::new();
+  let mut donor = InMemoryBlockStore::new();
   let (root, [roota, aa, ba, xa, ya]) = build_dag(&mut donor);
 
   // The laggard holds the WHOLE DAG, so a presence-only fast path would drain immediately and report
   // the sync complete. But one interior leaf, `x`, is MIS-STORED: bytes that do not hash to `xa` are
   // written under `xa` (a content-address violation a disk fault produces). The block is "present" but
   // corrupt.
-  let mut laggard = MemBlockStore::new();
+  let mut laggard = InMemoryBlockStore::new();
   for addr in [roota, aa, ba, ya] {
-    laggard.write_verified(donor.read_block(addr).unwrap());
+    laggard.put(donor.read_block(addr).unwrap());
   }
   let corrupt = leaf(b'#'); // distinct content, so it does not hash to `xa`.
   assert_ne!(block_address(&corrupt), xa);
-  laggard.write_block(xa, corrupt); // mis-store: bytes at `xa` that hash elsewhere.
+  laggard.insert_raw(xa, corrupt); // mis-store: bytes at `xa` that hash elsewhere.
   assert!(
     laggard.has_block(xa),
     "the corrupt block is locally present"
@@ -277,10 +282,10 @@ fn off_frontier_block_is_inert() {
   // A response whose address is NOT the current frontier front must be inert: nothing written,
   // no children enqueued, frontier front unchanged, next_request still returns the real front.
   // After the inert response, completing the sync via the real front must converge.
-  let mut donor = MemBlockStore::new();
+  let mut donor = InMemoryBlockStore::new();
   let (root, [roota, aa, ba, xa, ya]) = build_dag(&mut donor);
 
-  let mut laggard = MemBlockStore::new();
+  let mut laggard = InMemoryBlockStore::new();
   let mut sync = BlockSync::<SmRefs<DagSm>>::new(root);
 
   // Pump once: the only requested block is the root (empty laggard, nothing locally present).
@@ -365,11 +370,11 @@ fn cycle_and_bound_are_safe() {
   let dup = block(b'D', &[ca, ca]);
   let dupa = block_address(&dup);
 
-  let mut donor = MemBlockStore::new();
-  donor.write_verified(child.clone());
-  donor.write_verified(dup);
+  let mut donor = InMemoryBlockStore::new();
+  donor.put(child.clone());
+  donor.put(dup);
 
-  let mut laggard = MemBlockStore::new();
+  let mut laggard = InMemoryBlockStore::new();
   let mut sync = BlockSync::<SmRefs<DagSm>>::new(dupa);
   let requested = drive(&mut sync, &donor, &mut laggard);
 
@@ -392,13 +397,13 @@ fn cycle_and_bound_are_safe() {
   let droot = block(b'R', &[pa, qa]);
   let droota = block_address(&droot);
 
-  let mut donor2 = MemBlockStore::new();
-  donor2.write_verified(shared);
-  donor2.write_verified(p);
-  donor2.write_verified(q);
-  donor2.write_verified(droot);
+  let mut donor2 = InMemoryBlockStore::new();
+  donor2.put(shared);
+  donor2.put(p);
+  donor2.put(q);
+  donor2.put(droot);
 
-  let mut laggard2 = MemBlockStore::new();
+  let mut laggard2 = InMemoryBlockStore::new();
   let mut sync2 = BlockSync::<SmRefs<DagSm>>::new(droota);
   let requested2 = drive(&mut sync2, &donor2, &mut laggard2);
 
@@ -423,10 +428,10 @@ fn cycle_and_bound_are_safe() {
   let wide_root = block(b'W', &wide_children);
   let wide_root_a = block_address(&wide_root);
 
-  let mut donor3 = MemBlockStore::new();
-  donor3.write_verified(wide_root);
+  let mut donor3 = InMemoryBlockStore::new();
+  donor3.put(wide_root);
 
-  let mut laggard3 = MemBlockStore::new();
+  let mut laggard3 = InMemoryBlockStore::new();
   let mut sync3 = BlockSync::<SmRefs<DagSm>>::new(wide_root_a);
   // Pull and feed the root; enqueuing its MAX children pushes the reachable count over the cap.
   let addr = sync3

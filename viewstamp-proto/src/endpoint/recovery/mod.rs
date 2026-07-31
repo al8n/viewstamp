@@ -358,7 +358,7 @@ fn genesis_root(config: &Config, membership: &Membership, wal_capacity: u64) -> 
 /// recover (the same reason [`Result`] does not box its `Ok`).
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum Recovered<S, R = RestartOnly> {
+pub enum Recovered<S: StateMachine, R = RestartOnly> {
   /// This node occupies a slot in the recovered membership — a recovering [`Endpoint`] resuming the
   /// durable view in [`Status::Recovering`].
   Active(Endpoint<S, R>),
@@ -378,7 +378,7 @@ pub struct Retired {
   epoch: Epoch,
 }
 
-impl<S, R> Recovered<S, R> {
+impl<S: StateMachine, R> Recovered<S, R> {
   /// True iff this is [`Recovered::Active`] (the node occupies a slot and resumes as an endpoint).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_active(&self) -> bool {
@@ -805,6 +805,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       incarnation: super::next_incarnation(),
       next_op_id: 1,
       foreign_completions_rejected: 0,
+      block_jobs: VecDeque::new(),
+      block_jobs_outstanding: VecDeque::new(),
+      block_jobs_superseded: 0,
+      block_job_cursor: crate::BlockJobCursor::new(),
       pending: BTreeMap::new(),
       wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
@@ -1410,19 +1414,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // A missing block (`Ok(Some(_))`) in either walk: NOT a bound breach — discard, retry, escalate.
           _ => return,
         }
-        // Reconstruct through a VERIFY-ON-READ view: the walks above drained, but a block can bit-rot or
-        // be misdirected in the window before this destructive reconstruct, so check every block read
-        // against its content address. Reconstruct the SESSION table first into a local value, then the SM;
-        // a missing/corrupt block in either aborts (`None` / `RestoreError`), handled like a missing walk
-        // block above (discard, retry, escalate). On error nothing has mutated.
-        let verified = crate::block_store::VerifiedBlocks::new(&*blocks);
-        let Some(sessions) = super::session_blocks::decode_sessions(sessions_root, &verified)
-        else {
+        // Reconstruct through the VERIFY-ON-READ path: the walks above drained, but a block can bit-rot
+        // or be misdirected in the window before this reconstruct, so every block read is checked
+        // against its content address. Reconstruct the SESSION table first into a local value, then the
+        // SM into a DETACHED seed swapped in only on success; a missing/corrupt block in either aborts
+        // (`None` / `RestoreError`), handled like a missing walk block above (discard, retry,
+        // escalate). On error nothing has mutated — the live SM was never touched.
+        let Some(sessions) = super::session_blocks::decode_sessions(sessions_root, &*blocks) else {
           return;
         };
-        if self.sm.restore(sm_root, &verified).is_err() {
+        let verified = crate::block_store::VerifiedView::new(&*blocks);
+        let mut seed = self.sm.restore_seed();
+        if seed.restore(sm_root, &verified).is_err() {
           return;
         }
+        self.sm = seed;
         self.clients = sessions;
         // The SM now holds the durable checkpoint's content (`cr.op() == state.checkpoint_op()`,
         // verified above).
@@ -2051,13 +2057,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // + re-stage LOCALLY here (the Normal-only `sync_timeouts` does not run while Recovering). On success the
     // re-persist root drives `install_sync` + the flip to Normal; a still-failing flush leaves it owed and
     // the recover cadence re-attempts. No-op when none is owed / a write is in flight.
-    self.retry_install_flush(now, sb, blocks);
-    // If that just STAGED the re-persist (the flush succeeded), the recovery READ phase is done: the node
-    // now waits for the `on_sb_done` root completion, not a timer. Retire the recovery/solicit bookkeeping
-    // exactly as `on_recover_sync_checkpoint` does on a fresh staged reply — a still-armed recover-retry /
-    // sync-solicit would spin a poll_timeout driver (neither is serviced while Recovering with a staged sync).
+    self.retry_install_flush(now);
+    // A durability barrier (or the re-persist it stages) is now outstanding: the node waits on that
+    // completion, not on a read retry. Keep the cadence armed so a FAULTED barrier is re-attempted —
+    // the recovery bookkeeping is retired by the staging itself
+    // ([`Endpoint::on_checkpoint_blocks_flushed`]), which is the only point the superblock write is
+    // actually submitted, so a barrier that faults leaves the read phase intact for this retry.
     if self.pending_checkpoint.is_some() {
-      self.retire_recover_for_staged_sync();
+      self.timers.recover_retry = Some(now + RECOVER_READ_RETRANSMIT);
       return;
     }
     // Snapshot the PENDING ops (the in-flight tail reads) so we can re-borrow `recover` per op while
@@ -2160,7 +2167,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// reply after an install error re-runs a staging with a fresh READ-FREE `RecoverState` (empty
   /// `faulty`) and must not erase the original verdicts — nothing was re-read, so they stand until
   /// consumed by `complete_state_sync`.
-  fn retire_recover_for_staged_sync(&mut self) {
+  pub(super) fn retire_recover_for_staged_sync(&mut self) {
     if let Some(rec) = self.recover.as_ref()
       && !rec.faulty.is_empty()
     {
@@ -2518,22 +2525,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     let donor = from;
-    self.apply_sync(now, sb, blocks, donor, &m);
-    // `apply_sync` STAGES a `pending_checkpoint` (+ `pending_install`) iff it accepted the reply; it stages
-    // NOTHING on a reject (a corrupt membership, or — the cross-epoch crossing requirement — a below-target
-    // / empty-membership reply that does not cross). ONLY when it staged is the recovery READ phase done:
-    // abandon local recovery bookkeeping and retire the recovery/solicit timers (the node waits for
-    // `on_sb_done`, not a timer; a still-armed recover-retry / sync-solicit would spin a poll_timeout-driven
-    // driver, neither serviced while Recovering with a staged sync). On a REJECT we must KEEP the peer-fetch
-    // armed (`recover` + `awaiting_peer_checkpoint` + the solicit timer) so it re-fetches from another donor
-    // — tearing `recover` down here would silently end the fetch at the old epoch.
-    if self.pending_checkpoint.is_some() {
-      // Carry the faulty verdicts + retire the bookkeeping via the shared staging chokepoint (see
-      // `retire_recover_for_staged_sync` for the full rationale — the same teardown runs on the
-      // flush-retry staging lane, which is reached when THIS staging never happened because the first
-      // flush faulted, so the two must not drift).
-      self.retire_recover_for_staged_sync();
-    }
+    self.apply_sync(now, donor, &m);
+    // `apply_sync` accepts or rejects the reply; on acceptance it issues the durability barrier whose
+    // completion STAGES the re-persist. The recovery READ phase is retired by that staging
+    // ([`Endpoint::on_checkpoint_blocks_flushed`] → `retire_recover_for_staged_sync`), never here: a
+    // barrier that faults stages nothing, and the peer-fetch bookkeeping (`recover` +
+    // `awaiting_peer_checkpoint` + the solicit timer) must survive for the local retry — tearing it
+    // down on a mere acceptance would silently end the fetch at the old epoch.
   }
 
   /// Drive the recovery peer-fetch's SM-checkpoint-DAG block fetch. Returns `true` iff the DAG rooted at

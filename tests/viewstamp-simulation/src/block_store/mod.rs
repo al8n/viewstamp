@@ -75,12 +75,10 @@ impl MemBlockStore {
     self.blocks.is_empty()
   }
 
-  /// Writes `block` keyed by its content address.
-  ///
-  /// Equivalent to `write_block(block_address(&block), block)` — the address is derived from the
-  /// content, so the caller need not supply it separately.
-  pub fn write_verified(&mut self, block: Bytes) {
-    let addr = block_address(&block);
+  /// Plants `block` under `addr` WITHOUT deriving the address from the content — the sim's
+  /// fault-injection backdoor for planting corrupt blocks (bytes that do not hash to their key),
+  /// which [`BlockStore::put`] makes unrepresentable on the production path.
+  pub fn insert_raw(&mut self, addr: BlockAddress, block: Bytes) {
     self.blocks.insert(addr, block);
   }
 }
@@ -90,8 +88,14 @@ impl BlockStore for MemBlockStore {
     self.blocks.get(&addr).cloned()
   }
 
-  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+  fn put(&mut self, block: Bytes) -> BlockAddress {
+    let addr = block_address(&block);
     self.blocks.insert(addr, block);
+    addr
+  }
+
+  fn flush(&mut self) -> Result<(), viewstamp_proto::BlockStoreError> {
+    Ok(()) // in-memory is durable: nothing buffered to make durable.
   }
 
   fn has_block(&self, addr: BlockAddress) -> bool {

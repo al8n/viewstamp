@@ -50,7 +50,7 @@ struct PeerLink {
 /// coordinator + storage + socket on one task; the run loop's recv arm reads the socket directly —
 /// a readiness `recv_from` borrows the driver's one receive buffer and consumes nothing when a
 /// losing select arm drops it — so no helper task or socket clone exists.
-pub struct ReactorQuicDriver<R: Runtime, S, W, B, L, I> {
+pub struct ReactorQuicDriver<R: Runtime, S: StateMachine, W, B, L, I> {
   coord: QuicCoordinator<S, I>,
   wal: W,
   sb: B,
