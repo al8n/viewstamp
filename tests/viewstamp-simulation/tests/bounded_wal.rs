@@ -625,16 +625,17 @@ fn bounded_wal_laggard_with_wrapped_away_ops_recovers_via_state_sync() {
 /// than a contiguous range — keeping the gate deterministically non-vacuous without a huge seed sweep.
 #[test]
 fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
-  // Seeds an offline sweep (32 seeds, this exact N=12 / drop=300 / flap-5000-2500 scenario) found to
-  // drive a backup below its ring window — the connected overflow fires well within the budget below.
-  // Re-derive with the `zz_scan` harness if the scenario changes (the below-ring-window discipline now
-  // also gates the adoption and repair-fill appends, which reshapes every seed's trajectory).
+  // Seeds the `zz_scan_below_ring_window_provoking_seeds` harness (scanning 0..256 under this exact
+  // N=5 / interval=4 / ring=12 / drop=300 / flap-5000-2500 scenario) found to drive a backup below its
+  // ring window — the connected overflow fires well within the budget below. Re-derive with that
+  // harness if the scenario changes (the below-ring-window discipline gates the adoption and
+  // repair-fill appends too, which reshapes every seed's trajectory).
   // (The windowed bulk-repair channel + the carried checkpoint floors heal a reconnecting laggard's
   // checkpoint quickly — the held hole repairs in ~one round trip and the carried floor force-syncs
   // sub-floor holes at adoption — so the overflow confluence is rare and seed-specific, and the sync
   // the overflow rides is typically armed by the SAME delivery's carried floor a moment before the
   // ring guard runs.)
-  const PROVOKING_SEEDS: [u64; 3] = [9, 11, 14];
+  const PROVOKING_SEEDS: [u64; 3] = [2, 4, 6];
   let mut total_below_ring_window_syncs = 0u64;
   for seed in PROVOKING_SEEDS {
     // N=5 (a 4-of-5 quorum always commits + checkpoints), a SMALL checkpoint interval (4) and a SMALL ring

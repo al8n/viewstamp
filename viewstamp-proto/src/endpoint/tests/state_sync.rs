@@ -7675,8 +7675,11 @@ fn a_cancelled_superseding_sync_keeps_the_sm_reconstruct_obligation_gated() {
   let (_d8, _w8, s8) = donor_primary_at_checkpoint(8);
   let (env8, id8) = donor_envelope(&s8);
   seed_donor_blocks(&mut blocks, 8);
-  // Fire the sync-solicit timer so a fresh RequestSync (carrying the current nonce) is emitted to capture.
+  // Fire the sync-solicit timer so a fresh RequestSync (carrying the current nonce) is emitted to
+  // capture, and run the frontier re-drive it queues — a reply is not admitted while the transfer is
+  // mid-walk, exactly as a driver's storage step settles the lane before the next ingress.
   e.handle_timeout(later, &mut wal, &mut sb);
+  e.block_step(later, &mut wal, &mut sb, &mut blocks);
   let nonce = captured_sync_nonce(&mut e);
   e.handle_message(
     later,
@@ -7753,6 +7756,7 @@ fn a_retained_newer_install_is_not_orphaned_by_an_equal_checkpoint_reply() {
   seed_donor_blocks(&mut blocks, 8);
   blocks.script_flush_fault(1);
   e.handle_timeout(t1, &mut wal, &mut sb);
+  e.block_step(t1, &mut wal, &mut sb, &mut blocks);
   let nonce1 = captured_sync_nonce(&mut e);
   e.handle_message(
     t1,
@@ -9690,7 +9694,7 @@ fn a_progressing_crossing_survives_the_probe_then_a_stall_disarms() {
     primary_peer(),
     Message::BlockResponse(crate::BlockResponse::new(sm_root, Some(block))),
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(t1, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(
     e.block_fetch_crossing_answered_for_test(),

@@ -1719,6 +1719,15 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// it diagnosable. Same lifecycle as the other observability counters (reset to 0 on `new`/`recover`);
   /// exposed only via `dag_walks_capped()`.
   dag_walks_capped: u64,
+  /// Test/observability counter: how many times a fresh pin was REFUSED because the live transfer
+  /// already had a frontier WALK outstanding ([`Self::transfer_walk_in_flight`]) — at the state-sync
+  /// ingress, the recovery peer-fetch, and the reconstruct re-arm (every arming site). Admitting the
+  /// reply there would discard the walk's pending decision before it completes; the refusal costs one
+  /// re-solicit, and the walk lands on the very next storage step. A growing count does NOT mean the
+  /// transfer is stuck — the refusal is bounded and self-healing by construction — it means the
+  /// one-pin-at-a-time admission is genuinely engaging under contention. Same lifecycle as the other
+  /// observability counters (reset to 0 on `new`/`recover`); exposed only via `walk_pins_refused()`.
+  walk_pins_refused: u64,
   /// Test/observability counter: how many canonical-log selections actually FLOORED the union —
   /// [`Self::select_canonical_log`] dropped at least one canonical-donor entry at/below the vouched
   /// checkpoint floor `floor*` (the floored-union path doing real work). `0` while every selection's
@@ -2129,6 +2138,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       wal_stalls: 0,
       below_ring_window_syncs: 0,
       dag_walks_capped: 0,
+      walk_pins_refused: 0,
       unions_floored: 0,
       repair_batches_served: 0,
       prepare_batches_sent: 0,
@@ -4192,6 +4202,16 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn dag_walks_capped(&self) -> u64 {
     self.dag_walks_capped
+  }
+
+  /// Test/observability counter: how many times a fresh pin was refused because the live transfer's
+  /// frontier walk was still outstanding (one increment per refused pin, see the field). A non-zero
+  /// value is the one-pin-at-a-time admission guard becoming observable — NOT a stuck transfer, since
+  /// the refusal is bounded and self-healing by construction. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn walk_pins_refused(&self) -> u64 {
+    self.walk_pins_refused
   }
 
   /// Test/observability counter: how many canonical-log selections actually FLOORED the union —

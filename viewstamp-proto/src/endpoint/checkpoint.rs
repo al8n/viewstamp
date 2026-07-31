@@ -481,15 +481,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
                 // issues under the `sm_reconstruct` obligation it raises first. So this arm never
                 // sees a restore verdict: the completion ([`Self::on_sm_restored`]) either installs
                 // the content and runs the shared sync-completion tail (GC, the completion event,
-                // the sync teardown, the Normal/recovery flip, the crossing re-arm), or leaves the
-                // obligation owed and re-pulls the faulted block. None of that tail is justified
-                // until the SM actually holds M, which is exactly why it hangs off the completion.
+                // the sync teardown, the Normal/recovery flip, the crossing re-arm) AND the
+                // epoch-swap re-trigger, or leaves the obligation owed and re-pulls the faulted
+                // block. None of that tail is justified until the SM actually holds M, which is
+                // exactly why it hangs off the completion — and returning here keeps a swap root
+                // from being submitted while the SM still lags the checkpoint it names.
                 self.install_sync(now, install);
+                return;
               }
-              // The reconstruct is outstanding: the sync-completion tail, and the epoch-swap
-              // re-trigger below it, run from its completion. Returning here keeps a swap root from
-              // being submitted while the SM still lags the checkpoint it names.
-              return;
+              // NOTHING TO INSTALL: a view transition cancelled the pre-root staging while this root
+              // was in flight, so there is no SM content to reconstruct and no reconstruct to wait
+              // for. The tail still runs HERE — the handshake this root belonged to must be torn
+              // down and the crossing re-armed, or the node keeps an armed `sync` no reply can
+              // complete.
+              self.complete_state_sync(now, sb);
+              self.retry_unappended_adopted_tail(wal);
             }
             CheckpointKind::Ordinary => {
               // ORDINARY checkpoint: advance the in-memory checkpoint_op, then GC the WAL + per-op caches
