@@ -136,8 +136,9 @@ pub struct Cluster {
   /// indices stay stable) but is permanently `crashed` — never ticked, polled, delivered to, or
   /// restarted (the calm-window / final-quiesce / chaos restart loops skip it). Distinct from
   /// `crashed`, which is transient; a retired node is gone for the rest of the run. No in-tree path
-  /// retires a node (a removal needs an offline reconfiguration), so this stays `false` for every node;
-  /// the flag + its restart-loop guards are the foundation seam a future reconfiguration would set.
+  /// retires a node — the offline reconfiguration keeps the same member set, and no driven live change
+  /// reaches the `RemoveLearner` that would drop one — so this stays `false` for every node; the flag +
+  /// its restart-loop guards are the foundation seam a member-dropping reconfiguration would set.
   retired: Vec<bool>,
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
@@ -1407,8 +1408,8 @@ impl Cluster {
   /// lands, firing [`Event::MembershipChanged`] — which the cluster captures into
   /// [`replica_membership_swaps`](Self::replica_membership_swaps) for the live-reconfiguration
   /// checkers. `None` of the cluster's per-replica vectors are resized: a live change moves members
-  /// WITHIN the genesis node set (a genesis learner promoted to voter, a voter removed), so every
-  /// member that ever participates already has a running endpoint.
+  /// WITHIN the genesis node set (a genesis learner promoted to voter, a voter demoted back to a
+  /// learner), so every member that ever participates already has a running endpoint.
   pub fn propose_reconfigure_single_change(
     &mut self,
     delta: SingleVoterDelta,

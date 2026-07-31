@@ -1,10 +1,10 @@
 //! Safety / agreement checks over a cluster run.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 use smol_str::SmolStr;
-use viewstamp_proto::{Instant, MembershipChanged};
+use viewstamp_proto::{Instant, MembershipChanged, OpNumber};
 
 use crate::cluster::{AppliedEvent, Cluster};
 
@@ -41,9 +41,9 @@ impl CheckResult {
 ///    an op number but is consensus-layer, never applied to the state machine, so its op number is
 ///    legitimately absent from `applied()` — every replica skips the SAME numbers, so the applied
 ///    sequence stays a gap-free walk of the non-reconfigure op numbers, with no duplicate).
-/// 2. **Agreement** — across replicas, the shorter applied `(op, body)` sequence is a prefix of
-///    the longer (full content comparison, not just op numbers). Reconfigure ops are uniformly absent
-///    on every replica, so the applied sequences still agree element-for-element.
+/// 2. **Agreement** — every replica's applied `(op, body)` sequence is a prefix of the LONGEST one
+///    (full content comparison, not just op numbers). Reconfigure ops are uniformly absent on every
+///    replica, so the applied sequences still agree element-for-element.
 /// 3. **Client safety** — each client's replies are for strictly increasing request numbers `1..=n`.
 pub fn check_safety(cluster: &Cluster) -> CheckResult {
   // The committed `Reconfigure` op numbers — absent from every replica's applied stream, so the
@@ -70,13 +70,8 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
     }
     logs.push(applied);
   }
-  for i in 1..logs.len() {
-    let n = logs[0].len().min(logs[i].len());
-    if logs[0][..n] != logs[i][..n] {
-      return CheckResult::violation(format!(
-        "replica {i} diverges from replica 0 (content mismatch in applied prefix)"
-      ));
-    }
+  if let v @ CheckResult::Violation(_) = check_agreement(&logs) {
+    return v;
   }
   for i in 0..cluster.client_count() {
     for (idx, (rn, _)) in cluster.client(i).replies().iter().enumerate() {
@@ -86,6 +81,37 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
           idx + 1
         ));
       }
+    }
+  }
+  CheckResult::Ok
+}
+
+/// The cross-replica AGREEMENT comparison: every applied `(op, body)` log must be a content prefix of
+/// the LONGEST one. Pure over its inputs so the comparison is unit-testable without a live `Cluster`.
+///
+/// The canonical log is the LONGEST, not replica 0's. Comparing every log against replica 0 truncates
+/// each comparison to replica 0's length, so a divergence between two OTHER replicas past that length
+/// is invisible: with applied logs `[A]`, `[A,B]`, `[A,C]` both comparisons run over one element,
+/// both pass, and the `B` vs `C` divergence at position 1 goes unseen. The longest log covers every
+/// position any replica has applied, so a prefix comparison against it can hide no divergence.
+fn check_agreement(logs: &[Vec<(u64, Bytes)>]) -> CheckResult {
+  let Some((canonical, longest)) = logs.iter().enumerate().max_by_key(|(_, log)| log.len()) else {
+    return CheckResult::Ok;
+  };
+  for (i, log) in logs.iter().enumerate() {
+    if i == canonical {
+      continue;
+    }
+    let n = log.len().min(longest.len());
+    if log[..n] != longest[..n] {
+      // Pinpoint the first diverging position for the audit: which op, and the two bodies.
+      let pos = (0..n).find(|&p| log[p] != longest[p]).unwrap_or(0);
+      let (op, body) = &log[pos];
+      let (cop, cbody) = &longest[pos];
+      return CheckResult::violation(format!(
+        "replica {i} diverges from the longest applied log (replica {canonical}) at applied position \
+         {pos}: replica {i} has ({op},{body:?}) but replica {canonical} has ({cop},{cbody:?})"
+      ));
     }
   }
   CheckResult::Ok
@@ -231,6 +257,277 @@ impl DurabilityChecker {
         self.committed.len()
       ))
     }
+  }
+}
+
+/// One replica's DURABLE evidence for the durable-quorum fold: the configuration it is running under
+/// and the reach of its own durable storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableEvidence {
+  /// The replica's durable (superblock) configuration epoch.
+  epoch: u64,
+  /// The replica indices occupying that configuration's VOTING slots. Read off the durable membership
+  /// itself, so ONE observation names the WHOLE voting set: a set accumulated replica-by-replica would
+  /// understate the voters an op may be held by while the cluster is mid-transition (a voter that has
+  /// not yet installed the successor is still one of its voters), and an understated voter set
+  /// under-counts holders. Empty on a root that carries no membership.
+  voters: Vec<usize>,
+  /// How many VOTING slots that configuration has — the quorum denominator. It is the configuration's
+  /// own `replica_count`, not the number of `voters` resolved above, so a voting slot held by a member
+  /// id that names no simulated node still counts toward the quorum it is owed.
+  voter_count: usize,
+  /// The replica's durable checkpoint op: every committed op at or below it is folded into its
+  /// snapshot, so the snapshot — not a WAL slot — retains it.
+  checkpoint_op: u64,
+}
+
+/// One configuration in the durable-quorum checker's own epoch ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigView {
+  /// The replica indices occupying the configuration's VOTING slots.
+  voters: Vec<usize>,
+  /// The number of voting slots — the quorum denominator.
+  voter_count: usize,
+}
+
+impl ConfigView {
+  /// The configuration's commit quorum: a strict majority of its voting slots.
+  const fn quorum(&self) -> usize {
+    self.voter_count / 2 + 1
+  }
+}
+
+/// Stateful **durable-quorum** checker: EVERY committed op — not merely the newest — stays durably
+/// held by a quorum of the configuration that owes it, every tick.
+///
+/// Where [`DurabilityChecker`] proves no committed op is rewritten or lost cluster-wide, this checker
+/// proves the stronger retention property VSR's recovery rests on: a committed op is never absent from
+/// a QUORUM's durable medium. It is built from three ledgers, each folded on every
+/// [`observe`](Self::observe):
+///
+/// 1. **The committed ledger** — the real committed op NUMBERS, from the applied `(op, body)` streams
+///    (which carry the true op number) UNIONED with [`Cluster::committed_reconfigure_ops`]. A
+///    `Reconfigure` op is a consensus-layer op: committed and assigned an op number but never applied
+///    to the state machine, so its number is absent from every applied stream while it occupies a WAL
+///    slot under the same retention obligation. The applied LENGTH is therefore not an op number once
+///    a reconfiguration has committed — it is strictly below the committed frontier — so the ledger
+///    tracks numbers, never lengths. It is monotone: an op number admitted as committed is never
+///    retracted, only DISCHARGED (below).
+/// 2. **The configuration ledger** — `epoch -> voting set`, recorded from what each replica's DURABLE
+///    membership says. The quorum an op is owed is the LIVE configuration's, never the static genesis
+///    voter count, which a promotion or a demotion makes wrong in both directions. A configuration
+///    counts as INSTALLED once a quorum of its own voters hold it durably; that latches, and the
+///    highest installed epoch is the tip.
+/// 3. **The discharge floor** — the only thing that ends an op's WAL-residency obligation is QUORUM
+///    CHECKPOINT SUBSUMPTION: once a quorum of the owed configuration's voters have `checkpoint_op >=
+///    op`, the op lives in their durable snapshots and is permanently satisfied. Checkpoints subsume
+///    prefixes, so this is a monotone floor, and dropping everything at or below it is what keeps the
+///    per-tick work proportional to the un-checkpointed window rather than to the whole run.
+///
+/// An op is HELD by a replica iff its WAL slot is occupied (`Clean` or `Faulty` — a committed slot is
+/// never dropped by prune/truncate, and bit-rot does not un-occupy it) or it is folded into that
+/// replica's durable checkpoint. Holders are counted among VOTERS only: the commit quorum is a voter
+/// quorum, so a learner holding the op cannot stand in for a voter.
+#[derive(Debug)]
+pub struct DurableQuorumChecker {
+  /// The committed ops still under active obligation. Ops at or below [`Self::discharged`] are absent
+  /// — permanently satisfied, not retracted.
+  tracked: BTreeSet<u64>,
+  /// Every committed op at or below this is permanently satisfied by quorum checkpoint subsumption.
+  discharged: u64,
+  /// The highest APPLIED op number folded so far — the cursor that keeps admission proportional to the
+  /// newly applied tail instead of re-scanning the whole applied history each tick.
+  applied_frontier: u64,
+  /// The configuration ledger: `epoch -> the configuration that epoch installed`.
+  configs: BTreeMap<u64, ConfigView>,
+  /// The highest epoch observed installed on a quorum of its OWN voters. Latched: an op's obligation
+  /// moves to the successor the moment the successor reaches a quorum, and never moves back.
+  installed: u64,
+  /// How many replicas have had their durable storage WIPED over the run.
+  wipes: usize,
+}
+
+impl DurableQuorumChecker {
+  /// A durable-quorum checker for a cluster that starts in its genesis configuration (epoch 0).
+  pub fn new() -> Self {
+    Self {
+      tracked: BTreeSet::new(),
+      discharged: 0,
+      applied_frontier: 0,
+      configs: BTreeMap::new(),
+      installed: 0,
+      wipes: 0,
+    }
+  }
+
+  /// Record that a replica's durable storage was WIPED ([`Cluster::wipe_and_restart`]): its durable
+  /// copies are permanently forfeit with the disk, so the retention envelope relaxes by exactly the
+  /// wiped count (floored at one holder — see [`Self::fold`]).
+  pub fn note_wipe(&mut self) {
+    self.wipes += 1;
+  }
+
+  /// Fold one tick of durable evidence into the three ledgers and assert the retention obligation for
+  /// every tracked committed op. Pure over its inputs so the ledger + quorum logic is unit-testable
+  /// without a live `Cluster`: `evidence[i]` is replica `i`'s durable configuration + checkpoint,
+  /// `committed` names committed op numbers observed this tick (any order, repeats harmless), and
+  /// `held(i, op)` reports whether replica `i`'s WAL slot for `op` is occupied.
+  fn fold(
+    &mut self,
+    evidence: &[DurableEvidence],
+    committed: &[u64],
+    held: &dyn Fn(usize, u64) -> bool,
+  ) -> CheckResult {
+    // (1) The configuration ledger. Each observation names a whole voting set, so a configuration is
+    // complete the first time ANY replica is seen holding it; a root carrying no membership names no
+    // configuration. Per-epoch uniqueness (no two configurations at one epoch) is the
+    // `MembershipMonotonicChecker`'s / `ConfigLineageChecker`'s invariant, so this only records.
+    for e in evidence {
+      if e.voter_count == 0 {
+        continue;
+      }
+      self.configs.entry(e.epoch).or_insert_with(|| ConfigView {
+        voters: e.voters.clone(),
+        voter_count: e.voter_count,
+      });
+    }
+    // (2) The installed tip: a configuration is installed once a quorum of its OWN voters hold it
+    // durably. The durable epoch is monotone, so a replica at or beyond epoch `E` installed `E` on its
+    // way — hence `epoch >= E` rather than `== E`, which would need the sample to land inside the
+    // window where a quorum sits exactly at `E`.
+    let mut tip = self.installed;
+    for (&epoch, cfg) in self.configs.range((self.installed + 1)..) {
+      let installed_on = cfg
+        .voters
+        .iter()
+        .filter(|&&i| evidence.get(i).is_some_and(|e| e.epoch >= epoch))
+        .count();
+      if installed_on >= cfg.quorum() {
+        tip = tip.max(epoch);
+      }
+    }
+    self.installed = tip;
+    // (3) Admit newly observed committed ops. An op at or below the discharged floor is already
+    // permanently satisfied, so it is not re-admitted (the ledger drops nothing it has not
+    // discharged).
+    for &op in committed {
+      if op > self.discharged {
+        self.tracked.insert(op);
+      }
+    }
+    // (4) Discharge by quorum checkpoint subsumption: once a quorum of the owed configuration's voters
+    // have folded an op into their durable checkpoints, its retention no longer rests on any WAL slot.
+    // A checkpoint subsumes its whole prefix, so the discharge is a monotone FLOOR — the quorum-th
+    // largest checkpoint — and everything at or below it leaves active tracking.
+    if let Some(cfg) = self.configs.get(&self.installed) {
+      let quorum = cfg.quorum();
+      let mut checkpoints: Vec<u64> = cfg
+        .voters
+        .iter()
+        .filter_map(|&i| evidence.get(i).map(|e| e.checkpoint_op))
+        .collect();
+      if checkpoints.len() >= quorum {
+        checkpoints.sort_unstable_by(|a, b| b.cmp(a));
+        self.discharged = self.discharged.max(checkpoints[quorum - 1]);
+        self.tracked = self.tracked.split_off(&(self.discharged + 1));
+      }
+    }
+    // (5) The retention obligation, for EVERY tracked committed op — not merely the newest. The
+    // newest-op-only form rests on "a committed op was durably appended on a quorum at commit time and
+    // a committed slot stays occupied", which makes older ops a corollary of the newest one; that
+    // corollary is exactly what a lost interior op breaks, so it is asserted per op instead.
+    //
+    // Every tracked op is owed the INSTALLED TIP's quorum — one configuration for the whole tracked
+    // window, not a per-op attribution. That IS the rule "an op committed under configuration E is
+    // owed E's quorum until the successor is installed on a quorum, and the successor's from then on":
+    // the tip is E for exactly as long as no successor has reached a quorum, and it is the successor
+    // from the moment one has. The rule mirrors the protocol's own durability witness — a shrink
+    // commits only once the op is held by a quorum of the predecessor AND a quorum of the retained
+    // successor — so the oracle demands neither more than the protocol guarantees nor less.
+    let Some((_, cfg)) = self.configs.range(..=self.installed).next_back() else {
+      return CheckResult::Ok;
+    };
+    let quorum = cfg.quorum();
+    // WIPES weaken this bound HONESTLY, by exactly the wiped count: a wipe permanently forfeits one
+    // replica's durable copies, so a committed op held by a bare quorum can legitimately drop to
+    // `quorum - wipes` holders until repair/state-sync re-replicates it (the checker cannot cheaply
+    // know when that completes, so the relaxed envelope holds for the rest of the run). The floor is
+    // 1: a committed op held durably NOWHERE is an outright loss no fault budget excuses. With the
+    // wipe axis off (`wipes == 0` always) this is exactly the strict quorum bound — the base gates
+    // are untouched. The end-of-run check (post-quiesce, full committed history applied on an
+    // operational replica) stays fully strict on every lane.
+    let required = quorum.saturating_sub(self.wipes).max(1);
+    for &op in &self.tracked {
+      let holders = cfg
+        .voters
+        .iter()
+        .filter(|&&i| held(i, op) || evidence.get(i).is_some_and(|e| e.checkpoint_op >= op))
+        .count();
+      if holders < required {
+        return CheckResult::violation(format!(
+          "committed op {op} (owed epoch {}'s quorum) is durably held on only {holders} voters (< \
+           required {required} = quorum {quorum} - wipes {}) — a committed op is not retained \
+           durably by the surviving quorum",
+          self.installed, self.wipes
+        ));
+      }
+    }
+    CheckResult::Ok
+  }
+
+  /// Sample the cluster: fold this tick's durable evidence and newly committed ops, returning a
+  /// violation if any tracked committed op has fallen below its configuration's quorum of durable
+  /// holders. Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    let n = cluster.replica_count();
+    let evidence: Vec<DurableEvidence> = (0..n)
+      .map(|i| DurableEvidence {
+        epoch: cluster.replica_durable_epoch(i).get(),
+        voters: Self::voting_slots(cluster, i, n),
+        voter_count: cluster.replica_voter_count(i).map_or(0, usize::from),
+        checkpoint_op: cluster.replica_checkpoint_op(i).get(),
+      })
+      .collect();
+    // The committed `Reconfigure` ops (numbered + committed, never applied) plus the applied tail above
+    // the frontier cursor. The applied streams carry the true op number, and agreement makes the
+    // longest of them the committed history, so its tail is exactly the newly committed applied ops.
+    let mut committed: Vec<u64> = cluster.committed_reconfigure_ops().into_iter().collect();
+    let longest = (0..n)
+      .map(|i| cluster.replica_sm(i).applied())
+      .max_by_key(|applied| applied.len())
+      .unwrap_or(&[]);
+    for (op, _) in longest.iter().rev() {
+      if *op <= self.applied_frontier {
+        break;
+      }
+      committed.push(*op);
+    }
+    if let Some((op, _)) = longest.last() {
+      self.applied_frontier = self.applied_frontier.max(*op);
+    }
+    self.fold(&evidence, &committed, &|i, op| {
+      cluster.replica_appended_op(i, OpNumber::with(op))
+    })
+  }
+
+  /// The replica indices occupying replica `i`'s DURABLE voting slots. Members are keyed by their
+  /// stable `MemberId`, which the simulation assigns as the replica index, so a member id outside
+  /// the replica range names no simulated node (the live-reconfiguration axis adds such a sentinel as
+  /// a LEARNER) and holds no durable copy to count.
+  fn voting_slots(cluster: &Cluster, i: usize, replica_count: usize) -> Vec<usize> {
+    let voter_count = cluster.replica_voter_count(i).unwrap_or(0);
+    (0..voter_count)
+      .filter_map(|slot| cluster.replica_member_at(i, slot))
+      .map(|member| member.get())
+      .filter(|id| *id < replica_count as u128)
+      .map(|id| id as usize)
+      .collect()
+  }
+}
+
+impl Default for DurableQuorumChecker {
+  fn default() -> Self {
+    Self::new()
   }
 }
 

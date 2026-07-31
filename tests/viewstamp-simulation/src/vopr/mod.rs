@@ -33,8 +33,9 @@
 //!   checkpoint_op` and `commit_max >= commit_min` per replica (note `commit_max` is a re-learnable
 //!   hint that may exceed the locally-held `op`, so `op >= commit_max` is deliberately NOT asserted);
 //!   append-before-ack (no `PrepareOk` for an op whose WAL append has not completed, observed in
-//!   [`Cluster::tick`]); and every op in the cluster's committed history stays durably written (WAL
-//!   slot occupied — `Clean`/`Faulty` — or `<= checkpoint_op`) on at least a quorum.
+//!   [`Cluster::tick`]); and [`DurableQuorumChecker`] — every committed op, tracked by its real op
+//!   number and including the committed `Reconfigure` ops, stays durably written (WAL slot occupied —
+//!   `Clean`/`Faulty` — or `<= checkpoint_op`) on a quorum of the LIVE configuration that owes it.
 //! - **Liveness — over calm windows** (see above).
 //! - **End-of-run durability — after a final QUIESCE phase**: once the chaos loop ends, the driver
 //!   heals everything, restarts all crashed replicas, drops all faults, and ticks a healthy cluster to
@@ -58,8 +59,8 @@ use viewstamp_proto::{AcceptReducedFaultTolerance, Instant, MemberId, Prng, Sing
 use crate::{
   checker::{
     AppliedOnceChecker, BoundednessChecker, ConfigLineageChecker, DurabilityChecker,
-    EpochViewMonotonicChecker, MembershipMonotonicChecker, ReconfigureAppliedOnceChecker,
-    StalenessChecker, ViewMonotonicChecker, check_safety,
+    DurableQuorumChecker, EpochViewMonotonicChecker, MembershipMonotonicChecker,
+    ReconfigureAppliedOnceChecker, StalenessChecker, ViewMonotonicChecker, check_safety,
   },
   cluster::Cluster,
   network::Faults,
@@ -878,6 +879,10 @@ struct Vopr {
   /// the tip by one). The committed-swap-event counterpart of [`Self::membership`] (which folds the
   /// durable root); vacuously `Ok` off-axis.
   config_lineage: ConfigLineageChecker,
+  /// The per-op durable-retention net, observed every tick (same on-driver rationale as
+  /// [`Self::epoch_view`]): every committed op — tracked by its real op number, `Reconfigure` ops
+  /// included — stays durably held by a quorum of the LIVE configuration that owes it.
+  durable_quorum: DurableQuorumChecker,
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
@@ -1484,6 +1489,7 @@ impl Vopr {
       live_reconfig_actions: 0,
       reconfigure_once: ReconfigureAppliedOnceChecker::new(node_count),
       config_lineage: ConfigLineageChecker::new(node_count),
+      durable_quorum: DurableQuorumChecker::new(),
       sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
       report: VoprReport {
@@ -2472,9 +2478,10 @@ impl Vopr {
     // reply/solicitation binding + a genuine f-reducing shrink are covered in the SYSTEM sim, not only the
     // proto unit regressions): a slot-shifting `PromoteLearner`, a `DemoteVoter`↔re-promote OSCILLATION, or
     // `AddLearner` (the no-shift case + fallback). See `choose_live_reconfig_delta` for the mechanics and
-    // why a DEMOTE is a sound shrink driver here where a direct voter REMOVAL is not (the demotee stays a
-    // live, routable, log-current learner, so it stays addressable AND keeps the retained durable copy the
-    // survival-based `DurabilityChecker` scans — a removed node would lose both).
+    // why the shrink STOPS at the demote rather than carrying on to the `RemoveLearner` that would retire
+    // the demotee (the demotee stays a live, routable, log-current learner, so it stays addressable AND
+    // keeps the retained durable copy the survival-based `DurabilityChecker` scans — a retired node would
+    // lose both).
     //
     // The kind is drawn from a SEPARATE per-seed PRNG (`seed ^ RECONFIG_DELTA_MAGIC`), so the action
     // stream `self.prng` keeps its exact draw positions (the cadence + every other action unchanged). The
@@ -2554,12 +2561,12 @@ impl Vopr {
   /// `apply_actions` re-proposes across the `RequestLearnerProof`/`LearnerProof` round-trip (the
   /// `ProofPending` retry), and once the fresh proof covers the head the promote mints.
   ///
-  /// The DEMOTE oscillation is a SOUND voter-shrink driver here — where a direct voter REMOVAL is not —
-  /// because the demotee stays a live, routable, log-current LEARNER: learner-removal is NOT driven on
-  /// this axis, so it is never retired, the slot↔`MemberId` routing keeps addressing it, and it retains
-  /// its full applied log. So `DurabilityChecker`'s survival scan still finds every committed op on it
-  /// (the retained durable copy the shrink keeps), and no safety oracle is masked. A voter removal fails
-  /// both: the removed node is unaddressable in a slot-routed sim, and dropping its log-holder status is
+  /// The DEMOTE oscillation is a SOUND voter-shrink driver, and the axis deliberately STOPS there rather
+  /// than following it with the `RemoveLearner` that would retire the demotee: the demotee stays a live,
+  /// routable, log-current LEARNER, so the slot↔`MemberId` routing keeps addressing it and it retains its
+  /// full applied log. `DurabilityChecker`'s survival scan therefore still finds every committed op on it
+  /// (the retained durable copy the shrink keeps), and no safety oracle is masked. Retiring it would fail
+  /// both: a retired node is unaddressable in a slot-routed sim, and dropping its log-holder status is
   /// exactly what a shrink could use to hide a loss. Demote keeps both properties, so the existing
   /// oracles judge the shrink unchanged.
   ///
@@ -2811,6 +2818,9 @@ impl Vopr {
       dur.note_wipe(i);
       vm.note_wipe(i);
       self.epoch_view.note_wipe(i);
+      // The wiped replica's durable copies are gone with its disk, so the durable-retention envelope
+      // relaxes by exactly one holder (floored at one) for the rest of the run.
+      self.durable_quorum.note_wipe();
     }
 
     // Append-before-ack, observed during the tick we just ran (PrepareOk for a non-durable op).
@@ -2991,7 +3001,9 @@ impl Vopr {
   /// is a legal tail-gap shape: the replica has heard a higher op is committed but has not yet fetched
   /// it). Plus, for the cluster's committed history, that every committed op is durably present on at
   /// least a quorum (WAL `Clean` or `<= checkpoint_op`).
-  fn check_structural(&self, c: &Cluster, tick: u64) {
+  fn check_structural(&mut self, c: &Cluster, tick: u64) {
+    use crate::checker::CheckResult::Violation;
+
     for i in 0..self.node_count {
       let op = c.replica_op(i).get();
       let cmax = c.replica_commit_max(i).get();
@@ -3022,42 +3034,14 @@ impl Vopr {
     // durable WAL+snapshot". (We use "append completed / slot occupied" rather than "readable clean"
     // because the sim's permanent rot corrupts the BYTES of an already-durable committed slot after
     // commit — a peer-repaired concern — without ever making the op un-committed.)
-    let committed = max_committed(c);
-    if committed == 0 {
-      return;
-    }
-    let quorum = self.voting_count / 2 + 1;
-    // Check the newest committed op (the one most at risk of not yet being durable on a quorum). It
-    // is a sound proxy for the whole prefix: a committed op was, at commit time, durably appended on
-    // a quorum, and a committed slot stays occupied thereafter — so if the newest committed op is
-    // held by a quorum, every older committed op is too. Count holders among VOTERS only: the
-    // commit quorum is a voter quorum, so a learner holding the op cannot stand in for a voter.
-    let top = committed as u64;
-    let holders = (0..self.voting_count)
-      .filter(|&i| c.replica_appended_op(i, viewstamp_proto::OpNumber::with(top)))
-      .count();
-    // The committed-history high-water means at least one replica APPLIED op `top`, which the
-    // protocol only does after a quorum durably appended it — so a quorum of occupied holders must
-    // persist. A shortfall means a committed op vanished from a quorum's durable medium.
     //
-    // WIPES weaken this bound HONESTLY, by exactly the wiped count: a wipe permanently forfeits one
-    // replica's durable copies, so a committed op held by a bare quorum can legitimately drop to
-    // `quorum - wipes` holders until repair/state-sync re-replicates it (the checker cannot cheaply
-    // know when that completes, so the relaxed envelope holds for the rest of the run). The floor is
-    // 1: a committed op held durably NOWHERE is an outright loss no fault budget excuses. With the
-    // wipe axis off (`wipes_fired == 0` always) this is exactly the strict quorum bound — the base
-    // gates are untouched. The end-of-run check (post-quiesce, full committed history applied on an
-    // operational replica) stays fully strict on every lane.
-    let required = quorum
-      .saturating_sub(self.report.wipes_fired as usize)
-      .max(1);
-    if holders < required {
-      panic!(
-        "vopr seed {} tick {tick}: committed op {top} is durably held on only {holders} replicas \
-         (< required {required} = quorum {quorum} - wipes {}) — a committed op is not retained \
-         durably by the surviving quorum",
-        self.seed, self.report.wipes_fired
-      );
+    // Delegated to [`DurableQuorumChecker`], which tracks the committed history by its REAL op numbers
+    // (committed `Reconfigure` ops included — they hold a WAL slot under the same obligation while
+    // never appearing in an applied stream), asserts the obligation for EVERY tracked op rather than
+    // only the newest, and derives the quorum from the LIVE durable membership of the configuration
+    // that owes the op rather than from the static genesis voter count.
+    if let Violation(why) = self.durable_quorum.observe(c) {
+      panic!("vopr seed {} tick {tick}: durable-quorum: {why}", self.seed);
     }
   }
 
