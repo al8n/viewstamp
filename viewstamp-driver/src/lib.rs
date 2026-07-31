@@ -8,6 +8,7 @@ mod handle;
 mod reconcile;
 mod reconfigure;
 mod session;
+mod shutdown;
 
 pub use aggregate::{
   AggregatorPump, BatchConfig, BatchError, BatchHandle, DEFAULT_MAX_QUEUED_BYTES,
@@ -23,6 +24,7 @@ pub use reconfigure::{
   ReconfigureJob, ReconfigureProgress, StepOutcome, finish_reconfigure_on_retire, run_reconfigure,
 };
 pub use session::ReservationGuard;
+pub use shutdown::{SHUTDOWN_DRAIN_DEADLINE, ShutdownReport, StorageQuiescence};
 
 #[doc(hidden)]
 pub use clock::jittered;
@@ -37,6 +39,8 @@ pub use session::{
   REQUEST_TIMEOUT, RetiredAt, Retirement, build_endpoint, deliver_event, drain_pending, format,
   gate_command_on_retirement, pending_scan_interval, reap_and_collect_retransmits, retire,
 };
+#[doc(hidden)]
+pub use shutdown::drain_storage;
 
 /// Errors surfaced to the application through the [`Handle`].
 #[derive(Debug, thiserror::Error)]

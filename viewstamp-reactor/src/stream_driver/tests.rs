@@ -13,7 +13,7 @@ use agnostic::{
 use bytes::Bytes;
 
 use super::ReactorStreamDriver;
-use viewstamp_driver::{DriverError, REQUEST_TIMEOUT};
+use viewstamp_driver::{DriverError, REQUEST_TIMEOUT, SHUTDOWN_DRAIN_DEADLINE};
 
 use crate::{
   bridge::{BridgeOut, Conn as BridgeConn, ConnTask},
@@ -331,6 +331,12 @@ async fn a_probe_interval_not_below_the_round_lifetime_is_refused_at_constructio
 /// driver's REAL `handle_command`/`deliver_event`/`retransmit_stale`. No peers are configured, so
 /// nothing ever commits on its own — exactly the partitioned/slow case the submit budget must bound.
 async fn test_driver_with_handle() -> (TestStreamDriver, crate::Handle) {
+  test_driver_with_handle_over(InMemoryWal::new()).await
+}
+
+/// Like [`test_driver_with_handle`] but over a caller-supplied WAL, so a storage-timing test can
+/// hand it a backend whose appends complete slowly or not at all.
+async fn test_driver_with_handle_over(wal: InMemoryWal) -> (TestStreamDriver, crate::Handle) {
   const CLUSTER: u128 = 0x7777;
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|peer| {
@@ -342,7 +348,6 @@ async fn test_driver_with_handle() -> (TestStreamDriver, crate::Handle) {
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   });
   let (_ready_tx, ready_rx) = flume::unbounded();
-  let wal = InMemoryWal::new();
   let mut sb = InMemorySuperblock::new();
   // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
   viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
@@ -982,10 +987,14 @@ async fn the_out_queue_peak_is_exactly_backlog_cap_plus_one_chunk() {
 async fn next_deadline_folds_the_earliest_auth_deadline() {
   let mut driver = test_driver().await;
 
-  // Baseline: no conns and no consensus timer, so the ~50ms idle fallback governs.
+  // Baseline: no conns and no consensus timer, so the ~50ms idle fallback governs. The reference
+  // instant is captured BEFORE the call: `next_deadline`'s internal `now()` read can only land at
+  // or after it (`Instant` is monotonic and the call is synchronous), so the margin no longer
+  // depends on how much the scheduler delays between the two reads.
+  let before = std::time::Instant::now();
   let baseline = driver.next_deadline();
   assert!(
-    baseline >= std::time::Instant::now() + Duration::from_millis(40),
+    baseline >= before + Duration::from_millis(40),
     "without an auth deadline the idle fallback (~50ms) governs"
   );
 
@@ -1395,10 +1404,14 @@ async fn next_deadline_folds_the_pending_scan_deadline_stream() {
   let (mut driver, handle) = test_driver_with_handle().await;
 
   // Baseline: nothing pending, no conns, a never-driven endpoint — the ~50ms idle fallback
-  // governs, proving the (elapsed) scan deadline is not folded for an empty pending map.
+  // governs, proving the (elapsed) scan deadline is not folded for an empty pending map. The
+  // reference instant is captured BEFORE the call: `next_deadline`'s internal `now()` read can
+  // only land at or after it (`Instant` is monotonic and the call is synchronous), so the margin
+  // no longer depends on how much the scheduler delays between the two reads.
+  let before = std::time::Instant::now();
   let baseline = driver.next_deadline();
   assert!(
-    baseline >= std::time::Instant::now() + Duration::from_millis(40),
+    baseline >= before + Duration::from_millis(40),
     "with nothing pending the idle fallback governs (the scan deadline is not folded)"
   );
 
@@ -2090,4 +2103,117 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
     "a due timer re-drives the faulting checkpoint flush exactly once (saw {c2}, expected {})",
     c1 + 1
   );
+}
+
+/// A WAL whose staged appends need more polls to land than any teardown could deliver: the backend
+/// simply never completes what the endpoint submitted to it.
+const APPENDS_NEVER_LAND: u32 = u32::MAX;
+
+/// A WAL whose staged appends land only after this many polls. Chosen far above the TWO polls
+/// `run()`'s pre-loop `pump_outputs` delivers before the loop's first command drain takes the
+/// already-queued `Shutdown` — so an append staged here is provably still in flight when the
+/// shutdown is received, and only the teardown drain can complete it — while still finishing in
+/// tens of milliseconds at the drain's poll cadence.
+const APPENDS_LAND_AFTER: u32 = 64;
+
+/// Put one client request into the endpoint through the REAL `Handle::submit` + `handle_command`
+/// crossing, leaving its WAL append in flight, and assert the endpoint says so.
+///
+/// That assertion is the anti-vacuity precondition every drain test needs: a drain over an endpoint
+/// that owes storage nothing reports quiescence for free, so without it a green result would prove
+/// nothing. The returned submit future must be kept alive — dropping it cancels the reply receiver.
+fn submit_one_append_in_flight<'h>(
+  driver: &mut TestStreamDriver,
+  handle: &'h crate::Handle,
+) -> std::pin::Pin<Box<SubmitFut<'h>>> {
+  let mut fut: std::pin::Pin<Box<SubmitFut<'h>>> =
+    Box::pin(handle.submit(Bytes::from_static(b"durable")));
+  assert!(
+    poll_submit(fut.as_mut()).is_none(),
+    "the submit parks on its reply"
+  );
+  drain_one_command(driver);
+  assert!(
+    driver.coord.endpoint().has_inflight_storage(),
+    "the submitted request must leave a WAL append in flight, or the drain has nothing to prove"
+  );
+  fut
+}
+
+/// DEADLINE EXPIRY REPORTS HONESTLY (stream driver): against a backend that never completes the
+/// append the endpoint submitted, the teardown cannot reach quiescence — so it waits out
+/// `SHUTDOWN_DRAIN_DEADLINE`, then acks with `storage_quiesced() == false` and releases storage
+/// anyway. Both halves are the property: an unbounded wait would wedge every shutdown behind a stuck
+/// device, and reporting a clean stop would make an abandoned mid-write indistinguishable from a
+/// drained one. The elapsed floor is what proves it genuinely tried to drain rather than answering
+/// `false` on the spot.
+#[tokio::test]
+async fn deadline_expiry_acks_shutdown_unquiesced_stream() {
+  let (mut driver, handle) =
+    test_driver_with_handle_over(InMemoryWal::with_async_appends(APPENDS_NEVER_LAND)).await;
+  let submit = submit_one_append_in_flight(&mut driver, &handle);
+
+  let started = std::time::Instant::now();
+  let task = tokio::spawn(driver.run());
+  let report = tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE * 4, handle.shutdown())
+    .await
+    .expect("the shutdown acks rather than hanging on a backend that never completes")
+    .expect("shutdown acks teardown");
+  let elapsed = started.elapsed();
+
+  assert!(
+    !report.storage_quiesced(),
+    "an append the backend never completed must be reported as NOT quiesced"
+  );
+  assert!(
+    elapsed >= SHUTDOWN_DRAIN_DEADLINE,
+    "the teardown waited out the drain deadline before giving up, took {elapsed:?}"
+  );
+  assert!(
+    elapsed < SHUTDOWN_DRAIN_DEADLINE * 3,
+    "the wait is BOUNDED by the deadline, not open-ended; took {elapsed:?}"
+  );
+  task.await.expect("run() returns after the ack");
+  drop(submit);
+}
+
+/// THE DRAIN GENUINELY COMPLETES IN-FLIGHT WORK (stream driver): an append the endpoint still owed
+/// when the `Shutdown` arrived is carried to completion by the teardown drain, and the ack reports
+/// `storage_quiesced() == true`.
+///
+/// Non-vacuous by construction, not by hope. The `Shutdown` is enqueued BEFORE `run()` exists, so it
+/// is the first command the loop drains; the endpoint's own in-flight-storage signal is asserted
+/// true at that point; and the fixture needs `APPENDS_LAND_AFTER` polls to land against the two the
+/// pre-loop pump can deliver. So the append is still in flight when the shutdown is received, and a
+/// `true` report can only come from the drain having polled it through.
+#[tokio::test]
+async fn the_teardown_drain_completes_an_in_flight_append_stream() {
+  let (mut driver, handle) =
+    test_driver_with_handle_over(InMemoryWal::with_async_appends(APPENDS_LAND_AFTER)).await;
+  let submit = submit_one_append_in_flight(&mut driver, &handle);
+
+  let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+  let mut shutdown_fut = Box::pin(handle.shutdown());
+  assert!(
+    std::future::Future::poll(shutdown_fut.as_mut(), &mut cx).is_pending(),
+    "the shutdown enqueues its command and parks on the ack"
+  );
+  assert!(
+    driver.coord.endpoint().has_inflight_storage(),
+    "the append is STILL in flight now the shutdown is queued: this is the moment the drain must \
+     act on"
+  );
+
+  let task = tokio::spawn(driver.run());
+  let report = tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE * 2, shutdown_fut)
+    .await
+    .expect("a completing backend drains well inside the deadline")
+    .expect("shutdown acks teardown");
+
+  assert!(
+    report.storage_quiesced(),
+    "the drain carried the in-flight append to completion, so the stop was orderly"
+  );
+  task.await.expect("run() returns after the ack");
+  drop(submit);
 }

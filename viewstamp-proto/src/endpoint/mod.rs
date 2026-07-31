@@ -3574,11 +3574,14 @@ impl<S, R> Endpoint<S, R> {
   /// still holding for this endpoint.
   ///
   /// A real driver uses this for graceful shutdown (do not tear down the proactor while a write the
-  /// cluster may have acted on is un-acked) and for the restart-in-place drain (see the
-  /// [`OpId`](crate::OpId) lifetime contract: a driver retaining a completion-correlation table across
-  /// endpoint re-creation must drain/cancel all in-flight storage ops first, and this is the
-  /// proto-side "am I quiesced?" signal). The in-flight RECOVERY reads (`recover`) are deliberately NOT
-  /// included: they belong to a
+  /// cluster may have acted on is un-acked) and for the restart-in-place drain: draining before
+  /// rebuilding an endpoint over the same live storage handles still makes that shutdown CLEAN —
+  /// this method is how that settles — but it is no longer what makes it SAFE. Storage correlation
+  /// ids carry the incarnation of the endpoint that minted them (the [`OpId`](crate::OpId) lifetime
+  /// contract), and both storage completion routers and the synchronous-cancellation absorber refuse
+  /// a foreign incarnation before consulting any correlation table, so a completion the dead
+  /// instance still owed lands on nothing whether or not this method ever reached zero. The
+  /// in-flight RECOVERY reads (`recover`) are deliberately NOT included: they belong to a
   /// `Recovering`/`RecoveringHead` endpoint that is itself the product of `recover()` (not a quiesce
   /// target for a shutdown of a participating replica), and they resolve via `handle_storage`.
   #[cfg_attr(not(tarpaulin), inline(always))]

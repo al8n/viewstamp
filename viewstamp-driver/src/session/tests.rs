@@ -523,7 +523,7 @@ fn gate_command_on_retirement_passes_non_waiting_kinds_through() {
     MemberId::new(1),
     Epoch::new(1),
   );
-  let (ack, _ack_rx) = futures_channel::oneshot::channel::<()>();
+  let (ack, _ack_rx) = futures_channel::oneshot::channel::<crate::ShutdownReport>();
   assert!(
     matches!(
       super::gate_command_on_retirement(&retired, crate::Command::Shutdown { ack }),

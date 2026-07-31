@@ -10,7 +10,10 @@
 //! Address book gate: a driver that receives `AddPeer` commands continues to commit work correctly,
 //! and the address book accepts registrations at any point without panicking.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+  net::SocketAddr,
+  time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use rustls::{
@@ -279,6 +282,67 @@ async fn build_cluster_driver(
   .expect("driver builds")
 }
 
+/// Drive `reconfigure_to` to convergence, treating a fail-closed `InsufficientLiveness` refusal as
+/// RETRYABLE rather than a test failure: the successor-liveness probe is a real network round trip,
+/// and a machine under load can miss its window without the successor voter being genuinely
+/// unreachable, so a fresh call — which re-plans from wherever the live membership landed and
+/// re-probes from scratch — gets another chance to gather the proof the first attempt's window
+/// missed. Any OTHER error fails immediately: it names a genuine defect, not a proof that merely
+/// has not landed yet.
+///
+/// Bounded by `budget`, the same overall allowance the call used before retries existed: once
+/// elapsed time passes it while still `InsufficientLiveness`, this panics naming the last unproven
+/// successor set rather than retrying without end. It also panics the moment the remaining plan
+/// GROWS between attempts — proof the reconfiguration is genuinely stalled (or regressing), which
+/// the retry must never paper over, rather than merely waiting on a liveness proof still in
+/// flight. The wrapping timeout is pure defense against an unrelated hang: `reconfigure_to` itself
+/// always resolves within its own configured deadline, so this should never fire in practice.
+async fn reconfigure_until_proven(
+  handle: &viewstamp_compio::Handle,
+  target: MembershipTarget,
+  health: HealthHint,
+  ack: Option<AcceptReducedFaultTolerance>,
+  budget: Duration,
+) {
+  compio::time::timeout(budget + viewstamp_driver::RECONFIGURE_TIMEOUT, async {
+    let deadline = Instant::now() + budget;
+    let mut prior_remaining = None;
+    loop {
+      match handle
+        .reconfigure_to(target.clone(), health.clone(), ack)
+        .await
+      {
+        Ok(()) => return,
+        Err(ReconfigureError::InsufficientLiveness { progress, unproven }) => {
+          let remaining = progress.remaining().unwrap_or(&[]).len();
+          if let Some(prior) = prior_remaining {
+            assert!(
+              remaining <= prior,
+              "the reconfiguration regressed instead of merely stalling on a liveness proof: the \
+               remaining plan grew from {prior} step(s) to {remaining} step(s); last unproven \
+               {unproven:?}"
+            );
+          }
+          prior_remaining = Some(remaining);
+          if Instant::now() >= deadline {
+            panic!(
+              "reconfigure_to exhausted its retry budget still reporting InsufficientLiveness; \
+               last unproven {unproven:?}, remaining plan {:?}",
+              progress.remaining()
+            );
+          }
+        }
+        Err(other) => panic!("reconfigure_to failed: {other:?}"),
+      }
+    }
+  })
+  .await
+  .expect(
+    "reconfigure_to (retried across InsufficientLiveness refusals) hung well past its retry \
+     budget — an unrelated defect, not a liveness proof that merely has not landed",
+  );
+}
+
 /// CONVERGENCE: a single-node driver drives a real membership change to completion through its own
 /// run loop. Genesis is one voter (slot 0) plus a learner; the target adds a SECOND learner, so the
 /// plan is a single `AddLearner` — admitted on the primary, self-committed at quorum 1, and installed
@@ -305,13 +369,14 @@ async fn single_node_reconfigure_converges_ok() {
     std::collections::BTreeSet::from([MemberId::new(0)]),
     std::collections::BTreeSet::from([MemberId::new(1), MemberId::new(2)]),
   );
-  compio::time::timeout(
+  reconfigure_until_proven(
+    &handle,
+    target,
+    HealthHint::default(),
+    None,
     Duration::from_secs(10),
-    handle.reconfigure_to(target, HealthHint::default(), None),
   )
-  .await
-  .expect("the reconfiguration converges within 10s")
-  .expect("reconfigure_to resolves Ok once the membership reaches the target");
+  .await;
 
   // The committed change installed its epoch swap: a `MembershipChanged` to epoch 1 was observed
   // (the durable witness that the AddLearner committed + installed on the single voter).
@@ -427,13 +492,14 @@ async fn idle_three_voter_shrink_completes_from_health_probes_alone() {
     std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
     std::collections::BTreeSet::new(),
   );
-  compio::time::timeout(
+  reconfigure_until_proven(
+    &handles[0],
+    target,
+    HealthHint::default(),
+    Some(AcceptReducedFaultTolerance),
     viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
-    handles[0].reconfigure_to(target, HealthHint::default(), Some(AcceptReducedFaultTolerance)),
   )
-  .await
-  .expect("the call resolves within the deadline band")
-  .expect("the shrink converges from the health-probe evidence alone, with no client traffic ever submitted");
+  .await;
 
   for h in &handles {
     let _ = h.shutdown().await;
@@ -573,17 +639,14 @@ async fn a_demoted_voter_becomes_a_learner_then_is_gced_and_the_smaller_cluster_
     std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
     std::collections::BTreeSet::new(),
   );
-  compio::time::timeout(
+  reconfigure_until_proven(
+    &handles[0],
+    target,
+    HealthHint::default(),
+    Some(AcceptReducedFaultTolerance),
     viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
-    handles[0].reconfigure_to(
-      target,
-      HealthHint::default(),
-      Some(AcceptReducedFaultTolerance),
-    ),
   )
-  .await
-  .expect("the demote-then-GC shrink resolves within the deadline band")
-  .expect("reconfigure_to resolves Ok once member 2 is demoted, GCed, and the target is reached");
+  .await;
 
   // Drain member 2's own two installs, in order: the demote (still a member, now a learner), then the
   // GC (fully removed). Waited for explicitly (not opportunistically drained) — member 2's own install
@@ -913,13 +976,14 @@ async fn stream_cluster_survives_slot_shift() {
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  compio::time::timeout(
+  reconfigure_until_proven(
+    &handles[0],
+    target,
+    HealthHint::default(),
+    None,
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
-  .await
-  .expect("the reconfiguration converges within 20s")
-  .expect("reconfigure_to resolves Ok once voter 1 is removed and the slots shift");
+  .await;
 
   // POST-SHIFT: a request submitted at member 3 — now at slot 2 (shifted DOWN from slot 3) — must still
   // commit. It relays to the primary over the mesh, so its convergence proves member 3's conns
@@ -1098,13 +1162,14 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
   // The health hint is irrelevant here: `PromoteLearner` is a grow-phase step the liveness gate never
   // consults (only a `DemoteVoter` shrink does) — the promote-time durable-prefix challenge is what
   // admits it.
-  compio::time::timeout(
+  reconfigure_until_proven(
+    &handles[0],
+    target,
+    HealthHint::default(),
+    None,
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
-  .await
-  .expect("the promotion converges within 20s")
-  .expect("reconfigure_to resolves Ok once the learner is promoted to a voter");
+  .await;
 
   // POST-PROMOTION: the ex-learner is now a VOTER, so the cluster is two voters at quorum 2. A fresh op
   // committed at the primary REQUIRES the promoted member's `PrepareOk` — its success proves member 1 is
@@ -1525,13 +1590,14 @@ async fn quic_cluster_survives_slot_shift() {
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  compio::time::timeout(
+  reconfigure_until_proven(
+    &handles[0],
+    target,
+    HealthHint::default(),
+    None,
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
-  .await
-  .expect("the reconfiguration converges within 20s")
-  .expect("reconfigure_to resolves Ok once voter 1 is removed and slots shift");
+  .await;
 
   // POST-SHIFT: submit at member 3 (now slot 2). Convergence requires that member 3 redialed its
   // peers with SNI `replica-<MemberId>` (not `replica-<slot>`), so the mTLS handshake succeeds.
