@@ -1609,7 +1609,7 @@ pub fn run_vopr_with_reconfig_live(seed: u64, ticks: u64) -> VoprReport {
 /// root after the inherited landing and rewinds the durable epoch and view underneath a cluster
 /// that already acted on them.
 ///
-/// The crossing is TARGETED rather than left to coincidence — see [`Vopr::swap_rebuild_axis`] — and
+/// The crossing is TARGETED rather than left to coincidence — see `Vopr::swap_rebuild_axis` — and
 /// [`VoprReport::swap_root_rebuilds`] counts the rebuilds that genuinely landed inside a swap-root
 /// window, so the lane cannot pass while the two axes never actually met. Write chaos rides along
 /// for the reason [`run_vopr_with_restart_in_place`] gives: without it the inherited WAL work
@@ -2872,9 +2872,7 @@ impl Vopr {
         if trace {
           eprintln!("tick {tick}: HEAL one-way blocks");
         }
-        for b in &mut self.asym_victims {
-          *b = false;
-        }
+        self.asym_victims.fill(false);
         c.heal_one_way();
         self.report.heals += 1;
       }
@@ -2919,9 +2917,7 @@ impl Vopr {
         if trace {
           eprintln!("tick {tick}: HEAL one-way blocks (stale-read)");
         }
-        for b in &mut self.asym_victims {
-          *b = false;
-        }
+        self.asym_victims.fill(false);
         // The cut is healed: abandon the probe so a later failover is not mis-attributed to it.
         self.active_stale_probe = None;
         c.heal_one_way();
@@ -3458,9 +3454,10 @@ impl Vopr {
     // replica's per-replica monotonicity baselines (durable view, checkpoint high-water, durable
     // (epoch, view)) are forfeit with its disk — its fresh superblock honestly reads epoch 0 / view 0
     // / checkpoint 0, which is the amnesia itself, not a checker artifact. Every CLUSTER-level
-    // invariant below stays at full strength. (Drained into a local first so the on-driver
-    // `epoch_view` checker can be told without a second `&mut self` borrow conflicting with the drain.)
-    let wiped: Vec<usize> = self.wiped_pending.drain(..).collect();
+    // invariant below stays at full strength. (Taken into a local first so the on-driver
+    // `epoch_view` checker can be told without a second `&mut self` borrow conflicting with the
+    // iteration.)
+    let wiped = std::mem::take(&mut self.wiped_pending);
     for i in wiped {
       dur.note_wipe(i);
       vm.note_wipe(i);

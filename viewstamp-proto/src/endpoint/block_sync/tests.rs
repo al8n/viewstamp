@@ -64,12 +64,10 @@ impl StateMachine for DagSm {
       None => return std::vec::Vec::new(),
     };
     payload
-      .chunks_exact(16)
-      .map(|c| {
-        let mut a = [0u8; 16];
-        a.copy_from_slice(c);
-        BlockAddress::from_bytes(a)
-      })
+      .as_chunks::<16>()
+      .0
+      .iter()
+      .map(|&a| BlockAddress::from_bytes(a))
       .collect()
   }
 }

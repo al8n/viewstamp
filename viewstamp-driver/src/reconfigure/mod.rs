@@ -344,6 +344,11 @@ fn pick_fresh_quorum_preserving_demotion(
 ///
 /// PRECONDITIONS: SOLE-DRIVER + every target member ABSENT from `live` MUST be a FRESH, reachable node.
 /// The `members_seen` rule (passive observation) refuses to re-add an OBSERVED-then-removed member.
+// The large `Err` variant is the point: `InsufficientLiveness` hands the caller the full
+// resumable plan by value (the still-valid remaining steps it resumes from), it crosses the API
+// at most once per failed reconfiguration attempt (a cold operator path), and boxing it would
+// buy nothing while costing an allocation on every construction.
+#[allow(clippy::result_large_err)]
 pub async fn run_reconfigure<B: ReconfigureBackend>(
   backend: B,
   target: MembershipTarget,

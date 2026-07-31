@@ -274,6 +274,11 @@ impl Handle {
   /// [`crate::reconfigure::ReconfigureError::DriverGone`] if the channel is closed or the reply is
   /// dropped (terminal — the driver is gone, do not retry this handle); all other outcomes propagate
   /// from the driver-task executor loop.
+  // The large `Err` variant is the point: `InsufficientLiveness` hands the caller the full
+  // resumable plan by value (the still-valid remaining steps it resumes from), it crosses the API
+  // at most once per failed reconfiguration attempt (a cold operator path), and boxing it would
+  // buy nothing while costing an allocation on every construction.
+  #[allow(clippy::result_large_err)]
   pub async fn reconfigure_to(
     &self,
     target: viewstamp_proto::MembershipTarget,

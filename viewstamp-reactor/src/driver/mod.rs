@@ -363,7 +363,7 @@ where
   ///
   /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are STORAGE-QUIESCE
   /// and fd-release barriers. The teardown first drains the endpoint's in-flight storage — WAL,
-  /// superblock, and the block jobs on its lane (bounded; see [`Self::quiesce_storage`]) — so an
+  /// superblock, and the block jobs on its lane (bounded; see `Self::quiesce_storage`) — so an
   /// orderly stop is distinguishable from a crash, and reports the outcome in the ack's
   /// [`ShutdownReport`]. It then drops the socket — the driver
   /// is its SOLE owner (the recv arm borrows it in-loop; no helper task holds a clone), so that drop
