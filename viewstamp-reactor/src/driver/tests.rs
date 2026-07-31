@@ -48,6 +48,7 @@ fn genesis(n: u8) -> Membership {
 }
 
 use super::ReactorQuicDriver;
+use viewstamp_driver::BlockLane;
 use viewstamp_driver::{
   DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT, SHUTDOWN_DRAIN_DEADLINE,
 };
@@ -59,7 +60,6 @@ type TestQuicDriver = ReactorQuicDriver<
   LogSm,
   InMemoryWal,
   InMemorySuperblock,
-  MemBlocks,
   viewstamp_proto::ProvidedIdentity,
 >;
 
@@ -159,7 +159,7 @@ async fn test_quic_driver_with_config(
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     viewstamp_proto::ClientId::new(1),
     0,
     opts,

@@ -9,6 +9,6 @@ mod task;
 pub use driver::ReactorQuicDriver;
 pub use stream_driver::ReactorStreamDriver;
 pub use viewstamp_driver::{
-  Clock, Command, DriverConfig, DriverError, Handle, Reply, SHUTDOWN_DRAIN_DEADLINE,
+  BlockLane, Clock, Command, DriverConfig, DriverError, Handle, Reply, SHUTDOWN_DRAIN_DEADLINE,
   ShutdownReport, StorageQuiescence,
 };

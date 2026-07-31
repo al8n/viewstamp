@@ -48,19 +48,15 @@ fn genesis(n: u8) -> Membership {
   )
   .expect("valid genesis membership")
 }
+use viewstamp_driver::BlockLane;
 use viewstamp_driver::{
   DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT, SHUTDOWN_DRAIN_DEADLINE,
 };
 
 const CLUSTER: u128 = 0x5151;
 
-type TestQuicDriver = CompioQuicDriver<
-  LogSm,
-  InMemoryWal,
-  InMemorySuperblock,
-  MemBlocks,
-  viewstamp_proto::ProvidedIdentity,
->;
+type TestQuicDriver =
+  CompioQuicDriver<LogSm, InMemoryWal, InMemorySuperblock, viewstamp_proto::ProvidedIdentity>;
 
 /// A type-erased in-flight `submit` future, lifetime-bound to the borrowed `Handle` it ran from.
 type SubmitFut<'a> = dyn std::future::Future<Output = Result<crate::Reply, DriverError>> + 'a;
@@ -158,7 +154,7 @@ async fn test_quic_driver_with_config(
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     viewstamp_proto::ClientId::new(1),
     0,
     opts,

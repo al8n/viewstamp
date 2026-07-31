@@ -63,6 +63,7 @@ fn genesis(n: u8) -> Membership {
 
 /// A type-erased in-flight `submit` future, lifetime-bound to the borrowed `Handle` it ran from.
 type SubmitFut<'a> = dyn std::future::Future<Output = Result<crate::Reply, DriverError>> + 'a;
+use viewstamp_driver::BlockLane;
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 #[test]
@@ -75,7 +76,7 @@ fn stream_driver_type_resolves() {
 /// Build a driver bound on an ephemeral loopback port with no configured peers, so no dials fire
 /// until the test drives `dial_peer` itself. `R = Labeled<Passthrough>` (the loopback transport).
 async fn test_driver()
--> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
+-> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
   // A test driver models a genuine new cluster: FORMAT the store once (writing the pinned genesis
   // root) so recovery resumes the designated view-0 primary as Normal. `test_driver_with_storage`
   // (the dirty-store path) is deliberately NOT formatted.
@@ -91,7 +92,7 @@ async fn test_driver()
 async fn test_driver_with_storage(
   wal: InMemoryWal,
   sb: InMemorySuperblock,
-) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
+) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
   const CLUSTER: u128 = 0x7777;
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let dialer: super::DialerFactory<Labeled<Passthrough>> = Rc::new(|peer| {
@@ -103,7 +104,7 @@ async fn test_driver_with_storage(
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   });
   let (_ready_tx, ready_rx) = flume::unbounded();
-  let blocks = MemBlocks::default();
+  let blocks = BlockLane::inline(MemBlocks::default());
   let (driver, _handle) = CompioStreamDriver::new(
     config,
     genesis(3),
@@ -128,7 +129,7 @@ async fn test_driver_with_storage(
 /// drive a non-default [`crate::DriverConfig`] through the production path.
 async fn test_driver_with_config(
   cfg: crate::DriverConfig,
-) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
+) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
   test_driver_with_config_and_storage(cfg, InMemoryWal::new(), InMemorySuperblock::new()).await
 }
 
@@ -136,7 +137,7 @@ async fn test_driver_with_config_and_storage(
   cfg: crate::DriverConfig,
   wal: InMemoryWal,
   mut sb: InMemorySuperblock,
-) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
+) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
   const CLUSTER: u128 = 0x7777;
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   // A GENESIS fixture (empty store) is FORMATTED so recovery resumes rather than fail-stopping this
@@ -159,7 +160,7 @@ async fn test_driver_with_config_and_storage(
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -212,7 +213,7 @@ async fn a_peer_mesh_larger_than_the_conn_cap_is_refused_at_construction() {
       LogSm::default(),
       wal,
       sb,
-      MemBlocks::default(),
+      BlockLane::inline(MemBlocks::default()),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -280,7 +281,7 @@ async fn a_probe_interval_not_below_the_round_lifetime_is_refused_at_constructio
       LogSm::default(),
       wal,
       sb,
-      MemBlocks::default(),
+      BlockLane::inline(MemBlocks::default()),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -334,7 +335,7 @@ async fn a_probe_interval_not_below_the_round_lifetime_is_refused_at_constructio
 /// driver's REAL `handle_command`/`deliver_event`/`retransmit_stale`. No peers are configured, so
 /// nothing ever commits on its own — exactly the partitioned/slow case the submit budget must bound.
 async fn test_driver_with_handle() -> (
-  CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks>,
+  CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
   crate::Handle,
 ) {
   test_driver_with_handle_over(InMemoryWal::new()).await
@@ -345,7 +346,7 @@ async fn test_driver_with_handle() -> (
 async fn test_driver_with_handle_over(
   wal: InMemoryWal,
 ) -> (
-  CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks>,
+  CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
   crate::Handle,
 ) {
   const CLUSTER: u128 = 0x7777;
@@ -368,7 +369,7 @@ async fn test_driver_with_handle_over(
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -391,7 +392,7 @@ async fn test_driver_with_handle_over(
 /// [`StreamCoordinator::with_outbound_cap`] (the public `new` always uses the default cap).
 async fn test_driver_small_cap(
   cap: usize,
-) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
+) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
   let mut driver = test_driver().await;
   const CLUSTER: u128 = 0x7777;
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
@@ -413,13 +414,7 @@ async fn test_driver_small_cap(
 /// asserts the queued bytes / channel directly, never driving a real bridge), so dropping them on a
 /// close cancels nothing live. The held `out_rx` observes what `pump_outputs` admitted.
 fn register_handshaking_conn(
-  driver: &mut CompioStreamDriver<
-    LogSm,
-    Labeled<Passthrough>,
-    InMemoryWal,
-    InMemorySuperblock,
-    MemBlocks,
-  >,
+  driver: &mut CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
   peer: ReplicaId,
 ) -> (
   viewstamp_proto::ConnId,
@@ -585,7 +580,7 @@ async fn validation_resets_the_redial_backoff_to_base() {
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -793,7 +788,7 @@ async fn run_exits_with_an_in_flight_dial_to_an_unreachable_peer() {
     LogSm::default(),
     wal,
     sb,
-    MemBlocks::default(),
+    BlockLane::inline(MemBlocks::default()),
     ClientId::new(1),
     0,
     "127.0.0.1:0".parse().unwrap(),
@@ -1122,13 +1117,7 @@ async fn tune_peer_socket_sets_nodelay_and_keepalive() {
 /// made by `Handle::submit`; this completes the Handle->driver crossing the run loop would do. A
 /// `Submit` is never a shutdown, so `handle_command` returns `false` here.
 fn drain_one_command(
-  driver: &mut CompioStreamDriver<
-    LogSm,
-    Labeled<Passthrough>,
-    InMemoryWal,
-    InMemorySuperblock,
-    MemBlocks,
-  >,
+  driver: &mut CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
 ) {
   let cmd = driver.commands.try_recv().expect("a command was enqueued");
   let mut ack = None;
@@ -2068,7 +2057,7 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   viewstamp_driver::format(config, &genesis(1), &wal, &mut sb).expect("format the genesis store");
 
   let flush_attempts = Arc::new(AtomicUsize::new(0));
-  let blocks = FaultingBlocks::new(flush_attempts.clone());
+  let blocks = BlockLane::inline(FaultingBlocks::new(flush_attempts.clone()));
   let dialer: super::DialerFactory<Labeled<Passthrough>> = Rc::new(|peer| {
     let opts = LabelOptions::new(CLUSTER, peer);
     Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -2110,7 +2099,8 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
     .submit_client_request(now, &mut driver.wal, &mut driver.sb, request);
   driver
     .coord
-    .handle_storage(now, &mut driver.wal, &mut driver.sb, &mut driver.blocks);
+    .handle_storage_deferred(now, &mut driver.wal, &mut driver.sb);
+  driver.drive_block_lane(now);
 
   assert_eq!(
     driver.coord.endpoint().commit().get(),
@@ -2145,6 +2135,9 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   // never retried.
   for _ in 0..64 {
     driver.service_consensus_timer(now);
+    // The wake's own storage-lane step: a re-drive would queue the flush job here, so the count
+    // below is a real measure of how often the gate let one through.
+    driver.drive_block_lane(now);
   }
   let c1 = flush_attempts.load(Ordering::Relaxed);
   assert_eq!(
@@ -2156,6 +2149,7 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   // A due timer: pass `deadline` itself as `now` (`deadline <= deadline` holds), so the gate must
   // service it — exactly once, matching one due firing per cadence.
   driver.service_consensus_timer(deadline);
+  driver.drive_block_lane(deadline);
   let c2 = flush_attempts.load(Ordering::Relaxed);
   assert_eq!(
     c2,
@@ -2183,13 +2177,7 @@ const APPENDS_LAND_AFTER: u32 = 64;
 /// that owes storage nothing reports quiescence for free, so without it a green result would prove
 /// nothing. The returned submit future must be kept alive — dropping it cancels the reply receiver.
 fn submit_one_append_in_flight<'h>(
-  driver: &mut CompioStreamDriver<
-    LogSm,
-    Labeled<Passthrough>,
-    InMemoryWal,
-    InMemorySuperblock,
-    MemBlocks,
-  >,
+  driver: &mut CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
   handle: &'h crate::Handle,
 ) -> std::pin::Pin<Box<SubmitFut<'h>>> {
   let mut fut: std::pin::Pin<Box<SubmitFut<'h>>> =

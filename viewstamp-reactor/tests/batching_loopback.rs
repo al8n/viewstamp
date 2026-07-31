@@ -18,6 +18,7 @@ use viewstamp_proto::{
   BlockAddress, BlockStore, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
   ReplicaId, RestoreError, StateMachine, Superblock, Wal,
 };
+use viewstamp_reactor::BlockLane;
 use viewstamp_simulation::{
   InMemorySuperblock, InMemoryWal,
   sm::{BatchSm, SIM_UNIT_REPLY_CEILING},
@@ -197,7 +198,6 @@ type GateDriver = viewstamp_reactor::ReactorStreamDriver<
   Labeled<Passthrough>,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
-  MemBlocks,
 >;
 
 fn mk_dialer(me: u8) -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
@@ -243,7 +243,7 @@ async fn spawn_cluster() -> (Vec<viewstamp_reactor::Handle>, Vec<Arc<Mutex<Batch
     let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
     // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
     viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
     let (sm, recorder) = SharedSm::new();
     let (driver, handle) = GateDriver::new(
       config,

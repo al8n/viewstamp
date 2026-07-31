@@ -453,9 +453,55 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     blocks: &mut dyn BlockStore,
   ) {
     self.drain_storage(now, wal, sb, blocks);
+    self.settle(now, wal, sb);
+  }
+
+  /// Drive WAL/superblock completions through the consensus endpoint and pump, leaving the block
+  /// jobs the pass queued for an EXTERNAL storage lane: the caller drains them with
+  /// [`Self::poll_block_job`] and answers each with [`Self::on_block_done`].
+  ///
+  /// The lane-placement alternative to [`Self::handle_storage`]: that one holds the store and
+  /// executes every job on the calling thread, this one holds no store at all, so a long
+  /// materialize occupies the lane rather than the thread that pumps consensus. The caller owns
+  /// the [`BlockJobCursor`](crate::BlockJobCursor) and therefore the serial-in-issue-order
+  /// obligation the inline lane satisfies by construction.
+  pub fn handle_storage_deferred<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+  ) {
+    self.endpoint.handle_storage(now, wal, sb);
+    self.settle(now, wal, sb);
+  }
+
+  /// Takes the next block job the endpoint has queued, for a caller running an external storage
+  /// lane (see [`Self::handle_storage_deferred`]). `None` when none is queued.
+  pub fn poll_block_job(&mut self) -> Option<crate::BlockJob<S>> {
+    self.endpoint.poll_block_job()
+  }
+
+  /// Feeds back the completion of a block job an external storage lane executed, then pumps.
+  ///
+  /// Completions MUST arrive in the order their jobs were polled; the endpoint fail-stops on any
+  /// other order.
+  pub fn on_block_done<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    done: crate::BlockJobDone<S>,
+  ) {
+    self.endpoint.on_block_done(now, wal, sb, done);
+    self.settle(now, wal, sb);
+  }
+
+  /// The tail every storage-advancing entry point shares: drain the bridge (a completion can
+  /// release consensus messages that arrive as frames), reconcile routing against a membership the
+  /// advance may have installed — BEFORE the pump, so this pass's outputs use the new slots — then
+  /// pump the endpoint's outputs.
+  fn settle<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     self.drain_bridge(now, wal, sb);
-    // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
-    // membership; reconcile routing against it BEFORE the pump, so this pass's outputs use new slots.
     self.reconcile_routing(now);
     self.pump(now);
   }

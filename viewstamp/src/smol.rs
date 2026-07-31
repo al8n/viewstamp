@@ -11,10 +11,9 @@ pub type Runtime = agnostic::smol::SmolRuntime;
 
 /// A smol-backed QUIC driver — [`viewstamp_reactor::ReactorQuicDriver`] with its runtime pinned
 /// to smol.
-pub type ReactorQuicDriver<S, W, B, L, I> =
-  viewstamp_reactor::ReactorQuicDriver<Runtime, S, W, B, L, I>;
+pub type ReactorQuicDriver<S, W, B, I> = viewstamp_reactor::ReactorQuicDriver<Runtime, S, W, B, I>;
 
 /// A smol-backed TCP/TLS stream driver — [`viewstamp_reactor::ReactorStreamDriver`] with its
 /// runtime pinned to smol.
-pub type ReactorStreamDriver<S, T, W, B, L> =
-  viewstamp_reactor::ReactorStreamDriver<Runtime, S, T, W, B, L>;
+pub type ReactorStreamDriver<S, T, W, B> =
+  viewstamp_reactor::ReactorStreamDriver<Runtime, S, T, W, B>;

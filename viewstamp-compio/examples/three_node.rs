@@ -33,6 +33,7 @@
 use std::{net::SocketAddr, rc::Rc};
 
 use bytes::Bytes;
+use viewstamp_compio::BlockLane;
 use viewstamp_proto::{
   BlockAddress, BlockStore, ClientId, Config, Conn, LabelOptions, Labeled, MemberId, Membership,
   Passthrough, Peer, ReplicaId, Superblock, Wal,
@@ -222,7 +223,7 @@ async fn main() {
     // `first_request`) or use a fresh `ClientId` — this example starts fresh at 0.
     let session = ClientId::new(u128::from(id) + 1);
     // EMBEDDER OBLIGATION — the content-addressed block store for state-machine checkpoints.
-    let blocks = MemBlocks::default();
+    let blocks = BlockLane::spawn(MemBlocks::default());
 
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
