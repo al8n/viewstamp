@@ -163,9 +163,10 @@
 
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
-  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_reconfig,
-  run_vopr_with_reconfig_live, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_torn_headers, run_vopr_with_wipe, run_vopr_with_write_chaos,
+  run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
+  run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live, run_vopr_with_slow,
+  run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -686,6 +687,193 @@ fn vopr_wal_write_chaos_sweep_no_violations() {
   println!(
     "VOPR write-chaos sweep OK: wal_write_reorders={total_reorders} committed={total_committed} \
      view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed count for an AXIS lane: `VOPR_SEEDS` if set and parseable, else that lane's
+/// own `default`. Axis lanes are additive to the default sweep, so each carries a smaller committed
+/// band than [`sweep_seed_count`]'s, while one env var still widens the whole suite at once.
+fn axis_sweep_seed_count(default: u64) -> u64 {
+  std::env::var("VOPR_SEEDS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(default)
+}
+
+/// The contiguous seed range for the committed BLOCK-JOB DELAY sweep (same budget rationale as
+/// [`HOLD_SEEDS`]: this lane is ADDITIVE to the default sweep, and every replica's storage lane runs
+/// the delayed-job model for the whole run).
+const BLOCK_DELAY_SEEDS: u64 = 16;
+
+/// The committed BLOCK-JOB DELAY sweep: [`run_vopr_with_block_delay`] over `0..BLOCK_DELAY_SEEDS` —
+/// the axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var, so it
+/// cannot race other tests in this process and cannot be forgotten by a runner).
+///
+/// Every block job a replica polls is HELD on its serial storage lane for a few storage steps rather
+/// than executing in the iteration that polled it. That is the difference between block I/O being off
+/// the consensus pump structurally and being off it observably: with instantaneous jobs there is no
+/// moment at which a job is outstanding, so nothing about the pump's independence from the lane can
+/// be measured, and no completion can arrive to find the state it answered already gone.
+///
+/// The EXISTING oracles judge the outcome every tick — safety, durability, applied-once,
+/// view-monotonicity, the durable-checkpoint flush oracle, plus the liveness/final-quiesce gates — so
+/// a panic here is a REAL finding in the seam's supersession or publication gating, reported with its
+/// seed, never masked. The DEFAULT sweep leaves this axis OFF (a held job is a schedule change, so
+/// enabling it would move every pinned seed); delay-enabled runs are their own deterministic
+/// baselines, byte-identical to `VOPR_BLOCK_DELAY=1` runs of the same seeds.
+#[test]
+fn vopr_block_delay_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(BLOCK_DELAY_SEEDS);
+  let mut total_delayed = 0u64;
+  let mut total_superseded = 0u64;
+  let mut total_outstanding_ticks = 0u64;
+  let mut total_commits = 0u64;
+  let mut total_heartbeats = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR block-delay sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, block-delay axis \
+     forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_block_delay(seed, DEFAULT_TICKS);
+    total_delayed += r.block_jobs_delayed();
+    total_superseded += r.materializes_superseded_in_flight();
+    total_outstanding_ticks += r.block_job_outstanding_ticks();
+    total_commits += r.commits_while_block_job_outstanding();
+    total_heartbeats += r.heartbeats_while_block_job_outstanding();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity: the axis must genuinely HOLD jobs off the lane across the sweep, otherwise it has
+  // silently decayed into the inline-executor default and every witness below it is measuring an
+  // ordinary run.
+  assert!(
+    total_delayed > 0,
+    "the block-delay axis never held a job for a storage step across the sweep \
+     (block_jobs_delayed={total_delayed}) — the delay lane is vacuous (the plan is not plumbed \
+     through, or every draw was zero-length)"
+  );
+  assert!(
+    total_outstanding_ticks > 0,
+    "no tick ever ended with a block job outstanding \
+     (block_job_outstanding_ticks={total_outstanding_ticks}) — the anti-stall witnesses below have \
+     no window to speak about"
+  );
+  // THE ANTI-STALL WITNESS. Block I/O is off the consensus pump, so a busy storage lane must not stop
+  // the cluster committing or silence the heartbeat cadence beside it. Both are asserted rather than
+  // reported: a run where a job was outstanding for thousands of ticks and NOTHING committed would
+  // mean the pump is back behind the lane.
+  assert!(
+    total_commits > 0,
+    "the cluster committed nothing across {total_outstanding_ticks} ticks with a block job \
+     outstanding — block I/O is back on the consensus pump"
+  );
+  assert!(
+    total_heartbeats > 0,
+    "no replica emitted a heartbeat while its own storage lane was busy — the liveness cadence is \
+     stopping with the block layer"
+  );
+  assert!(
+    total_committed > 0,
+    "the block-delay sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no block-delay seed drove a view change — the transition that supersedes an in-flight \
+     materialize never happened"
+  );
+  // The SUPERSESSION count is NOTED, not asserted. Catching a materialize mid-flight needs a view
+  // transition to land inside one replica's hold window, a rare confluence under this schedule — the
+  // same treatment `below_ring_window_syncs` gets, and for the same reason: the property has a
+  // DETERMINISTIC gate that CONSTRUCTS the window
+  // (`block_jobs.rs::a_materialize_superseded_by_a_view_change_publishes_nothing` stalls a lane,
+  // forces a view change under the held materialize, and asserts it published nothing), so forcing a
+  // thin cross-seed assert here would buy a flaky gate rather than coverage.
+  println!(
+    "VOPR block-delay sweep OK: delayed={total_delayed} outstanding_ticks={total_outstanding_ticks} \
+     commits_while_outstanding={total_commits} heartbeats_while_outstanding={total_heartbeats} \
+     materializes_superseded={total_superseded} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed BLOCK-STORE FAULT sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const BLOCK_FAULT_SEEDS: u64 = 16;
+
+/// The committed BLOCK-STORE FAULT sweep: [`run_vopr_with_block_faults`] over `0..BLOCK_FAULT_SEEDS`
+/// — the axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern).
+///
+/// The sim's block store injects nothing by default: every write lands, every barrier succeeds, every
+/// read answers. That left the block layer the one piece of storage this sweep never faulted, while
+/// the WAL and superblock have carried torn, rotted, misdirected and reordered verdicts for lanes.
+/// This lane faults it two ways — a durability BARRIER that fails, and a RECONSTRUCT whose reads
+/// answer absent — and the standing oracles judge the result.
+///
+/// The oracle this lane exists for runs every tick on every lane: **no block a durable checkpoint
+/// root names may be un-flushed**. A failed barrier means the blocks a checkpoint wrote are NOT
+/// durable, so the endpoint must advance no pointer over them and must re-force the checkpoint on its
+/// cadence; a violation is a durable checkpoint naming blocks a crash would discard, which is
+/// committed state lost behind a valid-looking root. A panic here is a REAL finding in the
+/// write-all-then-flush ordering or the publication gate, reported with its seed, never masked.
+#[test]
+fn vopr_block_fault_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(BLOCK_FAULT_SEEDS);
+  let mut total_flush_faults = 0u64;
+  let mut total_restore_armed = 0u64;
+  let mut total_reads_faulted = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR block-fault sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, block-fault axis \
+     forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_block_faults(seed, DEFAULT_TICKS);
+    total_flush_faults += r.block_flush_faults_fired();
+    total_restore_armed += r.block_restore_faults_armed();
+    total_reads_faulted += r.block_read_faults_fired();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity: the barrier must genuinely have FAILED across the sweep, or the flush oracle spent
+  // the whole lane judging runs in which every block was durable the moment it was written.
+  assert!(
+    total_flush_faults > 0,
+    "no durability barrier ever failed across the sweep \
+     (block_flush_faults_fired={total_flush_faults}) — the flush-fault plan is inert and the \
+     durable-checkpoint flush oracle judged a fault-free run"
+  );
+  // The reconstruct fault needs BOTH halves: a job armed, and that job actually READING. An arm the
+  // executed job never consumed would leave the second at zero while the first rose, which is a lane
+  // reporting a fault it never delivered.
+  assert!(
+    total_restore_armed > 0,
+    "no reconstruct was ever armed with a read fault across the sweep — no seed reached the \
+     state-sync rebuild path this half of the axis faults"
+  );
+  assert!(
+    total_reads_faulted > 0,
+    "reconstructs were armed ({total_restore_armed}) but swallowed no read \
+     (block_read_faults_fired={total_reads_faulted}) — the fault was never delivered into a job"
+  );
+  assert!(
+    total_committed > 0,
+    "the block-fault sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no block-fault seed drove a view change — a faulted checkpoint never had to survive one"
+  );
+  println!(
+    "VOPR block-fault sweep OK: flush_faults={total_flush_faults} \
+     restore_faults_armed={total_restore_armed} reads_faulted={total_reads_faulted} \
+     committed={total_committed} view_change_seeds={seeds_with_view_change}"
   );
 }
 

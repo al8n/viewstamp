@@ -1,7 +1,8 @@
 use core::time::Duration;
+use std::collections::VecDeque;
 
 use bytes::Bytes;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 use viewstamp_proto::{
   AcceptReducedFaultTolerance, BlockAddress, BlockResponse, BlockStore, Committed, Config,
@@ -92,6 +93,42 @@ impl OfflineReconfig {
 /// the cap only bounds a pathological stream of rejected/duplicate blocks the walk never writes.
 const BLOCKS_FETCH_PROBE_CAP: usize = 16;
 
+/// The longest hold, in storage steps, the seeded delay plan may draw for one block job.
+///
+/// A storage step is one entry into `drain_storage`, of which every tick makes two per live replica,
+/// so the ceiling is a couple of ticks — long enough that commits and heartbeats demonstrably flow
+/// around an outstanding job and that a view change can supersede a materialize mid-flight, and short
+/// enough that the checkpoint cadence and the liveness oracles still judge a converging cluster
+/// rather than a wedged one.
+const BLOCK_HOLD_MAX_STEPS: u32 = 6;
+
+/// The longest hold the seeded delay plan may draw for a `Materialize` specifically.
+///
+/// A materialize is the one job a view transition can SUPERSEDE, and the window it has to survive to
+/// reach that is a whole view change — several ticks of election, not the storage step or two the
+/// other jobs' band covers. Held jobs never block the pump, so the cost of the wider band is only
+/// that a checkpoint publishes later; the checkpoint cadence re-forces whatever it drops.
+const MATERIALIZE_HOLD_MAX_STEPS: u32 = 48;
+
+/// The per-mille rate at which the seeded plan faults ONE reconstruct's reads.
+const RESTORE_FAULT_PER_MILLE: u32 = 250;
+
+/// How many reads an armed restore fault swallows. A reconstruct reads both DAGs block by block, so
+/// a cap well above one block makes the fault a genuine unreadable REGION rather than a single
+/// address the walk could route around, while still leaving the store readable for the next attempt.
+const RESTORE_FAULT_READS: u32 = 64;
+
+/// One block job polled from an endpoint and waiting on the replica's serial storage lane.
+struct HeldBlockJob {
+  job: viewstamp_proto::BlockJob<SimSm>,
+  /// Storage steps left before this job executes. Zero ⇒ ready now (the off-axis case).
+  remaining: u32,
+  /// Storage steps this job has actually WAITED. Distinct from the drawn hold because the head is
+  /// what ages: a job queued behind another starts ageing only once it reaches the front, exactly as
+  /// a serial lane works. `> 0` is what makes a completion attributable to the delay lane.
+  held_steps: u32,
+}
+
 pub struct Cluster {
   replicas: Vec<Endpoint<SimSm, SingleChange>>,
   /// Per-replica write-ahead logs (persist across crashes; see `crash`).
@@ -107,6 +144,48 @@ pub struct Cluster {
   /// which is what makes a dead incarnation's queued job executing after its successor's a caught
   /// order violation rather than silent corruption.
   block_lanes: Vec<viewstamp_proto::BlockJobCursor>,
+  /// Per-replica FIFO hold queue in front of the storage lane: jobs polled from the endpoint that
+  /// have not executed yet. Empty at every observation point unless the delay lane is armed (a
+  /// zero-hold job is polled and executed in one iteration), so an off-axis run never sees a
+  /// non-empty queue and every witness stated over it reads zero.
+  ///
+  /// FIFO is not a convenience here — it IS the executor's serial-in-issue-order contract. Holding
+  /// jobs in a queue and releasing only the head keeps issue order across an arbitrary hold, which is
+  /// why the delay lane cannot itself manufacture the ordering violation the cursor exists to catch.
+  block_holds: Vec<VecDeque<HeldBlockJob>>,
+  /// The seeded per-job hold plan: `Some(prng)` ⇒ each polled job draws a hold in
+  /// `1..=BLOCK_HOLD_MAX_STEPS` storage steps, `None` (the default) ⇒ every job holds for zero steps
+  /// and executes in the iteration that polled it. Installed by [`Self::set_block_job_delay`].
+  block_hold_plan: Option<Prng>,
+  /// The seeded per-job read-fault plan for RECONSTRUCTS: `Some(prng)` ⇒ each `Restore` job draws
+  /// whether its reads are faulted, `None` (the default) ⇒ no read is ever faulted. Installed by
+  /// [`Self::set_block_restore_faults`]. Restricted to `Restore` because the fault's purpose is to
+  /// reach the SM-reconstruct path — faulting a `Walk`'s reads would only re-drive a frontier, and
+  /// faulting a `Serve` is the corrupt-block axis that already exists.
+  block_restore_fault_plan: Option<Prng>,
+  /// How many jobs the hold plan kept outstanding for at least one storage step. `0` off-axis; the
+  /// delay lane's non-vacuity witness (a plan that drew zero-length holds would leave this at 0 while
+  /// looking armed).
+  block_jobs_delayed: u64,
+  /// How many DELAYED `Materialize` completions the endpoint dropped as SUPERSEDED — the job was
+  /// still held when the state it answered was abandoned. Counted from the endpoint's own
+  /// supersession counter sampled ACROSS the completion, so it names the exact job, and only for a
+  /// job that genuinely waited (`held_steps > 0`). `0` off-axis, and `0` even on-axis unless the
+  /// window really opened: the supersession lane's precondition witness.
+  materializes_superseded_in_flight: u64,
+  /// How many `Restore` jobs executed with their reads faulted. `0` off-axis; the restore-fault
+  /// lane's arming witness, paired with the store's own `read_faults_fired` (which proves the armed
+  /// job actually READ) so an arm the executor never consumed cannot pass for a fault.
+  block_restore_faults_armed: u64,
+  /// How many `Commit` heartbeats a replica emitted while its OWN storage lane held an outstanding
+  /// block job. `0` off-axis (the lane is never non-empty at an observation point); the anti-stall
+  /// witness that block I/O does not silence the liveness cadence it runs beside.
+  heartbeats_while_block_job_outstanding: u64,
+  /// Per-replica STALLED storage lane: while `true`, no held job is released however long it has
+  /// waited. All `false` by default. Deterministic (no draw), and the only way a test can hold one
+  /// specific job across an event it chooses — a seeded hold length cannot be aimed at a view change
+  /// that has not happened yet.
+  block_lane_paused: Vec<bool>,
   clients: Vec<ClientModel>,
   net: Network,
   clock: Clock,
@@ -451,6 +530,14 @@ impl Cluster {
       block_lanes: (0..node_count)
         .map(|_| viewstamp_proto::BlockJobCursor::new())
         .collect(),
+      block_holds: (0..node_count).map(|_| VecDeque::new()).collect(),
+      block_hold_plan: None,
+      block_restore_fault_plan: None,
+      block_jobs_delayed: 0,
+      materializes_superseded_in_flight: 0,
+      block_restore_faults_armed: 0,
+      heartbeats_while_block_job_outstanding: 0,
+      block_lane_paused: vec![false; n],
       clients: client_set,
       net: Network::new(),
       clock: Clock::new(),
@@ -1277,6 +1364,11 @@ impl Cluster {
     self.crashed[i] = true;
     self.sbs[i].discard_inflight();
     self.wals[i].discard_inflight();
+    // A held block job is work IN FLIGHT on the storage lane; the power went out before it ran, so it
+    // dies with the process exactly as a staged WAL write does. Dropping it also keeps the lane's
+    // execution-order witness sound across the restart: the cursor persists, the successor endpoint
+    // mints strictly-greater ids, and no dead-incarnation job is left to execute after them.
+    self.block_holds[i].clear();
   }
 
   /// Restart a previously-crashed replica: rebuild it from its durable WAL + superblock via
@@ -2142,6 +2234,272 @@ impl Cluster {
     self.replicas[i].reachable_checkpoint_block_count(&self.block_stores[i])
   }
 
+  /// THE DURABLE-CHECKPOINT FLUSH ORACLE: **no block a replica's DURABLE checkpoint root names is
+  /// un-flushed.** Returns the first violation found, or `None`.
+  ///
+  /// A durable checkpoint pointer is the claim "this state survives a crash", and it is only
+  /// truthful if every block it names crossed a successful [`BlockStore::flush`] BEFORE the pointer
+  /// was written. The endpoint enforces that by publishing a checkpoint only on an `Ok` barrier; the
+  /// store records which blocks a barrier actually carried across; this compares the two. A
+  /// violation is the exact shape the seam exists to prevent — a checkpoint naming blocks a crash
+  /// would discard, which is committed state lost behind a valid-looking root.
+  ///
+  /// SCOPE, stated honestly: both roots are checked directly, and the SM DAG is walked in FULL
+  /// through the embedder's public `block_references`. The session DAG's resolver is proto-private,
+  /// so that DAG is covered at its ROOT only — which is the same verdict for every block staged
+  /// alongside it, because a barrier carries the WHOLE staged set across or none of it, and the
+  /// session DAG is written and flushed in one job with the SM DAG it accompanies. An address the
+  /// store does not hold is skipped rather than blamed: presence is a different obligation, judged by
+  /// the existing durability and state-sync oracles.
+  ///
+  /// Pure observation — no PRNG draw, no message, no storage write — so it is safe on every lane, and
+  /// off-axis (no flush fault installed) it can only ever pass.
+  ///
+  /// COST: one DAG walk per replica, so a per-tick observer should gate it on
+  /// [`Self::durable_checkpoint_roots`] having CHANGED. That loses nothing: the property can only
+  /// break at the moment a root is PUBLISHED, because a held block never leaves the flushed set — only
+  /// the sweep removes an address from it, and the sweep removes the block itself, which the walk then
+  /// skips as absent.
+  pub fn check_durable_checkpoint_flushed(&self) -> Option<SmolStr> {
+    (0..self.replicas.len()).find_map(|i| self.check_replica_durable_checkpoint_flushed(i))
+  }
+
+  /// Replica `i`'s durable checkpoint DAG roots `(sm, sessions)`, or `None` until it has published a
+  /// checkpoint. A per-tick observer memoizes this to skip the walk when nothing was published.
+  pub fn durable_checkpoint_roots(&self, i: usize) -> Option<(BlockAddress, BlockAddress)> {
+    Some((
+      self.replicas[i].checkpoint_sm_root()?,
+      self.replicas[i].checkpoint_sessions_root()?,
+    ))
+  }
+
+  /// [`Self::check_durable_checkpoint_flushed`] narrowed to replica `i`.
+  pub fn check_replica_durable_checkpoint_flushed(&self, i: usize) -> Option<SmolStr> {
+    let store = &self.block_stores[i];
+    if let Some(root) = self.replicas[i].checkpoint_sessions_root()
+      && store.has_block(root)
+      && !store.is_flushed(root)
+    {
+      return Some(format_smolstr!(
+        "replica {i}: durable checkpoint (op {}) names session root {root:?}, which no successful \
+         flush has made durable",
+        self.replicas[i].checkpoint_op()
+      ));
+    }
+    let sm_root = self.replicas[i].checkpoint_sm_root()?;
+    // Walk the SM DAG from the durable root, following only blocks the store actually holds and
+    // whose bytes still hash to their address (a corrupt block's edges are garbage — the same rule
+    // the store's own sweep applies).
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = std::vec![sm_root];
+    while let Some(addr) = stack.pop() {
+      if !seen.insert(addr) {
+        continue;
+      }
+      let Some(block) = store.read_block(addr) else {
+        continue;
+      };
+      if !store.is_flushed(addr) {
+        return Some(format_smolstr!(
+          "replica {i}: durable checkpoint (op {}) names SM-DAG block {addr:?}, which no successful \
+           flush has made durable",
+          self.replicas[i].checkpoint_op()
+        ));
+      }
+      if block_address(&block) != addr {
+        continue;
+      }
+      for child in <SimSm as viewstamp_proto::StateMachine>::block_references(&block) {
+        stack.push(child);
+      }
+    }
+    None
+  }
+
+  /// Install (`Some(seed)`) or remove (`None`, the default) the SEEDED BLOCK-JOB DELAY lane: each job
+  /// a replica polls is held on its serial storage lane for `1..=BLOCK_HOLD_MAX_STEPS` storage steps
+  /// before it executes, instead of executing in the iteration that polled it.
+  ///
+  /// This is what makes the job seam's whole point observable: with block work off the consensus
+  /// pump, a slow store must delay only the checkpoint it is materializing, never the commits and
+  /// heartbeats flowing around it, and a materialize still running when a view change or a newer
+  /// checkpoint supersedes it must publish NOTHING. Neither window exists while jobs execute
+  /// instantaneously. The queue is FIFO and only its head is released, so the executor's
+  /// serial-in-issue-order contract is preserved by construction — the delay cannot itself manufacture
+  /// the ordering violation the lane's cursor exists to catch.
+  ///
+  /// OFF by default: with no plan, every job holds zero steps and executes exactly where an inline
+  /// executor would, so no draw is taken and the seeded schedule is byte-identical.
+  pub fn set_block_job_delay(&mut self, seed: Option<u64>) {
+    self.block_hold_plan = seed.map(Prng::new);
+  }
+
+  /// Install (`Some(seed)`) or remove (`None`, the default) the SEEDED BLOCK-STORE FLUSH-FAULT plan on
+  /// every replica's (empty) store: a barrier then fails on a seeded draw, leaving the blocks it was
+  /// asked to make durable merely staged.
+  ///
+  /// The endpoint must publish no checkpoint pointer over a failed barrier and must RE-FORCE the
+  /// checkpoint on its cadence, so the fault costs a checkpoint interval and nothing more. Each store
+  /// gets its own derived seed, so replicas fault independently rather than in lockstep.
+  ///
+  /// OFF by default, and constrained to a cluster that has not run: the plan decides how already-written
+  /// blocks would have become durable (see `MemBlockStore::set_flush_faults`).
+  pub fn set_block_flush_faults(&mut self, seed: Option<u64>) {
+    for (i, store) in self.block_stores.iter_mut().enumerate() {
+      store.set_flush_faults(seed.map(|s| Self::storage_seed(s, i as u16)));
+    }
+  }
+
+  /// Install (`Some(seed)`) or remove (`None`, the default) the SEEDED RECONSTRUCT read-fault plan: a
+  /// drawn `Restore` job runs with its store's next reads answering ABSENT, so the reconstruct fails
+  /// on an unreadable block instead of succeeding.
+  ///
+  /// The fault is delivered ASYNCHRONOUSLY, through the same job completion a clean reconstruct rides,
+  /// which is the property worth testing: a restore that fails must leave the live state machine
+  /// untouched (the job rebuilds into a detached seed) and must leave the reconstruct obligation OWED,
+  /// so the solicit cadence re-pulls and a later attempt succeeds.
+  ///
+  /// OFF by default: with no plan no draw is taken and no read is ever faulted.
+  pub fn set_block_restore_faults(&mut self, seed: Option<u64>) {
+    self.block_restore_fault_plan = seed.map(Prng::new);
+  }
+
+  /// How many block jobs the delay lane kept outstanding for at least one storage step. `0` with the
+  /// lane off; the delay axis's non-vacuity witness.
+  pub fn block_jobs_delayed(&self) -> u64 {
+    self.block_jobs_delayed
+  }
+
+  /// How many DELAYED `Materialize` completions the endpoint dropped as SUPERSEDED — the materialize
+  /// was still in flight when the state it answered was abandoned. `0` with the delay lane off; the
+  /// supersession lane's precondition witness (it counts only jobs that genuinely waited, and only
+  /// drops the endpoint reported across that exact completion).
+  pub fn materializes_superseded_in_flight(&self) -> u64 {
+    self.materializes_superseded_in_flight
+  }
+
+  /// How many `Restore` jobs the fault plan armed. `0` with the plan off.
+  pub fn block_restore_faults_armed(&self) -> u64 {
+    self.block_restore_faults_armed
+  }
+
+  /// How many `Commit` heartbeats a replica emitted while its OWN storage lane held an outstanding
+  /// block job. `0` with the delay lane off; the anti-stall witness that a busy storage lane does not
+  /// silence the liveness cadence beside it.
+  pub fn heartbeats_while_block_job_outstanding(&self) -> u64 {
+    self.heartbeats_while_block_job_outstanding
+  }
+
+  /// How many reads the armed restore faults actually SWALLOWED, summed over replicas. Paired with
+  /// [`Self::block_restore_faults_armed`]: an arm the executed job never consumed leaves this at 0, so
+  /// a lane cannot claim a fault it did not deliver.
+  pub fn block_read_faults_fired(&self) -> u64 {
+    self
+      .block_stores
+      .iter()
+      .map(MemBlockStore::read_faults_fired)
+      .sum()
+  }
+
+  /// How many barriers the seeded flush-fault plan FAILED, summed over replicas. `0` with the plan
+  /// off; the flush-fault axis's non-vacuity witness.
+  pub fn block_flush_faults_fired(&self) -> u64 {
+    self
+      .block_stores
+      .iter()
+      .map(MemBlockStore::flush_faults_fired)
+      .sum()
+  }
+
+  /// Whether replica `i` currently has a block job OUTSTANDING on its storage lane — polled from the
+  /// endpoint but not yet executed. Always `false` with the delay lane off and the lane unpaused (a
+  /// job is polled and executed in one iteration, so no observation point ever sees one held).
+  pub fn block_job_outstanding(&self, i: usize) -> bool {
+    !self.block_holds[i].is_empty()
+  }
+
+  /// The tag of the job at the head of replica `i`'s storage lane, or `None` when the lane is idle.
+  /// A test aiming an event at a specific in-flight job reads this to know the job is really there.
+  pub fn held_block_job_tag(&self, i: usize) -> Option<viewstamp_proto::BlockJobTag> {
+    self.block_holds[i].front().map(|h| h.job.tag())
+  }
+
+  /// How many jobs replica `i`'s storage lane is holding. `0` unless the lane is stalled or the delay
+  /// plan is installed.
+  pub fn held_block_job_count(&self, i: usize) -> usize {
+    self.block_holds[i].len()
+  }
+
+  /// DELIBERATELY violate the storage lane's serial-in-issue-order contract on replica `i`: execute
+  /// the SECOND job it is holding before the first, through the real executor, the real lane cursor
+  /// and the real store.
+  ///
+  /// This is a FALSIFIER, and it must PANIC. The order is a storage-safety obligation, not a
+  /// convenience — a `Gc` carrying one checkpoint generation's live roots executing after the next
+  /// generation's `Materialize` frees the very blocks the next durable root is about to name — so a
+  /// driver that reorders its lane has to be caught, not silently tolerated. The cursor admits only a
+  /// strictly-greater `(incarnation, sequence)`, so the later-issued job runs and the EARLIER-issued
+  /// one is stopped before it can touch the store.
+  ///
+  /// `deliver` selects WHICH of the two guards is under test, because the contract has two halves and
+  /// each is enforced in a different place:
+  ///
+  /// - `false` — execute both jobs against the store and drop their completions. The LANE CURSOR is
+  ///   then the only thing that can object, and it must, before the earlier-issued job touches the
+  ///   store. This is the half that protects the store itself.
+  /// - `true` — also feed each completion back. The ENDPOINT's completion-order guard then objects
+  ///   first, on the very first out-of-order completion, before the cursor gets a second admission.
+  ///   This is the half that protects the endpoint's correlation state.
+  ///
+  /// Requires two jobs to actually be held, and says so rather than returning quietly: a falsifier
+  /// that ran on a lane holding one job would report a clean pass having tested nothing.
+  #[doc(hidden)]
+  pub fn execute_held_block_jobs_out_of_issue_order_for_test(&mut self, i: usize, deliver: bool) {
+    assert!(
+      self.block_holds[i].len() >= 2,
+      "replica {i}'s storage lane holds {} job(s) — the out-of-order falsifier needs two",
+      self.block_holds[i].len()
+    );
+    let second = self.block_holds[i]
+      .remove(1)
+      .expect("the lane holds a second job");
+    let first = self.block_holds[i]
+      .pop_front()
+      .expect("the lane holds a first job");
+    for held in [second, first] {
+      let done = viewstamp_proto::execute_block_job(
+        &mut self.block_lanes[i],
+        held.job,
+        &mut self.block_stores[i],
+      );
+      if deliver {
+        let now = self.clock.now();
+        self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
+      }
+    }
+  }
+
+  /// STALL (or release) replica `i`'s storage lane: while stalled, no held job executes however long
+  /// it has waited, so whatever is at the head of the lane stays IN FLIGHT across whatever the caller
+  /// then drives. This is what lets a test put a `Materialize` in flight and hold it there ACROSS a
+  /// view change — the supersession window, which a seeded hold length can only reach by luck.
+  ///
+  /// Released lanes drain in the ordinary way on the next storage step, so nothing is lost: the jobs
+  /// execute in issue order and their completions are delivered in that order, exactly as an unstalled
+  /// lane's would be. Deterministic and OFF by default.
+  pub fn set_block_lane_paused(&mut self, i: usize, paused: bool) {
+    self.block_lane_paused[i] = paused;
+  }
+
+  /// Test-only: how many fresh pins replica `i` REFUSED because its live transfer's frontier walk was
+  /// still outstanding (the proto's one-pin-at-a-time admission guard). The VOPR sweep folds this
+  /// (reset-robustly, the counter zeroes on `recover`) so the guard's bounded, self-healing refusal is
+  /// observable rather than silent. Mirrors the proto's `Endpoint::walk_pins_refused`.
+  #[doc(hidden)]
+  pub fn replica_walk_pins_refused(&self, i: usize) -> u64 {
+    self.replicas[i].walk_pins_refused()
+  }
+
   /// Mis-store ONE locally-present block in replica `i`'s block store: overwrite the bytes at a
   /// non-root address reachable from its current durable checkpoint root with bytes that hash
   /// ELSEWHERE, so `block_address(bytes) != addr` (the content-address violation a disk fault — bit-rot
@@ -2486,27 +2844,137 @@ impl Cluster {
     self.groups[usize::from(a)] != self.groups[usize::from(b)]
   }
 
+  /// Age replica `i`'s hold queue by ONE storage step. Only the HEAD ages: the lane is serial, so a
+  /// job behind another has not started yet and its own hold begins when it reaches the front.
+  ///
+  /// `held_steps` counts a step the head WAITED for ANY reason — a hold it has not run out, or a
+  /// stalled lane — because it is the attribution predicate every witness below is stated over: a job
+  /// with `held_steps > 0` was genuinely in flight across a storage step, which is what makes its
+  /// completion something the delay lane can claim rather than an ordinary inline execution.
+  fn age_block_hold(&mut self, i: usize) {
+    let paused = self.block_lane_paused[i];
+    if let Some(head) = self.block_holds[i].front_mut() {
+      if head.remaining > 0 {
+        head.remaining -= 1;
+        head.held_steps += 1;
+      } else if paused {
+        head.held_steps += 1;
+      }
+    }
+  }
+
+  /// Queue a freshly-polled job behind whatever the lane already holds, drawing its hold from the
+  /// seeded plan. With no plan the hold is zero, so the job is ready in this same iteration.
+  ///
+  /// A `Materialize` draws from a LONGER band than the rest. It is the only job whose completion can
+  /// be superseded by a view transition, and the window it must survive is a whole view change — a
+  /// hold measured against the other jobs' would close before the transition it is meant to cross.
+  fn hold_block_job(&mut self, i: usize, job: viewstamp_proto::BlockJob<SimSm>) {
+    let remaining = match &mut self.block_hold_plan {
+      Some(prng) => {
+        let band = if job.tag().is_materialize() {
+          MATERIALIZE_HOLD_MAX_STEPS
+        } else {
+          BLOCK_HOLD_MAX_STEPS
+        };
+        1 + prng.below(u64::from(band)) as u32
+      }
+      None => 0,
+    };
+    self.block_holds[i].push_back(HeldBlockJob {
+      job,
+      remaining,
+      held_steps: 0,
+    });
+  }
+
+  /// Take the head of replica `i`'s hold queue if its hold has expired, else `None` (the lane is busy
+  /// and the caller must let the pump run on). A PAUSED lane never releases, whatever the holds say.
+  fn take_ready_block_job(&mut self, i: usize) -> Option<HeldBlockJob> {
+    if self.block_lane_paused[i] || self.block_holds[i].front()?.remaining > 0 {
+      return None;
+    }
+    self.block_holds[i].pop_front()
+  }
+
+  /// Arm replica `i`'s store to fault the next job's reads, if the seeded plan elects to fault THIS
+  /// job. Returns whether an arm was installed, so the caller clears exactly the arms it set.
+  fn arm_block_read_fault(&mut self, i: usize, tag: viewstamp_proto::BlockJobTag) -> bool {
+    if !tag.is_restore() {
+      return false;
+    }
+    let Some(prng) = &mut self.block_restore_fault_plan else {
+      return false;
+    };
+    if !prng.chance(RESTORE_FAULT_PER_MILLE, 1_000) {
+      return false;
+    }
+    self.block_stores[i].arm_read_faults(RESTORE_FAULT_READS);
+    self.block_restore_faults_armed += 1;
+    true
+  }
+
+  /// Fold one executed job's witnesses. `superseded_before` is the endpoint's supersession counter
+  /// sampled immediately BEFORE this completion was delivered, so a rise across it names this job.
+  fn note_block_job_done(
+    &mut self,
+    i: usize,
+    tag: viewstamp_proto::BlockJobTag,
+    held_steps: u32,
+    superseded_before: u64,
+  ) {
+    if held_steps == 0 {
+      return; // executed in the iteration that polled it — nothing the delay lane can claim.
+    }
+    self.block_jobs_delayed += 1;
+    if tag.is_materialize() && self.replicas[i].block_jobs_superseded() > superseded_before {
+      self.materializes_superseded_in_flight += 1;
+    }
+  }
+
   /// One simulation step.
   /// Drain replica `i`'s storage: WAL + superblock completions, and every block job it has queued,
-  /// executed inline on that replica's own serial lane.
+  /// executed on that replica's own serial lane.
   ///
   /// The loop re-drains WAL/superblock completions between jobs because a job completion can submit
   /// the superblock write it gates (a materialized checkpoint publishing its snapshot) and a
   /// superblock completion can queue the next job; it settles once neither side produces work. Jobs
   /// execute strictly in poll order on one cursor and their completions are fed back in that same
   /// order, so the executor's serial-in-issue-order contract holds by construction.
+  ///
+  /// A polled job is not executed directly: it enters the replica's FIFO hold queue and executes when
+  /// its hold expires. With the delay lane OFF (the default) the hold is zero, so the job polled in an
+  /// iteration is the job executed in that same iteration — byte-identical to executing inline. With
+  /// it ON the head ages ONE storage step per entry to this function, so the job stays outstanding
+  /// across ticks while the pump keeps committing and heartbeating around it.
   fn drain_storage(&mut self, i: usize, now: viewstamp_proto::Instant) {
+    self.age_block_hold(i);
     loop {
       self.replicas[i].handle_storage(now, &mut self.wals[i], &mut self.sbs[i]);
-      let Some(job) = self.replicas[i].poll_block_job() else {
+      if let Some(job) = self.replicas[i].poll_block_job() {
+        self.hold_block_job(i, job);
+      }
+      let Some(held) = self.take_ready_block_job(i) else {
         break;
       };
+      let tag = held.job.tag();
+      // Deliver an armed read fault into THIS job's reads and nowhere else: the store cannot see what
+      // it is serving, so the lane arms immediately before the executor runs and disarms immediately
+      // after. Off-axis `read_fault_arm` is `None` and neither call is made.
+      let faulted_reads = self.arm_block_read_fault(i, tag);
       let done = viewstamp_proto::execute_block_job(
         &mut self.block_lanes[i],
-        job,
+        held.job,
         &mut self.block_stores[i],
       );
+      if faulted_reads {
+        self.block_stores[i].arm_read_faults(0);
+      }
+      // Sample the endpoint's supersession counter ACROSS the completion so a drop is attributable to
+      // THIS job: the delta can only come from the completion just delivered.
+      let superseded_before = self.replicas[i].block_jobs_superseded();
       self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
+      self.note_block_job_done(i, tag, held.held_steps, superseded_before);
     }
     // Incrementality witness (closing half): a block the delivery observed MISSING and the walk has
     // now written was hash-verified + accepted by the frontier. An address still absent stays a
@@ -2611,6 +3079,14 @@ impl Cluster {
         // perturbs no schedule beyond the corrupted bytes themselves — the proto's block-fetch must
         // then REJECT the block (hash mismatch), re-request it, and still complete with correct state.
         let out = self.maybe_corrupt_block_response(out);
+        // ANTI-STALL witness: a `Commit` heartbeat emitted by a replica whose OWN storage lane is
+        // busy with an outstanding block job. This is what the job seam exists for, made observable —
+        // a primary materializing a checkpoint must keep the backups' idle view-change timers
+        // suppressed while it does. Off-axis the hold queue is always empty, so the branch never fires
+        // and the counter stays 0; either way this takes no draw and changes no schedule.
+        if matches!(out.msg_ref(), Message::Commit(_)) && self.block_job_outstanding(ri) {
+          self.heartbeats_while_block_job_outstanding += 1;
+        }
         outgoing.push((ReplicaId::new(ri as u16), out));
       }
     }

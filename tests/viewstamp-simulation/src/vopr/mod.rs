@@ -54,7 +54,9 @@
 use bytes::Bytes;
 use core::time::Duration;
 
-use viewstamp_proto::{AcceptReducedFaultTolerance, Instant, MemberId, Prng, SingleVoterDelta};
+use viewstamp_proto::{
+  AcceptReducedFaultTolerance, BlockAddress, Instant, MemberId, Prng, SingleVoterDelta,
+};
 
 use crate::{
   checker::{
@@ -321,6 +323,52 @@ pub struct VoprReport {
   /// the adversarial schedule. Read off [`Cluster::membership_swaps_observed`] (monotone on the
   /// cluster), so `max` is exact.
   live_swaps_observed: u64,
+  /// Cumulative fresh pins a replica REFUSED because its live transfer's frontier walk was still
+  /// outstanding (the proto's one-pin-at-a-time admission guard), summed over replicas and
+  /// accumulated reset-robustly across crash/restart like [`Self::forced_syncs`] (the `Endpoint`
+  /// counter zeroes on `recover`). NOT axis-gated — the guard sits on every arming path — so a value
+  /// here is simply what the run's schedule reached. The refusal is BOUNDED and self-healing (the
+  /// solicit re-fetches and the walk lands the next storage step), so this witnesses a liveness
+  /// MECHANISM rather than a violation: what it buys is visibility, since a change that turned a rare
+  /// bounded refusal into a frequent one would otherwise show up as nothing at all.
+  walk_pins_refused: u64,
+  /// How many block jobs the delay lane kept OUTSTANDING for at least one storage step this run. `0`
+  /// unless the block-delay axis is enabled (`VOPR_BLOCK_DELAY`, or [`run_vopr_with_block_delay`]);
+  /// `> 0` proves the axis genuinely held jobs off the lane rather than drawing zero-length holds —
+  /// the delay lane's headline non-vacuity witness.
+  block_jobs_delayed: u64,
+  /// How many DELAYED `Materialize` completions the endpoint dropped as SUPERSEDED this run: the
+  /// materialize was STILL IN FLIGHT when a view transition or a newer checkpoint abandoned the state
+  /// it answered. `0` with the delay axis off (nothing is ever in flight across a tick). `> 0` is the
+  /// supersession lane's PRECONDITION witness — what distinguishes a run that reached the window from
+  /// one that merely armed it — and the sweep asserts the cross-seed sum is `> 0`.
+  materializes_superseded_in_flight: u64,
+  /// How many ticks ended with at least one replica holding an outstanding block job this run. `0`
+  /// with the delay axis off; the anti-stall witness's PRECONDITION (a run where no job was ever
+  /// outstanding proves nothing about progress beside one).
+  block_job_outstanding_ticks: u64,
+  /// How far the cluster's committed frontier ADVANCED across ticks on which a block job was
+  /// outstanding this run. `0` with the delay axis off. `> 0` is the anti-stall witness proper: with
+  /// block I/O off the consensus pump, a busy storage lane must not stop the cluster committing.
+  commits_while_block_job_outstanding: u64,
+  /// How many `Commit` heartbeats a replica emitted while its OWN storage lane held an outstanding
+  /// block job this run (the cluster's monotone counter). `0` with the delay axis off; the anti-stall
+  /// witness's second half — the liveness cadence keeps running beside the busy lane, so the backups'
+  /// idle view-change timers stay suppressed.
+  heartbeats_while_block_job_outstanding: u64,
+  /// How many block-store durability BARRIERS the seeded plan FAILED this run, summed over replicas.
+  /// `0` unless the block-fault axis is enabled (`VOPR_BLOCK_FAULT`, or
+  /// [`run_vopr_with_block_faults`]). `> 0` proves the fault genuinely fired, which is what makes the
+  /// durable-checkpoint flush oracle's verdict on this run non-vacuous; the sweep asserts the
+  /// cross-seed sum is `> 0`.
+  block_flush_faults_fired: u64,
+  /// How many `Restore` jobs ran with their store reads faulted this run. `0` with the block-fault
+  /// axis off. Paired deliberately with [`Self::block_read_faults_fired`]: an arm the executed job
+  /// never consumed leaves THAT at 0, so a lane cannot claim a reconstruct fault it did not deliver.
+  block_restore_faults_armed: u64,
+  /// How many reads the armed reconstruct faults actually SWALLOWED this run, summed over replicas.
+  /// See [`Self::block_restore_faults_armed`].
+  block_read_faults_fired: u64,
 }
 
 impl VoprReport {
@@ -630,6 +678,62 @@ impl VoprReport {
   pub const fn live_swaps_observed(&self) -> u64 {
     self.live_swaps_observed
   }
+
+  /// The run-cumulative count of fresh pins refused while a transfer's frontier walk was outstanding
+  /// (the proto's one-pin-at-a-time admission guard). Not axis-gated; a bounded, self-healing
+  /// mechanism made visible to a sweep rather than a violation signal.
+  pub const fn walk_pins_refused(&self) -> u64 {
+    self.walk_pins_refused
+  }
+
+  /// How many block jobs the delay lane kept outstanding for at least one storage step. `0` with the
+  /// axis off; the delay lane's non-vacuity witness.
+  pub const fn block_jobs_delayed(&self) -> u64 {
+    self.block_jobs_delayed
+  }
+
+  /// How many DELAYED `Materialize` completions were dropped as SUPERSEDED — the job was still in
+  /// flight when a view transition or a newer checkpoint abandoned what it answered. `0` with the
+  /// axis off; the supersession lane's precondition witness.
+  pub const fn materializes_superseded_in_flight(&self) -> u64 {
+    self.materializes_superseded_in_flight
+  }
+
+  /// How many ticks ended with a block job outstanding. `0` with the axis off; the anti-stall
+  /// witness's precondition.
+  pub const fn block_job_outstanding_ticks(&self) -> u64 {
+    self.block_job_outstanding_ticks
+  }
+
+  /// How far the committed frontier advanced across ticks with a block job outstanding. `0` with the
+  /// axis off; `> 0` ⇒ a busy storage lane did not stop the cluster committing.
+  pub const fn commits_while_block_job_outstanding(&self) -> u64 {
+    self.commits_while_block_job_outstanding
+  }
+
+  /// How many `Commit` heartbeats a replica emitted while its own storage lane was busy. `0` with the
+  /// axis off; `> 0` ⇒ the liveness cadence kept running beside the busy lane.
+  pub const fn heartbeats_while_block_job_outstanding(&self) -> u64 {
+    self.heartbeats_while_block_job_outstanding
+  }
+
+  /// How many block-store durability barriers the seeded plan FAILED. `0` with the axis off; the
+  /// flush-fault lane's non-vacuity witness.
+  pub const fn block_flush_faults_fired(&self) -> u64 {
+    self.block_flush_faults_fired
+  }
+
+  /// How many `Restore` jobs ran with their reads faulted. `0` with the axis off.
+  pub const fn block_restore_faults_armed(&self) -> u64 {
+    self.block_restore_faults_armed
+  }
+
+  /// How many reads those arms actually swallowed. `0` with the axis off; an arm the executed job
+  /// never consumed leaves this at 0 while [`Self::block_restore_faults_armed`] rises, which is what
+  /// stops the lane claiming a fault it did not deliver.
+  pub const fn block_read_faults_fired(&self) -> u64 {
+    self.block_read_faults_fired
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -891,6 +995,37 @@ struct Vopr {
   /// Replicas wiped since the last invariant check, queued so [`Self::check_invariants`] can tell the
   /// stateful checkers their per-replica baselines are forfeit BEFORE they next observe the cluster.
   wiped_pending: Vec<usize>,
+  /// Whether the BLOCK-JOB DELAY axis is enabled for this run: the `VOPR_BLOCK_DELAY` env var, or
+  /// force-enabled via [`run_vopr_with_block_delay`]. Same discipline as [`Self::hold_axis`]: with the
+  /// axis OFF no plan is installed on the cluster and no draw is consumed anywhere (the hold plan
+  /// derives from the run seed behind its own magic, never from the action stream), so the default
+  /// per-seed schedule stays byte-identical; a delay-enabled run is its OWN deterministic baseline.
+  ///
+  /// The axis holds each polled block job on its replica's serial storage lane for a few storage
+  /// steps instead of executing it inline, which is the only way the seam's two async windows exist at
+  /// all: a materialize still running when a view change or a newer checkpoint supersedes it, and a
+  /// storage lane busy while the consensus pump must keep committing and heartbeating.
+  block_delay_axis: bool,
+  /// Whether the BLOCK-STORE FAULT axis is enabled for this run: the `VOPR_BLOCK_FAULT` env var, or
+  /// force-enabled via [`run_vopr_with_block_faults`]. Same discipline as [`Self::block_delay_axis`].
+  ///
+  /// The axis installs two seeded faults on the block layer: a durability BARRIER that fails (leaving
+  /// the checkpoint's blocks merely staged, so the endpoint must publish nothing and re-force on
+  /// cadence) and a RECONSTRUCT whose reads answer absent (so the restore fails asynchronously,
+  /// through the completion a clean one rides). The durable-checkpoint flush oracle judges the first;
+  /// the standing durability/liveness suite judges both.
+  block_fault_axis: bool,
+  /// The committed high-water observed at the last tick that ended with a block job outstanding, so
+  /// [`VoprReport::commits_while_block_job_outstanding`] folds the ADVANCE across such ticks rather
+  /// than a bare high-water. `None` until the first such tick.
+  block_outstanding_committed: Option<usize>,
+  /// Per-replica last-observed `walk_pins_refused`, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`] (the `Endpoint` counter zeroes on `recover`).
+  walk_pins_refused_seen: Vec<u64>,
+  /// Per-replica last-CHECKED durable checkpoint DAG roots, so the flush oracle walks a replica's DAG
+  /// only when it has PUBLISHED a new checkpoint. Complete rather than merely cheap: the property can
+  /// only break at publication, since a held block never leaves the store's flushed set.
+  checkpoint_roots_seen: Vec<Option<(BlockAddress, BlockAddress)>>,
   report: VoprReport,
 }
 
@@ -974,6 +1109,69 @@ pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
 pub fn run_vopr_with_write_chaos(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.write_chaos_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the BLOCK-JOB DELAY axis FORCE-ENABLED, independent of the
+/// `VOPR_BLOCK_DELAY` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]).
+/// Every block job a replica polls is then HELD on its serial storage lane for a few storage steps
+/// before it executes, instead of executing in the iteration that polled it.
+///
+/// The default sweep executes block work instantaneously, which closes off exactly the two windows
+/// the job seam was built to open. This axis opens both:
+///
+/// - a MATERIALIZE still running when a view transition or a newer checkpoint abandons the state it
+///   answers. Its completion must publish NOTHING — no superblock pointer over roots the endpoint no
+///   longer means, and no regression of the durable checkpoint pointer. The proto drops such a
+///   completion as superseded; [`VoprReport::materializes_superseded_in_flight`] counts the drops that
+///   happened to a job that genuinely WAITED, so the lane cannot pass on a run that never reached the
+///   window.
+/// - a storage lane BUSY while the consensus pump must keep running. Commits must keep landing and
+///   heartbeats must keep flowing around an outstanding job
+///   ([`VoprReport::commits_while_block_job_outstanding`] /
+///   [`VoprReport::heartbeats_while_block_job_outstanding`]) — impossible to witness at all while a
+///   job occupies zero time.
+///
+/// The hold queue is FIFO and releases only its head, so the executor's serial-in-issue-order
+/// contract is preserved by construction: this axis delays jobs, it never REORDERS them (the
+/// order-violation falsifier is a separate deterministic test, since a violation must fail-stop).
+/// The existing oracles judge the outcome every tick — safety, durability, applied-once, plus the
+/// durable-checkpoint flush oracle — so a panic here is a REAL finding in the seam's supersession or
+/// publication gating, reported with its seed, never masked.
+///
+/// A delay-enabled run is a pure function of `(seed, ticks)` and its own deterministic baseline (the
+/// hold plan derives from the run seed behind a separate magic, never from the action stream, so the
+/// default schedule stays byte-identical with the axis off).
+pub fn run_vopr_with_block_delay(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.block_delay_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the BLOCK-STORE FAULT axis FORCE-ENABLED, independent of the
+/// `VOPR_BLOCK_FAULT` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]).
+/// The sim's block store injects nothing by default — every write lands, every barrier succeeds,
+/// every read answers — which leaves the whole block layer the one piece of storage the adversarial
+/// sweep never faults. This axis faults it two ways:
+///
+/// - a seeded DURABILITY BARRIER FAILURE. The blocks the checkpoint just wrote stay merely staged, so
+///   nothing it named is durable. The endpoint must therefore advance NO pointer over them and
+///   re-force the checkpoint on its cadence, which the durable-checkpoint flush oracle
+///   ([`Cluster::check_durable_checkpoint_flushed`]) checks every tick: **no block a durable
+///   checkpoint root names is un-flushed**. A violation is committed state stranded behind a
+///   valid-looking root — the exact failure the write-all-then-flush ordering exists to prevent.
+/// - a seeded RECONSTRUCT READ FAULT: a `Restore` job's reads answer ABSENT, so the rebuild fails on
+///   an unreadable block. The fault arrives ASYNCHRONOUSLY, through the same completion a clean
+///   reconstruct rides, which is the property worth stressing: the live state machine must be
+///   untouched (the job rebuilds into a detached seed the endpoint installs only whole), the
+///   obligation must stay OWED, and the solicit cadence must drive a later attempt to success.
+///
+/// A fault-enabled run is a pure function of `(seed, ticks)` and its own deterministic baseline (both
+/// plans derive from the run seed behind separate magics, never from the action stream, so the
+/// default schedule stays byte-identical with the axis off).
+pub fn run_vopr_with_block_faults(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.block_fault_axis = true;
   run_seeded(v, ticks)
 }
 
@@ -1494,6 +1692,11 @@ impl Vopr {
       durable_quorum: DurableQuorumChecker::new(),
       sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
+      block_delay_axis: env_flag("VOPR_BLOCK_DELAY"),
+      block_fault_axis: env_flag("VOPR_BLOCK_FAULT"),
+      block_outstanding_committed: None,
+      walk_pins_refused_seen: vec![0; node_count],
+      checkpoint_roots_seen: vec![None; node_count],
       report: VoprReport {
         seed,
         replicas: node_count,
@@ -1620,6 +1823,22 @@ impl Vopr {
     if self.write_chaos_axis {
       const WRITE_CHAOS_SEED_MAGIC: u64 = 0x0F0F_C4A0_5EED_D1CE;
       c.set_wal_write_chaos(Some(self.seed ^ WRITE_CHAOS_SEED_MAGIC));
+    }
+    // BLOCK-JOB DELAY axis: each polled block job waits a few storage steps on its replica's serial
+    // lane before executing. Same discipline as the write-chaos axis above — the plan seed derives
+    // from the run seed behind its own magic, NOT the action stream, and the call is CONDITIONAL, so
+    // an off-axis run makes no cluster call and consumes no draw.
+    if self.block_delay_axis {
+      const BLOCK_DELAY_SEED_MAGIC: u64 = 0xB10C_DE1A_5EED_0F1F;
+      c.set_block_job_delay(Some(self.seed ^ BLOCK_DELAY_SEED_MAGIC));
+    }
+    // BLOCK-STORE FAULT axis: seeded barrier failures + seeded reconstruct read faults, each behind
+    // its OWN magic so the two fault streams are independent of each other and of every other plan.
+    if self.block_fault_axis {
+      const BLOCK_FLUSH_FAULT_SEED_MAGIC: u64 = 0xF105_4FA0_5EED_B10C;
+      const BLOCK_RESTORE_FAULT_SEED_MAGIC: u64 = 0x2E57_04E5_5EED_B10C;
+      c.set_block_flush_faults(Some(self.seed ^ BLOCK_FLUSH_FAULT_SEED_MAGIC));
+      c.set_block_restore_faults(Some(self.seed ^ BLOCK_RESTORE_FAULT_SEED_MAGIC));
     }
     // install the seed-derived bounded ring LAST so its storage rebuild composes over the
     // async-WAL/superblock modes + the storage-fault plan set above (each rebuild preserves the others'
@@ -2850,6 +3069,25 @@ impl Vopr {
     if let Some(why) = c.take_durable_view_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
     }
+    // THE DURABLE-CHECKPOINT FLUSH ORACLE: no block a durable checkpoint root names may be
+    // un-flushed. Observed on EVERY lane — it is a pure read over bookkeeping the store already
+    // keeps, so it costs the default schedule nothing and cannot perturb it, and off-axis (where no
+    // barrier ever fails) it can only pass. On the block-fault axis it is the oracle the axis exists
+    // for: a violation is a durable checkpoint pointer naming blocks a crash would discard, i.e.
+    // committed state stranded behind a valid-looking root.
+    for i in 0..self.node_count {
+      let roots = c.durable_checkpoint_roots(i);
+      if roots == self.checkpoint_roots_seen[i] {
+        continue; // no checkpoint published since the last walk — nothing new can have broken.
+      }
+      self.checkpoint_roots_seen[i] = roots;
+      if let Some(why) = c.check_replica_durable_checkpoint_flushed(i) {
+        panic!(
+          "vopr seed {} tick {tick}: durable-checkpoint flush: {why}",
+          self.seed
+        );
+      }
+    }
     if let Violation(why) = check_safety(c) {
       if std::env::var("VOPR_DUMP").is_ok() {
         self.dump_divergence(c, tick);
@@ -3277,6 +3515,14 @@ impl Vopr {
         self.report.header_only_carriers_emitted += carriers - self.header_only_carriers_seen[i];
       }
       self.header_only_carriers_seen[i] = carriers;
+      // Pins refused while a transfer's frontier walk was outstanding — the one-pin-at-a-time
+      // admission guard, which is on every arming path and so is folded on EVERY lane, not behind an
+      // axis. Same reset-robust positive-delta accumulation (the counter zeroes on `recover`).
+      let refused = c.replica_walk_pins_refused(i);
+      if refused > self.walk_pins_refused_seen[i] {
+        self.report.walk_pins_refused += refused - self.walk_pins_refused_seen[i];
+      }
+      self.walk_pins_refused_seen[i] = refused;
       // Session-cap evictions (the churn lane's non-vacuity witness), same reset-robust
       // positive-delta accumulation (the counter zeroes on `recover`).
       let evicted = c.replica_sessions_evicted(i);
@@ -3293,6 +3539,30 @@ impl Vopr {
       .report
       .recovered_band_max
       .max(c.recovered_band_high_water());
+    // BLOCK-LANE witnesses. All are cluster-level monotone counters (the `Cluster` struct outlives
+    // every replica crash/restart and nothing resets them), so a plain read is exact — no
+    // positive-delta accumulation needed. Every one of them is identically 0 with both block axes off,
+    // which is what keeps this fold inert on the default lane.
+    self.report.block_jobs_delayed = c.block_jobs_delayed();
+    self.report.materializes_superseded_in_flight = c.materializes_superseded_in_flight();
+    self.report.heartbeats_while_block_job_outstanding = c.heartbeats_while_block_job_outstanding();
+    self.report.block_flush_faults_fired = c.block_flush_faults_fired();
+    self.report.block_restore_faults_armed = c.block_restore_faults_armed();
+    self.report.block_read_faults_fired = c.block_read_faults_fired();
+    // ANTI-STALL witness: on a tick that ENDS with a block job still outstanding somewhere, record the
+    // tick and fold how far the committed frontier moved since the last such tick. Folding the ADVANCE
+    // (not a high-water) is what makes it a progress claim: commits landed WHILE the storage lane was
+    // busy. Off-axis no lane is ever non-empty here, so neither counter can leave 0.
+    if (0..self.node_count).any(|i| c.block_job_outstanding(i)) {
+      self.report.block_job_outstanding_ticks += 1;
+      let committed = max_committed(c);
+      if let Some(prev) = self.block_outstanding_committed
+        && committed > prev
+      {
+        self.report.commits_while_block_job_outstanding += (committed - prev) as u64;
+      }
+      self.block_outstanding_committed = Some(committed);
+    }
     // LEARNER non-vacuity witnesses (the learner lane), accumulated over the learner ids only — a
     // voter slot stays 0. All three use the SAME reset-robust positive-delta accumulation as
     // `forced_syncs`: a `recover` rebuilds the `Endpoint` (resetting the applied log, the view to the
