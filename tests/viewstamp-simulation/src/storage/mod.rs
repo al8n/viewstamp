@@ -1323,6 +1323,26 @@ impl InMemorySuperblock {
     })
   }
 
+  /// Test-only: the epoch named by a staged (in-flight) ROOT write that ADVANCES the durable epoch
+  /// past the current root's, if any. `None` in synchronous mode, when nothing is staged, and when
+  /// every staged root carries the durable epoch.
+  ///
+  /// This is the window detector for "an epoch swap is with the device": the commit-first swap
+  /// commits the `Reconfigure` op, stages the successor membership, and submits a root whose scalar
+  /// epoch is the SUCCESSOR's while the in-memory epoch stays the predecessor's — so while this
+  /// returns `Some(e)` the swap has been handed to the medium but has not landed, and the endpoint
+  /// still runs at the predecessor configuration. Stated against the DURABLE root rather than the
+  /// queue's own head, so it answers the question a rebuild asks: is an epoch on its way to this
+  /// medium that the medium has not published yet?
+  #[doc(hidden)]
+  pub fn staged_epoch_advance_for_test(&self) -> Option<u64> {
+    let live = self.state.epoch().get();
+    self.staged.iter().find_map(|(_, w)| match w {
+      StagedSbWrite::Root { state, .. } if state.epoch().get() > live => Some(state.epoch().get()),
+      _ => None,
+    })
+  }
+
   /// Test-only: whether the DURABLE root's `(checkpoint_op, checkpoint_id)` pair names a checkpoint
   /// envelope this store actually holds — the stored generation at `checkpoint_op` exists and its
   /// bytes hash to `checkpoint_id`. Vacuously true while no checkpoint is rooted (`checkpoint_op ==
