@@ -288,6 +288,123 @@ fn a_foreign_completion_is_refused_across_an_in_place_restart() {
   );
 }
 
+/// Crossing the retaining rebuild with the REORDERING device: an in-place restart under write
+/// chaos must keep every slot's durable content owned by its newest writer.
+///
+/// The test above proves the incarnation choke refuses a predecessor's COMPLETIONS; this one is
+/// about its WRITES. Under the ordered async WAL that test uses, a serial writer completes the
+/// predecessor's staged appends strictly before any successor write to the same slot, so the
+/// refusal is the whole story. Under write chaos the staged appends are un-cancellable device
+/// writes that complete in a seeded out-of-submission order — so a predecessor's abandoned append
+/// can land AFTER the successor endpoint has re-appended that op and released its vote on the
+/// completion of its own write. Refusing the late completion un-sends nothing: the physical slot
+/// then holds the dead incarnation's bytes underneath a vote the primary counted by content.
+///
+/// The schedule is the sibling test's, chaos-crossed: depose the view-0 primary (bending the two
+/// incarnations' id → op maps), rebuild replica 2 in place with several appends in flight, and let
+/// the chaos device drain. The stale-landing oracle judges every landing: no write minted by an
+/// older incarnation may land over content a newer incarnation landed. The presence-based oracles
+/// (append-before-ack, durable quorum) are asserted clean alongside, which is exactly the
+/// blindness: they count occupied slots, so an eviction that leaves the slot occupied is invisible
+/// to them.
+#[test]
+#[ignore = "pins an open defect: a rebuilt endpoint's empty slot-quiescence fence lets a \
+            predecessor's un-cancellable write land over a slot its successor re-appended (and may \
+            have voted); un-ignore when the fence survives an in-place rebuild"]
+fn an_in_place_restart_under_write_chaos_keeps_every_voted_slots_content() {
+  use crate::checker::{CheckResult, DurableQuorumChecker};
+
+  /// The jitter base: chaos appends stay in flight `1..=2 * WAL_DELAY` polls.
+  const WAL_DELAY: u32 = 32;
+  /// Far above anything this run commits, so no checkpoint fires and every landed slot stays above
+  /// the prune floor (nothing the oracle watches is ever legitimately discharged mid-run).
+  const NO_CHECKPOINT: u64 = 32_768;
+  /// Enough closed-loop clients that several appends are outstanding at once.
+  const CLIENTS: u32 = 8;
+  /// Ticks of ordinary operation before the primary is deposed, and again before the swap.
+  const PHASE_TICKS: u32 = 60;
+  /// Ticks after the swap — wide enough that every retained chaos write has landed.
+  const OBSERVE_TICKS: u32 = 300;
+  /// The run seed. This seed's post-deposition schedule leaves replica 2's successor re-appending
+  /// an op the predecessor still has staged, with the chaos release order landing the
+  /// predecessor's write LAST — and the replica's recorded vote for that op names the content the
+  /// late landing evicts.
+  const SEED: u64 = 64;
+  /// The chaos-device seed, derived from the run seed.
+  const CHAOS_SEED: u64 = SEED ^ 0x00C0_FFEE;
+
+  let mut c = Cluster::with_checkpoint_ops(3, CLIENTS, 200, SEED, NO_CHECKPOINT);
+  c.set_async_wal_delay(Some(WAL_DELAY));
+  c.set_wal_write_chaos(Some(CHAOS_SEED));
+  let mut quorum = DurableQuorumChecker::new();
+  for _ in 0..PHASE_TICKS {
+    c.tick();
+  }
+  // Depose the view-0 primary: the view change is what makes the successor's id → op map disagree
+  // with its predecessor's (see the sibling test), so a re-minted op can target a slot whose old
+  // write is still with the device.
+  c.crash(0);
+  for _ in 0..PHASE_TICKS {
+    c.tick();
+  }
+  c.restart_in_place(2);
+  let inherited = c.wal_staged_len_for_test(2);
+  assert!(
+    inherited > 0,
+    "ANTI-VACUITY: the successor endpoint inherited no in-flight write — the swap retained \
+     nothing, so no late landing can exist"
+  );
+
+  let mut stale: Option<SmolStr> = None;
+  let mut forged_ack: Option<SmolStr> = None;
+  let mut lost_quorum: Option<SmolStr> = None;
+  for _ in 0..OBSERVE_TICKS {
+    c.tick();
+    if let Some(v) = c.take_stale_landing_violation() {
+      stale.get_or_insert(v);
+    }
+    if let Some(v) = c.take_append_before_ack_violation() {
+      forged_ack.get_or_insert(v);
+    }
+    if let CheckResult::Violation(v) = quorum.observe(&c) {
+      lost_quorum.get_or_insert(v);
+    }
+  }
+
+  // ANTI-VACUITY: the lane is live — the dead endpoint's completions really were delivered into
+  // the successor and refused, and the chaos device really reordered landings on the rebuilt
+  // replica.
+  assert!(
+    c.replica_foreign_completions_rejected(2) > 0,
+    "the predecessor's completions never reached the successor — the crossing went vacuous"
+  );
+  assert!(
+    c.wal_write_reorders_fired(2) > 0,
+    "the chaos device never reordered a landing on the rebuilt replica — the crossing went vacuous"
+  );
+
+  // The presence-based oracles stay clean: an eviction that leaves the slot occupied is exactly
+  // what they cannot see.
+  assert!(
+    forged_ack.is_none(),
+    "append-before-ack tripped, so this run's failure is not the silent-eviction shape: \
+     {forged_ack:?}"
+  );
+  assert!(
+    lost_quorum.is_none(),
+    "the durable-quorum oracle tripped, so this run's failure is not the silent-eviction shape: \
+     {lost_quorum:?}"
+  );
+
+  // THE INVARIANT: no write minted by an older incarnation landed over durable content a newer
+  // incarnation had already landed. The violation message names the evicted content and, when the
+  // replica voted for that op, the vote whose durable backing vanished.
+  assert!(
+    stale.is_none(),
+    "an abandoned predecessor write physically evicted a successor's landed slot: {stale:?}"
+  );
+}
+
 #[test]
 fn crashed_replica_stops_and_is_skipped() {
   let mut c = Cluster::new(3, 1, 1, 7);

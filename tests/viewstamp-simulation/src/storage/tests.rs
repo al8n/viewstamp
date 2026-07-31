@@ -1151,3 +1151,96 @@ fn bounded_ring_composes_with_async_appends() {
   assert_eq!(w.status(OpNumber::with(3)), SlotStatus::Clean);
   assert_eq!(w.op_head(), OpNumber::with(3));
 }
+
+/// A header for the stale-landing tests: identity varies with `client` so an eviction's description
+/// names distinguishable content.
+fn landing_header(op: u64, client: u128) -> Header {
+  Header::new(
+    OpNumber::with(op),
+    View::new(),
+    ClientId::new(client),
+    RequestNumber::with(1),
+    b"x",
+  )
+}
+
+#[test]
+fn an_older_incarnations_landing_over_a_newer_ones_is_a_stale_landing() {
+  // Async mode with zero delay: each staged append lands on the next poll, so the LANDING ORDER is
+  // the submission order — letting this test choose who lands over whom.
+  let mut w = InMemoryWal::with_async_appends(0);
+  // Incarnation 7 (the successor) lands op 1 first.
+  w.submit_append(
+    WriteId::new(7, 1),
+    OpNumber::with(1),
+    landing_header(1, 9),
+    bytes::Bytes::from_static(b"new"),
+  );
+  assert_eq!(w.poll(), Some(WalDone::Appended(WriteId::new(7, 1))));
+  assert_eq!(w.stale_landings_fired(), 0, "a first landing has no holder");
+  // Incarnation 5 (the dead predecessor, its write retained across a rebuild) lands the same op
+  // afterwards: an older writer's bytes over a newer writer's landed slot.
+  w.submit_append(
+    WriteId::new(5, 1),
+    OpNumber::with(1),
+    landing_header(1, 7),
+    bytes::Bytes::from_static(b"old"),
+  );
+  assert_eq!(w.poll(), Some(WalDone::Appended(WriteId::new(5, 1))));
+  assert_eq!(w.stale_landings_fired(), 1, "the stale landing is counted");
+  let (op, why) = w
+    .take_stale_landing()
+    .expect("the stale landing is recorded");
+  assert_eq!(op, 1);
+  assert!(
+    why.contains("incarnation 5") && why.contains("incarnation 7"),
+    "the description names both writers: {why}"
+  );
+  assert!(w.take_stale_landing().is_none(), "drained");
+}
+
+#[test]
+fn a_newer_incarnations_landing_over_an_older_ones_is_ordinary() {
+  // The legitimate direction — recovery repairs, adoption re-appends — must stay silent.
+  let mut w = InMemoryWal::with_async_appends(0);
+  w.submit_append(
+    WriteId::new(5, 1),
+    OpNumber::with(1),
+    landing_header(1, 7),
+    bytes::Bytes::from_static(b"old"),
+  );
+  assert_eq!(w.poll(), Some(WalDone::Appended(WriteId::new(5, 1))));
+  w.submit_append(
+    WriteId::new(7, 1),
+    OpNumber::with(1),
+    landing_header(1, 9),
+    bytes::Bytes::from_static(b"new"),
+  );
+  assert_eq!(w.poll(), Some(WalDone::Appended(WriteId::new(7, 1))));
+  assert_eq!(w.stale_landings_fired(), 0);
+  assert!(w.take_stale_landing().is_none());
+}
+
+#[test]
+fn a_truncated_slot_has_no_holder_for_a_late_landing_to_be_stale_against() {
+  // Truncation empties the slot: whatever lands into the trimmed region afterwards is landing into
+  // ownerless space (the tolerated resurrection), not evicting anyone.
+  let mut w = InMemoryWal::with_async_appends(0);
+  w.submit_append(
+    WriteId::new(7, 1),
+    OpNumber::with(1),
+    landing_header(1, 9),
+    bytes::Bytes::from_static(b"new"),
+  );
+  assert_eq!(w.poll(), Some(WalDone::Appended(WriteId::new(7, 1))));
+  w.truncate(OpNumber::with(0));
+  w.submit_append(
+    WriteId::new(5, 1),
+    OpNumber::with(1),
+    landing_header(1, 7),
+    bytes::Bytes::from_static(b"old"),
+  );
+  assert_eq!(w.poll(), Some(WalDone::Appended(WriteId::new(5, 1))));
+  assert_eq!(w.stale_landings_fired(), 0);
+  assert!(w.take_stale_landing().is_none());
+}

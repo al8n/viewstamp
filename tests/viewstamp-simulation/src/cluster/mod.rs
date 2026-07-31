@@ -1,5 +1,5 @@
 use core::time::Duration;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 use smol_str::{SmolStr, format_smolstr};
@@ -387,6 +387,14 @@ pub struct Cluster {
   /// replica's apply stream legitimately re-emits from its durable checkpoint (recovery re-applies
   /// `(checkpoint_op .. commit_max]`; a wipe re-applies from genesis).
   incarnations: Vec<u64>,
+  /// Per-replica record of the LATEST content-addressed vote emitted per op: `op → (view,
+  /// prepare_checksum)`, captured at `PrepareOk` emission in [`tick`](Self::tick) (a `PrepareOk`
+  /// carries the identity address of the operation the sender holds at that op). Pure observation —
+  /// no PRNG draw, no message, no storage write — so every schedule stays byte-identical. Read by
+  /// [`take_stale_landing_violation`](Self::take_stale_landing_violation) to name, when a stale WAL
+  /// landing evicts a slot, the vote whose durable backing vanished with it. Survives restarts (a
+  /// sent vote is not un-sent by rebuilding the endpoint that sent it).
+  latest_votes: Vec<BTreeMap<u64, (u64, u128)>>,
   /// Per-replica edge-detector for the re-formation escalation: `true` if replica `i` was in
   /// `Status::RecoveringHead` at the end of the PREVIOUS [`tick`](Self::tick). Sampled each tick to
   /// count [`reform_escalations_fired`](Self::reform_escalations_fired): a node that was
@@ -593,6 +601,7 @@ impl Cluster {
       applied_streams: vec![Vec::new(); n],
       membership_swaps: vec![Vec::new(); n],
       incarnations: vec![0; n],
+      latest_votes: vec![BTreeMap::new(); n],
       was_recovering_head: vec![false; n],
       was_recovering_head_inc: vec![0; n],
       recovered_band_high_water: 0,
@@ -1442,7 +1451,9 @@ impl Cluster {
   /// `recover` returns `Active`. A `Retired` here — the node absent from its own durable membership — is a
   /// harness bug (a parked node must never be routed a plain restart).
   pub fn restart(&mut self, i: usize) {
-    match self.recover_in_place(i) {
+    // The crash cleared this replica's held block jobs with the process, so the lane the successor
+    // recovers over holds nothing — the empty occupancy is the truthful one.
+    match self.recover_in_place(i, viewstamp_proto::BlockLaneOccupancy::empty()) {
       Ok(None) => self.crashed[i] = false,
       Ok(Some(r)) => {
         panic!("replica {i} recovered Retired (absent from its own durable membership): {r:?}")
@@ -1465,7 +1476,10 @@ impl Cluster {
   ///
   /// This models a supervised in-place rebuild — a driver-level restart, a recovery retry — where the
   /// process replaces the endpoint but the submission/completion queues below it (an io_uring ring, a
-  /// thread pool's outstanding writes) are neither drained nor cancelled. It is deliberately NOT
+  /// thread pool's outstanding writes) are neither drained nor cancelled. The skipped drain is
+  /// deliberate: the storage contract makes draining to quiescence load-bearing for a rebuild over
+  /// live handles, and this lane retains the in-flight work precisely to exercise where the two
+  /// incarnations meet over one medium. It is deliberately NOT
   /// [`crash`](Self::crash) + [`restart`](Self::restart): `crash` models power loss and so
   /// `discard_inflight`s both fixtures, destroying exactly the writes and completions that survive
   /// here. Nor is it [`wipe_and_restart`](Self::wipe_and_restart), which forfeits the durable state.
@@ -1476,7 +1490,11 @@ impl Cluster {
   /// The replica is never marked crashed — it keeps being ticked across the swap, so the successor
   /// endpoint is live when the predecessor's completions arrive. Correlation ids restart at `1` in the
   /// new endpoint ([`OpId`](viewstamp_proto::OpId) is minted per endpoint), so a retained completion
-  /// carries an id the successor also mints; where the two meet is the lane this exercises.
+  /// carries an id the successor also mints; where the two meet is the lane this exercises. And
+  /// because the block lane's queue survives with everything else, the successor is recovered with
+  /// the outgoing endpoint's [`lane_occupancy`](viewstamp_proto::Endpoint::lane_occupancy): the
+  /// retained jobs still occupy the lane's admission quotas until their (refused) completions
+  /// release them.
   ///
   /// A restart in place runs over the store the running endpoint just wrote, so recovery always
   /// succeeds; a `Retired` or a recover error here is a harness bug (this is not a path for a parked
@@ -1486,7 +1504,12 @@ impl Cluster {
     // the same reason `crash` does: the ops they record WERE applied, and an uncaptured tail would
     // vanish from every recorded stream and read as a lost op.
     self.record_applied_events(i);
-    match self.recover_in_place(i) {
+    // The lane survives this swap — `block_holds` keeps every queued job and the hold pump keeps
+    // delivering their completions — so the successor inherits what the outgoing endpoint still
+    // has outstanding on it. Started empty instead, every incarnation would capture one more
+    // checkpoint image behind its predecessors' un-drained one.
+    let lane = self.replicas[i].lane_occupancy();
+    match self.recover_in_place(i, lane) {
       Ok(None) => self.crashed[i] = false,
       Ok(Some(r)) => {
         panic!("replica {i} recovered Retired across an in-place restart: {r:?}")
@@ -1509,6 +1532,7 @@ impl Cluster {
   fn recover_in_place(
     &mut self,
     i: usize,
+    lane: viewstamp_proto::BlockLaneOccupancy,
   ) -> Result<Option<viewstamp_proto::Retired>, viewstamp_proto::RecoverError> {
     self.incarnations[i] += 1;
     let cfg = self.replica_config(i as u16);
@@ -1529,6 +1553,7 @@ impl Cluster {
       self.make_sm(),
       &mut self.wals[i],
       &mut self.sbs[i],
+      lane,
     )? {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
@@ -1605,7 +1630,9 @@ impl Cluster {
     // BEFORE the recover so the window is closed at both ends — a rebuild clears it, a fail-stop
     // leaves it standing over the stale handle.
     self.wiped_storage[i] = true;
-    match self.recover_in_place(i) {
+    // The crash that preceded this wipe cleared the held block jobs with the process (only a
+    // previously-crashed replica is wiped), so the lane holds nothing for the successor.
+    match self.recover_in_place(i, viewstamp_proto::BlockLaneOccupancy::empty()) {
       // A wiped LEARNER resumes empty and rejoins (it never votes, so no amnesia risk).
       Ok(None) => {
         self.crashed[i] = false;
@@ -2500,6 +2527,17 @@ impl Cluster {
     self.block_holds[i].len()
   }
 
+  /// How many of the jobs replica `i`'s storage lane is holding carry `tag` — the whole queue, not
+  /// just its head. A test bounding a specific RESOURCE reads this: a `Materialize` held anywhere in
+  /// the queue carries a full state-machine image plus a session projection, so the count of held
+  /// materializes IS the count of captured images the lane has not yet consumed.
+  pub fn held_block_jobs_with_tag(&self, i: usize, tag: viewstamp_proto::BlockJobTag) -> usize {
+    self.block_holds[i]
+      .iter()
+      .filter(|h| h.job.tag() == tag)
+      .count()
+  }
+
   /// DELIBERATELY violate the storage lane's serial-in-issue-order contract on replica `i`: execute
   /// the SECOND job it is holding before the first, through the real executor, the real lane cursor
   /// and the real store.
@@ -2792,6 +2830,73 @@ impl Cluster {
   #[doc(hidden)]
   pub fn wal_write_reorders_fired(&self, i: usize) -> u64 {
     self.wals[i].chaos_reorders_fired()
+  }
+
+  /// Drains the first STALE-LANDING violation any replica's WAL has recorded since the last drain: a
+  /// write minted by an OLDER endpoint incarnation landed over durable slot content a NEWER
+  /// incarnation had already landed — the physical slot overwrite the slot-quiescence fence exists
+  /// to prevent, across endpoint rebuilds as much as within one. When the holder replica's recorded
+  /// vote set names that op, the message carries the vote too: the durable content the vote named is
+  /// the content the stale landing just evicted. `None` when no WAL holds one.
+  pub fn take_stale_landing_violation(&mut self) -> Option<SmolStr> {
+    for i in 0..self.wals.len() {
+      if let Some((op, why)) = self.wals[i].take_stale_landing() {
+        let vote = match self.latest_votes[i].get(&op) {
+          Some((view, checksum)) => format!(
+            "; the replica's latest vote for op {op} (PrepareOk in view {view}) named \
+             prepare_checksum {checksum:#x}, whose durable backing this landing evicted"
+          ),
+          None => String::new(),
+        };
+        return Some(format!("replica {i}: {why}{vote}").into());
+      }
+    }
+    None
+  }
+
+  /// Test-only: how many stale landings replica `i`'s WAL has recorded since construction (every
+  /// older-incarnation-over-newer slot eviction, not only the drained first). The non-vacuity
+  /// witness that a retained predecessor write genuinely landed late over a successor's slot.
+  #[doc(hidden)]
+  pub fn wal_stale_landings_fired(&self, i: usize) -> u64 {
+    self.wals[i].stale_landings_fired()
+  }
+
+  /// Test-only: the checkpoint op named by a staged (in-flight) checkpoint-advancing ROOT write on
+  /// replica `i`'s superblock, if one is in flight — the "envelope durable, pointer still with the
+  /// device" window (see the fixture accessor). `None` outside that window.
+  #[doc(hidden)]
+  pub fn sb_staged_checkpoint_root_op_for_test(&self, i: usize) -> Option<u64> {
+    self.sbs[i].staged_checkpoint_root_op_for_test()
+  }
+
+  /// Test-only: whether replica `i`'s DURABLE root names a checkpoint envelope its own store holds
+  /// (the stored generation at the root's `checkpoint_op` hashes to the root's `checkpoint_id`).
+  /// `false` is the self-poisoned pointer: the pair was assembled from two checkpoints' timelines,
+  /// so recovery from this disk alone cannot verify its own checkpoint.
+  #[doc(hidden)]
+  pub fn sb_root_names_stored_checkpoint(&self, i: usize) -> bool {
+    self.sbs[i].root_names_stored_checkpoint_for_test()
+  }
+
+  /// Test-only: the checkpoint op replica `i`'s DURABLE root currently names — read off the
+  /// superblock, not the endpoint (across an in-place rebuild the two can legitimately disagree
+  /// while a predecessor's root write is still landing, which is exactly what a test asserting on
+  /// that window needs to see).
+  #[doc(hidden)]
+  pub fn sb_checkpoint_op_for_test(&self, i: usize) -> u64 {
+    use viewstamp_proto::Superblock;
+    self.sbs[i].state().checkpoint_op().get()
+  }
+
+  /// Test-only: the view replica `i`'s DURABLE root currently names. A view-adoption's durable-view
+  /// root write has landed exactly when this advances — the observable a test needs to know THIS
+  /// replica's adoption root reached the medium (its in-memory view advances earlier, and other
+  /// replicas' views say nothing about this one's disk).
+  #[doc(hidden)]
+  pub fn sb_view_for_test(&self, i: usize) -> u64 {
+    use viewstamp_proto::Superblock;
+    self.sbs[i].state().view().get()
   }
 
   /// Partition the replicas into groups: `groups[i]` is replica `i`'s group id. Replica↔replica
@@ -3150,6 +3255,14 @@ impl Cluster {
           let op = ok.op();
           let msg_view = ok.view().get();
           let cur_view = self.replicas[ri].view().get();
+          // Record the vote's content address (latest per op wins). The `PrepareOk` names the
+          // identity of the operation the sender holds at `op` — the value its durable slot must
+          // still hold once that slot's writes quiesce. A stale-view ack is inert (`on_prepare_ok`
+          // drops it, never counting it toward a quorum) and is not recorded, mirroring the
+          // exemption below. Pure observation: no draw, no message, no storage write.
+          if op.get() > 0 && msg_view >= cur_view {
+            self.latest_votes[ri].insert(op.get(), (msg_view, ok.prepare_checksum()));
+          }
           if op.get() > 0
             && msg_view >= cur_view
             && !self.replica_appended_op(ri, op)

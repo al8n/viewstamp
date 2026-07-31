@@ -292,7 +292,16 @@ where
       .await
       .map_err(DriverError::Bind)?;
 
-    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
+    let endpoint = build_endpoint(
+      config,
+      membership,
+      state_machine,
+      &mut wal,
+      &mut sb,
+      // The lane's own accounting: what it still holds for a dead predecessor endpoint, if an
+      // embedder handed this driver a surviving lane clone; empty on a fresh lane.
+      blocks.occupancy(),
+    )?;
     let mut coord = QuicCoordinator::with_identity(endpoint, opts, rng_seed, identity);
 
     let now = clock.now();

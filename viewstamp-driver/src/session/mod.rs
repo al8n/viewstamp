@@ -113,21 +113,31 @@ where
 /// with wall-clock nanos captured here: every construction is a distinct incarnation by
 /// derivation, not by an embedder-supplied value that could repeat.
 ///
-/// Storage completions are separately fenced, and that fence needs nothing from this constructor.
-/// Each call pairs ONE fresh endpoint with the storage handles the driver takes ownership of, and
-/// the driver never rebuilds an endpoint over live handles — but even where an embedder does, the
-/// endpoint stamps its own storage-correlation incarnation into every [`viewstamp_proto::OpId`] it
-/// mints and refuses any completion carrying another. So a completion predating this endpoint lands
-/// on nothing rather than aliasing one of its ops. Draining in-flight ops before construction still
-/// makes shutdown CLEAN — it is how the endpoint's in-flight storage set settles — but it is not
-/// what makes it SAFE. (Distinct from the recovery nonce above: that fences stale RECOVERY
-/// RESPONSES between peers, this fences stale STORAGE COMPLETIONS within one process.)
+/// Storage completions are separately fenced. Each call pairs ONE fresh endpoint with the storage
+/// handles the driver takes ownership of, and the driver never rebuilds an endpoint over live
+/// handles. An embedder that does must drain the predecessor's in-flight storage to quiescence
+/// FIRST — that drain is load-bearing for safety, not shutdown hygiene. The incarnation stamped
+/// into every [`viewstamp_proto::OpId`] makes a completion predating this endpoint INERT on the
+/// correlation plane (it lands on nothing rather than aliasing one of this endpoint's ops), but
+/// the refusal cancels no write: the predecessor's bytes can still land, and an endpoint built
+/// over an un-quiesced medium lacks the slot-quiescence witnesses to defer its conflicting
+/// re-appends. (Distinct from the recovery nonce above: that fences stale RECOVERY RESPONSES
+/// between peers, this fences stale STORAGE COMPLETIONS within one process.)
+///
+/// What that fence does NOT cover is the block lane's DEPTH, which is why `lane` is required: the
+/// endpoint's block-job admission quotas (one image capture, the serve cap) bound the lane, the
+/// lane can outlive the endpoint it served (an embedder rebuilding a driver passes the same
+/// [`BlockLane`](crate::BlockLane) clone), and quotas reborn empty over its un-drained queue would
+/// admit one more full checkpoint image per rebuild. The drivers read the truth off the lane they
+/// were handed ([`BlockLane::occupancy`](crate::BlockLane::occupancy)) — correct for a fresh lane
+/// and a survivor alike, however the predecessor ended.
 pub fn build_endpoint<S, W, B>(
   config: Config,
   membership: Membership,
   sm: S,
   wal: &mut W,
   sb: &mut B,
+  lane: viewstamp_proto::BlockLaneOccupancy,
 ) -> Result<Endpoint<S, SingleChange>, DriverError>
 where
   S: StateMachine,
@@ -148,7 +158,9 @@ where
   // zero-sized PhantomData witness with no runtime representation; the driver always carries the
   // capability so the coordinators can call `propose_membership` without the embedder opting in
   // per-instance.
-  match Endpoint::<S, SingleChange>::recover_with_reconfig(config, membership, seed, sm, wal, sb)? {
+  match Endpoint::<S, SingleChange>::recover_with_reconfig(
+    config, membership, seed, sm, wal, sb, lane,
+  )? {
     Recovered::Active(endpoint) => Ok(endpoint),
     Recovered::Retired(retired) => Err(DriverError::Retired {
       local: retired.local(),

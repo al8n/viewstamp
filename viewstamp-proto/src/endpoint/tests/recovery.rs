@@ -64,9 +64,17 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -259,9 +267,17 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -363,9 +379,17 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   let mut wal2 = ScriptedWal::with_entries(3);
   wal2.script_read_fault(OpNumber::with(2), u8::MAX);
   let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
-  let mut r2 = Endpoint::recover(cfg2, genesis(3), 0, CountSm::default(), &mut wal2, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r2 = Endpoint::recover(
+    cfg2,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal2,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r2.storage_step(now, &mut wal2, &mut sb, &mut blocks);
     if !r2.status().is_recovering() {
@@ -426,9 +450,17 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -552,9 +584,17 @@ fn recover_drops_a_stale_committed_op_read_back_body_faulty_not_resurrected_as_r
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -614,9 +654,17 @@ fn recover_drops_a_genuinely_absent_committed_op_as_today() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -654,6 +702,7 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -683,6 +732,7 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
     EchoSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -715,6 +765,7 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -899,9 +950,17 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   };
   let cfg = Config::try_new(1, MemberId::new(2)).unwrap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -1245,6 +1304,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1517,6 +1577,7 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1571,6 +1632,7 @@ fn recovered_backup_resumes_normal_unchanged() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1609,6 +1671,7 @@ fn recovered_mid_view_change_redrives_the_in_progress_view_change() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1647,6 +1710,7 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1859,6 +1923,7 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1935,9 +2000,17 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -2091,9 +2164,17 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -2218,9 +2299,17 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -2356,9 +2445,17 @@ fn recover_reads_the_deep_tail_when_a_mid_tail_read_resolves_only_via_timeout() 
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
   // Drive storage drains + the recover-retry timer past the per-op budget: the faulty top op exhausts and
   // the continuation (from the timeout path) extends to the second batch, which reads K.
@@ -2430,9 +2527,17 @@ fn recover_carries_a_faulting_interior_op_above_a_stale_commit_max_not_dropped_a
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 20) {
     r.storage_step(t, &mut wal, &mut sb, &mut blocks);
@@ -2511,6 +2616,7 @@ fn recovering_head_drops_the_uncommitted_faulty_head_but_keeps_a_committed_inter
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -2568,9 +2674,17 @@ fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_hea
   wal.head = u64::MAX; // a bit-rotted head scalar
   wal.capacity = 38; // a BOUNDED ring → the read ceiling is checkpoint 2 + 38 = 40
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.op(),
@@ -2685,9 +2799,17 @@ fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not
   let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
   wal.entries.insert(6, (rotted, body));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Exhaust both budgets: the unidentifiable head lands in `rec.faulty`; the checkpoint escalates to
   // the peer fetch. The awaiting gate holds recovery open BEFORE the faulty-head decision.
   drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
@@ -2822,9 +2944,17 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
   let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
   wal.entries.insert(6, (rotted, body));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     r.awaiting_peer_checkpoint_for_test(),
@@ -2944,6 +3074,7 @@ fn the_staged_install_carries_every_faulty_verdict_not_just_the_untruthed_head()
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3053,9 +3184,17 @@ fn recover_reads_a_committed_band_above_the_imposed_ring_on_a_ring_less_wal() {
   let mut wal = ScriptedWal::with_entries(commit_max); // ring-less (default capacity), holds 1..=commit_max
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     r.op(),
     OpNumber::with(commit_max),
@@ -3096,9 +3235,17 @@ fn recover_finds_a_committed_tail_above_a_stale_commit_when_the_head_scalar_unde
   let mut sb = sb_formatted(); // FORMATTED-empty root: STALE durable commit == checkpoint_op == 0
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     r.op(),
     OpNumber::with(held),
@@ -3158,6 +3305,7 @@ fn recover_does_not_skip_a_written_head_whose_header_op_field_rotted() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3235,6 +3383,7 @@ fn a_committed_head_whose_body_faulty_completion_carries_a_rotted_header_resolve
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3320,6 +3469,7 @@ fn a_committed_head_with_a_bit_rotted_header_resolves_via_the_root_not_recoverin
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3387,6 +3537,7 @@ fn a_root_vouched_committed_head_whose_read_answers_absent_becomes_a_repair_hole
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3454,6 +3605,7 @@ fn a_poisoned_sealed_commit_does_not_force_an_unbounded_recovery_read() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3528,6 +3680,7 @@ fn a_root_vouched_committed_head_with_no_wal_header_becomes_a_repair_hole_not_re
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -3589,9 +3742,17 @@ fn recover_reads_the_committed_band_when_the_op_head_scalar_under_reports() {
   wal.head = ring; // a corrupt-LOW head scalar, far below the durable committed frontier
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     r.op(),
     OpNumber::with(commit_max),
@@ -3672,9 +3833,17 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // `recover` submits the FIRST bounded read batch (`RECOVER_TAIL_WINDOW` slots); the continuation batches
   // THE CORE assertion: the recovered head reads the FULL durable committed band — `self.op == commit_max`,
   // NOT the old `checkpoint_op + RECOVER_TAIL_WINDOW`. The single-pass read window is bounded by the WAL
@@ -3820,9 +3989,17 @@ fn recover_bounds_the_read_window_for_a_ring_less_wal_with_a_corrupt_op_head() {
   };
   let mut sb = sb_formatted(); // formatted-empty: models a store that ran (op_head is corrupt, not wiped)
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Complete the genesis geometry-pin root write (the only storage completion outstanding).
   e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
@@ -3867,9 +4044,17 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
     "the durable root has NO committed band above the checkpoint"
   );
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Complete the genesis geometry-pin root write (the only storage completion outstanding).
   e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
@@ -3965,9 +4150,17 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -4102,9 +4295,17 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
@@ -4172,6 +4373,7 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -4219,6 +4421,7 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
     EchoSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -4292,9 +4495,17 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
 
   // Drain op 1's clean read (resolved); op 2 stays pending with NO completion (its read is held).
@@ -4365,6 +4576,7 @@ fn recover_rebuilds_log_and_op_from_wal() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -4412,9 +4624,17 @@ fn recover_restores_real_bodies() {
   e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   drop(e); // crash
 
-  let mut recovered = Endpoint::recover(cfg(), genesis(3), 0, EchoSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut recovered = Endpoint::recover(
+    cfg(),
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   recovered.storage_step(now, &mut wal, &mut sb, &mut blocks); // restore the tail bodies → Normal
   assert_eq!(recovered.status(), Status::Normal);
@@ -4494,6 +4714,7 @@ fn recover_restores_a_nonzero_durable_view() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -4560,9 +4781,17 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
   );
   drop(e); // crash
 
-  let mut r = Endpoint::recover(cfg(), genesis(1), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg(),
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
   // Simulate the recover-retry timer minting a FRESH checkpoint read id before the original (slow) read's
   // completion is drained — the completion will then arrive under a SUPERSEDED id.
@@ -4648,9 +4877,17 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   // recover walks the local DAG and restores from it rather than escalating to a peer fetch.
   blocks.put(good_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
-  let mut e = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert!(
     e.recover.as_ref().unwrap().checkpoint.is_some(),
@@ -4747,10 +4984,17 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // metadata (commit/checkpoint/op) is set synchronously in Phase 1; the SM snapshot restore
   // happens in the Recovering handle_storage loop (Phase 2), so pump it before the SM asserts. The
   // SAME `blocks` store carries the checkpoint DAG across the crash (the SM blocks persist).
-  let mut recovered =
-    Endpoint::recover(cfg(), genesis(1), 0, CountSm::default(), &mut wal, &mut sb)
-      .expect("recover accepts this store")
-      .expect_active();
+  let mut recovered = Endpoint::recover(
+    cfg(),
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   assert_eq!(
     recovered.commit(),
@@ -4843,9 +5087,17 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   // read restores from the local DAG.
   blocks.put(good_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
-  let mut e = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.commit(),
@@ -4955,9 +5207,17 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   // read restores from the local DAG.
   blocks.put(good_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
-  let mut e = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Drain #1: the truncated read does NOT panic — it is rejected; still Recovering.
   sb.flush();
   e.storage_step(now, &mut wal, &mut sb, &mut blocks);
@@ -5014,9 +5274,17 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
 
   // Drive well past the per-op retry budget (RECOVER_READ_RETRIES), pumping the recover-retry timer
@@ -5158,9 +5426,17 @@ fn a_quarantine_hint_does_not_escalate_a_checkpoint_exhausted_local_recovery() {
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   while e.poll_message().is_some() {}
   // Precondition: a checkpoint-exhausted local recovery — Recovering, awaiting a peer checkpoint, a
@@ -5252,9 +5528,17 @@ fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(
@@ -5341,9 +5625,17 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert!(
     e.is_primary(),
     "replica 0 recovered at view 0 is the primary of its view"
@@ -5493,9 +5785,17 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Drive the verify-failure exhaustion (pumping the recover-retry timer each round) → must NOT panic.
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
@@ -5612,9 +5912,17 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
 
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.commit_max(),
@@ -5854,9 +6162,17 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation
   // (pumping the recover-retry timer each round).
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
@@ -6004,9 +6320,17 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
@@ -6154,9 +6478,17 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
@@ -6295,9 +6627,17 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     r.log.get(&2).map(|e| e.client),
     Some(ClientId::new(99)),
@@ -6399,9 +6739,17 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   // THE PLACEMENT GUARD: op 2 is NOT promoted to Repairing off the misplaced (op-99-stamped) header — it
@@ -6441,10 +6789,17 @@ fn recover_with_no_checkpoint_is_unchanged() {
   assert_eq!(e.checkpoint_op(), OpNumber::with(0), "no checkpoint taken");
   drop(e);
 
-  let mut recovered =
-    Endpoint::recover(cfg(), genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-      .expect("recover accepts this store")
-      .expect_active();
+  let mut recovered = Endpoint::recover(
+    cfg(),
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   recovered.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads → Normal
   assert_eq!(recovered.status(), Status::Normal);
@@ -6483,9 +6838,17 @@ fn recover_bounds_the_read_window_for_a_huge_op_head() {
     .clone()
     .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, RECOVER_TAIL_WINDOW);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Complete the genesis geometry-pin root write (the only storage completion outstanding).
   e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   // The scan found no written slot and there is nothing committed → nothing to read, no phantom
@@ -6538,9 +6901,17 @@ fn recover_does_not_overflow_with_a_checkpoint_op_near_u64_max() {
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   // The CORE assertion is simply that this does not overflow-panic.
-  let e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     wal.done.len(),
@@ -6617,9 +6988,17 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   // restores from the local DAG.
   blocks.put(donor_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
-  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // The head DERIVES from the durable-header scan — the raw scalar is never consulted — so the
   // provisional head is the true written frontier IMMEDIATELY: the phantom band `(frontier, head]`
   // (which the lying scalar claims) has no headers to find and is never materialized nor read.
@@ -6729,9 +7108,17 @@ fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
   let mut wal = ScriptedWal::with_entries(3);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, Instant::ZERO);
   assert_eq!(
     r.log_floor,
@@ -6763,9 +7150,17 @@ fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
   let mut wal2 = ScriptedWal::with_entries(1);
   let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
-  let mut r2 = Endpoint::recover(cfg2, genesis(3), 0, CountSm::default(), &mut wal2, &mut sb2)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r2 = Endpoint::recover(
+    cfg2,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal2,
+    &mut sb2,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r2, &mut wal2, &mut sb2, &mut blocks2, Instant::ZERO);
   assert_eq!(
     r2.log_floor,
@@ -6815,9 +7210,17 @@ fn recover_derives_the_head_when_the_op_head_scalar_under_reports_zero() {
   wal.head = 0; // the under-reporting scalar — hides all three written slots if trusted
   let mut sb = sb_formatted(); // a FORMATTED root (the store ran); only the op_head scalar rotted
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     e.op(),
     OpNumber::with(3),
@@ -6852,6 +7255,7 @@ fn recover_fails_stops_a_virgin_voter_even_with_surviving_wal_headers() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
   .expect_err("a virgin voter with surviving WAL headers must fail-stop, not recover the tail");
@@ -6879,8 +7283,16 @@ fn recover_resumes_a_virgin_learner_with_surviving_wal_headers() {
   .expect("valid 3-voter + 1-learner genesis membership");
   let mut wal = ScriptedWal::with_entries(3);
   let mut sb = TestSb::default(); // virgin root — a learner may resume over it
-  let recovered = Endpoint::recover(cfg, membership, 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("a virgin learner resumes (it never votes)");
+  let recovered = Endpoint::recover(
+    cfg,
+    membership,
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("a virgin learner resumes (it never votes)");
   assert!(
     matches!(recovered, Recovered::Active(_)),
     "the learner recovers Active, not fail-stop"
@@ -6928,6 +7340,7 @@ fn genesis_commit_writes_a_durable_root_so_the_voter_recovers() {
     CountSm::default(),
     &mut wal2,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("a formatted voter store recovers, never fail-stops");
   assert!(
@@ -6982,9 +7395,17 @@ fn recover_refuses_a_changed_checkpoint_ops() {
     ..Default::default()
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 16).unwrap();
-  let err = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .map(|_| ())
-    .expect_err("a shrunk checkpoint interval must be refused");
+  let err = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .map(|_| ())
+  .expect_err("a shrunk checkpoint interval must be refused");
   assert_eq!(
     err,
     RecoverError::CheckpointOpsChanged {
@@ -7009,9 +7430,17 @@ fn recover_refuses_a_changed_wal_capacity() {
     ..Default::default()
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // checkpoint_ops 32 matches
-  let err = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .map(|_| ())
-    .expect_err("a changed backend capacity must be refused");
+  let err = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .map(|_| ())
+  .expect_err("a changed backend capacity must be refused");
   assert_eq!(
     err,
     RecoverError::WalCapacityChanged {
@@ -7055,9 +7484,17 @@ fn recover_refuses_a_non_virgin_root_with_unrecorded_geometry() {
     ..Default::default()
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let err = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .map(|_| ())
-    .expect_err("a non-virgin geometry-unrecorded root must be refused");
+  let err = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .map(|_| ())
+  .expect_err("a non-virgin geometry-unrecorded root must be refused");
   assert_eq!(
     err,
     RecoverError::GeometryNotRecorded {
@@ -7080,9 +7517,17 @@ fn recover_refuses_a_wal_below_the_liveness_floor() {
   let mut sb = TestSb::default();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 32).unwrap();
   assert_eq!(cfg.minimum_wal_capacity(), 33, "interval + 1");
-  let err = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .map(|_| ())
-    .expect_err("a WAL below the liveness floor must be refused");
+  let err = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .map(|_| ())
+  .expect_err("a WAL below the liveness floor must be refused");
   assert_eq!(
     err,
     RecoverError::WalCapacityBelowMinimum {
@@ -7109,9 +7554,17 @@ fn format_pins_geometry_and_fences_a_shrunk_restart() {
     "format pins the live geometry pair into the genesis root"
   );
   // Recovery over the formatted store settles synchronously (empty WAL, nothing to read).
-  let e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("the formatted store recovers")
-    .expect_active();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("the formatted store recovers")
+  .expect_active();
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -7120,9 +7573,17 @@ fn format_pins_geometry_and_fences_a_shrunk_restart() {
   drop(e);
   // A restart under a SHRUNK interval is refused off the pinned genesis root.
   let shrunk = Config::with_checkpoint_ops(1, MemberId::new(1), 16).unwrap();
-  let err = Endpoint::recover(shrunk, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .map(|_| ())
-    .expect_err("the pinned geometry fences the restart");
+  let err = Endpoint::recover(
+    shrunk,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .map(|_| ())
+  .expect_err("the pinned geometry fences the restart");
   assert_eq!(
     err,
     RecoverError::CheckpointOpsChanged {
@@ -7142,9 +7603,17 @@ fn a_formatted_genesis_store_resumes_the_view_0_primary() {
   let mut wal = ScriptedWal::with_entries(0);
   let mut sb = TestSb::default();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("a virgin store formats");
-  let e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("the formatted store recovers")
-    .expect_active();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("the formatted store recovers")
+  .expect_active();
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -7175,6 +7644,7 @@ fn a_wiped_multi_node_voter_fails_stop_rather_than_participating() {
     CountSm::default(),
     &mut { wal },
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
   .expect_err("a wiped multi-node voter must fail-stop, not participate");
@@ -7191,9 +7661,17 @@ fn a_recovered_formatted_primary_with_any_appended_op_still_abdicates() {
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("formats");
-  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Complete the op-1 tail read; the terminal decision then abdicates despite the format witness.
   e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
@@ -7263,9 +7741,17 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
   let mut wal = wal0;
   let mut sb = sb0;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts the formatted store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts the formatted store")
+  .expect_active();
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -7349,9 +7835,17 @@ fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
 
   // The predecessor stages an op-1 append (the ReorderWal withholds its completion — the write is
   // with the device) and is dropped WITHOUT a drain: the restart-in-place shape.
-  let mut dead = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover the formatted store")
-    .expect_active();
+  let mut dead = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover the formatted store")
+  .expect_active();
   assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
   dead.handle_message(
     Instant::ZERO,
@@ -7368,9 +7862,17 @@ fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
   drop(dead);
 
   // The successor recovers over the SAME live storage: a fresh incarnation, no writes of its own.
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover over the live storage")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover over the live storage")
+  .expect_active();
   while r.poll_message().is_some() {}
 
   // Adopt view 1 at canonical head 0 — BELOW the staged op — so the adoption's truncate
@@ -7424,9 +7926,17 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover the formatted store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover the formatted store")
+  .expect_active();
   while r.poll_message().is_some() {}
 
   // The successor's own live write: a view-0 Prepare for op 1 stages an append whose completion
@@ -7494,6 +8004,163 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
   );
 }
 
+/// Once a slot's writes have all quiesced, the durable slot holds the identity the replica's vote
+/// named — across an endpoint rebuild over live storage exactly as within one incarnation.
+///
+/// The slot-quiescence fence keeps this within one incarnation: `wal_writes` remembers every
+/// un-quiesced physical write, and `submit_or_defer_append` defers any re-append that would touch
+/// the same slot until the old write's completion proves it settled. This test drives the SAME
+/// schedule across a rebuild: the predecessor endpoint leaves an un-cancellable op-1 append with the
+/// device (a proactor write nothing can recall), the successor is built over the live storage, a
+/// view change legitimately re-mints op 1 for a DIFFERENT operation, and the successor appends and
+/// votes for the replacement. The device then completes the two writes newest-first — an order the
+/// `Wal` contract expressly permits — so the predecessor's abandoned bytes land LAST, over the slot
+/// whose content the successor's `PrepareOk` already named to the primary. The vote is counted
+/// toward a commit quorum by content address, so the durable slot silently disagreeing with it is
+/// the committed-value-loss shape: on the next recovery this replica re-serves the predecessor's
+/// operation at op 1 with a fully self-consistent header.
+///
+/// The release loop is schedule-agnostic (it lands whatever is staged, newest-first per op, feeding
+/// each completion to the endpoint), so it expresses both the current submit-immediately behaviour
+/// and a fence that defers the successor's re-append until the predecessor's write settles: under
+/// either, once nothing is staged, the durable identity at op 1 must equal the voted identity.
+#[test]
+#[ignore = "pins an open defect: a rebuilt endpoint starts with an empty slot-quiescence fence, so \
+            a predecessor's un-cancelled write lands over the slot its successor re-appended and \
+            voted; un-ignore when the fence survives an in-place rebuild"]
+fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
+  let cfg = Config::try_new(1, MemberId::new(2)).unwrap(); // member 2: a backup of views 0 and 1
+  // NON-cancelling: `truncate`/`prune` keep staged writes in flight (un-cancellable device writes),
+  // and completions release only when the test lands them — newest-first per op.
+  let mut wal = ReorderWal::new();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+
+  // The predecessor stages an op-1 append (completion withheld — the write is with the device) and
+  // is dropped WITHOUT a drain: the restart-in-place shape. Append-before-ack holds, so it never
+  // voted for op 1 — no other replica knows the op exists.
+  let mut dead = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover the formatted store")
+  .expect_active();
+  assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
+  dead.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "the predecessor's append is staged, its completion withheld, when the endpoint is replaced"
+  );
+  drop(dead);
+
+  // The successor recovers over the SAME live storage. Its scan reads only landed entries, so op 1
+  // is absent and its head is 0 — and its fence witness set starts empty.
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    1,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover over the live storage")
+  .expect_active();
+  while r.poll_message().is_some() {}
+
+  // View 1 formed without this replica (nobody holds op 1 — it was never acked), and its primary
+  // re-mints op 1 for a DIFFERENT operation. The successor adopts the canonical log and re-appends
+  // op 1 with the replacement identity; commit 0 leaves it uncommitted, so the adoption owes the
+  // new primary a `PrepareOk` for it once the append completes.
+  let replacement = bytes::Bytes::from_static(b"replacement");
+  r.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(9),
+        RequestNumber::with(1),
+        replacement.clone(),
+      )],
+    )),
+  );
+  assert_eq!(r.view(), View::with(1), "the adoption completed");
+  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // drain the durable-view write
+
+  // Land every staged write for op 1, newest-first — the completion order the `Wal` contract
+  // permits and the one that lands the abandoned predecessor bytes LAST. Each landing's completion
+  // is fed to the endpoint before the next; a deferred re-append the fence releases mid-loop simply
+  // re-enters the staged set and is landed too. Capture the vote the successor emits along the way.
+  let mut voted: Option<u128> = None;
+  let mut landings = 0;
+  while wal.staged_len() > 0 {
+    landings += 1;
+    assert!(landings <= 8, "the release loop settles");
+    assert!(
+      wal.release_latest_for(1),
+      "every write staged by this schedule targets op 1"
+    );
+    r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+    while let Some(out) = r.poll_message() {
+      if let Message::PrepareOk(ok) = out.msg_ref()
+        && ok.op() == OpNumber::with(1)
+        && ok.view() == View::with(1)
+      {
+        voted = Some(ok.prepare_checksum());
+      }
+    }
+  }
+
+  // ANTI-VACUITY: the successor really voted (the primary will count this toward a commit quorum),
+  // and the predecessor's late completion really was delivered into the successor and refused — the
+  // landing happened, it just answered a dead endpoint.
+  let voted = voted.expect("the successor votes for op 1 once its own append completes");
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the predecessor's completion was delivered across the rebuild and refused at the choke"
+  );
+
+  // THE INVARIANT: every write to op 1 has quiesced, so the durable slot must hold exactly the
+  // identity the vote named. A mismatch is the predecessor's abandoned operation sitting,
+  // self-consistent, where the voted replacement was — committed-value loss on the next recovery.
+  let header = wal.header(OpNumber::with(1)).expect("op 1 is durable");
+  let durable =
+    crate::storage::prepare_identity(header.client(), header.request(), header.body_checksum());
+  assert_eq!(
+    durable, voted,
+    "op 1's writes have all quiesced, but the durable slot does not hold the identity the \
+     successor's PrepareOk named — the predecessor's late landing evicted the voted operation"
+  );
+  assert_eq!(
+    wal.durable_body(1),
+    Some(replacement),
+    "the durable body at op 1 is the voted replacement"
+  );
+}
+
 #[test]
 fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
   // CONSENSUS-SAFETY regression. A solo cluster (replica_count 1) that committed
@@ -7511,6 +8178,7 @@ fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
     CountSm::default(),
     &mut { wal },
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
   .expect_err("a wiped solo voter must fail-stop, not resume");
@@ -7526,6 +8194,7 @@ fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
     CountSm::default(),
     &mut { wal2 },
     &mut sb2,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("a formatted solo store recovers")
   .expect_active();

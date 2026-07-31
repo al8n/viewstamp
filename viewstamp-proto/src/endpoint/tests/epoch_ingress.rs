@@ -362,6 +362,7 @@ fn recovering_with_hole_at_epoch(
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();

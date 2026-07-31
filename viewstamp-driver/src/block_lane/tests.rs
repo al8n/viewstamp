@@ -65,8 +65,16 @@ fn single_voter() -> (
   let mut wal = InMemoryWal::new();
   let mut sb = InMemorySuperblock::new();
   crate::format(config, &genesis(1), &wal, &mut sb).expect("format the genesis store");
-  let endpoint = crate::build_endpoint(config, genesis(1), LogSm::default(), &mut wal, &mut sb)
-    .expect("the formatted store builds an endpoint");
+  let endpoint = crate::build_endpoint(
+    config,
+    genesis(1),
+    LogSm::default(),
+    &mut wal,
+    &mut sb,
+    // Every test's lane is created fresh, after this endpoint: nothing can occupy it yet.
+    viewstamp_proto::BlockLaneOccupancy::empty(),
+  )
+  .expect("the formatted store builds an endpoint");
   (endpoint, wal, sb)
 }
 
@@ -164,19 +172,50 @@ fn an_inline_lane_answers_within_the_submit() {
   assert_eq!(done.id(), id, "the completion answers the submitted job");
 }
 
+/// Drive an endpoint through its first checkpoint — materialize executed inline against a private
+/// store, completion delivered, durable root published — and return the GC sweep that publication
+/// queues, UN-executed. The sweep is the canonical earlier-issued half of the reorder hazard the
+/// lane cursor exists to stop, and unlike a materialize it occupies no admission quota, so it
+/// reaches the cursor rather than the lane's occupancy fail-stop.
+fn first_sweep_job(
+  endpoint: &mut Endpoint<LogSm, SingleChange>,
+  wal: &mut InMemoryWal,
+  sb: &mut InMemorySuperblock,
+) -> BlockJob<LogSm> {
+  let now = Instant::ZERO;
+  let mut cursor = viewstamp_proto::BlockJobCursor::new();
+  let mut blocks = MemBlocks::default();
+  let materialize = first_job(endpoint, wal, sb);
+  let done = viewstamp_proto::execute_block_job(&mut cursor, materialize, &mut blocks);
+  endpoint.on_block_done(now, wal, sb, done);
+  for _ in 0..64 {
+    endpoint.handle_storage(now, wal, sb);
+    if let Some(job) = endpoint.poll_block_job() {
+      if job.tag() == viewstamp_proto::BlockJobTag::Gc {
+        return job;
+      }
+      let done = viewstamp_proto::execute_block_job(&mut cursor, job, &mut blocks);
+      endpoint.on_block_done(now, wal, sb, done);
+    }
+  }
+  panic!("a published checkpoint owes a GC sweep over its live roots");
+}
+
 /// THE CURSOR'S CROSS-INCARNATION CHECK, and why the lane must own it.
 ///
 /// Two endpoints sharing one storage lane model a rebuild in place: incarnations come from one
 /// process-wide monotone counter, so the endpoint built SECOND carries the larger one. Executing the
 /// dead endpoint's still-queued job AFTER its successor's — the interleaving an asynchronous lane
-/// makes reachable — is exactly what the lane's cursor exists to stop, and it fail-stops here.
+/// makes reachable — is exactly what the lane's cursor exists to stop, and it fail-stops here. The
+/// vehicle is a GC sweep, the cursor's own canonical hazard: a stale sweep running late frees the
+/// blocks a newer durable root names.
 #[test]
 #[should_panic(expected = "block job executed out of issue order")]
 fn one_lane_stops_a_dead_endpoints_job_running_after_its_successors() {
   let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_job(&mut dead, &mut dead_wal, &mut dead_sb);
+  let dead_job = first_sweep_job(&mut dead, &mut dead_wal, &mut dead_sb);
   let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_job(&mut live, &mut live_wal, &mut live_sb);
+  let live_job = first_sweep_job(&mut live, &mut live_wal, &mut live_sb);
   assert!(
     live_job.id().incarnation() > dead_job.id().incarnation(),
     "the endpoint built second holds the later incarnation",
@@ -194,9 +233,9 @@ fn one_lane_stops_a_dead_endpoints_job_running_after_its_successors() {
 #[test]
 fn a_fresh_lanes_first_admission_is_unchecked() {
   let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_job(&mut dead, &mut dead_wal, &mut dead_sb);
+  let dead_job = first_sweep_job(&mut dead, &mut dead_wal, &mut dead_sb);
   let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_job(&mut live, &mut live_wal, &mut live_sb);
+  let live_job = first_sweep_job(&mut live, &mut live_wal, &mut live_sb);
 
   let successors_lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
   successors_lane.submit(live_job);
@@ -209,15 +248,156 @@ fn a_fresh_lanes_first_admission_is_unchecked() {
   );
 }
 
+/// A dead endpoint's MATERIALIZE, though, never even reaches the cursor: the image occupies the
+/// lane's admission accounting, which an `Option` carries because the endpoint admits one capture
+/// per LANE — so a second image is refused at submit, before anything touches the store. This is
+/// the two-endpoints-one-lane misuse (a rebuild that inherited no occupancy) caught at its
+/// earliest observable point.
+#[test]
+#[should_panic(expected = "a second Materialize was submitted")]
+fn one_lane_refuses_a_second_image_at_submit() {
+  let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
+  let dead_job = first_job(&mut dead, &mut dead_wal, &mut dead_sb);
+  let (mut live, mut live_wal, mut live_sb) = single_voter();
+  let live_job = first_job(&mut live, &mut live_wal, &mut live_sb);
+
+  let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
+  lane.submit(live_job);
+  lane.submit(dead_job);
+}
+
+/// The lane accounts for its own occupancy: a quota-bounded job counts from `submit` until its
+/// completion leaves `try_recv`, EXECUTION notwithstanding — an inline lane has already run the job
+/// by the time `submit` returns, but the image still occupies the lane until the completion is
+/// handed back, because handing it back is what lets the endpoint above release the capture.
+#[test]
+fn a_lane_holds_a_materialize_from_submit_until_its_completion_leaves() {
+  use viewstamp_proto::BlockLaneOccupancy;
+
+  let (mut endpoint, mut wal, mut sb) = single_voter();
+  let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
+  assert_eq!(
+    lane.occupancy(),
+    BlockLaneOccupancy::empty(),
+    "a fresh lane holds nothing"
+  );
+
+  let job = first_job(&mut endpoint, &mut wal, &mut sb);
+  let id = job.id();
+  lane.submit(job);
+  assert_eq!(
+    lane.occupancy(),
+    BlockLaneOccupancy::new(Some(id), 0),
+    "the submitted materialize occupies the lane even though the inline lane already executed it"
+  );
+  // A clone shares the accounting, exactly as it shares the cursor — it is the SAME lane.
+  let carried = lane.clone();
+  assert_eq!(
+    carried.occupancy(),
+    BlockLaneOccupancy::new(Some(id), 0),
+    "a clone reports the same occupancy"
+  );
+
+  let done = carried
+    .try_recv()
+    .expect("the inline lane executed the job");
+  assert_eq!(done.id(), id);
+  assert_eq!(
+    lane.occupancy(),
+    BlockLaneOccupancy::empty(),
+    "handing the completion out — from any clone — frees the lane"
+  );
+}
+
+/// THE REBUILD CARRY, end to end at the driver seam: an endpoint dies with a materialize on its
+/// lane; the embedder rebuilds over the surviving lane clone and the same storage, passing
+/// [`BlockLane::occupancy`]; the successor starts with the capture site closed, the dead
+/// completion arrives foreign — refused, publishing nothing — and that refusal is what re-opens
+/// the capture, after which the successor checkpoints normally.
+///
+/// Built empty instead, the successor would capture a second full image behind the dead one: one
+/// image per rebuild, on a lane that never drained.
+#[test]
+fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
+  use viewstamp_proto::BlockLaneOccupancy;
+
+  let config = Config::with_checkpoint_ops(CLUSTER, MemberId::new(0_u128), 1)
+    .expect("a valid single-voter config");
+  let (mut dead, mut wal, mut sb) = single_voter();
+  let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
+  let dead_job = first_job(&mut dead, &mut wal, &mut sb);
+  let dead_id = dead_job.id();
+  lane.submit(dead_job);
+  drop(dead); // the driver holding the endpoint is gone; the embedder kept the lane and storage
+
+  let occupancy = lane.occupancy();
+  assert_eq!(
+    occupancy,
+    BlockLaneOccupancy::new(Some(dead_id), 0),
+    "the surviving lane still holds the dead endpoint's image"
+  );
+  let mut live = crate::build_endpoint(
+    config,
+    genesis(1),
+    LogSm::default(),
+    &mut wal,
+    &mut sb,
+    occupancy,
+  )
+  .expect("the dirty store rebuilds an endpoint over its surviving lane");
+
+  // The dead job's completion lands foreign: refused wholesale — and the refusal releases the
+  // inherited capture, which is what lets the successor checkpoint again below.
+  let now = Instant::ZERO;
+  let done = lane.try_recv().expect("the lane hands back the dead job");
+  assert_eq!(done.id(), dead_id);
+  live.on_block_done(now, &mut wal, &mut sb, done);
+  assert_eq!(
+    live.foreign_completions_rejected(),
+    1,
+    "the dead incarnation's materialize was refused at the choke"
+  );
+
+  // Settle the successor's recovery reads, then commit fresh work: `first_job` PANICS if no
+  // materialize is issued, so it doubles as the assertion that the refusal genuinely re-opened the
+  // capture site.
+  for _ in 0..8 {
+    live.handle_storage(now, &mut wal, &mut sb);
+  }
+  let job = first_job(&mut live, &mut wal, &mut sb);
+  lane.submit(job);
+  let deadline = std::time::Instant::now() + LANE_ANSWER_DEADLINE;
+  while live.has_inflight_storage() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the rebuilt endpoint never quiesced after inheriting the lane's occupancy",
+    );
+    live.handle_storage(now, &mut wal, &mut sb);
+    while let Some(job) = live.poll_block_job() {
+      lane.submit(job);
+    }
+    while let Some(done) = lane.try_recv() {
+      live.on_block_done(now, &mut wal, &mut sb, done);
+    }
+  }
+  assert!(
+    viewstamp_proto::Superblock::state(&sb)
+      .checkpoint_op()
+      .get()
+      >= 1,
+    "the successor never published its own checkpoint after the inherited capture released"
+  );
+}
+
 /// A CLONE is the same lane: same store, same cursor. This is how a lane survives the driver that
 /// held it, so a rebuilt driver executes against a cursor that already remembers what the dead
 /// driver's lane ran.
 #[test]
 fn a_clone_carries_the_lanes_cursor_past_the_driver_that_held_it() {
   let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_job(&mut dead, &mut dead_wal, &mut dead_sb);
+  let dead_job = first_sweep_job(&mut dead, &mut dead_wal, &mut dead_sb);
   let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_job(&mut live, &mut live_wal, &mut live_sb);
+  let live_job = first_sweep_job(&mut live, &mut live_wal, &mut live_sb);
 
   let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
   let carried = lane.clone();

@@ -1401,9 +1401,15 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// drop is the safety property — a superseded materialize must never publish a root — and this is
   /// the non-vacuity witness that the supersession path is genuinely exercised.
   block_jobs_superseded: u64,
-  /// How many `Serve` jobs (peer `RequestBlock` answers) are outstanding, bounded by
-  /// [`MAX_OUTSTANDING_BLOCK_SERVES`] so an inbound request rate above the storage lane's drain rate
-  /// cannot grow the job queue without limit.
+  /// How many `Serve` jobs (peer `RequestBlock` answers) are outstanding ON THE LANE — whichever
+  /// incarnation issued them — bounded by [`MAX_OUTSTANDING_BLOCK_SERVES`] so an inbound request
+  /// rate above the storage lane's drain rate cannot grow the job queue without limit.
+  ///
+  /// The bound is on the lane's depth, so this count has the LANE's lifetime, not this endpoint's:
+  /// a rebuild over a surviving lane inherits it ([`crate::BlockLaneOccupancy`] through `recover`),
+  /// and a dead incarnation's serve releases its slot when its completion is REFUSED at the
+  /// incarnation choke — the same delivery that would have consumed it. Counting only own serves
+  /// would let every incarnation admit a fresh cap behind its predecessors' still-queued serves.
   block_serves_outstanding: usize,
   /// How many peer `RequestBlock`s were dropped at the outstanding-serve cap. Observability only —
   /// the requester's ARQ re-sends — and the non-vacuity witness that the bound engaged.
@@ -1475,6 +1481,17 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// whose flush faulted — nothing is published, no pointer moves, and the sticky cadence
   /// (`maybe_checkpoint` / `maybe_pay_checkpoint_debt` from the commit tails and the primary heartbeat)
   /// re-forces it once the lane returns the completion this field is waiting for.
+  ///
+  /// The image occupies the LANE, so this guard has the LANE's lifetime, not this endpoint's — it
+  /// may name a job a DEAD incarnation issued. An endpoint rebuilt over a surviving lane (a restart
+  /// in place) inherits the outstanding capture through [`crate::BlockLaneOccupancy`] rather than
+  /// starting `None` over a queue that never drained; started `None`, every incarnation would
+  /// capture one more full image behind its predecessors' (the same accumulation the view-churn
+  /// paragraph above describes, driven by rebuilds instead of transitions). Released at exactly one
+  /// of two sites, both of them the lane handing the image back: the completion is CONSUMED
+  /// ([`Self::on_checkpoint_materialized`], an own-incarnation job) or REFUSED at the incarnation
+  /// choke ([`Self::on_block_done`], a dead incarnation's job — the refusal publishes nothing, but
+  /// it is still the delivery proving the image left the queue).
   materializing: Option<crate::JobId>,
   /// The op number of this replica's latest durable checkpoint (0 until the first checkpoint
   /// goes durable). Carried on `Commit` and `PrepareOk` as the checkpoint-quorum signal.
@@ -2145,6 +2162,9 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
+      // Genesis runs over a store formatted virgin in the same call, so no storage lane over it can
+      // hold anything yet: the lane quotas (this and `block_serves_outstanding` above) start empty
+      // BY CONSTRUCTION here, where `recover` must be TOLD what a possibly-surviving lane holds.
       materializing: None,
       checkpoint_op: OpNumber::new(),
       checkpoint_sm_root: None,
@@ -3734,13 +3754,14 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// still holding for this endpoint.
   ///
   /// A real driver uses this for graceful shutdown (do not tear down the proactor while a write the
-  /// cluster may have acted on is un-acked) and for the restart-in-place drain: draining before
-  /// rebuilding an endpoint over the same live storage handles still makes that shutdown CLEAN —
-  /// this method is how that settles — but it is no longer what makes it SAFE. Storage correlation
-  /// ids carry the incarnation of the endpoint that minted them (the [`OpId`](crate::OpId) lifetime
-  /// contract), and both storage completion routers and the synchronous-cancellation absorber refuse
-  /// a foreign incarnation before consulting any correlation table, so a completion the dead
-  /// instance still owed lands on nothing whether or not this method ever reached zero. The
+  /// cluster may have acted on is un-acked) and for the restart-in-place drain — and for a rebuild
+  /// over the same live storage handles that drain is load-bearing for SAFETY, exactly as the
+  /// `wal_writes` term below says. The incarnation choke makes a dead instance's completion INERT
+  /// on the correlation plane (it releases no ack and retires no table entry — the
+  /// [`OpId`](crate::OpId) contract), but it cancels no write, so the dead instance's bytes can
+  /// still land. A successor built while this method reads `true` starts without the
+  /// physical-write witnesses those entries carry and cannot defer the conflicting re-appends the
+  /// slot-quiescence fence exists to hold. The
   /// in-flight RECOVERY reads (`recover`) are deliberately NOT included: they belong to a
   /// `Recovering`/`RecoveringHead` endpoint that is itself the product of `recover()` (not a quiesce
   /// target for a shutdown of a participating replica), and they resolve via `handle_storage`.
@@ -4630,6 +4651,15 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn foreign_completions_rejected(&self) -> u64 {
     self.foreign_completions_rejected
+  }
+
+  /// What this endpoint still has outstanding on its block-storage lane — the value a rebuild over
+  /// that SURVIVING lane must hand to [`recover`](Self::recover), read from the endpoint being
+  /// replaced (after its last completion was delivered, before the successor is constructed). See
+  /// [`BlockLaneOccupancy`](crate::BlockLaneOccupancy) for the lifetime rule this carries.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn lane_occupancy(&self) -> crate::BlockLaneOccupancy {
+    crate::BlockLaneOccupancy::new(self.materializing, self.block_serves_outstanding)
   }
 
   /// Whether `id` was minted by a PREVIOUS endpoint instance over this storage, counting it if so.
@@ -6225,7 +6255,11 @@ where
   ///    storage (a restart in place, whose lane still owed jobs). It is refused wholesale and
   ///    counted, exactly as a foreign WAL/superblock completion is — the sequence numbers restart at
   ///    1 in every incarnation, so letting one reach the dispatch below could publish a dead
-  ///    endpoint's checkpoint DAG under THIS endpoint's in-flight checkpoint token.
+  ///    endpoint's checkpoint DAG under THIS endpoint's in-flight checkpoint token. The refusal is
+  ///    also where an INHERITED lane quota releases ([`crate::BlockLaneOccupancy`]): a refused
+  ///    completion is still the lane's delivery that the dead job — a materialize's image capture, a
+  ///    serve's cap slot — has left the queue, so the quota it occupied frees here, without any of
+  ///    its output being consumed.
   /// 2. **THE ISSUE-ORDER WITNESS.** Only the FRONT of the outstanding queue may complete: block
   ///    jobs must execute serially in issue order (a `Gc` carrying generation N's roots reordered
   ///    after generation N+1's `Materialize` frees the very blocks the next durable root names), and
@@ -6242,6 +6276,29 @@ where
     done: BlockJobDone<S>,
   ) {
     if self.is_foreign_completion(done.id.op_id()) {
+      // The dead job's LANE QUOTA releases on its refusal — occupancy accounting, not correlation:
+      // no output is consumed, no correlation table is touched, nothing publishes. The quotas bound
+      // the LANE's depth and were inherited across the rebuild (`BlockLaneOccupancy`), and this
+      // refused delivery is the lane's own proof that the job — and the image or cap slot it
+      // occupied — has left the queue. Without the release an inherited materialize would hold the
+      // capture site closed forever (its completion can only ever arrive foreign).
+      //
+      // The release ASSUMES nothing beyond what it can match, keeping the choke's posture (refuse
+      // whatever arrives, however it got here): the materialize slot frees only on the FULL id —
+      // incarnation included, so a stray completion whose sequence merely aliases can free neither
+      // the inherited capture nor an own one — and the serve decrement floors at zero, so a stray
+      // serve never wraps the cap. A stray that matches nothing is simply refused, as before.
+      match &done.output {
+        BlockJobOutput::Materialized { .. } => {
+          if self.materializing == Some(done.id) {
+            self.materializing = None;
+          }
+        }
+        BlockJobOutput::Served { .. } => {
+          self.block_serves_outstanding = self.block_serves_outstanding.saturating_sub(1);
+        }
+        _ => {}
+      }
       return;
     }
     let expected = self.block_jobs_outstanding.pop_front();

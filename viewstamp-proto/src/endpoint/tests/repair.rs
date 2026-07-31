@@ -573,9 +573,17 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   assert_eq!(r.commit_max(), OpNumber::with(2), "op 2 is KNOWN committed");

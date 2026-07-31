@@ -114,10 +114,19 @@
 //!
 //! This matters for a driver that rebuilds the endpoint over the same LIVE storage handles — a
 //! restart-in-place, where the io_uring fd or thread pool below the endpoint is never torn down and
-//! still owes completions for the dead instance's submissions. Draining or cancelling in-flight ops
-//! before constructing the new endpoint remains the right thing to do for a CLEAN shutdown (it is
-//! how `has_inflight_storage` settles), but it is not what keeps the endpoint SAFE. A real crash
-//! needs no such care: in-flight ops die with the process. Full statement: the contract on [`OpId`].
+//! still owes completions for the dead instance's submissions. What the refusal provides is
+//! CORRELATION safety: a late completion is INERT — it can never release an ack, cast a vote, or
+//! retire a table entry of the successor. What it does NOT provide is physical cancellation:
+//! refusing the receipt does not unsend the write, and the dead instance's bytes can still land in
+//! their slot at any moment until the backend completes them. The slot-quiescence witnesses
+//! therefore have the MEDIUM's lifetime, not any endpoint's, and a rebuild over live handles is
+//! safe only if they survive it — a successor built without them cannot defer its re-appends to
+//! slots it does not know are fenced, so an abandoned old write can land OVER a slot the successor
+//! re-appended and acked (the committed-value-loss class the fence exists to close). Draining the
+//! medium to quiescence before the rebuild is what discharges that obligation. A real crash
+//! discharges it differently — in-flight ops die with the process, up to the device-latency window
+//! in which a write already at the device can still land after process death (a bounded exposure
+//! this threat model accepts, not a zero one). Full statement: the contract on [`OpId`].
 
 use std::vec::Vec;
 
@@ -183,11 +192,15 @@ pub const HEADER_ENCODED_LEN: usize = 128;
 /// **Foreign completions are rejected, not aliased.** An endpoint dispatches a completion only when
 /// its incarnation matches the endpoint's own; a completion minted by a previous incarnation is
 /// refused wholesale at a single choke point before any correlation table is consulted. That closes
-/// the restart-in-place hazard structurally: a driver that rebuilds the endpoint over live storage
-/// handles — without tearing down the io_uring fd or thread pool beneath it — can deliver a
-/// pre-restart completion into the new endpoint, and it lands on nothing. Draining in-flight ops
-/// before re-creating an endpoint remains good practice for a CLEAN shutdown, but it is no longer
-/// load-bearing for SAFETY.
+/// the CORRELATION half of the restart-in-place hazard: a driver that rebuilds the endpoint over
+/// live storage handles — without tearing down the io_uring fd or thread pool beneath it — can
+/// deliver a pre-restart completion into the new endpoint, and it lands on nothing: it releases no
+/// ack, casts no vote, retires no table entry. It does NOT close the PHYSICAL half: refusing the
+/// completion cancels nothing, so the dead instance's write can still land in its slot — and a
+/// successor that did not inherit the slot-quiescence witnesses cannot defer the conflicting
+/// re-appends the fence exists to hold. Draining in-flight ops to quiescence before re-creating an
+/// endpoint over the same live handles is therefore load-bearing for SAFETY, not merely hygiene
+/// for a clean shutdown.
 ///
 /// The id never reaches disk or the wire; a backend treats it as an opaque token to echo back.
 ///

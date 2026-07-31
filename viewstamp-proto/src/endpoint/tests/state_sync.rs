@@ -676,9 +676,17 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 2);
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Drive past the per-op retry budget so it escalates to a peer fetch (pumping the recover-retry
   // timer each round — the timer owns the read-retry budget).
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
@@ -1723,9 +1731,17 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   seed_donor_blocks(&mut blocks, 6);
-  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(e.awaiting_peer_checkpoint_for_test());
@@ -2927,9 +2943,17 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   drop(e); // crash
   // Recover from the same wal/sb: the synced checkpoint is the durable root.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let mut recovered = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut recovered = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     recovered.checkpoint_op(),
     OpNumber::with(4),
@@ -3655,8 +3679,16 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
   // epoch/prev_epoch/membership are unchanged. The laggard's stable id is MemberId 1 (slot 1), retained in
   // E2, so it recovers Active.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let recovered = match Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
+  let recovered = match Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
   {
     Recovered::Active(r) => r,
     Recovered::Retired(_) => panic!("MemberId 1 is retained in E2 → recover Active"),
@@ -4693,9 +4725,17 @@ fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds(
     checkpoint: Some((OpNumber::with(2), env)),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  let mut e = Endpoint::recover(cfg, genesis_mem, 9, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis_mem,
+    9,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // Drive the recovery storage to completion (the checkpoint read restores the SM + sessions).
   let now = Instant::ZERO;
   for _ in 0..8 {

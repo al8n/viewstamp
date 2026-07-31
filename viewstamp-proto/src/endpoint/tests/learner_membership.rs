@@ -506,6 +506,7 @@ fn a_learner_recovered_mid_view_change_catches_up_and_never_emits_a_dvc() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();

@@ -501,3 +501,152 @@ fn a_faulted_reconstruct_still_converges() {
      retry, not the catch-up"
   );
 }
+
+/// Restarting an endpoint IN PLACE, over a storage lane that still holds its predecessor's
+/// `Materialize`, must not let the successor capture ANOTHER checkpoint image behind it.
+///
+/// The lane outlives endpoint rebuilds by design — that is the restart-in-place contract — so any
+/// per-endpoint admission guard silently resets while the queued image it guards persists. Each
+/// successor then recovers over the still-old superblock, re-learns the committed frontier from its
+/// WAL and the primary's heartbeats, finds the checkpoint cadence due again, and captures one more
+/// full image into a lane that never drained: one image per incarnation, unbounded. The capture
+/// admission must therefore be scoped to the LANE — the successor inherits the outstanding capture
+/// and refuses new ones until the lane hands that image back.
+///
+/// The window is built: replica 1's lane is paused before anything commits, so its first capture is
+/// the first image the lane ever holds and nothing can publish. Every phase asserts it genuinely
+/// happened — the image was outstanding, each restart minted a new incarnation over the retained
+/// image, and each round re-crossed the checkpoint boundary — so a run where the situation never
+/// arose fails loudly rather than passing vacuously.
+#[test]
+fn restarts_in_place_over_a_busy_lane_add_no_checkpoint_image() {
+  /// In-place restarts to survive: each one is an incarnation whose capture site starts fresh.
+  const RESTARTS: u64 = 4;
+  /// Ticks after each re-crossed boundary for the (re-armed) cadence to attempt a capture: the
+  /// commit tails and heartbeats that force a checkpoint fire well within this window.
+  const SETTLE_TICKS: u32 = 400;
+
+  // Three voters, no faults: the primary stays put, so after every restart replica 1's committed
+  // frontier is re-driven by the primary's heartbeats alone, and a missing capture is attributable
+  // to the admission guard rather than to a lost message. The client load stops at 6 committed ops —
+  // past the checkpoint interval of 4, but inside the ring window an un-advanced checkpoint leaves.
+  let mut c = Cluster::with_checkpoint_ops(3, 2, 3, 13, CHECKPOINT_OPS);
+  let mut watch: Vec<Watch> = (0..c.node_count()).map(|_| Watch::default()).collect();
+
+  // Pause the lane FIRST: the materialize about to be captured must stay queued forever, and the
+  // durable checkpoint pointer must still be 0 when the restarts begin (each successor recovers
+  // from the still-old superblock).
+  c.set_block_lane_paused(1, true);
+  let mut captured = false;
+  for _ in 0..SEARCH_TICKS {
+    tick_checked(&mut c, &mut watch);
+    if c.held_block_jobs_with_tag(1, BlockJobTag::Materialize) == 1 {
+      captured = true;
+      break;
+    }
+  }
+  assert!(
+    captured,
+    "replica 1 never captured a checkpoint image onto its paused lane — the outstanding-materialize \
+     window was never entered"
+  );
+  assert_eq!(
+    c.replica_checkpoint_op(1).get(),
+    0,
+    "replica 1 published a checkpoint despite its paused lane — the restarts below would not \
+     recover over a still-old superblock"
+  );
+
+  for round in 0..RESTARTS {
+    let incarnation_before = c.replica_incarnation(1);
+    c.restart_in_place(1);
+    assert!(
+      c.replica_incarnation(1) > incarnation_before,
+      "round {round}: the in-place restart did not mint a new endpoint incarnation"
+    );
+    assert!(
+      c.held_block_jobs_with_tag(1, BlockJobTag::Materialize) >= 1,
+      "round {round}: the lane did not retain the predecessor's materialize across the swap — the \
+       accumulation window was never entered"
+    );
+    // Re-drive the checkpoint boundary: the successor re-learns the committed frontier (its WAL
+    // tail plus the primary's heartbeats) until the cadence is due again, then settles long enough
+    // for every capture attempt the cadence will make.
+    let mut redriven = false;
+    for _ in 0..SEARCH_TICKS {
+      tick_checked(&mut c, &mut watch);
+      if c.replica_commit_max(1).get() >= CHECKPOINT_OPS {
+        redriven = true;
+        break;
+      }
+    }
+    assert!(
+      redriven,
+      "round {round}: the successor never re-crossed the checkpoint boundary, so its capture site \
+       was never re-armed and the round proved nothing"
+    );
+    for _ in 0..SETTLE_TICKS {
+      tick_checked(&mut c, &mut watch);
+    }
+    assert_eq!(
+      c.replica_checkpoint_op(1).get(),
+      0,
+      "round {round}: a checkpoint published under a paused lane"
+    );
+  }
+
+  // THE BOUND. However many incarnations rebuilt over it, the lane holds at most ONE captured
+  // image: the successor inherits the outstanding capture instead of adding its own behind it.
+  let images = c.held_block_jobs_with_tag(1, BlockJobTag::Materialize);
+  assert!(
+    images <= 1,
+    "replica 1's lane holds {images} captured checkpoint images after {RESTARTS} in-place restarts \
+     — every incarnation added one behind its predecessor's, so the queue grows without bound"
+  );
+
+  // Release the lane: the retained image executes, its completion names a dead incarnation and is
+  // refused — which is exactly what frees the inherited admission — and the still-due cadence then
+  // captures fresh and PUBLISHES. The bound must cost restarts nothing but the wait.
+  c.set_block_lane_paused(1, false);
+  let mut published = false;
+  for _ in 0..SEARCH_TICKS {
+    tick_checked(&mut c, &mut watch);
+    if c.replica_checkpoint_op(1).get() >= CHECKPOINT_OPS {
+      published = true;
+      break;
+    }
+  }
+  assert!(
+    published,
+    "replica 1 never published a checkpoint after its lane drained — the inherited admission was \
+     never released, wedging the capture site forever"
+  );
+  assert!(
+    c.replica_foreign_completions_rejected(1) > 0,
+    "no dead incarnation's completion ever reached the final endpoint — the restarts outran \
+     nothing, so the run never exercised the inheritance it claims to test"
+  );
+
+  // And the cluster converges: the abused replica ends at the committed frontier it re-learned.
+  for _ in 0..DRAIN_TICKS {
+    tick_checked(&mut c, &mut watch);
+    if c.is_quiescent() {
+      break;
+    }
+  }
+  assert!(
+    matches!(check_safety(&c), viewstamp_simulation::CheckResult::Ok),
+    "replicas diverged after repeated in-place restarts over a busy lane: {:?}",
+    check_safety(&c)
+  );
+  let frontier = committed_frontier(&c);
+  assert!(
+    frontier > 0,
+    "the cluster committed nothing, so the re-driven boundary means nothing"
+  );
+  assert_eq!(
+    c.replica_commit_max(1).get(),
+    frontier,
+    "replica 1 never reached the committed frontier after its restarts"
+  );
+}

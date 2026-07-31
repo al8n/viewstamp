@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use bytes::Bytes;
 use viewstamp_proto::{
   BodyFaulty, CheckpointRead, Header, OpNumber, Prng, ReadId, ReadOk, SlotStatus, Superblock,
-  SuperblockDone, VsrState, Wal, WalDone, WriteId,
+  SuperblockDone, VsrState, Wal, WalDone, WriteId, checkpoint_id,
 };
 
 /// Seeded storage-fault plan for one replica's WAL + superblock. Deterministic per (seed, replica):
@@ -226,6 +226,23 @@ pub struct InMemoryWal {
   /// actually REORDERED completions (the fence was exercised), not merely staged them FIFO. Persists
   /// across `restart` because the WAL struct does.
   chaos_reorders_fired: u64,
+  /// The medium's own record of who last wrote each durable slot: op → the ENDPOINT INCARNATION
+  /// carried by the write whose landing last populated `entries` for that op. Endpoint incarnations
+  /// are minted from a process-monotone counter, so ordering two writers is a plain comparison: a
+  /// landing that carries a LOWER incarnation than the slot's recorded holder is an OLDER writer's
+  /// bytes physically evicting content a NEWER writer already landed — the stale-landing shape the
+  /// endpoint's slot-quiescence fence exists to make impossible, including across endpoint rebuilds
+  /// over this same live WAL. Trimmed wherever `entries` is (truncate / prune / ring eviction), and
+  /// deliberately KEPT across `crash`/`restart` (the durable content it describes survives too).
+  landed_by: BTreeMap<u64, u64>,
+  /// The first stale landing observed (see [`InMemoryWal::landed_by`]): the op plus a description of
+  /// the eviction — which incarnations collided and what identity each header carried. Held until
+  /// drained ([`take_stale_landing`](Self::take_stale_landing)); later stale landings only advance
+  /// the counter.
+  stale_landing: Option<(u64, String)>,
+  /// How many stale landings occurred since construction. `> 0` is the non-vacuity witness that an
+  /// older incarnation's write genuinely landed over a newer incarnation's durable slot content.
+  stale_landings_fired: u64,
 }
 
 impl Default for InMemoryWal {
@@ -259,6 +276,9 @@ impl InMemoryWal {
       capacity: None,
       write_chaos: None,
       chaos_reorders_fired: 0,
+      landed_by: BTreeMap::new(),
+      stale_landing: None,
+      stale_landings_fired: 0,
     }
   }
 
@@ -326,6 +346,21 @@ impl InMemoryWal {
   #[doc(hidden)]
   pub fn chaos_reorders_fired(&self) -> u64 {
     self.chaos_reorders_fired
+  }
+
+  /// Test-only: drain the first recorded STALE LANDING — `(op, description)` of a write minted by an
+  /// OLDER endpoint incarnation landing over durable slot content a NEWER incarnation had already
+  /// landed (see [`InMemoryWal::landed_by`]). `None` when none has occurred since the last drain.
+  #[doc(hidden)]
+  pub fn take_stale_landing(&mut self) -> Option<(u64, String)> {
+    self.stale_landing.take()
+  }
+
+  /// Test-only: how many stale landings occurred since construction (every older-over-newer slot
+  /// eviction, not only the first). Persists across `restart` because the WAL struct does.
+  #[doc(hidden)]
+  pub fn stale_landings_fired(&self) -> u64 {
+    self.stale_landings_fired
   }
 
   /// Creates an empty, reliable WAL in **async-append mode**: every `submit_append` stages the entry
@@ -481,6 +516,46 @@ impl InMemoryWal {
     self.torn_headers.retain(|&o| o == op || o % n != slot);
     self.head_read_faults.retain(|&o| o == op || o % n != slot);
     self.staged.retain(|s| s.op == op || s.op % n != slot);
+    self.landed_by.retain(|&o, _| o == op || o % n != slot);
+  }
+
+  /// Record a physical landing at `op` by the write `id`, checking it against the slot's current
+  /// holder ([`InMemoryWal::landed_by`]): a landing whose incarnation is LOWER than the holder's is
+  /// an older writer's bytes evicting content a newer writer already landed — recorded as a stale
+  /// landing for [`take_stale_landing`](Self::take_stale_landing) to drain. Called at the one moment
+  /// a write reaches `entries`, in both the synchronous and the staged paths, BEFORE the insert (so
+  /// the evicted header is still readable for the description).
+  fn note_landing(&mut self, op: u64, id: WriteId, header: &Header) {
+    if let Some(&holder) = self.landed_by.get(&op)
+      && id.incarnation() < holder
+    {
+      self.stale_landings_fired += 1;
+      if self.stale_landing.is_none() {
+        let evicted = self.entries.get(&op).map(|(h, _)| {
+          format!(
+            "(client={}, request={}, body_checksum={:#x})",
+            h.client().get(),
+            h.request().get(),
+            h.body_checksum()
+          )
+        });
+        self.stale_landing = Some((
+          op,
+          format!(
+            "a WAL write minted by incarnation {} landed at op {op} OVER content landed by \
+             incarnation {holder}: the slot now holds (client={}, request={}, body_checksum={:#x}) \
+             where it durably held {} — an abandoned old write physically evicted a newer \
+             endpoint's landed slot",
+            id.incarnation(),
+            header.client().get(),
+            header.request().get(),
+            header.body_checksum(),
+            evicted.as_deref().unwrap_or("nothing readable"),
+          ),
+        ));
+      }
+    }
+    self.landed_by.insert(op, id.incarnation());
   }
 
   /// Land a staged append: the physical write happens NOW — the bounded-ring eviction of the
@@ -490,6 +565,7 @@ impl InMemoryWal {
   /// so the two release modes cannot drift on what landing does.
   fn land_staged(&mut self, done: PendingAppend) {
     self.evict_wrapped_slot(done.op);
+    self.note_landing(done.op, done.id, &done.header);
     if done.rot {
       self.rotted.insert(done.op);
     }
@@ -609,6 +685,10 @@ impl Wal for InMemoryWal {
       None => {
         // Bounded ring: writing slot `op mod n` physically evicts the op that last held it.
         self.evict_wrapped_slot(op.get());
+        // The landing ledger records the synchronous write too (an inline landing can never be
+        // stale — nothing is ever in flight to reorder around — but the holder record must be
+        // current so a later staged landing is compared against the true last writer).
+        self.note_landing(op.get(), id, &header);
         if rot {
           self.rotted.insert(op.get());
         }
@@ -712,6 +792,8 @@ impl Wal for InMemoryWal {
     self.rotted.retain(|&op| op <= above.get());
     self.torn_headers.retain(|&op| op <= above.get());
     self.head_read_faults.retain(|&op| op <= above.get());
+    // A truncated slot holds nothing, so it has no holder for a later landing to be stale against.
+    self.landed_by.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
     // WRITE-CHAOS mode: the staged appends are ALREADY AT THE DEVICE — un-cancellable. They stay in
     // flight (each keeps ticking and lands late, briefly resurrecting the trimmed region — the
@@ -745,6 +827,7 @@ impl Wal for InMemoryWal {
     self.rotted.retain(|&op| op >= below.get());
     self.torn_headers.retain(|&op| op >= below.get());
     self.head_read_faults.retain(|&op| op >= below.get());
+    self.landed_by.retain(|&op, _| op >= below.get());
     // WRITE-CHAOS mode: staged appends below the floor stay in flight (un-cancellable device writes;
     // a late landing below the checkpoint is inert — the snapshot owns that prefix), exactly as in
     // `truncate` above.
@@ -1032,6 +1115,42 @@ impl InMemorySuperblock {
       return None;
     }
     self.snapshots.get(&live).map(Bytes::len)
+  }
+
+  /// Test-only: the checkpoint op named by a staged (in-flight) ROOT write that ADVANCES the durable
+  /// checkpoint pointer past the current root's, if any. `None` in synchronous mode, when nothing is
+  /// staged, and when every staged root keeps or rewinds the pointer. This is the window detector
+  /// for "a checkpoint's step-2 root is with the device": the proto submits that root only after the
+  /// checkpoint envelope write completed, so while this returns `Some(q)` the envelope for `q` is
+  /// durably in the store and only the POINTER to it is still in flight.
+  #[doc(hidden)]
+  pub fn staged_checkpoint_root_op_for_test(&self) -> Option<u64> {
+    let live = self.live_checkpoint_op();
+    self.staged.iter().find_map(|(_, w)| match w {
+      StagedSbWrite::Root { state, .. } if state.checkpoint_op().get() > live => {
+        Some(state.checkpoint_op().get())
+      }
+      _ => None,
+    })
+  }
+
+  /// Test-only: whether the DURABLE root's `(checkpoint_op, checkpoint_id)` pair names a checkpoint
+  /// envelope this store actually holds — the stored generation at `checkpoint_op` exists and its
+  /// bytes hash to `checkpoint_id`. Vacuously true while no checkpoint is rooted (`checkpoint_op ==
+  /// 0`). `false` is the self-poisoned-pointer state: the two root fields were taken from two
+  /// different checkpoints' timelines, so recovery's placement + content-address verification against
+  /// this root cannot succeed from local disk and a replica with NO disk fault anywhere is forced to
+  /// peer-fetch its own checkpoint.
+  #[doc(hidden)]
+  pub fn root_names_stored_checkpoint_for_test(&self) -> bool {
+    let live = self.live_checkpoint_op();
+    if live == 0 {
+      return true;
+    }
+    self
+      .snapshots
+      .get(&live)
+      .is_some_and(|snap| checkpoint_id(snap) == self.state.checkpoint_id())
   }
 
   /// GC checkpoint snapshot generations no longer reachable: drop every entry STRICTLY OLDER than the

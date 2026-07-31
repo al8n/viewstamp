@@ -57,8 +57,16 @@ fn recover_resolves_self_by_member_id_and_returns_active() {
   // membership resolution now).
   let cfg = Config::try_new(1, MemberId::new(7)).unwrap();
 
-  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store");
+  let recovered = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store");
   let e = match recovered {
     Recovered::Active(e) => e,
     Recovered::Retired(_) => panic!("self IS in the membership → Active"),
@@ -83,8 +91,16 @@ fn recover_returns_retired_when_self_absent() {
   // Local member 99 is absent from the durable membership.
   let cfg = Config::try_new(1, MemberId::new(99)).unwrap();
 
-  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store");
+  let recovered = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store");
   let retired = match recovered {
     Recovered::Retired(r) => r,
     Recovered::Active(_) => panic!("self is ABSENT from the durable membership → Retired"),
@@ -134,8 +150,16 @@ fn recover_bridges_a_legacy_root_to_the_passed_genesis() {
   let mut sb = sb_with_state(legacy);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
 
-  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store");
+  let recovered = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store");
   let e = match recovered {
     Recovered::Active(e) => e,
     Recovered::Retired(_) => panic!("legacy root bridges to the passed genesis; self IS present"),
@@ -161,9 +185,17 @@ fn recover_prefers_the_root_membership_over_the_passed_param() {
 
   // Pass a DIFFERENT genesis (the standard `genesis(3)`, MemberId(i) at slot i → MemberId(1) at slot
   // 1). The durable root places MemberId(1) at slot 0, so the resolved slot proves which won.
-  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(
     e.replica(),
     ReplicaId::new(0),
@@ -182,9 +214,17 @@ fn recover_resolves_a_learner_self_to_active() {
   let mut sb = sb_with_state(state);
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap();
 
-  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert_eq!(e.replica(), ReplicaId::new(2), "learner self at slot 2");
   assert!(e.is_learner(), "slot 2 is a learner in 2v+1l");
 }
@@ -253,9 +293,17 @@ fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() 
   let mut sb = sb_with_state(succ_state);
   // The local member (MemberId 3) is the newly-added voter in the successor — present → Active.
   let cfg = Config::try_new(2, MemberId::new(3)).unwrap();
-  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
 
   // The recovered node is at E+1, and its lineage ADMITS both the current and the predecessor config_id,
   // while REJECTING an unrelated/forked id — exactly the cross-epoch catch-up admission a laggard needs.
@@ -339,9 +387,17 @@ fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Ep
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // local = MemberId 1 → slot 1 (a voter)
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -458,9 +514,17 @@ fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(0, MemberId::new(0)).unwrap(); // local = MemberId 0 → slot 0 (the only voter)
   let mut now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(1), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -511,9 +575,17 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap(); // local = the LEARNER at slot 2
   let mut now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   assert!(
     r.is_learner(),
     "the local node is a learner (slot 2 in 2v+1l)"
@@ -669,9 +741,17 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now2 = Instant::ZERO;
-  let mut r2 = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal2, &mut sb2)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r2 = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal2,
+    &mut sb2,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r2, &mut wal2, &mut sb2, &mut blocks2, now2);
   assert_eq!(
     r2.status(),
@@ -830,9 +910,17 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -918,9 +1006,17 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -1134,9 +1230,17 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // The single-pass read window is bounded by the ring capacity (`op_head.min(checkpoint_op + capacity)` ==
   // op_head here), so the whole sealed band up to K is materialized up front — the recovered head reads up
   // to the sealed committed frontier K, not `checkpoint_op + RECOVER_TAIL_WINDOW`.
@@ -1222,9 +1326,17 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts this store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
   // The single-pass read window is bounded by the ring capacity (== op_head here), so the full held tail up
   // to K is materialized regardless of the stale durable commit C0.
   assert_eq!(

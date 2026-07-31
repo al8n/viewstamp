@@ -190,6 +190,10 @@ fn report_digest(r: &VoprReport) -> u64 {
     // hash's schema without any behavioral change — the off-axis `reform_escalations_fired == 0` guard
     // lives in the committed sweep instead (an accidental off-axis engagement would re-form a wedge and
     // so perturb the applied/committed columns regardless).
+    // The restart-in-place witness (in_place_restarts) is likewise NOT folded: the axis is opt-in,
+    // so the counter is identically zero on the default schedule, and an accidental off-axis
+    // engagement would rebuild endpoints mid-run and perturb the applied/committed columns
+    // regardless.
   ] {
     fnv1a_u64(&mut h, v);
   }

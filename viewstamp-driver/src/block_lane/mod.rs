@@ -17,7 +17,7 @@
 //! inline lane executes on the submitting thread under one mutex, which is serial by the same
 //! argument. Neither placement can reorder, and the cursor fail-stops if one ever did.
 //!
-//! # The cursor's lifetime
+//! # The lane-lifetime state: the cursor, and the occupancy
 //!
 //! The cursor belongs to the LANE, and the lane OWNS the store — the store cannot be handed to a
 //! rebuilt endpoint without its lane, because there is no way to take it back out. That is what
@@ -28,11 +28,23 @@
 //! unchecked), so [`BlockLane`] is CLONE and the clone shares one lane: an embedder rebuilding a
 //! driver in place passes the SAME lane, and its cursor — with any job the dead endpoint still owed
 //! — carries across the rebuild.
+//!
+//! The admission half crosses the same way. The endpoint's lane quotas — one un-consumed checkpoint
+//! image capture, the outstanding-serve cap — bound this lane's DEPTH, so like the cursor they have
+//! the lane's lifetime, and an endpoint rebuilt over a surviving lane must be constructed with what
+//! it still holds ([`BlockLaneOccupancy`](viewstamp_proto::BlockLaneOccupancy), a required
+//! `Endpoint::recover` input). The lane accounts for that itself, from its own traffic — a job
+//! counts from [`submit`](BlockLane::submit) until its completion is handed back out of
+//! [`recv`](BlockLane::recv)/[`try_recv`](BlockLane::try_recv) — so
+//! [`occupancy`](BlockLane::occupancy) is correct however the previous driver ended, clean drain or
+//! abandoned deadline, and a rebuilt driver reads the truth off the lane it was handed rather than
+//! trusting its predecessor's teardown to have said goodbye.
 
 use std::sync::{Arc, Mutex};
 
 use viewstamp_proto::{
-  BlockJob, BlockJobCursor, BlockJobDone, BlockStore, StateMachine, execute_block_job,
+  BlockJob, BlockJobCursor, BlockJobDone, BlockJobTag, BlockLaneOccupancy, BlockStore, JobId,
+  StateMachine, execute_block_job,
 };
 
 /// The store, the execution-order cursor, and (for a spawned lane) the thread block jobs run on.
@@ -53,6 +65,63 @@ pub struct BlockLane<S: StateMachine> {
   /// always-ready select winner.
   done_tx: flume::Sender<BlockJobDone<S>>,
   done_rx: flume::Receiver<BlockJobDone<S>>,
+  /// The lane's own admission accounting, shared by every clone: what this lane holds between a
+  /// job's [`submit`](Self::submit) and its completion leaving [`recv`](Self::recv)/
+  /// [`try_recv`](Self::try_recv). Derived from the lane's traffic alone so it stays truthful
+  /// across an unclean predecessor teardown; see [`occupancy`](Self::occupancy).
+  holds: Arc<Mutex<Holds>>,
+}
+
+/// The quota-bounded jobs a lane currently holds — the source [`BlockLane::occupancy`] reports.
+#[derive(Default)]
+struct Holds {
+  /// The `Materialize` between submit and hand-out, if any. At most one can exist: the endpoint's
+  /// capture site admits one image capture per LANE (across its own rebuilds), and the hand-out
+  /// clearing this always precedes the endpoint consuming — and so releasing — that capture.
+  materializing: Option<JobId>,
+  /// `Serve` jobs between submit and hand-out.
+  serves: usize,
+}
+
+impl Holds {
+  /// Records a submitted job as held.
+  fn admit<S: StateMachine>(&mut self, job: &BlockJob<S>) {
+    match job.tag() {
+      BlockJobTag::Materialize => {
+        assert!(
+          self.materializing.is_none(),
+          "a second Materialize was submitted while the lane still holds one — the endpoint's \
+           capture site admits one image capture per lane, so this lane is being shared in a way \
+           its occupancy cannot describe",
+        );
+        self.materializing = Some(job.id());
+      }
+      BlockJobTag::Serve => self.serves += 1,
+      _ => {}
+    }
+  }
+
+  /// Records a completion leaving the lane: whatever slot its job held is free.
+  fn release<S: StateMachine>(&mut self, done: &BlockJobDone<S>) {
+    match done.tag() {
+      BlockJobTag::Materialize => {
+        debug_assert_eq!(
+          self.materializing,
+          Some(done.id()),
+          "a Materialize completion left the lane that its accounting never admitted",
+        );
+        self.materializing = None;
+      }
+      BlockJobTag::Serve => {
+        debug_assert!(
+          self.serves > 0,
+          "a Serve completion left the lane that its accounting never admitted",
+        );
+        self.serves = self.serves.saturating_sub(1);
+      }
+      _ => {}
+    }
+  }
 }
 
 /// Where a submitted job executes.
@@ -97,6 +166,7 @@ impl<S: StateMachine> Clone for BlockLane<S> {
       },
       done_tx: self.done_tx.clone(),
       done_rx: self.done_rx.clone(),
+      holds: Arc::clone(&self.holds),
     }
   }
 }
@@ -174,6 +244,7 @@ impl<S: StateMachine + Send + 'static> BlockLane<S> {
       sink: Sink::Spawned(jobs_tx),
       done_tx,
       done_rx,
+      holds: Arc::new(Mutex::new(Holds::default())),
     }
   }
 }
@@ -195,7 +266,27 @@ impl<S: StateMachine> BlockLane<S> {
       }))),
       done_tx,
       done_rx,
+      holds: Arc::new(Mutex::new(Holds::default())),
     }
+  }
+
+  /// What this lane currently holds — every job between its [`submit`](Self::submit) and its
+  /// completion leaving [`recv`](Self::recv)/[`try_recv`](Self::try_recv) — in the exact form
+  /// `Endpoint::recover` requires when an endpoint is rebuilt over this lane.
+  ///
+  /// Derived from the lane's own traffic, never from the endpoint above it, so it is truthful
+  /// however the previous driver ended: a job abandoned mid-execution at a drain deadline is still
+  /// held (its completion will surface here later and be refused by the successor, which is what
+  /// releases the quota), while a completion the dead driver consumed but never delivered is NOT —
+  /// nothing will ever deliver it, so nothing may wait on it. Read it when constructing a driver
+  /// over a lane that may have served a predecessor; a fresh lane reports
+  /// [`BlockLaneOccupancy::empty`].
+  pub fn occupancy(&self) -> BlockLaneOccupancy {
+    let holds = self
+      .holds
+      .lock()
+      .expect("the block-storage lane's accounting mutex is poisoned");
+    BlockLaneOccupancy::new(holds.materializing, holds.serves)
   }
 
   /// Hands one job to the lane, to execute after every job already submitted.
@@ -215,6 +306,13 @@ impl<S: StateMachine> BlockLane<S> {
   /// bounded shutdown drain (see [`ShutdownReport`](crate::ShutdownReport)) can never see it
   /// resolve, and teardown reports unquiesced once its deadline elapses rather than hanging.
   pub fn submit(&self, job: BlockJob<S>) {
+    // Held from BEFORE the job can execute: a Spawned worker could otherwise finish the job and a
+    // concurrent `occupancy` read miss it in both places (not yet admitted, already executed).
+    self
+      .holds
+      .lock()
+      .expect("the block-storage lane's accounting mutex is poisoned")
+      .admit(&job);
     match &self.sink {
       Sink::Spawned(jobs) => {
         assert!(
@@ -236,12 +334,23 @@ impl<S: StateMachine> BlockLane<S> {
     }
   }
 
+  /// Records `done` as leaving the lane: its job no longer occupies it.
+  fn release(&self, done: &BlockJobDone<S>) {
+    self
+      .holds
+      .lock()
+      .expect("the block-storage lane's accounting mutex is poisoned")
+      .release(done);
+  }
+
   /// Takes one completion the lane has finished, or `None` when it has none ready.
   ///
   /// Completions come back in submission order; feed them to the endpoint in the order this
   /// returns them.
   pub fn try_recv(&self) -> Option<BlockJobDone<S>> {
-    self.done_rx.try_recv().ok()
+    let done = self.done_rx.try_recv().ok()?;
+    self.release(&done);
+    Some(done)
   }
 
   /// Resolves when the lane finishes its next job, yielding that completion — the run loop's wake
@@ -252,7 +361,10 @@ impl<S: StateMachine> BlockLane<S> {
   /// to a disconnect (the lane retains a sender), so a select arm may park on it indefinitely.
   pub async fn recv(&self) -> BlockJobDone<S> {
     match self.done_rx.recv_async().await {
-      Ok(done) => done,
+      Ok(done) => {
+        self.release(&done);
+        done
+      }
       // Unreachable while `self` is alive, since `self.done_tx` is a live sender. Parking rather
       // than returning keeps a hypothetical disconnect from making this a permanently-ready select
       // arm that spins the run loop.

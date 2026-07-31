@@ -1738,6 +1738,314 @@ fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
   );
 }
 
+/// A view-0 `Commit` carrying `commit` — the heartbeat that re-drives a backup's committed
+/// frontier (and, with it, the checkpoint cadence) after a restart.
+fn commit_msg(commit: u64) -> Message {
+  Message::Commit(Commit::new(
+    View::new(),
+    OpNumber::with(commit),
+    OpNumber::new(),
+    crate::Epoch::new(0),
+    0,
+  ))
+}
+
+#[test]
+fn a_restart_in_place_inherits_the_lanes_outstanding_materialize() {
+  // THE ACCUMULATION BOUND, ACROSS ENDPOINT REBUILDS. The test above pins the bound across view
+  // churn WITHIN one endpoint; this pins it across the other reset the guard must survive — a
+  // restart in place, where the storage lane (queue, delivery) outlives the endpoint and `recover`
+  // builds a successor over it. The image occupies the LANE, so the successor is constructed with
+  // the lane's occupancy: its capture site starts CLOSED over the still-queued image, opens only
+  // when the lane delivers that image's completion (refused at the incarnation choke — a dead
+  // incarnation's job can complete no other way), and only then captures fresh.
+  //
+  // NEUTER CHECK: reset `materializing` to `None` in `recover` instead of inheriting `lane` and the
+  // re-driven boundary below queues a SECOND full image behind the first.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(); // a backup of view 0
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+
+  // The predecessor crosses the checkpoint boundary and captures — but the lane never executes the
+  // job, so the image stays queued when the endpoint is replaced.
+  let mut dead = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover the formatted store")
+  .expect_active();
+  assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
+  for op in 1..=2 {
+    dead.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+  }
+  for _ in 0..4 {
+    dead.handle_storage(now, &mut wal, &mut sb);
+  }
+  dead.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  let held = dead
+    .poll_block_job()
+    .expect("the crossed boundary owes an image capture");
+  assert!(held.tag().is_materialize());
+  let lane = dead.lane_occupancy();
+  assert_eq!(
+    lane,
+    crate::BlockLaneOccupancy::new(Some(held.id()), 0),
+    "the outgoing endpoint reports the un-drained capture as the lane's occupancy"
+  );
+  drop(dead);
+
+  // The successor recovers over the same storage AND the same lane. It re-learns the committed
+  // frontier and finds the cadence due again — every condition for a capture except the one that
+  // matters: the lane already holds an image.
+  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut wal, &mut sb, lane)
+    .expect("recover in place over the live storage")
+    .expect_active();
+  for _ in 0..4 {
+    live.handle_storage(now, &mut wal, &mut sb);
+  }
+  live.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  assert_eq!(
+    live.status(),
+    Status::Normal,
+    "ANTI-VACUITY: back in Normal"
+  );
+  assert_eq!(
+    live.commit(),
+    OpNumber::with(2),
+    "ANTI-VACUITY: the committed frontier was re-learned past the boundary"
+  );
+  assert_eq!(
+    live.checkpoint_op(),
+    OpNumber::with(0),
+    "ANTI-VACUITY: nothing published, so a capture is genuinely due"
+  );
+  assert!(
+    live.poll_block_job().is_none(),
+    "the successor captured a second image behind the lane's un-drained one"
+  );
+
+  // The lane finally executes the predecessor's job. Its completion names a dead incarnation —
+  // refused, publishing nothing — and that refusal is what re-opens the capture site.
+  let mut cursor = crate::BlockJobCursor::new();
+  let done = crate::execute_block_job(&mut cursor, held, &mut blocks);
+  live.on_block_done(now, &mut wal, &mut sb, done);
+  assert_eq!(
+    live.foreign_completions_rejected(),
+    1,
+    "the dead incarnation's materialize was refused at the choke"
+  );
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(0),
+    "the refused completion advanced no durable pointer"
+  );
+
+  // Re-drive the still-due cadence (the next heartbeat): the freed capture site takes the boundary
+  // it refused above, and this capture publishes.
+  live.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  let fresh = live
+    .poll_block_job()
+    .expect("the released capture site takes the still-due boundary");
+  assert!(fresh.tag().is_materialize());
+  let done = crate::execute_block_job(&mut cursor, fresh, &mut blocks);
+  live.on_block_done(now, &mut wal, &mut sb, done);
+  live.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(2),
+    "the successor's own capture published once the inherited one released"
+  );
+}
+
+#[test]
+fn a_restart_in_place_inherits_the_lanes_outstanding_serves() {
+  // The serve cap is the OTHER lane-depth quota, carried by the same occupancy: `Serve` jobs a dead
+  // endpoint left on the lane still occupy it, so the successor's cap must count them — and each
+  // one frees its slot when the lane delivers its completion, refused at the incarnation choke.
+  //
+  // NEUTER CHECK: reset `block_serves_outstanding` to 0 in `recover` instead of inheriting `lane`
+  // and the admission loop below accepts a full fresh cap (the refusal assertions fail).
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+
+  let mut dead = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover the formatted store")
+  .expect_active();
+  let requester = Peer::Replica(ReplicaId::new(0));
+  let addr = crate::block_address(b"a block some laggard wants");
+  dead.on_request_block(requester, addr);
+  dead.on_request_block(requester, addr);
+  let first = dead.poll_block_job().expect("the first serve is queued");
+  let second = dead.poll_block_job().expect("the second serve is queued");
+  assert!(first.tag().is_serve() && second.tag().is_serve());
+  let lane = dead.lane_occupancy();
+  assert_eq!(
+    lane,
+    crate::BlockLaneOccupancy::new(None, 2),
+    "the outgoing endpoint reports both un-drained serves"
+  );
+  drop(dead);
+
+  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut wal, &mut sb, lane)
+    .expect("recover in place over the live storage")
+    .expect_active();
+  while live.poll_message().is_some() {} // discard the recover chatter; watch for serve replies
+  // The successor's cap starts two slots down: it admits exactly `MAX - 2` before refusing.
+  for _ in 0..MAX_OUTSTANDING_BLOCK_SERVES - 2 {
+    live.on_request_block(requester, addr);
+  }
+  assert_eq!(
+    live.block_serves_refused(),
+    0,
+    "ANTI-VACUITY: every admission below the inherited-adjusted cap was accepted"
+  );
+  live.on_request_block(requester, addr);
+  assert_eq!(
+    live.block_serves_refused(),
+    1,
+    "the cap counts the dead endpoint's serves still on the lane"
+  );
+
+  // The lane delivers one dead serve: refused at the choke — no reply is emitted for it — and its
+  // cap slot frees, so the next request is admitted again.
+  let mut cursor = crate::BlockJobCursor::new();
+  let done = crate::execute_block_job(&mut cursor, first, &mut blocks);
+  live.on_block_done(now, &mut wal, &mut sb, done);
+  assert_eq!(
+    live.foreign_completions_rejected(),
+    1,
+    "the dead incarnation's serve was refused at the choke"
+  );
+  assert!(
+    live.poll_message().is_none(),
+    "a refused serve answers no requester"
+  );
+  live.on_request_block(requester, addr);
+  assert_eq!(
+    live.block_serves_refused(),
+    1,
+    "the freed slot admits the next request — the inherited count releases as the lane drains"
+  );
+  drop(second);
+}
+
+/// A capture that was QUEUED on the endpoint but never POLLED must not wedge the successor's
+/// capture site forever.
+///
+/// The two tests above cover the rebuild landing AFTER the driver polled the job: the job is on the
+/// lane, the lane will execute it, and its (refused) completion is what re-opens the capture site.
+/// This test lands the rebuild in the window BEFORE the poll: the image capture sits in the
+/// endpoint-local job queue, `lane_occupancy` already claims it (`materializing` is set at issue
+/// time, when the job is queued — not at poll time), and the endpoint is replaced. The un-polled job
+/// is dropped with the dead endpoint — no lane ever received it — while the claimed occupancy is
+/// inherited by the successor. Nothing can ever deliver a completion for a job that no longer
+/// exists, so the inherited claim has no release: the capture site must still open, or this replica
+/// never checkpoints again — the prune floor freezes, the WAL ring fills, and the replica wedges.
+///
+/// The drive below is behaviour-only: it re-learns the committed frontier, executes every job the
+/// successor's lane yields, and re-drives the still-due cadence across several heartbeats. However
+/// the rebuild carries the lane's state, a checkpoint must eventually publish.
+#[test]
+#[ignore = "pins an open defect: an image capture still in the endpoint-local queue at a rebuild is \
+            dropped while its lane occupancy is inherited, so no completion can ever release the \
+            successor's capture site and the replica never checkpoints again; un-ignore when the \
+            queued job survives the rebuild (or the occupancy stops claiming it)"]
+fn a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site() {
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(); // a backup of view 0
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+
+  // The predecessor crosses the checkpoint boundary and queues the image capture — and is replaced
+  // BEFORE the driver polls it off the endpoint.
+  let mut dead = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    EchoSm,
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover the formatted store")
+  .expect_active();
+  for op in 1..=2 {
+    dead.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+  }
+  for _ in 0..4 {
+    dead.handle_storage(now, &mut wal, &mut sb);
+  }
+  dead.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  let lane = dead.lane_occupancy();
+  assert_ne!(
+    lane,
+    crate::BlockLaneOccupancy::empty(),
+    "ANTI-VACUITY: the occupancy claims the image while the job is still QUEUED, un-polled"
+  );
+  // The un-polled job dies with the endpoint: no lane holds it, so nothing will ever complete it.
+  drop(dead);
+
+  // The successor recovers over the same storage with the occupancy the outgoing endpoint reported.
+  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut wal, &mut sb, lane)
+    .expect("recover in place over the live storage")
+    .expect_active();
+  let mut cursor = crate::BlockJobCursor::new();
+  for _ in 0..4 {
+    for _ in 0..4 {
+      live.handle_storage(now, &mut wal, &mut sb);
+    }
+    // The heartbeat re-drives the committed frontier and, with it, the still-due capture cadence.
+    live.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+    // Execute EVERYTHING the successor's lane yields, to completion — if the queued job survived
+    // the rebuild, this runs it (its completion refused or published, either releases the site);
+    // if the site re-opens, this runs the fresh capture.
+    while let Some(job) = live.poll_block_job() {
+      let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
+      live.on_block_done(now, &mut wal, &mut sb, done);
+    }
+    live.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    live.status(),
+    Status::Normal,
+    "ANTI-VACUITY: back in Normal"
+  );
+  assert_eq!(
+    live.commit(),
+    OpNumber::with(2),
+    "ANTI-VACUITY: the committed frontier was re-learned past the boundary"
+  );
+
+  // THE INVARIANT: the boundary is crossed and the cadence has been re-driven repeatedly with the
+  // lane fully drained each round — a checkpoint must have published. A capture site that never
+  // opens again is the permanent wedge: no checkpoint, no prune, a frozen floor.
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(2),
+    "no checkpoint ever published after the rebuild: the inherited occupancy claims an image no \
+     lane holds, and with no completion to refuse, nothing ever re-opens the capture site"
+  );
+}
+
 /// Drive a backup to a DURABLE checkpoint, then hand back two freshly issued block jobs (two GC
 /// sweeps over the live roots) plus the parts. Two OUTSTANDING jobs is the precondition every
 /// issue-order falsifier needs, and it is asserted at every use.
