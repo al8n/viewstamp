@@ -1112,6 +1112,7 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1172,6 +1173,7 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();

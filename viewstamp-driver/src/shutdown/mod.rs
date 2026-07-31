@@ -67,16 +67,21 @@ impl ShutdownReport {
   /// [`BlockLane::submit`](crate::BlockLane::submit)'s panic docs). The endpoint owes it forever, so
   /// the drain always runs out the clock in that case and this reports `false`.
   ///
-  /// `false` is a legitimate, SAFE outcome — not a failure the driver papers over, and not
-  /// something to retry. On expiry the driver drops storage mid-write, which is exactly what a
+  /// `false` is a legitimate outcome for a TEARDOWN — not a failure the driver papers over, and
+  /// not something to retry. On expiry the driver drops storage mid-write, which is exactly what a
   /// crash does, and a crash is an event this system is built to survive: a WAL slot either holds a
   /// completed append or it does not, and the next boot re-derives the durable extent from the
-  /// durable headers either way. The abandoned completion cannot do damage after the fact either —
-  /// a storage correlation id is scoped to the endpoint incarnation that minted it, so a completion
+  /// durable headers either way. A late completion is also inert on the correlation plane — a
+  /// storage correlation id is scoped to the endpoint incarnation that minted it, so a completion
   /// landing once this endpoint is gone can never equal an id a rebuilt endpoint mints, and is
   /// refused at a single choke point before any correlation table is consulted. That is what makes
-  /// a BOUNDED wait acceptable here instead of a wedge risk: an unbounded one would trade a
-  /// survivable outcome for an unbounded hang.
+  /// a BOUNDED wait acceptable for a teardown instead of a wedge risk: an unbounded one would
+  /// trade a survivable outcome for an unbounded hang. What `false` does NOT license is rebuilding
+  /// an endpoint over the SAME still-live handles: the un-quiesced writes it reports are physical
+  /// facts the refusal cannot cancel, and a successor built over them lacks the slot-quiescence
+  /// witnesses to defer its conflicting re-appends. After an expired drain the safe successors are
+  /// process exit or releasing the handles with the process — crash semantics, which the next boot
+  /// recovers.
   ///
   /// What `false` does tell an embedder is that this stop was not orderly — some durability work
   /// the endpoint had submitted has an unknown outcome, so the next boot may have a tail to

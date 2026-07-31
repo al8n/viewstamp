@@ -353,7 +353,16 @@ where
     let listener = TcpListener::bind(bind_addr)
       .await
       .map_err(DriverError::Bind)?;
-    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
+    let endpoint = build_endpoint(
+      config,
+      membership,
+      state_machine,
+      &mut wal,
+      &mut sb,
+      // The lane's own accounting: what it still holds for a dead predecessor endpoint, if an
+      // embedder handed this driver a surviving lane clone; empty on a fresh lane.
+      blocks.occupancy(),
+    )?;
     let coord = StreamCoordinator::new(endpoint);
     // Seed the peer_book from the initial (slot -> addr) peers using the coordinator's membership
     // to resolve each slot to its stable MemberId.

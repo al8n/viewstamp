@@ -449,8 +449,9 @@ impl<S: StateMachine> Endpoint<S, RestartOnly> {
     sm: S,
     wal: &mut W,
     sb: &mut B,
+    lane: crate::BlockLaneOccupancy,
   ) -> Result<Recovered<S, RestartOnly>, RecoverError> {
-    Self::recover_with_reconfig(config, membership, seed, sm, wal, sb)
+    Self::recover_with_reconfig(config, membership, seed, sm, wal, sb, lane)
   }
 }
 
@@ -532,6 +533,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// same replica. (The deterministic simulation does this with its seeded PRNG, drawing a distinct
   /// value per replica incarnation.)
   ///
+  /// **`lane` must describe the block-storage lane this endpoint is recovered OVER.** The block-job
+  /// admission quotas — one un-consumed checkpoint image capture, the outstanding-serve cap — bound
+  /// the LANE's depth, and the lane can outlive the endpoint being replaced (a restart in place
+  /// leaves its queue and its completion delivery running). Quotas reborn empty over a lane that
+  /// never drained would admit one more full image (and a fresh cap of serves) per incarnation, an
+  /// unbounded accumulation the incarnation choke does not bound: it stops stale jobs from
+  /// PUBLISHING, not from weighing. So every recover states the lane's occupancy: what the endpoint
+  /// being replaced still had outstanding
+  /// ([`Endpoint::lane_occupancy`](crate::Endpoint::lane_occupancy), or the lane's own accounting)
+  /// when the lane survives, or [`BlockLaneOccupancy::empty`](crate::BlockLaneOccupancy::empty)
+  /// when none does — a cold start, or a crash that discarded the queue with the process. The
+  /// inherited quotas release as the surviving lane delivers the dead jobs' completions, each one
+  /// refused at the incarnation choke; an occupancy that does not match what the lane will deliver
+  /// therefore either wedges the capture site (claimed but never delivered) or re-opens the
+  /// accumulation (delivered but never claimed).
+  ///
   /// **Fail-fast parameter validation (the WAL-geometry fence).** Before any storage I/O, the live
   /// parameters are validated against the store. [`Wal::capacity`] below
   /// [`Config::minimum_wal_capacity`](crate::Config) is refused (the primary would wedge). A
@@ -562,6 +579,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sm: S,
     wal: &mut W,
     sb: &mut B,
+    lane: crate::BlockLaneOccupancy,
   ) -> Result<Recovered<S, R>, RecoverError> {
     let state = sb.state();
     // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
@@ -806,22 +824,35 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       block_jobs: VecDeque::new(),
       block_jobs_outstanding: VecDeque::new(),
       block_jobs_superseded: 0,
-      block_serves_outstanding: 0,
+      // INHERITED from the lane this endpoint is recovered over, not reset: the serve cap bounds
+      // the LANE's depth, and a surviving lane still holds the dead endpoint's serves. Each one
+      // frees its slot when the lane delivers its completion (refused at the incarnation choke).
+      block_serves_outstanding: lane.serves,
       block_serves_refused: 0,
       pending: BTreeMap::new(),
+      // KNOWN UNSOUND over a live medium, and the reason a rebuild over live handles requires a
+      // completed drain first: this endpoint-lifetime rebirth discards the slot-quiescence
+      // witnesses for any writes a predecessor still has with the device. Their completions are
+      // refused as foreign — which cancels nothing — so the successor cannot defer conflicting
+      // re-appends to slots it does not know are fenced, and an abandoned old write can land OVER
+      // a slot the successor re-appended and acked. A crash needs no witnesses (in-flight ops die
+      // with the process, up to the device-latency window); a rebuild over live handles is safe
+      // only when the medium was drained to quiescence before this constructor ran.
       wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
-      // A fresh incarnation has NO in-flight writes of its OWN: a crash discards the predecessor's
-      // with the process, and where the storage layer outlives the endpoint (a restart in place) the
-      // predecessor's completions name its incarnation and are refused rather than entered here. So
-      // no op is wrongly judged "released" before the first `run_gc` re-raises this from 0.
+      // No op is wrongly judged "released" before the first `run_gc` re-raises this from 0: a
+      // released-op judgment applies only to this incarnation's own writes.
       wal_pruned: 0,
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
-      // A fresh endpoint owes the lane nothing: the predecessor's jobs (if the storage outlived it)
-      // name its incarnation and are refused, never completed into this one.
-      materializing: None,
+      // INHERITED, not reset. A surviving lane may still hold the dead endpoint's `Materialize` —
+      // a full image the choke's refusal cannot retract — and this guard is what keeps the capture
+      // site closed until the lane hands that image back. Starting `None` over such a lane would
+      // let every incarnation capture one more image behind its predecessors': an unbounded queue
+      // built one rebuild at a time. The inherited job's completion can only arrive FOREIGN, so its
+      // refusal at the incarnation choke doubles as this guard's release.
+      materializing: lane.materializing,
       checkpoint_op: OpNumber::with(checkpoint_op),
       // Set when the durable checkpoint envelope is read back + restored (`on_recover_sb_done`),
       // which decodes the `sm_root`; `None` until then (block GC skips a cycle without a live root).

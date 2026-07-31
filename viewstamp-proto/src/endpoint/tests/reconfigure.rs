@@ -700,6 +700,7 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
     CountSm::default(),
     &mut rwal,
     &mut rsb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
   let r = match recovered {
@@ -1525,10 +1526,17 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  let mut e =
-    Endpoint::<CountSm>::recover(cfg, genesis_mem, 9, CountSm::default(), &mut wal, &mut sb)
-      .expect("recover accepts this store")
-      .expect_active();
+  let mut e = Endpoint::<CountSm>::recover(
+    cfg,
+    genesis_mem,
+    9,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts this store")
+  .expect_active();
 
   // The recovered node is in the debt window: at the successor epoch, gate owed.
   assert_eq!(
@@ -6106,6 +6114,7 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
   let mut e = match recovered {
@@ -6937,6 +6946,7 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
   let mut e = match recovered {
@@ -7532,9 +7542,17 @@ fn a_demoted_node_cold_recovers_as_a_learner() {
   drop(e); // the crash: only the durable storage survives
 
   let cfg = Config::try_new(2, MemberId::new(2)).expect("the demotee's stable identity");
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
-    .expect("recover accepts the demoted store")
-    .expect_active();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    crate::BlockLaneOccupancy::empty(),
+  )
+  .expect("recover accepts the demoted store")
+  .expect_active();
   let now = Instant::ZERO;
   for _ in 0..32 {
     r.storage_step(now, &mut wal, &mut sb, &mut blocks);

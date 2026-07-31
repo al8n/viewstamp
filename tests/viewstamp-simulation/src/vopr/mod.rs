@@ -88,6 +88,10 @@ pub struct VoprReport {
   crashes: u64,
   /// How many restart actions fired.
   restarts: u64,
+  /// How many restart-in-place actions fired (an endpoint rebuilt over its live, still-running
+  /// storage layer — staged writes and queued completions retained). `0` off-axis; NOT folded into
+  /// the report digest (axis-gated, identically zero on the default schedule).
+  in_place_restarts: u64,
   /// How many partition (isolate-a-replica) actions fired.
   partitions: u64,
   /// How many heal actions fired (outside calm windows).
@@ -420,6 +424,12 @@ impl VoprReport {
   /// How many restart actions fired.
   pub const fn restarts(&self) -> u64 {
     self.restarts
+  }
+
+  /// How many restart-in-place actions fired (an endpoint rebuilt over its live storage layer, with
+  /// everything the backend still owed the predecessor retained). `0` off-axis.
+  pub const fn in_place_restarts(&self) -> u64 {
+    self.in_place_restarts
   }
 
   /// How many partition (isolate-a-replica) actions fired.
@@ -865,6 +875,15 @@ struct Vopr {
   /// deterministic baseline. No `VOPR_NO_*` shrink mask exists for it: masking would be identical to
   /// simply not enabling the axis (nothing else in the schedule depends on the chaos draws).
   write_chaos_axis: bool,
+  /// Whether the RESTART-IN-PLACE axis is enabled for this run: the `VOPR_RESTART_IN_PLACE` env var,
+  /// or force-enabled via [`run_vopr_with_restart_in_place`] (which forces the write-chaos axis on
+  /// with it — see its docs for why the two only bite together). Same discipline as
+  /// [`Self::hold_axis`]: with the axis OFF its per-tick chance draw is skipped entirely (no PRNG
+  /// value consumed — the default per-seed schedule stays byte-identical); an enabled run is its OWN
+  /// deterministic baseline. The action rebuilds a LIVE replica's endpoint over its running storage
+  /// layer ([`Cluster::restart_in_place`]): staged writes stay staged and queued completions stay
+  /// queued, so the successor endpoint inherits everything the backend still owes its predecessor.
+  restart_in_place_axis: bool,
   /// How many wipe ACTIONS this run has taken (counted against [`WIPE_BUDGET`]). Advances whether or
   /// not the `VOPR_NO_WIPE` mask downgraded the effect, so a masked shrink run keeps the exact same
   /// action schedule + PRNG stream as the unmasked run it is diagnosing.
@@ -1175,6 +1194,25 @@ pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
 /// committed write-chaos sweep.
 pub fn run_vopr_with_write_chaos(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.write_chaos_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the RESTART-IN-PLACE axis AND the WAL WRITE-CHAOS axis both
+/// FORCE-ENABLED (the same programmatic-override pattern as [`run_vopr_with_hold`]). The two axes
+/// are enabled together because restart-in-place is nearly inert under the ordered FIFO WAL — a
+/// serial writer completes a predecessor's staged appends before any successor write to the same
+/// slot can land, so the rebuild inherits nothing that can reorder. Under write chaos the dead
+/// incarnation's staged appends are un-cancellable device writes that release in a seeded
+/// out-of-submission order UNDERNEATH the successor endpoint: the schedule in which the endpoint's
+/// slot-quiescence fence must hold across a rebuild, not merely within one incarnation. The
+/// stale-landing oracle judges every landing (an older incarnation's bytes over a newer
+/// incarnation's landed slot), alongside every existing oracle; a panic here is a REAL finding in
+/// the rebuild's fence continuity, reported with its seed, never masked. A run is a pure function of
+/// `(seed, ticks)` and its own deterministic baseline.
+pub fn run_vopr_with_restart_in_place(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.restart_in_place_axis = true;
   v.write_chaos_axis = true;
   run_seeded(v, ticks)
 }
@@ -1731,6 +1769,7 @@ impl Vopr {
       wipe_axis: env_flag("VOPR_WIPE"),
       torn_header_axis: env_flag("VOPR_TORN_HEADER"),
       write_chaos_axis: env_flag("VOPR_WRITE_CHAOS"),
+      restart_in_place_axis: env_flag("VOPR_RESTART_IN_PLACE"),
       wipe_actions: 0,
       churn_axis: env_flag("VOPR_CHURN"),
       churn_actions: 0,
@@ -2410,6 +2449,23 @@ impl Vopr {
       self.restart_and_track(c, i);
     }
 
+    // (c'') RESTART-IN-PLACE a live replica: its endpoint is replaced over the running storage
+    // layer — staged WAL/superblock writes stay staged, queued completions stay queued, the block
+    // lane keeps its jobs — so the successor inherits everything the backend still owes the
+    // predecessor. The replica is never crashed (it keeps being ticked across the swap), so no
+    // minority budget is charged; the draw is consumed only with the axis on, keeping the default
+    // schedule byte-identical.
+    if self.restart_in_place_axis
+      && self.prng.chance(1, 64)
+      && let Some(i) = self.pick_live_for_in_place(c)
+    {
+      if trace {
+        eprintln!("tick {tick}: RESTART-IN-PLACE replica {i}");
+      }
+      c.restart_in_place(i);
+      self.report.in_place_restarts += 1;
+    }
+
     // (c') WIPE-and-restart a crashed replica (the amnesia axis): it comes back with FRESH, EMPTY
     // durable storage — a replaced disk — so every promise its pre-wipe durable state made (view
     // participation, durable quorum copies) is forfeit. Only with the axis enabled (a wipe-enabled
@@ -3075,6 +3131,16 @@ impl Vopr {
     }
   }
 
+  /// Pick a LIVE replica for an in-place endpoint rebuild, if any: not crashed (its storage layer
+  /// must be running underneath the swap — `restart_in_place` models a supervised rebuild, not a
+  /// power loss) and not retired (a parked node must never be rebuilt).
+  fn pick_live_for_in_place(&mut self, c: &Cluster) -> Option<usize> {
+    let candidates: Vec<usize> = (0..self.node_count)
+      .filter(|&i| !c.is_crashed(i) && !c.is_retired(i))
+      .collect();
+    self.pick(&candidates)
+  }
+
   /// Pick a currently-crashed replica to restart, if any. Excludes a RETIRED node (a reconfiguration
   /// removed it; it is parked crashed-forever and must never be restarted — a restart would recover it
   /// `Retired` and panic).
@@ -3132,6 +3198,14 @@ impl Vopr {
 
     // Append-before-ack, observed during the tick we just ran (PrepareOk for a non-durable op).
     if let Some(why) = c.take_append_before_ack_violation() {
+      panic!("vopr seed {} tick {tick}: {why}", self.seed);
+    }
+    // Stale landing: a WAL write minted by an OLDER endpoint incarnation landed over durable slot
+    // content a NEWER incarnation had already landed — an abandoned write physically evicting a
+    // successor's slot (the content a counted vote may have named is gone from the medium). Only
+    // reachable when an endpoint is rebuilt over live storage with un-cancellable writes in flight
+    // (the restart-in-place × write-chaos crossing); identically silent on every other schedule.
+    if let Some(why) = c.take_stale_landing_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
     }
     // Frame cap: NO legitimate inter-replica message may exceed the transport frame cap. The

@@ -171,9 +171,10 @@
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
   run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
-  run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live, run_vopr_with_slow,
-  run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
-  run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
+  run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live,
+  run_vopr_with_restart_in_place, run_vopr_with_slow, run_vopr_with_stale_read,
+  run_vopr_with_torn_headers, run_vopr_with_wipe, run_vopr_with_wipe_learners,
+  run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -1820,5 +1821,66 @@ fn replay_single_seed() {
     r.bounded_seed_wrapped(),
     r.large_bodies_sent(),
     r.oversized_dropped(),
+  );
+}
+
+/// The contiguous seed range for the restart-in-place sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const RESTART_IN_PLACE_SEEDS: u64 = 16;
+
+/// Restart-in-place regression seeds: every seed of `0..192` on which the crossed axis fails
+/// today, pinned with the axis FORCED ON. Two failure shapes, both deterministic per seed:
+///
+/// - **33, 59, 64, 78, 134, 179, 186** — an applied-history safety violation shortly after an
+///   in-place rebuild under chaos landings: a replica's state machine applies an op number BELOW
+///   the position it sits at (e.g. seed 33: `applied op 1580 at position 1583`), the
+///   applied-stream shape of a committed op being re-served with the wrong sequencing.
+/// - **162** — a calm-window LIVELOCK: with every replica up, the network healed, and client work
+///   outstanding, the committed high-water stops advancing.
+const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 8] = [33, 59, 64, 78, 134, 162, 179, 186];
+
+/// The committed RESTART-IN-PLACE sweep: [`run_vopr_with_restart_in_place`] over
+/// `0..RESTART_IN_PLACE_SEEDS` plus the pinned regression seeds — the in-place endpoint rebuild
+/// crossed with the write-chaos WAL, both FORCE-ENABLED programmatically. A rebuilt endpoint
+/// inherits everything its predecessor's storage layer still owes — staged un-cancellable appends,
+/// queued completions, the block lane's jobs — and the chaos device lands those writes in a seeded
+/// out-of-submission order underneath the successor. The stale-landing oracle (no older
+/// incarnation's write may land over a newer incarnation's landed slot) and every standing oracle
+/// judge the outcome.
+///
+/// The DEFAULT sweep deliberately leaves both axes OFF (extra draws would shift every pinned
+/// regression seed), so this lane runs them on its own seeds, the same pattern as the other axis
+/// sweeps.
+#[test]
+#[ignore = "pins an open defect: rebuilding an endpoint over live storage discards the \
+            slot-quiescence fence and the lane state the medium still owes, and the pinned seeds \
+            fail on the consequences (stale landings, applied-history violations, a calm-window \
+            livelock); un-ignore when an in-place rebuild carries them"]
+fn vopr_restart_in_place_sweep_no_violations() {
+  let mut total_in_place = 0u64;
+  let mut total_committed = 0usize;
+  println!(
+    "VOPR restart-in-place sweep: 0..{RESTART_IN_PLACE_SEEDS} contiguous + \
+     {RESTART_IN_PLACE_REGRESSION_SEEDS:?} pinned, {DEFAULT_TICKS} ticks each, restart-in-place + \
+     write-chaos axes forced on"
+  );
+  for seed in (0..RESTART_IN_PLACE_SEEDS).chain(RESTART_IN_PLACE_REGRESSION_SEEDS) {
+    let r = run_vopr_with_restart_in_place(seed, DEFAULT_TICKS);
+    total_in_place += r.in_place_restarts();
+    total_committed += r.max_committed();
+  }
+  // Non-vacuity: endpoints really were rebuilt over live storage, and the runs did real work.
+  assert!(
+    total_in_place > 0,
+    "the axis never rebuilt an endpoint in place across the sweep (in_place_restarts=0) — the lane \
+     is vacuous"
+  );
+  assert!(
+    total_committed > 0,
+    "the restart-in-place sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  println!(
+    "VOPR restart-in-place sweep OK: in_place_restarts={total_in_place} \
+     committed={total_committed}"
   );
 }

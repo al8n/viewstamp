@@ -1062,6 +1062,7 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1153,6 +1154,7 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
     NoopSm,
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
@@ -1206,6 +1208,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
