@@ -87,6 +87,11 @@ impl OfflineReconfig {
 /// field, no branch, no allocation). It simply makes [`Endpoint::propose_membership`] reachable so the
 /// cluster can drive a LIVE single-member reconfiguration; a cluster that never proposes one runs
 /// exactly as a `RestartOnly` cluster would.
+/// How many un-closed incrementality probes a replica may carry between storage steps. A transfer
+/// runs ONE stop-and-wait pull at a time, so a handful covers every legitimate in-flight response;
+/// the cap only bounds a pathological stream of rejected/duplicate blocks the walk never writes.
+const BLOCKS_FETCH_PROBE_CAP: usize = 16;
+
 pub struct Cluster {
   replicas: Vec<Endpoint<SimSm, SingleChange>>,
   /// Per-replica write-ahead logs (persist across crashes; see `crash`).
@@ -326,6 +331,12 @@ pub struct Cluster {
   /// observational (reads store membership; no PRNG draw, no message, no schedule change), so every
   /// off-axis schedule stays byte-identical.
   blocks_fetched: Vec<u64>,
+  /// Per-replica addresses a delivered `BlockResponse` carried that the receiver did NOT already hold
+  /// — the OPEN half of the incrementality witness. The proto writes a fetched block inside its
+  /// frontier-walk JOB, not in the delivery, so presence is sampled again after the storage lane runs
+  /// (see [`Self::drain_storage`]) rather than immediately. Pure observation: no PRNG draw, no
+  /// message, no schedule effect.
+  blocks_fetch_probe: Vec<std::vec::Vec<viewstamp_proto::BlockAddress>>,
   /// How many of the next outbound `BlockResponse` payloads to CORRUPT before shipping (flip one byte,
   /// so `block_address(bytes) != addr`), decremented once per corruption. `0` (default) ⇒ no served
   /// block is ever altered and the corruption branch is never entered, so the default schedule is
@@ -478,6 +489,7 @@ impl Cluster {
       recovered_band_high_water: 0,
       reform_escalations_fired: 0,
       blocks_fetched: vec![0; n],
+      blocks_fetch_probe: (0..n).map(|_| std::vec::Vec::new()).collect(),
       corrupt_block_responses: 0,
       corrupted_blocks_served: 0,
     }
@@ -2496,6 +2508,22 @@ impl Cluster {
       );
       self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
     }
+    // Incrementality witness (closing half): a block the delivery observed MISSING and the walk has
+    // now written was hash-verified + accepted by the frontier. An address still absent stays a
+    // candidate for a later step — the walk that would write it may not have run yet (a walk is
+    // already in flight for that transfer) — so re-arm rather than drop it, and cap the list at the
+    // outstanding pull count so a stream of rejected blocks cannot grow it.
+    let mut probe = core::mem::take(&mut self.blocks_fetch_probe[i]);
+    probe.retain(|&addr| {
+      if self.block_stores[i].has_block(addr) {
+        self.blocks_fetched[i] += 1;
+        false
+      } else {
+        true
+      }
+    });
+    probe.truncate(BLOCKS_FETCH_PROBE_CAP);
+    self.blocks_fetch_probe[i] = probe;
   }
 
   pub fn tick(&mut self) {
@@ -2608,18 +2636,18 @@ impl Cluster {
             // or a not-yet-installed successor) keeps its raw value — the proto then drops it at the
             // sender binding exactly as the real transport's unresolved-peer path would.
             let from = self.translate_from_for_receiver(ri, m.from);
-            // Incrementality witness: a present `BlockResponse` the receiver did not already hold and
-            // DOES hold after delivery was hash-verified + written by the proto's block-fetch (a
-            // corrupted/mismatched block is rejected, never written, so never counted). Sampling
-            // `has_block` around the delivery is pure observation — no PRNG draw, no message, no
-            // schedule change — so off-axis runs stay byte-identical.
-            let fetched_addr = match &m.msg {
-              Message::BlockResponse(br) if br.is_present() => {
-                let addr = br.addr();
-                (!self.block_stores[ri].has_block(addr)).then_some(addr)
-              }
-              _ => None,
-            };
+            // Incrementality witness (open half): a present `BlockResponse` the receiver does not
+            // already hold. The proto writes a fetched block inside the frontier-walk JOB the delivery
+            // queues, so the closing sample runs after the storage lane does (`drain_storage`); a
+            // corrupted/mismatched block is rejected there, never written, so never counted. Sampling
+            // `has_block` is pure observation — no PRNG draw, no message, no schedule change — so
+            // off-axis runs stay byte-identical.
+            if let Message::BlockResponse(br) = &m.msg
+              && br.is_present()
+              && !self.block_stores[ri].has_block(br.addr())
+            {
+              self.blocks_fetch_probe[ri].push(br.addr());
+            }
             self.replicas[ri].handle_message(
               now,
               &mut self.wals[ri],
@@ -2627,11 +2655,6 @@ impl Cluster {
               from,
               m.msg,
             );
-            if let Some(addr) = fetched_addr
-              && self.block_stores[ri].has_block(addr)
-            {
-              self.blocks_fetched[ri] += 1;
-            }
           }
         }
         Target::Client(id) => {
