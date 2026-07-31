@@ -1357,6 +1357,22 @@ impl Cluster {
     self.storages[i].roots_in_flight()
   }
 
+  /// Replica `i`'s in-flight WAL append count — every endpoint incarnation's, across every
+  /// state-sync generation over the medium (for the boundedness checker). Bounded by the session
+  /// append quota ([`Self::replica_append_quota`]), enforced at the session's submission choke;
+  /// on the default ring-less WAL the quota is the ONLY append bound (no slot ever aliases), so
+  /// this pair is the oracle that append → lag → sync-forward cycles cannot accumulate backend
+  /// writes without limit.
+  pub fn replica_wal_appends_in_flight(&self, i: usize) -> usize {
+    self.storages[i].wal_appends_in_flight()
+  }
+
+  /// Replica `i`'s session append quota — the ceiling `replica_wal_appends_in_flight` must never
+  /// exceed, derived by the session from the durable root's recorded checkpoint interval.
+  pub fn replica_append_quota(&self, i: usize) -> u64 {
+    self.storages[i].append_quota()
+  }
+
   /// Replica `i`'s in-flight checkpoint-envelope write count (for the boundedness checker). The
   /// session's envelope fence admits one outstanding envelope, so this never exceeds 1 — constant
   /// across endpoint rebuilds and catch-up postures, because the fence reads the session ledger.

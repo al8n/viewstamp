@@ -472,7 +472,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               self.pending_install.as_ref().and_then(|pi| {
                 pi.successor
                   .clone()
-                  .map(|m| (m, pi.successor_prev_config_id))
+                  .map(|m| (m, pi.successor_prev_config_id, pi.successor_install_op))
               })
             })
             .flatten();
@@ -487,7 +487,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // synced checkpoint; the correlated install then refuses the stale successor at
           // `install_membership`'s forward-epoch guard.
           let state = match &successor {
-            Some((successor, successor_prev_config_id))
+            Some((successor, successor_prev_config_id, successor_install_op))
               if successor.epoch() > storage.effective_root().epoch() =>
             {
               self.durable_root_with_successor(
@@ -499,6 +499,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
                 headers,
                 successor,
                 *successor_prev_config_id,
+                successor_install_op
+                  .expect("a crossing install carries its validated producing op"),
               )
             }
             _ => self.durable_root(
@@ -1716,9 +1718,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// own) must make the new configuration DURABLE in the SAME root that records the synced checkpoint,
   /// not only install it in memory — otherwise a later crash/wipe recovers the OLD epoch off this root
   /// and silently REVERTS the membership install (re-stranding the replica at the old epoch). So this
-  /// stamps the SUCCESSOR's `epoch`/membership and the predecessor's epoch as `prev_epoch`, and writes
+  /// stamps the SUCCESSOR's `epoch`/membership and the predecessor's epoch as `prev_epoch`, writes
   /// the POST-swap lineage ring (the superseded predecessor `config_id` shifted in — exactly what
-  /// [`Endpoint::install_membership`]'s `push_lineage` builds), mirroring `submit_swap_epoch`. The
+  /// [`Endpoint::install_membership`]'s `push_lineage` builds), and records the DONOR-CARRIED op
+  /// that produced the successor as `config_install_op`, mirroring `submit_swap_epoch`. The
   /// consensus frontier (`view`/`log_view`/`commit`/`checkpoint_op`/`checkpoint_id` + the band headers)
   /// is the synced one, carried unchanged.
   #[allow(clippy::too_many_arguments)]
@@ -1732,6 +1735,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     committed_headers: std::vec::Vec<Header>,
     successor: &Membership,
     successor_prev_config_id: Option<u128>,
+    successor_install_op: OpNumber,
   ) -> crate::VsrState {
     // The POST-crossing lineage, from the VERIFIED chain (matching the in-memory `install_sync` push). On
     // a MULTI-epoch skip the installed config's immediate predecessor is the VERIFIED `prev_config_id`
@@ -1767,12 +1771,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       prev_epoch,
       successor.clone(),
       prior_config_ids,
-      // A cross-epoch sync install has no LOCAL reconfigure op (the laggard synced PAST it), so carry the
-      // synced frontier `checkpoint_op` as `config_install_op` — the SAME value `install_sync` sets in
-      // memory. The donor attached this successor only because ITS checkpoint reached the reconfigure op
-      // `N`, and this `checkpoint_op` equals that donor checkpoint, so `checkpoint_op >= N`: a safe,
-      // restart-survivable lower bound for the gate on this node (now a potential re-donor).
-      checkpoint_op,
+      // The op that PRODUCED the successor — the donor-carried `config_install_op` the crossing
+      // validated (`apply_sync`: at/below this synced frontier, at/above the timeline's own
+      // record), recorded VERBATIM and the SAME value `install_sync` sets in memory. Verbatim is
+      // load-bearing twice over: a node recovering off this root reports and re-serves the REAL
+      // committed `Reconfigure` op (the frontier is an ordinary client op whenever the donor
+      // checkpointed past the swap), and the serve gate (`checkpoint_op >= config_install_op`)
+      // still holds by the validation's own upper bound.
+      successor_install_op,
     )
     // The vouched carried-log floor, raised to the synced checkpoint (the install advances the live
     // floor to the same point at this root's completion); a higher adoption-learned floor is kept.

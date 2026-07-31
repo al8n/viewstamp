@@ -19,10 +19,9 @@
 //! oracle rests on.
 
 use bytes::Bytes;
-use viewstamp_proto::Storage;
 use viewstamp_proto::{
   ClientId, Commit, Config, Endpoint, Epoch, Instant, MemberId, Membership, Message, OpNumber,
-  Peer, Prepare, PrepareOk, ReplicaId, RequestNumber, StartViewChange, Superblock, View,
+  Peer, Prepare, PrepareOk, ReplicaId, RequestNumber, StartViewChange, Storage, Superblock, View,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, MemBlockStore};
 

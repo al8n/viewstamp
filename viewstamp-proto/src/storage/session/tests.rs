@@ -1,17 +1,18 @@
-use std::collections::VecDeque;
-use std::vec::Vec;
+use std::{collections::VecDeque, vec::Vec};
 
 use bytes::Bytes;
 
 use super::{AppendSubmission, CheckpointSubmission, Storage};
-use crate::block_job::{BlockJobDone, BlockJobKind, BlockJobOutput, BlockJobTag, WalkPurpose};
-use crate::block_store::{BlockAddress, BlockStore};
-use crate::endpoint::block_sync::BlockWalks;
-use crate::state_machine::StateMachine;
-use crate::storage::{
-  Header, ReadId, SlotStatus, Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId,
+use crate::{
+  ClientId, JobId, OpNumber, RequestNumber, View,
+  block_job::{BlockJobDone, BlockJobKind, BlockJobOutput, BlockJobTag, WalkPurpose},
+  block_store::{BlockAddress, BlockStore},
+  endpoint::block_sync::BlockWalks,
+  state_machine::StateMachine,
+  storage::{
+    Header, ReadId, SlotStatus, Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId,
+  },
 };
-use crate::{ClientId, JobId, OpNumber, RequestNumber, View};
 
 /// The minimal state machine the session needs to be generic over: block jobs carry the SM's image
 /// type, so the lane front is parameterized by one.
@@ -1031,4 +1032,94 @@ fn a_completion_out_of_issue_order_is_refused_by_the_lanes_witness() {
   s.enqueue_block_job(dead, sweep());
   s.enqueue_block_job(live, sweep());
   s.settle_block_job(&done(live, BlockJobTag::Gc, addr()));
+}
+
+#[test]
+fn the_append_quota_is_the_doubled_implied_ring_of_the_recorded_interval() {
+  // The unstamped fixture root records no checkpoint interval, so the quota derives the
+  // pipeline-only floor: `2 × (IMPLIED_RING_INTERVALS × 0 + MAX_PIPELINE)`. A stamped store
+  // scales with its recorded interval — asserted through the same accessor the simulation
+  // boundedness checker reads, so the checker's bound and the session's gate can never diverge.
+  let s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  assert_eq!(s.append_quota(), 2048, "the pipeline-only floor (2 × 1024)");
+
+  let mut stamped = MockSb::new();
+  stamped.state = root(0, 0).with_wal_geometry(2, u64::MAX);
+  let s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), stamped);
+  assert_eq!(
+    s.append_quota(),
+    2 * (4 * 2 + 1024),
+    "a recorded interval widens the implied ring the quota doubles"
+  );
+}
+
+#[test]
+fn a_ring_less_append_backlog_is_refused_at_the_session_quota() {
+  // The default backend is ring-less (`capacity == u64::MAX`), where the slot-quiescence fence
+  // bounds NOTHING: distinct ops never alias, so before the quota every submission was admitted
+  // and the ledger grew one entry per op with no time-independent bound — the append → lag →
+  // sync-forward accumulation shape, since state-sync abandons append ownership while these
+  // physical facts survive and truncate/prune may cancel none of them. The quota is the
+  // capacity-independent ceiling that refuses the backlog at the choke, retryably.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let quota = s.append_quota();
+  for op in 1..=quota {
+    assert_eq!(
+      submit(&mut s, WriteId::new(1, op), op),
+      AppendSubmission::Submitted,
+      "a healthy in-flight window is never deferred (op {op} of quota {quota})"
+    );
+  }
+  assert_eq!(s.wal_appends_in_flight() as u64, quota);
+  assert!(
+    matches!(
+      submit(&mut s, WriteId::new(1, quota + 1), quota + 1),
+      AppendSubmission::QuotaExhausted { .. }
+    ),
+    "the submission past the quota is refused with its bytes handed back"
+  );
+  assert_eq!(
+    s.wal_appends_in_flight() as u64,
+    quota,
+    "a refused submission enters neither the ledger nor the backend"
+  );
+}
+
+#[test]
+fn any_quiescence_frees_quota_headroom_for_a_deferred_append() {
+  // The quota's release trigger is AGGREGATE headroom — any in-flight append quiescing — not the
+  // refused op's own slot: the blockers are arbitrary older writes, so slot-keyed release could
+  // never fire for a quota-refused op whose slot was free all along.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let quota = s.append_quota();
+  for op in 1..=quota {
+    assert_eq!(
+      submit(&mut s, WriteId::new(1, op), op),
+      AppendSubmission::Submitted
+    );
+  }
+  assert!(matches!(
+    submit(&mut s, WriteId::new(1, quota + 1), quota + 1),
+    AppendSubmission::QuotaExhausted { .. }
+  ));
+  // One arbitrary old write completes — headroom appears, and the retried submission is admitted.
+  s.wal_mut().land(WriteId::new(1, 3));
+  let polled = s.poll_wal().expect("the landed completion drains");
+  assert_eq!(
+    polled.freed_slot,
+    Some(3),
+    "the quiesced slot rides the completion"
+  );
+  assert_eq!(
+    submit(&mut s, WriteId::new(1, quota + 2), quota + 1),
+    AppendSubmission::Submitted,
+    "the freed headroom admits the retried append"
+  );
+  assert!(
+    matches!(
+      submit(&mut s, WriteId::new(1, quota + 3), quota + 2),
+      AppendSubmission::QuotaExhausted { .. }
+    ),
+    "the ledger is back at the quota, so the next submission waits for the next quiescence"
+  );
 }

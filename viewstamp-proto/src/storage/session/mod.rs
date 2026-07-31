@@ -12,31 +12,49 @@
 //!
 //! The session is the only route to every backend submission, so each lane's bound is enforced
 //! where the lane is entered — never trusted to the callers' discipline, which endpoint rebuilds
-//! and abandoned correlations reset:
+//! and abandoned correlations reset. Each entry below states its bound FOR THE DEFAULT
+//! CONFIGURATION first; where a tighter bound exists only under a particular configuration, the
+//! condition is named explicitly, because a bound that silently assumes a non-default
+//! configuration is not a bound:
 //!
-//! - **appends** — the slot-quiescence fence: at most one in-flight write per physical ring slot
-//!   ([`Storage::submit_append`] returns [`AppendSubmission::SlotFenced`] otherwise), so the append
-//!   ledger never exceeds the ring capacity;
+//! - **appends** — two independent gates at one choke ([`Storage::submit_append`]):
+//!   - the *session append quota*: at most [`Storage::append_quota`] in-flight appends over the
+//!     medium — `2 × (IMPLIED_RING_INTERVALS × checkpoint_ops + MAX_PIPELINE)`, derived from the
+//!     durable root's recorded checkpoint interval and deliberately independent of
+//!     [`Wal::capacity`] ([`AppendSubmission::QuotaExhausted`] refuses the rest, retryably). This
+//!     is THE default-configuration bound: it holds for the default ring-less backend
+//!     (`capacity == u64::MAX`), for a bounded ring of any size, and across state-sync
+//!     generations — the append ownership an install abandons still occupies the quota until the
+//!     write quiesces, so accumulation over repeated sync-forward cycles is capped here;
+//!   - the *slot-quiescence fence*: at most one in-flight write per physical ring slot
+//!     ([`AppendSubmission::SlotFenced`]). On a bounded backend this additionally caps the ledger
+//!     at the ring capacity — tighter than the quota only when `capacity` is below it. On the
+//!     DEFAULT ring-less backend distinct ops never alias, so the fence bounds NOTHING there; it
+//!     is a write-ordering guard, and the quota above is the only append bound.
 //! - **durable roots** — the CONSTANT-depth timeline: at most one root with the backend
 //!   ([`Storage::submit_root`] parks the rest in queue order), at most [`MAX_INFLIGHT_ROOTS`]
 //!   entries on the whole timeline (asserted at the submission choke in every profile) —
 //!   supersession forfeits a live correlation's replaced root ([`Storage::forfeit_root`]) and
 //!   endpoint construction collapses every parked leftover of the dead incarnations
-//!   ([`Storage::collapse_parked_roots`]), so the depth never scales with the rebuild count;
+//!   ([`Storage::collapse_parked_roots`]), so the depth never scales with the rebuild count.
+//!   Unconditional: the constant holds in every configuration;
 //! - **checkpoint envelopes** — the one-outstanding fence: at most one envelope write on the
 //!   medium ([`Storage::submit_checkpoint`] returns [`CheckpointSubmission::EnvelopeFenced`]
-//!   otherwise);
+//!   otherwise). Unconditional;
 //! - **block jobs** — the lane front's per-kind admission quotas (one image capture, one frontier
 //!   walk, the serve cap), which cap the lane's total depth at the serve cap plus a small
-//!   per-obligation constant.
+//!   per-obligation constant. Unconditional: the quotas are compile-time constants.
 //!
-//! Each bound is a CONSTANT — independent of ops, views, time, and the endpoint rebuild count —
-//! and each has a per-tick oracle in the simulation (the backend asserts and the boundedness
-//! checker), so a caller change that would re-open a lane trips a sweep instead of growing
-//! quietly.
+//! Each bound is a CONSTANT for a given deployment — independent of ops, views, time, and the
+//! endpoint rebuild count (the append quota scales only with the configured checkpoint interval,
+//! fixed at format time and fenced by recovery) — and each has a per-tick oracle in the
+//! simulation (the backend asserts and the boundedness checker), so a caller change that would
+//! re-open a lane trips a sweep instead of growing quietly.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::vec::Vec;
+use std::{
+  collections::{BTreeMap, BTreeSet, VecDeque},
+  vec::Vec,
+};
 
 use bytes::Bytes;
 
@@ -90,7 +108,7 @@ fn key(id: WriteId) -> SessionKey {
 /// [`Wal::submit_append`] through the session without receiving — and having to handle — the
 /// verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "an unhandled SlotFenced verdict drops the append silently — park it for release"]
+#[must_use = "an unhandled fence verdict drops the append silently — park it for release"]
 pub(crate) enum AppendSubmission {
   /// The append was submitted; its write is now in the session ledger until it quiesces.
   Submitted,
@@ -98,6 +116,18 @@ pub(crate) enum AppendSubmission {
   /// slot; nothing was submitted, and the submission's bytes come back to the caller to park
   /// until the session reports the slot freed.
   SlotFenced {
+    /// The refused submission's header, returned for parking.
+    header: Header,
+    /// The refused submission's body, returned for parking.
+    body: Bytes,
+  },
+  /// The session append quota is exhausted: [`Storage::append_quota`] writes are already in
+  /// flight over this medium, across every endpoint incarnation and state-sync generation that
+  /// ever wrote it. Nothing was submitted; the bytes come back to the caller to park until ANY
+  /// in-flight append quiesces and frees quota headroom. Unlike [`Self::SlotFenced`] the refusal
+  /// is not keyed to this op's slot — the blockers are arbitrary older writes — so the release
+  /// trigger is aggregate headroom, not the slot's own quiescence.
+  QuotaExhausted {
     /// The refused submission's header, returned for parking.
     header: Header,
     /// The refused submission's body, returned for parking.
@@ -209,7 +239,26 @@ pub struct Storage<W, B, S: StateMachine> {
   /// op, or its ring alias `op ± k·capacity`), across every endpoint incarnation that ever wrote
   /// this medium — completion reordering can never let abandoned old bytes land OVER a replacement
   /// some endpoint already acked.
+  ///
+  /// Its SIZE is bounded by the session append quota ([`Self::append_quota`]), enforced at the
+  /// same choke: on the default ring-less backend the fence alone bounds nothing (distinct ops
+  /// never alias), and state-sync deliberately abandons append OWNERSHIP while these physical
+  /// facts survive, so without the quota each append → lag → sync-forward cycle would grow this
+  /// ledger — and the backend's write queue — without any time-independent bound.
   wal_writes: BTreeMap<SessionKey, u64>,
+  /// The CANONICAL SLOTS the in-flight appends occupy — `op` on a ring-less backend, `op mod
+  /// capacity` on a bounded one — kept in lockstep with [`Self::wal_writes`] (inserted at submit,
+  /// removed at each quiesce). The fence predicate is a membership probe here, so admission costs
+  /// `O(log n)` instead of scanning the whole ledger per submission. At most one in-flight write
+  /// per canonical slot exists (the fence's own guarantee), so a set — not a multiset — is
+  /// sufficient, and a collision on insert is a session logic error, asserted in every profile.
+  wal_slots: BTreeSet<u64>,
+  /// The session append quota, derived ONCE from the durable root's recorded checkpoint interval
+  /// (`0` = not yet derived; [`Self::submit_append`] derives it before the first admission and
+  /// [`Self::append_quota`] derives it on read). See [`Self::append_quota`] for the value and why
+  /// it is capacity-independent. Stable for the session's lifetime: the geometry it derives from
+  /// is pinned at format time and recovery refuses a restart under a different interval.
+  append_quota: u64,
   /// EVERY in-flight durable-root write, in queue order, each with the exact [`VsrState`] it
   /// will make durable. The single-serialized-writer contract delivers their completions in this
   /// order, so the BACK entry is the root the medium is guaranteed to converge to — the effective
@@ -275,6 +324,8 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
       wal,
       sb,
       wal_writes: BTreeMap::new(),
+      wal_slots: BTreeSet::new(),
+      append_quota: 0,
       roots: VecDeque::new(),
       roots_submitted: 0,
       checkpoints: BTreeMap::new(),
@@ -387,6 +438,19 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
     self.roots.len()
   }
 
+  /// The number of in-flight physical WAL appends over this medium — every endpoint incarnation's,
+  /// across every state-sync generation. Never exceeds [`Self::append_quota`]: the quota gate at
+  /// [`Self::submit_append`] refuses further admissions (retryably) while this many writes are
+  /// outstanding.
+  ///
+  /// Exposed for the simulation boundedness checker, which independently re-asserts the bound per
+  /// tick. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn wal_appends_in_flight(&self) -> usize {
+    self.wal_writes.len()
+  }
+
   /// The number of in-flight checkpoint-envelope writes — `0` or `1`, never more: the envelope
   /// fence ([`Self::submit_checkpoint`]) refuses a second submission while one is outstanding.
   ///
@@ -430,28 +494,61 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
 }
 
 impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
-  /// Whether `a` and `b` occupy the same physical WAL slot under this medium's capacity: the same
-  /// op, or — on a bounded backend, whose placement is `op mod capacity` (the trait-level
-  /// placement contract) — ring aliases. A ring-less backend (`capacity == u64::MAX`) stores every
-  /// op at its own location, so only the same-op case aliases; its extent-recycling discipline is
-  /// the trait's extent-reuse clause.
+  /// The CANONICAL SLOT `op` occupies under this medium's capacity: `op` itself on a ring-less
+  /// backend (`capacity == u64::MAX` — every op has its own location, per the trait's extent-reuse
+  /// clause), `op mod capacity` on a bounded one (the trait-level placement contract). Two ops
+  /// alias exactly when their canonical slots are equal, so the fence's witness set can be a slot
+  /// SET probed in `O(log n)` rather than a per-submission scan of the whole ledger.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  fn slots_alias(&self, a: u64, b: u64) -> bool {
+  fn canonical_slot(&self, op: u64) -> u64 {
     let capacity = self.wal.capacity();
-    a == b || (capacity != u64::MAX && a % capacity == b % capacity)
+    if capacity == u64::MAX {
+      op
+    } else {
+      op % capacity
+    }
   }
 
   /// Whether some in-flight physical write targets `op`'s ring slot — ANY incarnation's. The fence
   /// predicate: while true, a new append to `op` must be parked, because append completions may
   /// reorder and submitting now could let the old bytes land LAST, leaving the durable slot
-  /// holding a value no live ack/vote named. The map is pipeline-bounded, so the scan is cheap.
+  /// holding a value no live ack/vote named.
   pub(crate) fn slot_write_in_flight(&self, op: u64) -> bool {
-    self.wal_writes.values().any(|&v| self.slots_alias(v, op))
+    self.wal_slots.contains(&self.canonical_slot(op))
+  }
+
+  /// The session append quota: the ceiling on in-flight appends over this medium, every endpoint
+  /// incarnation and state-sync generation combined — twice the proto-imposed ring
+  /// (`2 × (IMPLIED_RING_INTERVALS × checkpoint_ops + MAX_PIPELINE)`), derived from the durable
+  /// root's recorded checkpoint interval (an un-stamped fixture root derives the pipeline-only
+  /// floor). Twice, because one implied ring bounds a single generation's legitimate in-flight
+  /// window, and a sync-forward legitimately opens a fresh window while the abandoned one is
+  /// still quiescing — so healthy operation, including one full-window handover, never meets the
+  /// quota, while unbounded cross-generation accumulation is refused at the second full window.
+  ///
+  /// Deliberately INDEPENDENT of [`Wal::capacity`]: a bounded ring already gets the tighter
+  /// per-slot fence bound when its capacity is below this value, and a huge finite ring must not
+  /// inflate the quota into vacuity — the whole point is a bound that holds for EVERY backend,
+  /// the default ring-less one included. Derived here rather than handed in by the endpoint so
+  /// the bound can never depend on a caller remembering to install it.
+  ///
+  /// Exposed for the simulation boundedness checker, which asserts
+  /// [`Self::wal_appends_in_flight`] `<=` this per tick. Not part of the stable API.
+  #[doc(hidden)]
+  pub fn append_quota(&self) -> u64 {
+    if self.append_quota != 0 {
+      return self.append_quota;
+    }
+    crate::endpoint::session_append_quota(self.sb.state().checkpoint_ops())
   }
 
   /// Fenced append submission — the ONLY route to [`Wal::submit_append`]. Either records the write
-  /// in the session ledger and submits it, or reports the slot fenced by an un-quiesced older
-  /// write (this endpoint's or a dead predecessor's) and submits nothing.
+  /// in the session ledger and submits it, or refuses it with the bytes handed back for parking:
+  /// [`AppendSubmission::SlotFenced`] when an un-quiesced older write (this endpoint's or a dead
+  /// predecessor's) holds the physical slot, [`AppendSubmission::QuotaExhausted`] when the
+  /// session append quota ([`Self::append_quota`]) is spent. The slot fence is judged FIRST: a
+  /// same-slot refusal must carry the slot-keyed release trigger even under quota pressure, or
+  /// its waiter would miss the exact quiescence that frees its slot.
   pub(crate) fn submit_append(
     &mut self,
     id: WriteId,
@@ -462,8 +559,23 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     if self.slot_write_in_flight(op.get()) {
       return AppendSubmission::SlotFenced { header, body };
     }
+    if self.append_quota == 0 {
+      self.append_quota = self.append_quota();
+    }
+    if self.wal_writes.len() as u64 >= self.append_quota {
+      return AppendSubmission::QuotaExhausted { header, body };
+    }
     self.wal.submit_append(id, op, header, body);
     self.wal_writes.insert(key(id), op.get());
+    let vacant = self.wal_slots.insert(self.canonical_slot(op.get()));
+    // One in-flight write per canonical slot is the fence's own guarantee, checked just above, so
+    // an occupied slot here is a session logic error — the two witness structures diverged, and a
+    // fence over an untrustworthy witness set risks exactly the stale-landing overwrite it exists
+    // to prevent. Fail-stop in every profile, like the other medium-trust violations.
+    assert!(
+      vacant,
+      "an admitted append's canonical slot was already occupied: op {op:?}"
+    );
     AppendSubmission::Submitted
   }
 
@@ -493,7 +605,7 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     cancelled
       .into_iter()
       .map(|id| {
-        let freed_slot = self.wal_writes.remove(&key(id));
+        let freed_slot = self.retire_wal_write(id);
         // Every append over this medium was recorded at submission, whichever endpoint submitted
         // it — so an id the ledger never saw is the backend cancelling an append it was never
         // handed. Enforced in every profile: a backend inventing write facts is a medium whose
@@ -508,6 +620,23 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
       .collect()
   }
 
+  /// Retire one in-flight append from the ledger — completion or synchronous cancellation alike —
+  /// returning the op whose canonical slot it freed (`None` for an id the ledger never saw). The
+  /// ONLY removal route, so the slot set can never drift from the ledger it indexes.
+  fn retire_wal_write(&mut self, id: WriteId) -> Option<u64> {
+    let op = self.wal_writes.remove(&key(id))?;
+    let slot = self.canonical_slot(op);
+    let occupied = self.wal_slots.remove(&slot);
+    // The insert at admission is unconditional for every ledgered write, so a missing slot here
+    // is the same witness-set divergence the admission assert refuses — fail-stop in every
+    // profile before the fence answers another admission off the diverged set.
+    assert!(
+      occupied,
+      "a retiring append's canonical slot was not occupied: op {op}"
+    );
+    Some(op)
+  }
+
   /// Drain the next WAL completion, settling its medium fact first: a completed append — ANY
   /// incarnation's — leaves the ledger here, and the freed slot rides alongside the completion so
   /// the caller can release a fence-deferred re-append even when the completion itself is refused
@@ -515,7 +644,7 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   pub(crate) fn poll_wal(&mut self) -> Option<WalPolled> {
     let done = self.wal.poll()?;
     let freed_slot = match &done {
-      WalDone::Appended(id) | WalDone::Cancelled(id) => self.wal_writes.remove(&key(*id)),
+      WalDone::Appended(id) | WalDone::Cancelled(id) => self.retire_wal_write(*id),
       _ => None,
     };
     Some(WalPolled { done, freed_slot })

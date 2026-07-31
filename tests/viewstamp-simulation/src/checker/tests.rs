@@ -1153,6 +1153,35 @@ fn reconfigure_applied_once_flags_a_divergent_successor() {
 }
 
 #[test]
+fn reconfigure_applied_once_flags_a_fabricated_producing_op() {
+  // Two replicas report the SAME epoch produced by DIFFERENT ops: a direct participant names the
+  // committed Reconfigure op (10), while a laggard that crossed via state-sync names its crossing
+  // checkpoint frontier (13 — an ordinary client op). The forward op -> successor map cannot see
+  // this (13 collides with nothing), so the inverse epoch -> op map is the net that catches a
+  // fabricated producing op.
+  let mut once = ReconfigureAppliedOnceChecker::new(2);
+  let s0 = vec![swap(0, 10, 1, 0xAA)];
+  let s1 = vec![swap(0, 13, 1, 0xAA)];
+  assert!(
+    once.fold(&[&s0, &s1]).is_violation(),
+    "one epoch reported as produced by two different ops must be flagged"
+  );
+}
+
+#[test]
+fn reconfigure_applied_once_accepts_a_crossing_that_names_the_producing_op() {
+  // The healthy crossing: the laggard's sync carried the real producing op through the payload, so
+  // its report matches the direct participants' — same epoch, same op, same successor.
+  let mut once = ReconfigureAppliedOnceChecker::new(2);
+  let s0 = vec![swap(0, 10, 1, 0xAA)];
+  let s1 = vec![swap(0, 10, 1, 0xAA)];
+  assert!(
+    once.fold(&[&s0, &s1]).is_ok(),
+    "a crossing that names the true producing op agrees with the direct installs"
+  );
+}
+
+#[test]
 fn config_lineage_empty_streams_pass() {
   let mut lin = ConfigLineageChecker::new(3);
   assert!(lin.fold(&[&[], &[], &[]]).is_ok());

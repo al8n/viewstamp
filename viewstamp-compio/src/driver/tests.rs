@@ -48,9 +48,8 @@ fn genesis(n: u8) -> Membership {
   )
   .expect("valid genesis membership")
 }
-use viewstamp_driver::BlockLane;
 use viewstamp_driver::{
-  DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT, SHUTDOWN_DRAIN_DEADLINE,
+  BlockLane, DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT, SHUTDOWN_DRAIN_DEADLINE,
 };
 
 const CLUSTER: u128 = 0x5151;

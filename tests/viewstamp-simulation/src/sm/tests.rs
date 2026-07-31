@@ -1,5 +1,4 @@
-use super::materialize_sm;
-use super::*;
+use super::{materialize_sm, *};
 use crate::block_store::MemBlockStore;
 
 #[test]
