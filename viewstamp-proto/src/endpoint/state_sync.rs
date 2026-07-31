@@ -331,10 +331,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// guard then drops every subsequent overflowing prepare until the sync installs. Unbounded WAL
   /// (`capacity == u64::MAX`) can never overflow, so this is inert for the default — and for an in-quorum
   /// backup under a bounded ring (its checkpoint tracks the quorum, so `K - checkpoint_op <= capacity`).
-  pub(crate) fn maybe_sync_below_ring_window<W: Wal>(
+  pub(crate) fn maybe_sync_below_ring_window<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &W,
+    storage: &Storage<W, B>,
     pop: u64,
     cluster_checkpoint: OpNumber,
   ) -> bool {
@@ -344,7 +344,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (`effective_wal_capacity` — the backend's own, or the proto-imposed ring for a ring-less backend):
     // enforcing it here is the backup half of the `op_head <= checkpoint_op + effective` geometry that
     // `recover()`'s read ceiling leans on.
-    let capacity = self.effective_wal_capacity(wal);
+    let capacity = self.effective_wal_capacity(storage);
     if pop.saturating_sub(self.checkpoint_op.get()) <= capacity {
       return false; // fits the ring — append normally.
     }
@@ -745,10 +745,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// to the laggard (the transports route `Peer::Replica(slot)` by slot index — a reply to the stale
   /// claimed slot would be misrouted to whoever now occupies it). On the common same-slot path
   /// `from`'s slot == `m.replica()`, so this is byte-identical.
-  pub(crate) fn on_request_sync<B: Superblock>(
+  pub(crate) fn on_request_sync<W: Wal, B: Superblock>(
     &mut self,
     _now: Instant,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     m: crate::RequestSync,
   ) {
@@ -809,7 +809,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // read. Without the dedupe, a buggy peer's solicit burst would stack N concurrent reads. (A
     // same-nonce burst — the timer-retransmit common case — is answered identically; a re-armed sync's
     // newer nonce is shipped without an extra round trip.)
-    self.submit_or_refresh_serve(sb, from, m.nonce());
+    self.submit_or_refresh_serve(storage, from, m.nonce());
   }
 
   /// Record (or refresh) the single in-flight serve for `requester` (keyed by its `Peer` — a current
@@ -817,7 +817,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the echoed nonce is refreshed in place (the completion answers the LATEST solicitation) — no
   /// second checkpoint read is issued; otherwise submit one read and insert the entry. The structural
   /// one-read-per-requester bound on `sync_serving`.
-  fn submit_or_refresh_serve<B: Superblock>(&mut self, sb: &mut B, requester: Peer, nonce: u64) {
+  fn submit_or_refresh_serve<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    requester: Peer,
+    nonce: u64,
+  ) {
     if let Some(serving) = self.sync_serving.get_mut(&requester) {
       serving.nonce = nonce;
       return;
@@ -835,7 +840,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     let id = self.mint_read_id();
-    sb.submit_read_checkpoint(id);
+    storage.submit_checkpoint_read(id);
     self.sync_serving.insert(
       requester,
       SyncServe {
@@ -855,7 +860,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// id`); a mismatch DROPS the read (the serve path is then as strict as `recover`'s `id_ok` gate). Also
   /// re-checks status + view-durability + replica range at SHIP time (all may have changed between submit
   /// and completion): if we are no longer Normal, or our view is no longer durable, we drop the reply.
-  pub(crate) fn serve_sync_checkpoint<B: Superblock>(&mut self, sb: &B, cr: crate::CheckpointRead) {
+  pub(crate) fn serve_sync_checkpoint<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &Storage<W, B>,
+    cr: crate::CheckpointRead,
+  ) {
     // Serve entries are keyed by REQUESTER (one outstanding serve each); match this completion
     // against the recorded read `OpId`. No match ⇒ not a serve-read we issued (a stale/foreign
     // completion) — ignore. The scan is bounded by `replica_count` (<= 64).
@@ -912,7 +921,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // == self.checkpoint_op` gate above already pinned the durable op, so this completes the (op, id)
     // match against the durable root — the serve path is now exactly as strict as recover. On mismatch
     // DROP it (the requester re-solicits and another peer, or our next clean read, serves).
-    if id != sb.state().checkpoint_id() {
+    if id != storage.sb().state().checkpoint_id() {
       return;
     }
     // Serve the SUCCESSOR membership the snapshot reflects: the canonical `ReconfigurePayload` of our
@@ -1363,10 +1372,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// leaves its outstanding walk answering nothing — the returned frontiers are dropped and counted,
   /// never merged into its successor's (which would graft one pin's discovery order onto another's
   /// DAG).
-  pub(super) fn on_walked<W: Wal>(
+  pub(super) fn on_walked<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     job: crate::JobId,
     done: crate::block_job::WalkDone<S>,
   ) {
@@ -1421,7 +1430,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // drain here is the same self-heal `retry_install_flush` performs for an owed local install: the
       // fence is re-checked inside, so a still-occupied superblock simply defers again to the next tick.
       WalkPurpose::Arq => match next {
-        None => self.on_fetch_drained(now, wal),
+        None => self.on_fetch_drained(now, storage),
         Some(addr) => self.emit(Outgoing::new(
           Recipient::To(donor),
           Message::RequestBlock(addr),
@@ -1430,7 +1439,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // A freshly pinned transfer: install if the store already holds both DAGs, else pull the first
       // missing block.
       WalkPurpose::Arm => match next {
-        None => self.on_fetch_drained(now, wal),
+        None => self.on_fetch_drained(now, storage),
         Some(addr) => self.emit(Outgoing::new(
           Recipient::To(donor),
           Message::RequestBlock(addr),
@@ -1458,16 +1467,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         from,
         addr,
         present,
-      } => self.on_response_walked(now, wal, from, addr, present, next),
+      } => self.on_response_walked(now, storage, from, addr, present, next),
       WalkPurpose::RecoverProbe(_) => unreachable!("handled above, before the transfer graft"),
     }
   }
 
   /// The `BlockResponse` continuation, after its block was ingested and the frontiers re-drained.
-  fn on_response_walked<W: Wal>(
+  fn on_response_walked<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     from: Peer,
     addr: BlockAddress,
     present: bool,
@@ -1531,7 +1540,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // the re-pin window — a same-epoch trigger cannot wrongly downgrade a genuine in-progress crossing.
         self.send_request_sync(now);
       }
-      None => self.on_fetch_drained(now, wal),
+      None => self.on_fetch_drained(now, storage),
     }
   }
 
@@ -1555,7 +1564,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Fenced on a free superblock, the same single-writer fence the ingress applies: a root landing
   /// between the walk's issue and its completion must not let a re-persist stage underneath it. The
   /// transfer stays pinned and drained, and the solicit cadence re-drives it once the root lands.
-  fn on_fetch_drained<W: Wal>(&mut self, now: Instant, wal: &mut W) {
+  fn on_fetch_drained<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return;
     }
@@ -1575,7 +1584,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let donor = bf.donor;
     let checkpoint = bf.checkpoint;
     if self.status.is_recovering() && self.awaiting_peer_checkpoint() {
-      self.complete_recover_peer_fetch(now, wal, donor, checkpoint);
+      self.complete_recover_peer_fetch(now, storage, donor, checkpoint);
     } else {
       self.apply_sync(now, donor, &checkpoint);
     }
@@ -2192,8 +2201,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(super) fn on_sm_restored<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     result: Result<(S, std::collections::BTreeMap<u128, Session>), crate::RestoreError>,
   ) {
     let Some(recon) = self.sm_reconstruct.as_mut() else {
@@ -2233,22 +2241,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `deferred_appends` wholesale at its reset, and `checkpoint_op` was already advanced to the synced
     // M before the reconstruct, so every deferral a post-install append could have parked sits strictly
     // ABOVE the floor this prune frees.
-    let cancelled = wal.truncate(self.op);
-    self.absorb_wal_cancellations(wal, cancelled);
-    let cancelled = wal.prune(checkpoint_op);
+    let cancelled = storage.truncate(self.op);
+    self.absorb_wal_cancellations(storage, cancelled);
+    let cancelled = storage.prune(checkpoint_op);
     self.wal_pruned = self.wal_pruned.max(checkpoint_op.get().saturating_sub(1));
-    self.absorb_wal_cancellations(wal, cancelled);
+    self.absorb_wal_cancellations(storage, cancelled);
     // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
     // checkpoint root, GC the WAL caches, and complete the sync bookkeeping. This is the SINGLE
     // completion tail — a clean first reconstruct and one that succeeded only after several re-pulls
     // reach it identically.
-    self.complete_state_sync(now, sb);
+    self.complete_state_sync(now, storage);
     // The install advanced `checkpoint_op` (the ring window slid forward): re-drive any adopted-tail
     // append that was skipped over the old window.
-    self.retry_unappended_adopted_tail(wal);
+    self.retry_unappended_adopted_tail(storage);
     // The SM reconstructed + the sync completed → a staged epoch swap that was waiting for a free
     // superblock now gets its slot (the same re-trigger `on_sb_done`'s tail makes).
-    self.maybe_swap_epoch(sb);
+    self.maybe_swap_epoch(storage);
   }
 
   /// Re-pin the owed SM-reconstruct's block-fetch to a FRESH donor (its prior donor went dark, and a new

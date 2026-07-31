@@ -4,6 +4,7 @@ use bytes::Bytes;
 use viewstamp_proto::{
   BlockAddress, BlockJob, BlockJobDone, BlockStore, BlockStoreError, ClientId, Config, Endpoint,
   Epoch, Instant, MemberId, Membership, Message, Peer, Request, RequestNumber, SingleChange,
+  Storage,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
@@ -57,38 +58,35 @@ fn genesis(n: u8) -> Membership {
 /// A sole voter is its own quorum, so its own durable append commits the op with no peer traffic.
 fn single_voter() -> (
   Endpoint<LogSm, SingleChange>,
-  InMemoryWal,
-  InMemorySuperblock,
+  Storage<InMemoryWal, InMemorySuperblock>,
 ) {
   let config = Config::with_checkpoint_ops(CLUSTER, MemberId::new(0_u128), 1)
     .expect("a valid single-voter config");
-  let mut wal = InMemoryWal::new();
+  let wal = InMemoryWal::new();
   let mut sb = InMemorySuperblock::new();
   crate::format(config, &genesis(1), &wal, &mut sb).expect("format the genesis store");
+  let mut storage = Storage::new(wal, sb);
   let endpoint = crate::build_endpoint(
     config,
     genesis(1),
     LogSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     // Every test's lane is created fresh, after this endpoint: nothing can occupy it yet.
     viewstamp_proto::BlockLaneOccupancy::empty(),
   )
   .expect("the formatted store builds an endpoint");
-  (endpoint, wal, sb)
+  (endpoint, storage)
 }
 
 /// Commit one client op and return the first block job the endpoint queues for it.
 fn first_job(
   endpoint: &mut Endpoint<LogSm, SingleChange>,
-  wal: &mut InMemoryWal,
-  sb: &mut InMemorySuperblock,
+  storage: &mut Storage<InMemoryWal, InMemorySuperblock>,
 ) -> BlockJob<LogSm> {
   let now = Instant::ZERO;
   endpoint.handle_message(
     now,
-    wal,
-    sb,
+    storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -97,7 +95,7 @@ fn first_job(
     )),
   );
   for _ in 0..64 {
-    endpoint.handle_storage(now, wal, sb);
+    endpoint.handle_storage(now, storage);
     if let Some(job) = endpoint.poll_block_job() {
       return job;
     }
@@ -113,11 +111,11 @@ fn first_job(
 /// green run is the ordering assertion twice over.
 #[test]
 fn a_spawned_lane_carries_a_checkpoint_to_its_durable_root() {
-  let (mut endpoint, mut wal, mut sb) = single_voter();
+  let (mut endpoint, mut storage) = single_voter();
   let lane: BlockLane<LogSm> = BlockLane::spawn(MemBlocks::default());
   let now = Instant::ZERO;
 
-  let first = first_job(&mut endpoint, &mut wal, &mut sb);
+  let first = first_job(&mut endpoint, &mut storage);
   let mut issued = vec![first.id()];
   let mut answered = Vec::new();
   lane.submit(first);
@@ -125,19 +123,19 @@ fn a_spawned_lane_carries_a_checkpoint_to_its_durable_root() {
   // Drive to quiescence: a completion can release the next job (the materialize's durable root is
   // what lets the sweep run), so the loop alternates until the endpoint owes no storage at all.
   let deadline = std::time::Instant::now() + LANE_ANSWER_DEADLINE;
-  while endpoint.has_inflight_storage() {
+  while endpoint.has_inflight_storage(&storage) {
     assert!(
       std::time::Instant::now() < deadline,
       "the spawned lane left the endpoint owing storage after {LANE_ANSWER_DEADLINE:?}",
     );
-    endpoint.handle_storage(now, &mut wal, &mut sb);
+    endpoint.handle_storage(now, &mut storage);
     while let Some(job) = endpoint.poll_block_job() {
       issued.push(job.id());
       lane.submit(job);
     }
     while let Some(done) = lane.try_recv() {
       answered.push(done.id());
-      endpoint.on_block_done(now, &mut wal, &mut sb, done);
+      endpoint.on_block_done(now, &mut storage, done);
     }
     std::thread::yield_now();
   }
@@ -147,7 +145,7 @@ fn a_spawned_lane_carries_a_checkpoint_to_its_durable_root() {
     "every issued job is answered, in the order it was issued"
   );
   assert_eq!(
-    viewstamp_proto::Superblock::state(&sb)
+    viewstamp_proto::Superblock::state(storage.sb())
       .checkpoint_op()
       .get(),
     1,
@@ -159,10 +157,10 @@ fn a_spawned_lane_carries_a_checkpoint_to_its_durable_root() {
 /// a test can step a driver without waiting on a thread.
 #[test]
 fn an_inline_lane_answers_within_the_submit() {
-  let (mut endpoint, mut wal, mut sb) = single_voter();
+  let (mut endpoint, mut storage) = single_voter();
   let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
 
-  let job = first_job(&mut endpoint, &mut wal, &mut sb);
+  let job = first_job(&mut endpoint, &mut storage);
   let id = job.id();
   lane.submit(job);
 
@@ -179,23 +177,22 @@ fn an_inline_lane_answers_within_the_submit() {
 /// reaches the cursor rather than the lane's occupancy fail-stop.
 fn first_sweep_job(
   endpoint: &mut Endpoint<LogSm, SingleChange>,
-  wal: &mut InMemoryWal,
-  sb: &mut InMemorySuperblock,
+  storage: &mut Storage<InMemoryWal, InMemorySuperblock>,
 ) -> BlockJob<LogSm> {
   let now = Instant::ZERO;
   let mut cursor = viewstamp_proto::BlockJobCursor::new();
   let mut blocks = MemBlocks::default();
-  let materialize = first_job(endpoint, wal, sb);
+  let materialize = first_job(endpoint, storage);
   let done = viewstamp_proto::execute_block_job(&mut cursor, materialize, &mut blocks);
-  endpoint.on_block_done(now, wal, sb, done);
+  endpoint.on_block_done(now, storage, done);
   for _ in 0..64 {
-    endpoint.handle_storage(now, wal, sb);
+    endpoint.handle_storage(now, storage);
     if let Some(job) = endpoint.poll_block_job() {
       if job.tag() == viewstamp_proto::BlockJobTag::Gc {
         return job;
       }
       let done = viewstamp_proto::execute_block_job(&mut cursor, job, &mut blocks);
-      endpoint.on_block_done(now, wal, sb, done);
+      endpoint.on_block_done(now, storage, done);
     }
   }
   panic!("a published checkpoint owes a GC sweep over its live roots");
@@ -212,10 +209,10 @@ fn first_sweep_job(
 #[test]
 #[should_panic(expected = "block job executed out of issue order")]
 fn one_lane_stops_a_dead_endpoints_job_running_after_its_successors() {
-  let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_sweep_job(&mut dead, &mut dead_wal, &mut dead_sb);
-  let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_sweep_job(&mut live, &mut live_wal, &mut live_sb);
+  let (mut dead, mut dead_storage) = single_voter();
+  let dead_job = first_sweep_job(&mut dead, &mut dead_storage);
+  let (mut live, mut live_storage) = single_voter();
+  let live_job = first_sweep_job(&mut live, &mut live_storage);
   assert!(
     live_job.id().incarnation() > dead_job.id().incarnation(),
     "the endpoint built second holds the later incarnation",
@@ -232,10 +229,10 @@ fn one_lane_stops_a_dead_endpoints_job_running_after_its_successors() {
 /// would forfeit the guarantee silently — this is what that forfeit looks like.
 #[test]
 fn a_fresh_lanes_first_admission_is_unchecked() {
-  let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_sweep_job(&mut dead, &mut dead_wal, &mut dead_sb);
-  let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_sweep_job(&mut live, &mut live_wal, &mut live_sb);
+  let (mut dead, mut dead_storage) = single_voter();
+  let dead_job = first_sweep_job(&mut dead, &mut dead_storage);
+  let (mut live, mut live_storage) = single_voter();
+  let live_job = first_sweep_job(&mut live, &mut live_storage);
 
   let successors_lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
   successors_lane.submit(live_job);
@@ -256,10 +253,10 @@ fn a_fresh_lanes_first_admission_is_unchecked() {
 #[test]
 #[should_panic(expected = "a second Materialize was submitted")]
 fn one_lane_refuses_a_second_image_at_submit() {
-  let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_job(&mut dead, &mut dead_wal, &mut dead_sb);
-  let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_job(&mut live, &mut live_wal, &mut live_sb);
+  let (mut dead, mut dead_storage) = single_voter();
+  let dead_job = first_job(&mut dead, &mut dead_storage);
+  let (mut live, mut live_storage) = single_voter();
+  let live_job = first_job(&mut live, &mut live_storage);
 
   let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
   lane.submit(live_job);
@@ -274,7 +271,7 @@ fn one_lane_refuses_a_second_image_at_submit() {
 fn a_lane_holds_a_materialize_from_submit_until_its_completion_leaves() {
   use viewstamp_proto::BlockLaneOccupancy;
 
-  let (mut endpoint, mut wal, mut sb) = single_voter();
+  let (mut endpoint, mut storage) = single_voter();
   let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
   assert_eq!(
     lane.occupancy(),
@@ -282,7 +279,7 @@ fn a_lane_holds_a_materialize_from_submit_until_its_completion_leaves() {
     "a fresh lane holds nothing"
   );
 
-  let job = first_job(&mut endpoint, &mut wal, &mut sb);
+  let job = first_job(&mut endpoint, &mut storage);
   let id = job.id();
   lane.submit(job);
   assert_eq!(
@@ -323,9 +320,9 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
 
   let config = Config::with_checkpoint_ops(CLUSTER, MemberId::new(0_u128), 1)
     .expect("a valid single-voter config");
-  let (mut dead, mut wal, mut sb) = single_voter();
+  let (mut dead, mut storage) = single_voter();
   let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
-  let dead_job = first_job(&mut dead, &mut wal, &mut sb);
+  let dead_job = first_job(&mut dead, &mut storage);
   let dead_id = dead_job.id();
   lane.submit(dead_job);
   drop(dead); // the driver holding the endpoint is gone; the embedder kept the lane and storage
@@ -340,8 +337,7 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
     config,
     genesis(1),
     LogSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     occupancy,
   )
   .expect("the dirty store rebuilds an endpoint over its surviving lane");
@@ -351,7 +347,7 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
   let now = Instant::ZERO;
   let done = lane.try_recv().expect("the lane hands back the dead job");
   assert_eq!(done.id(), dead_id);
-  live.on_block_done(now, &mut wal, &mut sb, done);
+  live.on_block_done(now, &mut storage, done);
   assert_eq!(
     live.foreign_completions_rejected(),
     1,
@@ -362,26 +358,26 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
   // materialize is issued, so it doubles as the assertion that the refusal genuinely re-opened the
   // capture site.
   for _ in 0..8 {
-    live.handle_storage(now, &mut wal, &mut sb);
+    live.handle_storage(now, &mut storage);
   }
-  let job = first_job(&mut live, &mut wal, &mut sb);
+  let job = first_job(&mut live, &mut storage);
   lane.submit(job);
   let deadline = std::time::Instant::now() + LANE_ANSWER_DEADLINE;
-  while live.has_inflight_storage() {
+  while live.has_inflight_storage(&storage) {
     assert!(
       std::time::Instant::now() < deadline,
       "the rebuilt endpoint never quiesced after inheriting the lane's occupancy",
     );
-    live.handle_storage(now, &mut wal, &mut sb);
+    live.handle_storage(now, &mut storage);
     while let Some(job) = live.poll_block_job() {
       lane.submit(job);
     }
     while let Some(done) = lane.try_recv() {
-      live.on_block_done(now, &mut wal, &mut sb, done);
+      live.on_block_done(now, &mut storage, done);
     }
   }
   assert!(
-    viewstamp_proto::Superblock::state(&sb)
+    viewstamp_proto::Superblock::state(storage.sb())
       .checkpoint_op()
       .get()
       >= 1,
@@ -394,10 +390,10 @@ fn a_rebuilt_endpoint_inherits_the_surviving_lanes_occupancy() {
 /// driver's lane ran.
 #[test]
 fn a_clone_carries_the_lanes_cursor_past_the_driver_that_held_it() {
-  let (mut dead, mut dead_wal, mut dead_sb) = single_voter();
-  let dead_job = first_sweep_job(&mut dead, &mut dead_wal, &mut dead_sb);
-  let (mut live, mut live_wal, mut live_sb) = single_voter();
-  let live_job = first_sweep_job(&mut live, &mut live_wal, &mut live_sb);
+  let (mut dead, mut dead_storage) = single_voter();
+  let dead_job = first_sweep_job(&mut dead, &mut dead_storage);
+  let (mut live, mut live_storage) = single_voter();
+  let live_job = first_sweep_job(&mut live, &mut live_storage);
 
   let lane: BlockLane<LogSm> = BlockLane::inline(MemBlocks::default());
   let carried = lane.clone();

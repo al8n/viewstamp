@@ -83,7 +83,7 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
   // each of the three steps is observed in isolation.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -95,14 +95,9 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
   };
 
   // Commit op 1: not yet at the interval; no checkpoint, nothing inflight on the superblock.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    Peer::Client(ClientId::new(7)),
-    req(1),
-  );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // append durable → commit op 1
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(1));
+  e.storage_step(now, &mut storage, &mut blocks); // append durable → commit op 1
   assert_eq!(e.commit(), OpNumber::with(1));
   assert_eq!(
     e.checkpoint_op(),
@@ -110,37 +105,37 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
     "no checkpoint before the interval"
   );
   assert!(
-    !sb.has_inflight(),
+    !storage.sb_mut().has_inflight(),
     "no superblock write before the interval"
   );
 
   // Commit op 2: commit_min reaches checkpoint_op(0)+checkpoint_ops(2)=2 → step 1: the snapshot
   // write is submitted (inflight) but NOT yet durable.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    Peer::Client(ClientId::new(7)),
-    req(2),
-  );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // append durable → commit op 2 → submit_write_checkpoint
+  e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(2));
+  e.storage_step(now, &mut storage, &mut blocks); // append durable → commit op 2 → submit_write_checkpoint
   assert_eq!(e.commit(), OpNumber::with(2));
-  assert!(sb.has_inflight(), "step 1: the snapshot write is inflight");
+  assert!(
+    storage.sb_mut().has_inflight(),
+    "step 1: the snapshot write is inflight"
+  );
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(0),
     "checkpoint not durable until BOTH sb writes complete"
   );
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(0),
     "the durable root still names the OLD checkpoint after only step 1's submit"
   );
 
   // Flush step 1 (snapshot durable) → step 2: the VsrState root write is submitted (inflight).
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  assert!(sb.has_inflight(), "step 2: the root write is inflight");
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    storage.sb_mut().has_inflight(),
+    "step 2: the root write is inflight"
+  );
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(0),
@@ -148,17 +143,17 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
   );
 
   // Flush step 2 (root durable) → step 3: the checkpoint officially advances in-memory.
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  assert!(!sb.has_inflight(), "the sequence is complete");
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(!storage.sb_mut().has_inflight(), "the sequence is complete");
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(2),
     "checkpoint durable after both writes"
   );
   // The durable root now names the new checkpoint, with a non-zero content id (hash of envelope).
-  assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
-  assert_ne!(sb.state().checkpoint_id(), 0);
+  assert_eq!(storage.sb_mut().state().checkpoint_op(), OpNumber::with(2));
+  assert_ne!(storage.sb_mut().state().checkpoint_id(), 0);
   // The root-durable arm surfaced as an observability event for exactly the checkpointed op.
   assert!(
     core::iter::from_fn(|| e.poll_event())
@@ -176,7 +171,7 @@ fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
   // is treated as data, and the sticky cadence re-forces the checkpoint once the flush succeeds.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -191,15 +186,10 @@ fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
 
   // Commit ops 1,2 → commit_min reaches the boundary and `force_checkpoint` runs — it writes the DAG
   // blocks, flushes (which FAULTS), and returns false WITHOUT submitting the checkpoint envelope.
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.commit(), OpNumber::with(2), "the ops still commit");
   assert_eq!(
@@ -208,11 +198,11 @@ fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
     "a failed block-store flush does NOT advance the checkpoint pointer"
   );
   assert!(
-    sb.checkpoint.is_none(),
+    storage.sb_mut().checkpoint.is_none(),
     "no superblock checkpoint write was submitted when the flush faulted (no torn checkpoint)"
   );
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(0),
     "the durable root still names the OLD checkpoint after the flush fault"
   );
@@ -225,22 +215,16 @@ fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
   // still sees `commit_min(3) >= checkpoint_op(0)+2`, so the sticky re-force fires immediately and THIS
   // time the flush succeeds, so the checkpoint completes durably (advancing the pointer to 3). This is
   // the storage-fault-discipline payoff: the failed barrier only DELAYED the checkpoint, never lost it.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    Peer::Client(ClientId::new(7)),
-    req(3),
-  );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(3));
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.commit(), OpNumber::with(3));
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(3),
     "once the flush succeeds the re-forced checkpoint advances the pointer"
   );
-  assert_eq!(sb.state().checkpoint_op(), OpNumber::with(3));
-  assert_ne!(sb.state().checkpoint_id(), 0);
+  assert_eq!(storage.sb_mut().state().checkpoint_op(), OpNumber::with(3));
+  assert_ne!(storage.sb_mut().state().checkpoint_id(), 0);
 }
 
 #[test]
@@ -251,7 +235,7 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
   // the first is in flight — only ONE checkpoint completes, landing at the op it staged (2).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -263,20 +247,15 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
   };
 
   // Commit ops 1,2 → checkpoint triggers (step 1: snapshot write inflight, NOT durable).
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.commit(), OpNumber::with(2));
   assert_eq!(e.checkpoint_op(), OpNumber::with(0));
   assert!(
-    sb.has_inflight(),
+    storage.sb_mut().has_inflight(),
     "the first checkpoint's snapshot write is inflight"
   );
 
@@ -285,14 +264,8 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
   // a primary must not assign new ops while a checkpoint-persist is in flight (an op-reuse hazard).
   // So commit stays at 2, and (a fortiori) no second checkpoint is armed.
   for rn in 3..=4 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.commit(),
@@ -307,40 +280,34 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
 
   // Drive the first (and only) in-flight checkpoint — staged at target_op=2 — to completion by
   // flushing its two writes. It advances checkpoint_op to 2 exactly (no second checkpoint started).
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // step 1 done → step 2 (root write) inflight
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // step 2 done → checkpoint advances to 2
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks); // step 1 done → step 2 (root write) inflight
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks); // step 2 done → checkpoint advances to 2
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(2),
     "exactly one checkpoint completed at its staged op (2), no double-trigger"
   );
-  assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
+  assert_eq!(storage.sb_mut().state().checkpoint_op(), OpNumber::with(2));
 
   // Now the checkpoint is durable (no persist in flight), so the primary serves again. Resending
   // 3,4 commits them; commit_min reaches 4 → the boundary re-evaluates (4 >= checkpoint_op(2)+2) and
   // a SECOND checkpoint triggers at op 4 and completes. This proves the gate only suppressed the
   // OVERLAP, and that the serve-defense releases the moment the persist finishes.
   for rn in 3..=4 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.commit(),
     OpNumber::with(4),
     "the primary serves again once the persist is durable (3,4 now commit)"
   );
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // snapshot done → root write
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // root done → checkpoint advances
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks); // snapshot done → root write
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks); // root done → checkpoint advances
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(4),
@@ -356,7 +323,7 @@ fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
   // sim `Cluster` exercises each tick, so a long-enough sim run checkpoints.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -366,15 +333,10 @@ fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
       Bytes::from(std::vec![rn as u8]),
     ))
   };
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.commit(), OpNumber::with(2));
   assert_eq!(
@@ -382,8 +344,8 @@ fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
     OpNumber::with(2),
     "synchronous superblock completes both checkpoint writes in the boundary-commit drain"
   );
-  assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
-  assert_ne!(sb.state().checkpoint_id(), 0);
+  assert_eq!(storage.sb_mut().state().checkpoint_op(), OpNumber::with(2));
+  assert_ne!(storage.sb_mut().state().checkpoint_id(), 0);
 }
 
 #[test]
@@ -394,7 +356,7 @@ fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
   // NEW request still commits (apply reads from commit_min, not from a pruned op).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -404,24 +366,19 @@ fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
       Bytes::from(std::vec![rn as u8]),
     ))
   };
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // append durable → commit; on op 2, checkpoint completes
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks); // append durable → commit; on op 2, checkpoint completes
   }
   assert_eq!(e.checkpoint_op(), OpNumber::with(2));
   // Quorum=1 → prune floor = checkpoint_op = 2 → ops <= 2 are freed from the WAL.
   assert!(
-    wal.header(OpNumber::with(1)).is_none(),
+    storage.wal_mut().header(OpNumber::with(1)).is_none(),
     "op 1 pruned from the WAL"
   );
   assert!(
-    wal.header(OpNumber::with(2)).is_none(),
+    storage.wal_mut().header(OpNumber::with(2)).is_none(),
     "op 2 pruned from the WAL"
   );
   // The in-memory log + inflight caches are trimmed to (floor .. head] = empty here (head == 2).
@@ -437,14 +394,8 @@ fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
     "inflight cache trimmed below the checkpoint"
   );
   // A NEW request still commits (op 3) — the SM applies from commit_min, not from a pruned op.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    Peer::Client(ClientId::new(7)),
-    req(3),
-  );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(3));
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(3),
@@ -466,17 +417,17 @@ fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
   // (replica 1 of 3) to a durable checkpoint via Prepares + Commits and asserts it pruned.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The backup has heard from no peers → its quorum_checkpoint_op is 0 (conservative).
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::with(0));
   // Append ops 1,2 via Prepares from the primary (replica 0, view 0), pumping the durable append.
+  let mut storage = Storage::new(wal, sb);
   for op in 1..=2u64 {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(0)),
       Message::Prepare(Prepare::new(
         View::new(),
@@ -490,13 +441,12 @@ fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
         Bytes::from(std::vec![op as u8]),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   // Commit op 2 so the backup's commit_min reaches the boundary and it checkpoints.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::Commit(Commit::new(
       View::new(),
@@ -506,7 +456,7 @@ fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
       0,
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.commit(), OpNumber::with(2), "backup committed op 2");
   assert_eq!(
     e.checkpoint_op(),
@@ -522,7 +472,8 @@ fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
     "the backup's quorum floor is 0 (only self reports a checkpoint) — yet it still pruned"
   );
   assert!(
-    wal.header(OpNumber::with(1)).is_none() && wal.header(OpNumber::with(2)).is_none(),
+    storage.wal_mut().header(OpNumber::with(1)).is_none()
+      && storage.wal_mut().header(OpNumber::with(2)).is_none(),
     "a backup prunes its WAL below its own checkpoint (boundedness), no quorum reports needed"
   );
   assert_eq!(
@@ -543,7 +494,7 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
   // N=3 so a view change is reachable, but checkpoint_ops=2 and we commit 2 ops as primary first.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -555,19 +506,13 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
   };
   // Commit 2 ops with a 2-of-3 quorum (replica 1 acks), so commit_min reaches 2 and a checkpoint
   // is taken. The primary's own append + replica 1's PrepareOk = quorum 2.
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks); // primary's own append durable (own vote)
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable (own vote)
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -583,7 +528,7 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
         0,
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain any checkpoint writes
+    e.storage_step(now, &mut storage, &mut blocks); // drain any checkpoint writes
   }
   assert_eq!(e.commit(), OpNumber::with(2));
   assert_eq!(
@@ -591,15 +536,14 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
     OpNumber::with(2),
     "checkpoint is durable at op 2"
   );
-  let id_before = sb.state().checkpoint_id();
+  let id_before = storage.sb_mut().state().checkpoint_id();
   assert_ne!(id_before, 0);
 
   // Force a view change: two peers send StartViewChange(view 1) → SVC quorum → ViewChange(1),
   // which submits a durable-view write. Pump it.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -610,8 +554,7 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -621,14 +564,14 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
     )),
   );
   assert_eq!(e.status(), Status::ViewChange);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the durable-view write completes
+  e.storage_step(now, &mut storage, &mut blocks); // the durable-view write completes
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(2),
     "the view-change durable-view write must PRESERVE the checkpoint_op (not regress to 0)"
   );
   assert_eq!(
-    sb.state().checkpoint_id(),
+    storage.sb_mut().state().checkpoint_id(),
     id_before,
     "and preserve the matching checkpoint id"
   );
@@ -648,16 +591,16 @@ fn primary_tracks_quorum_checkpoint_op() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // A fresh primary in Normal view 0 with no peers heard from has quorum_checkpoint_op == 0.
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::new());
   // Quorum-checkpoint tracking is independent of inflight: the ok is recorded for its replica even
   // without a matching inflight op (the replica-id range check is the only guard).
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -677,8 +620,7 @@ fn primary_tracks_quorum_checkpoint_op() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -698,7 +640,7 @@ fn quorum_checkpoint_op_single_replica_is_self() {
   // N=1, quorum=1 → the quorum checkpoint is exactly self's checkpoint (no peers to wait for).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::new());
@@ -709,15 +651,10 @@ fn quorum_checkpoint_op_single_replica_is_self() {
       Bytes::from(std::vec![rn as u8]),
     ))
   };
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.checkpoint_op(), OpNumber::with(2));
   assert_eq!(
@@ -736,13 +673,13 @@ fn peer_checkpoint_is_monotone_under_reordering() {
   // all rely on monotone per-peer checkpoints (a regressing floor could un-fire the escalation).
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary(), "replica 0 is the view-0 primary");
   // A PrepareOk from replica 1 reporting checkpoint_op = 8.
+  let mut storage = Storage::new(wal, sb);
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -758,8 +695,7 @@ fn peer_checkpoint_is_monotone_under_reordering() {
   // A REORDERED older PrepareOk from replica 1 reporting checkpoint_op = 4 — must NOT regress.
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -783,12 +719,12 @@ fn on_commit_records_the_primary_checkpoint_monotonically() {
   // The backup-side record path (`on_commit`) is likewise monotone: a reordered older Commit from
   // the primary must not lower the recorded primary checkpoint.
   let mut e = sync_backup(); // replica 1 of 3, primary is replica 0
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -802,8 +738,7 @@ fn on_commit_records_the_primary_checkpoint_monotonically() {
   // A reordered older Commit (checkpoint 2) must not regress the recorded value.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -880,7 +815,7 @@ fn adoption_rolls_back_an_orphaned_accept_ahead_watermark() {
   // op 2 (watermark 2, reply cached at request 1) but never committed it, then adopt a higher view whose
   // canonical head is op 1 — op 2 is dropped, and the watermark must roll back to the reply-backed 1.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   e.force_state_for_test(0, 2, 1, 0, &[]);
   e.log.insert(
@@ -914,10 +849,10 @@ fn adoption_rolls_back_an_orphaned_accept_ahead_watermark() {
   );
 
   // Adopt view 1 whose canonical head is op 1 (commit 1): the uncommitted op 2 is truncated.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(crate::StartView::new(
       View::with(1),
@@ -992,42 +927,39 @@ fn chaos_ok(op: u64, replica: u16, checkpoint_op: u64) -> Message {
 /// Returns the endpoint + storage with the outgoing queue drained.
 fn primary_with_op1_write_held_across_checkpoint_gc() -> (
   Endpoint<NoopSm>,
-  ReorderWal,
-  TestSb,
+  Storage<ReorderWal, TestSb>,
   crate::block_store::InMemoryBlockStore,
 ) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, 4);
-  let (mut wal, mut sb) = (ReorderWal::bounded(4), TestSb::default());
+  let (wal, sb) = (ReorderWal::bounded(4), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Op 1 = body `[1]` staged (completion HELD). Both backups vote → op 1 commits WITHOUT the
   // primary's own vote (2-of-3 quorum from the backups alone) while its own append is still in
   // flight — the client is replied to on the strength of the BACKUPS' durable copies.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     chaos_req(1),
   );
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "op 1's append is staged, its completion withheld"
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     chaos_ok(1, 1, 0),
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     chaos_ok(1, 2, 0),
   );
@@ -1042,21 +974,22 @@ fn primary_with_op1_write_held_across_checkpoint_gc() -> (
   // still 0 (no peer has REPORTED a checkpoint).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     chaos_req(2),
   );
-  assert!(wal.release_latest_for(2), "op 2's append lands normally");
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own vote for op 2
+  assert!(
+    storage.wal_mut().release_latest_for(2),
+    "op 2's append lands normally"
+  );
+  e.storage_step(now, &mut storage, &mut blocks); // own vote for op 2
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     chaos_ok(2, 1, 0),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the checkpoint writes
+  e.storage_step(now, &mut storage, &mut blocks); // drain the checkpoint writes
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(2),
@@ -1064,35 +997,32 @@ fn primary_with_op1_write_held_across_checkpoint_gc() -> (
   );
 
   // Ops 3 and 4: mint + release + both backups ack CARRYING `checkpoint_op = 2`, so the quorum
-  // checkpoint rises to 2 and the checkpoint at op 4 runs GC with prune floor 2 → `wal.prune(3)`.
+  // checkpoint rises to 2 and the checkpoint at op 4 runs GC with prune floor 2 → `storage.wal_mut().prune(3)`.
   for op in 3..=4 {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       chaos_req(op),
     );
     assert!(
-      wal.release_latest_for(op),
+      storage.wal_mut().release_latest_for(op),
       "op {op}'s append lands normally"
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own vote
+    e.storage_step(now, &mut storage, &mut blocks); // own vote
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(1)),
       chaos_ok(op, 1, 2),
     );
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(2)),
       chaos_ok(op, 2, 2),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain (op 4's commit fires the checkpoint + GC)
+    e.storage_step(now, &mut storage, &mut blocks); // drain (op 4's commit fires the checkpoint + GC)
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -1100,21 +1030,21 @@ fn primary_with_op1_write_held_across_checkpoint_gc() -> (
     "the checkpoint at op 4 is durable"
   );
   assert_eq!(
-    wal.durable_body(2),
+    storage.wal_mut().durable_body(2),
     None,
     "the GC prune freed the durable WAL slots through op 2"
   );
   assert!(
-    wal.durable_body(3).is_some() && wal.durable_body(4).is_some(),
+    storage.wal_mut().durable_body(3).is_some() && storage.wal_mut().durable_body(4).is_some(),
     "the un-pruned tail (ops 3, 4) is durably held"
   );
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "op 1's write is STILL staged — the prune could not cancel the device write"
   );
   while e.poll_message().is_some() {}
-  (e, wal, sb, blocks)
+  (e, storage, blocks)
 }
 
 #[test]
@@ -1125,7 +1055,7 @@ fn gc_retires_a_checkpoint_subsumed_deferred_appends_bookkeeping() {
   // the deferred entry AND the `appending` mark it owns — because a dropped waiter never mints a
   // completion: an orphaned mark would hold `has_inflight_storage()` true until the next generation
   // reset, wedging the graceful-shutdown, restart-drain, and seal paths on a healthy replica.
-  let (mut e, mut wal, mut sb, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
+  let (mut e, mut storage, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
   let now = Instant::ZERO;
 
   // Op 5 (the ring alias of op 1 under capacity 4) mints and DEFERS behind op 1's un-quiesced
@@ -1133,27 +1063,24 @@ fn gc_retires_a_checkpoint_subsumed_deferred_appends_bookkeeping() {
   // without ever having been submitted locally.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     chaos_req(5),
   );
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "op 5's append is deferred (only op 1's old write is physically staged)"
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     chaos_ok(5, 1, 4),
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     chaos_ok(5, 2, 4),
   );
@@ -1167,28 +1094,28 @@ fn gc_retires_a_checkpoint_subsumed_deferred_appends_bookkeeping() {
   // so the boundary's GC runs with a prune floor covering the deferred op 5.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     chaos_req(6),
   );
-  assert!(wal.release_latest_for(6), "op 6's append lands normally");
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own vote for op 6
+  assert!(
+    storage.wal_mut().release_latest_for(6),
+    "op 6's append lands normally"
+  );
+  e.storage_step(now, &mut storage, &mut blocks); // own vote for op 6
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     chaos_ok(6, 1, 6),
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     chaos_ok(6, 2, 6),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // checkpoint at 6 → root durable → GC
+  e.storage_step(now, &mut storage, &mut blocks); // checkpoint at 6 → root durable → GC
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(6),
@@ -1198,10 +1125,13 @@ fn gc_retires_a_checkpoint_subsumed_deferred_appends_bookkeeping() {
   // Quiesce the one remaining physical write — op 1's blocker — and drain. With the waiter's whole
   // footprint retired, NOTHING is left in flight: the drain signal settles instead of reading true
   // forever off an `appending` mark no completion can ever clear.
-  assert!(wal.release_latest_for(1), "op 1's old write finally lands");
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert!(
-    !e.has_inflight_storage(),
+    storage.wal_mut().release_latest_for(1),
+    "op 1's old write finally lands"
+  );
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    !e.has_inflight_storage(&storage),
     "the checkpoint-subsumed waiter left no orphaned bookkeeping — storage fully quiesces"
   );
   while e.poll_message().is_some() {}
@@ -1218,20 +1148,19 @@ fn ring_wrap_reappend_defers_until_the_pruned_slots_old_write_quiesces() {
   // bytes LAST — evicting the COMMITTED op 5's durable value from the shared slot while its commit
   // (and client reply) stand: committed-value loss. The fence DEFERS op 5's append until op 1's
   // write quiesces, so op 5's bytes are the last write to the slot.
-  let (mut e, mut wal, mut sb, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
+  let (mut e, mut storage, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
   let now = Instant::ZERO;
 
   // Mint op 5 (body `[5]`) — the ring alias of op 1's slot. The Prepare broadcasts (consensus
   // proceeds), but the physical append is DEFERRED behind op 1's un-quiesced write.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     chaos_req(5),
   );
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "op 5's append was DEFERRED by the fence (only op 1's old write is staged) despite the \
      admission window allowing the mint"
@@ -1252,8 +1181,7 @@ fn ring_wrap_reappend_defers_until_the_pruned_slots_old_write_quiesces() {
   // append (append-before-ack), which is deferred.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     chaos_ok(5, 1, 2),
   );
@@ -1271,9 +1199,9 @@ fn ring_wrap_reappend_defers_until_the_pruned_slots_old_write_quiesces() {
   // committing op 5 with the backup's ack. Reverted (no fence): op 5's append was submitted at mint
   // ALONGSIDE op 1's, so newest-first lands op 5 FIRST and op 1's stale bytes LAST — evicting the
   // committed op 5's durable value, which the final durable_body assert catches.
-  while let Some(&newest) = wal.staged_ops().last() {
-    assert!(wal.release_latest_for(newest));
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(&newest) = storage.wal_mut().staged_ops().last() {
+    assert!(storage.wal_mut().release_latest_for(newest));
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.commit(),
@@ -1283,17 +1211,17 @@ fn ring_wrap_reappend_defers_until_the_pruned_slots_old_write_quiesces() {
   // THE property: the durable ring slot holds the COMMITTED op 5's bytes — the last write to the
   // slot — and op 1's stale resurrection was evicted by the wrap, not the other way around.
   assert_eq!(
-    wal.durable_body(5),
+    storage.wal_mut().durable_body(5),
     Some(Bytes::from(std::vec![5u8])),
     "the shared ring slot durably holds the committed op 5's bytes, not op 1's late stale write"
   );
   assert_eq!(
-    wal.durable_body(1),
+    storage.wal_mut().durable_body(1),
     None,
     "op 1's resurrected entry was evicted by op 5's wrap (the checkpoint owns its content)"
   );
   assert!(
-    !e.has_inflight_storage(),
+    !e.has_inflight_storage(&storage),
     "every physical write quiesced — nothing lingers after the choreography"
   );
 }
@@ -1307,20 +1235,20 @@ fn async_cancellation_of_a_released_ops_write_retires_it_silently() {
   // endpoint must retire the bookkeeping ON THE SPOT — no vote cast, no resubmit staged (the op is
   // released; nothing is owed) — so the storage-drain signal settles and a driver's graceful
   // teardown completes.
-  let (mut e, mut wal, mut sb, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
+  let (mut e, mut storage, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
   let now = Instant::ZERO;
 
   assert!(
-    e.has_inflight_storage(),
+    e.has_inflight_storage(&storage),
     "op 1's un-quiesced write still holds the storage-drain signal true"
   );
   assert!(
-    wal.cancel_latest_for(1),
+    storage.wal_mut().cancel_latest_for(1),
     "the backend async-cancels op 1's staged write"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![] as std::vec::Vec<u64>,
     "nothing was re-submitted for the released op (the cancellation is not a fault to retry)"
   );
@@ -1330,12 +1258,12 @@ fn async_cancellation_of_a_released_ops_write_retires_it_silently() {
     "no vote/commit moved — the released op's cancellation owes nothing"
   );
   assert_eq!(
-    wal.durable_body(1),
+    storage.wal_mut().durable_body(1),
     None,
     "the cancelled write never landed (no resurrection)"
   );
   assert!(
-    !e.has_inflight_storage(),
+    !e.has_inflight_storage(&storage),
     "the released-op cancellation retired ALL bookkeeping — the endpoint settles"
   );
 }
@@ -1355,41 +1283,47 @@ fn async_cancellation_of_a_live_ops_write_degrades_to_a_resubmit() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
+  let (wal, sb) = (ReorderWal::new(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     chaos_req(1),
   );
-  assert_eq!(wal.staged_ops(), std::vec![1], "op 1's append is staged");
+  assert_eq!(
+    storage.wal_mut().staged_ops(),
+    std::vec![1],
+    "op 1's append is staged"
+  );
   assert!(
-    wal.cancel_latest_for(1),
+    storage.wal_mut().cancel_latest_for(1),
     "the backend spuriously cancels the LIVE append"
   );
   assert_eq!(
-    wal.staged_len(),
+    storage.wal_mut().staged_len(),
     0,
     "the cancel popped the old write before the endpoint reacts"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "a FRESH re-submit was staged for the live op (degraded to a retry, not a leak)"
   );
 
   // The retried append lands → the primary's own vote; one backup ack completes the quorum.
-  assert!(wal.release_latest_for(1), "the re-submitted append lands");
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    storage.wal_mut().release_latest_for(1),
+    "the re-submitted append lands"
+  );
+  e.storage_step(now, &mut storage, &mut blocks);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     chaos_ok(1, 1, 0),
   );
@@ -1399,12 +1333,12 @@ fn async_cancellation_of_a_live_ops_write_degrades_to_a_resubmit() {
     "liveness preserved: the op still commits despite the spurious cancellation"
   );
   assert_eq!(
-    wal.durable_body(1),
+    storage.wal_mut().durable_body(1),
     Some(Bytes::from(std::vec![1u8])),
     "the durable slot holds the retried append's bytes"
   );
   assert!(
-    !e.has_inflight_storage(),
+    !e.has_inflight_storage(&storage),
     "nothing lingers once the retried append quiesced"
   );
 }
@@ -1427,21 +1361,19 @@ fn backup_checkpointing_every(ops: u64) -> Endpoint<EchoSm> {
 /// backup's appends quiesce.
 fn accept_and_commit(
   e: &mut Endpoint<EchoSm>,
-  wal: &mut TestWal,
-  sb: &mut StepSb,
+  storage: &mut Storage<TestWal, StepSb>,
   blocks: &mut crate::block_store::InMemoryBlockStore,
   ops: core::ops::RangeInclusive<u64>,
   commit: u64,
 ) {
   let now = Instant::ZERO;
   for op in ops {
-    e.handle_message(now, wal, sb, primary_peer(), prepare(op, 0));
+    e.handle_message(now, storage, primary_peer(), prepare(op, 0));
   }
-  e.storage_step(now, wal, sb, blocks);
+  e.storage_step(now, storage, blocks);
   e.handle_message(
     now,
-    wal,
-    sb,
+    storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -1464,11 +1396,12 @@ fn commits_advance_while_a_checkpoint_materialize_is_still_being_written() {
   // Here the driver's storage lane TAKES the job and does not execute it (a slow disk), and the
   // backup keeps accepting and applying ops the whole time.
   let mut e = backup_checkpointing_every(2);
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
-  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  let mut storage = Storage::new(wal, sb);
+  accept_and_commit(&mut e, &mut storage, &mut blocks, 1..=2, 2);
   assert_eq!(
     e.commit(),
     OpNumber::with(2),
@@ -1486,17 +1419,17 @@ fn commits_advance_while_a_checkpoint_materialize_is_still_being_written() {
     "the queued job is the checkpoint's DAG write"
   );
   assert!(
-    e.has_inflight_storage(),
+    e.has_inflight_storage(&storage),
     "the held materialize counts as outstanding durability work"
   );
   assert!(
-    !sb.has_inflight(),
+    !storage.sb_mut().has_inflight(),
     "no superblock write exists yet — the pointer may not name blocks that are not flushed"
   );
 
   // CONSENSUS PROGRESS WHILE IT IS HELD: accept + commit two more ops purely through the ingress
   // path, and observe the endpoint still answering.
-  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 3..=4, 4);
+  accept_and_commit(&mut e, &mut storage, &mut blocks, 3..=4, 4);
   assert_eq!(
     e.commit(),
     OpNumber::with(4),
@@ -1509,7 +1442,7 @@ fn commits_advance_while_a_checkpoint_materialize_is_still_being_written() {
   // ANTI-VACUITY (the second half): the job was STILL unexecuted across all of that — the progress
   // above genuinely overlapped the write rather than following it.
   assert!(
-    e.has_inflight_storage(),
+    e.has_inflight_storage(&storage),
     "the materialize is still outstanding after the commits advanced"
   );
   assert_eq!(
@@ -1521,15 +1454,15 @@ fn commits_advance_while_a_checkpoint_materialize_is_still_being_written() {
   // Now the lane finishes. Only THEN does the checkpoint's superblock write appear.
   let mut cursor = crate::BlockJobCursor::new();
   let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
-  e.on_block_done(now, &mut wal, &mut sb, done);
+  e.on_block_done(now, &mut storage, done);
   assert!(
-    sb.has_inflight(),
+    storage.sb_mut().has_inflight(),
     "the completed+flushed DAG releases the snapshot write"
   );
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(2),
@@ -1544,24 +1477,24 @@ fn a_materialize_that_crosses_a_view_change_is_superseded_and_never_published() 
   // endpoint no longer owns, and naming them would advance the durable pointer off a generation the
   // replica abandoned.
   let mut e = backup_checkpointing_every(2);
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
-  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  let mut storage = Storage::new(wal, sb);
+  accept_and_commit(&mut e, &mut storage, &mut blocks, 1..=2, 2);
   let job = e
     .poll_block_job()
     .expect("crossing the checkpoint boundary issues the materialize");
-  let durable_before = sb.state().checkpoint_op();
+  let durable_before = storage.sb_mut().state().checkpoint_op();
 
   // A VIEW CHANGE fires while the DAG is being written: this backup's own idle timeout proposes
   // view 1 and a peer's StartViewChange completes the quorum.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -1584,7 +1517,7 @@ fn a_materialize_that_crosses_a_view_change_is_superseded_and_never_published() 
   // The lane finishes AFTER the transition. Its result must be refused.
   let mut cursor = crate::BlockJobCursor::new();
   let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
-  e.on_block_done(later, &mut wal, &mut sb, done);
+  e.on_block_done(later, &mut storage, done);
   assert_eq!(
     e.block_jobs_superseded(),
     1,
@@ -1601,7 +1534,7 @@ fn a_materialize_that_crosses_a_view_change_is_superseded_and_never_published() 
      — the checkpoint's absence is a refusal, not an unreachable superblock"
   );
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     durable_before,
     "the durable checkpoint pointer never moved"
   );
@@ -1625,13 +1558,14 @@ fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
   // NEUTER CHECK: drop the `materializing` guard in `force_checkpoint` and the queue grows by one
   // `Materialize` per round below (5 instead of 1).
   let mut e = backup_checkpointing_every(2);
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Cross the checkpoint boundary once: the first capture is issued and the lane is PAUSED from here
   // on (no `poll_block_job`, so nothing the endpoint issues ever executes).
-  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  let mut storage = Storage::new(wal, sb);
+  accept_and_commit(&mut e, &mut storage, &mut blocks, 1..=2, 2);
   assert!(
     matches!(
       e.pending_checkpoint.map(|pc| pc.step),
@@ -1650,8 +1584,7 @@ fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
     let t = now + core::time::Duration::from_millis(1000 * (round as u64 + 1));
     e.handle_message(
       t,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(primary)),
       Message::StartView(crate::StartView::new(
         View::with(view),
@@ -1671,13 +1604,12 @@ fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
     // Settle the adoption's durable-view write WITHOUT touching the block lane, then re-drive the
     // commit tail so the (still due) cadence genuinely attempts a fresh capture.
     for _ in 0..4 {
-      sb.flush();
-      e.handle_storage(t, &mut wal, &mut sb);
+      storage.sb_mut().flush();
+      e.handle_storage(t, &mut storage);
     }
     e.handle_message(
       t,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(primary)),
       Message::Commit(Commit::new(
         View::with(view),
@@ -1724,7 +1656,7 @@ fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
   let last = now + core::time::Duration::from_millis(9000);
   for job in jobs {
     let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
-    e.on_block_done(last, &mut wal, &mut sb, done);
+    e.on_block_done(last, &mut storage, done);
   }
   assert!(
     e.block_jobs_superseded() > superseded_before,
@@ -1732,7 +1664,7 @@ fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
      supersession, which is exactly what the rounds above kept producing"
   );
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(0),
     "and no superseded image ever advanced the durable checkpoint pointer"
   );
@@ -1763,32 +1695,32 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_materialize() {
   // NEUTER CHECK: reset `materializing` to `None` in `recover` instead of inheriting `lane` and the
   // re-driven boundary below queues a SECOND full image behind the first.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(); // a backup of view 0
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
 
   // The predecessor crosses the checkpoint boundary and captures — but the lane never executes the
   // job, so the image stays queued when the endpoint is replaced.
+  let mut storage = Storage::new(wal, sb);
   let mut dead = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover the formatted store")
   .expect_active();
   assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
   for op in 1..=2 {
-    dead.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+    dead.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
   }
   for _ in 0..4 {
-    dead.handle_storage(now, &mut wal, &mut sb);
+    dead.handle_storage(now, &mut storage);
   }
-  dead.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  dead.handle_message(now, &mut storage, primary_peer(), commit_msg(2));
   let held = dead
     .poll_block_job()
     .expect("the crossed boundary owes an image capture");
@@ -1804,13 +1736,13 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_materialize() {
   // The successor recovers over the same storage AND the same lane. It re-learns the committed
   // frontier and finds the cadence due again — every condition for a capture except the one that
   // matters: the lane already holds an image.
-  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut wal, &mut sb, lane)
+  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut storage, lane)
     .expect("recover in place over the live storage")
     .expect_active();
   for _ in 0..4 {
-    live.handle_storage(now, &mut wal, &mut sb);
+    live.handle_storage(now, &mut storage);
   }
-  live.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  live.handle_message(now, &mut storage, primary_peer(), commit_msg(2));
   assert_eq!(
     live.status(),
     Status::Normal,
@@ -1835,30 +1767,30 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_materialize() {
   // refused, publishing nothing — and that refusal is what re-opens the capture site.
   let mut cursor = crate::BlockJobCursor::new();
   let done = crate::execute_block_job(&mut cursor, held, &mut blocks);
-  live.on_block_done(now, &mut wal, &mut sb, done);
+  live.on_block_done(now, &mut storage, done);
   assert_eq!(
     live.foreign_completions_rejected(),
     1,
     "the dead incarnation's materialize was refused at the choke"
   );
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(0),
     "the refused completion advanced no durable pointer"
   );
 
   // Re-drive the still-due cadence (the next heartbeat): the freed capture site takes the boundary
   // it refused above, and this capture publishes.
-  live.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  live.handle_message(now, &mut storage, primary_peer(), commit_msg(2));
   let fresh = live
     .poll_block_job()
     .expect("the released capture site takes the still-due boundary");
   assert!(fresh.tag().is_materialize());
   let done = crate::execute_block_job(&mut cursor, fresh, &mut blocks);
-  live.on_block_done(now, &mut wal, &mut sb, done);
-  live.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  live.on_block_done(now, &mut storage, done);
+  live.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(2),
     "the successor's own capture published once the inherited one released"
   );
@@ -1873,18 +1805,18 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_serves() {
   // NEUTER CHECK: reset `block_serves_outstanding` to 0 in `recover` instead of inheriting `lane`
   // and the admission loop below accepts a full fresh cap (the refusal assertions fail).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
 
+  let mut storage = Storage::new(wal, sb);
   let mut dead = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover the formatted store")
@@ -1904,7 +1836,7 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_serves() {
   );
   drop(dead);
 
-  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut wal, &mut sb, lane)
+  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut storage, lane)
     .expect("recover in place over the live storage")
     .expect_active();
   while live.poll_message().is_some() {} // discard the recover chatter; watch for serve replies
@@ -1928,7 +1860,7 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_serves() {
   // cap slot frees, so the next request is admitted again.
   let mut cursor = crate::BlockJobCursor::new();
   let done = crate::execute_block_job(&mut cursor, first, &mut blocks);
-  live.on_block_done(now, &mut wal, &mut sb, done);
+  live.on_block_done(now, &mut storage, done);
   assert_eq!(
     live.foreign_completions_rejected(),
     1,
@@ -1964,37 +1896,40 @@ fn a_restart_in_place_inherits_the_lanes_outstanding_serves() {
 /// successor's lane yields, and re-drives the still-due cadence across several heartbeats. However
 /// the rebuild carries the lane's state, a checkpoint must eventually publish.
 #[test]
-#[ignore = "pins an open defect: an image capture still in the endpoint-local queue at a rebuild is \
-            dropped while its lane occupancy is inherited, so no completion can ever release the \
-            successor's capture site and the replica never checkpoints again; un-ignore when the \
-            queued job survives the rebuild (or the occupancy stops claiming it)"]
+#[ignore = "pins an open defect the STORAGE session does not close: the capture site's admission \
+            quota is claimed at QUEUE time and relayed across the rebuild, while the queued job \
+            itself dies with the endpoint's own queue — so the successor inherits a claim no lane \
+            can ever release. The medium's write facts now have an owner whose lifetime is the \
+            medium's; the LANE's occupancy still has none. Un-ignore when the job queue and its \
+            quotas live in one object with the lane's lifetime, so the claim and the job it \
+            describes cannot come apart"]
 fn a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(); // a backup of view 0
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
 
   // The predecessor crosses the checkpoint boundary and queues the image capture — and is replaced
   // BEFORE the driver polls it off the endpoint.
+  let mut storage = Storage::new(wal, sb);
   let mut dead = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover the formatted store")
   .expect_active();
   for op in 1..=2 {
-    dead.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+    dead.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
   }
   for _ in 0..4 {
-    dead.handle_storage(now, &mut wal, &mut sb);
+    dead.handle_storage(now, &mut storage);
   }
-  dead.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+  dead.handle_message(now, &mut storage, primary_peer(), commit_msg(2));
   let lane = dead.lane_occupancy();
   assert_ne!(
     lane,
@@ -2005,24 +1940,24 @@ fn a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site(
   drop(dead);
 
   // The successor recovers over the same storage with the occupancy the outgoing endpoint reported.
-  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut wal, &mut sb, lane)
+  let mut live = Endpoint::recover(cfg, genesis(3), 1, EchoSm, &mut storage, lane)
     .expect("recover in place over the live storage")
     .expect_active();
   let mut cursor = crate::BlockJobCursor::new();
   for _ in 0..4 {
     for _ in 0..4 {
-      live.handle_storage(now, &mut wal, &mut sb);
+      live.handle_storage(now, &mut storage);
     }
     // The heartbeat re-drives the committed frontier and, with it, the still-due capture cadence.
-    live.handle_message(now, &mut wal, &mut sb, primary_peer(), commit_msg(2));
+    live.handle_message(now, &mut storage, primary_peer(), commit_msg(2));
     // Execute EVERYTHING the successor's lane yields, to completion — if the queued job survived
     // the rebuild, this runs it (its completion refused or published, either releases the site);
     // if the site re-opens, this runs the fresh capture.
     while let Some(job) = live.poll_block_job() {
       let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
-      live.on_block_done(now, &mut wal, &mut sb, done);
+      live.on_block_done(now, &mut storage, done);
     }
-    live.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    live.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     live.status(),
@@ -2039,7 +1974,7 @@ fn a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site(
   // lane fully drained each round — a checkpoint must have published. A capture site that never
   // opens again is the permanent wedge: no checkpoint, no prune, a frozen floor.
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     OpNumber::with(2),
     "no checkpoint ever published after the rebuild: the inherited occupancy claims an image no \
      lane holds, and with no completion to refuse, nothing ever re-opens the capture site"
@@ -2049,22 +1984,23 @@ fn a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site(
 /// Drive a backup to a DURABLE checkpoint, then hand back two freshly issued block jobs (two GC
 /// sweeps over the live roots) plus the parts. Two OUTSTANDING jobs is the precondition every
 /// issue-order falsifier needs, and it is asserted at every use.
+#[allow(clippy::type_complexity)]
 fn two_outstanding_block_jobs() -> (
   Endpoint<EchoSm>,
-  TestWal,
-  StepSb,
+  Storage<TestWal, StepSb>,
   crate::block_store::InMemoryBlockStore,
   BlockJob<EchoSm>,
   BlockJob<EchoSm>,
 ) {
   let mut e = backup_checkpointing_every(2);
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  let mut storage = Storage::new(wal, sb);
+  accept_and_commit(&mut e, &mut storage, &mut blocks, 1..=2, 2);
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -2085,7 +2021,7 @@ fn two_outstanding_block_jobs() -> (
     second.id(),
     "precondition: two DISTINCT jobs are outstanding"
   );
-  (e, wal, sb, blocks, first, second)
+  (e, storage, blocks, first, second)
 }
 
 #[test]
@@ -2093,14 +2029,14 @@ fn the_storage_lane_executes_block_jobs_in_issue_order() {
   // CONTROL ARM for the two falsifiers below: in issue order, both the lane's cursor and the
   // endpoint's completion gate accept the pair. Without this the `should_panic` arms could pass for
   // the wrong reason (any panic, from any cause).
-  let (mut e, mut wal, mut sb, mut blocks, first, second) = two_outstanding_block_jobs();
+  let (mut e, mut storage, mut blocks, first, second) = two_outstanding_block_jobs();
   let mut cursor = crate::BlockJobCursor::new();
   let d1 = crate::execute_block_job(&mut cursor, first, &mut blocks);
   let d2 = crate::execute_block_job(&mut cursor, second, &mut blocks);
-  e.on_block_done(Instant::ZERO, &mut wal, &mut sb, d1);
-  e.on_block_done(Instant::ZERO, &mut wal, &mut sb, d2);
+  e.on_block_done(Instant::ZERO, &mut storage, d1);
+  e.on_block_done(Instant::ZERO, &mut storage, d2);
   assert!(
-    !e.has_inflight_storage(),
+    !e.has_inflight_storage(&storage),
     "both jobs retired, so the endpoint owes no storage work"
   );
 }
@@ -2114,7 +2050,7 @@ fn a_storage_lane_that_executes_out_of_issue_order_fails_stop() {
   // greater, so the later-issued job (delivered first here) executes and the EARLIER one is stopped
   // before it touches the store — which is the direction that matters, since the damaging job (the
   // stale sweep) is always the earlier of the pair.
-  let (_e, _wal, _sb, mut blocks, first, second) = two_outstanding_block_jobs();
+  let (_e, _storage, mut blocks, first, second) = two_outstanding_block_jobs();
   let mut cursor = crate::BlockJobCursor::new();
   let _ = crate::execute_block_job(&mut cursor, second, &mut blocks);
   let _ = crate::execute_block_job(&mut cursor, first, &mut blocks);
@@ -2126,11 +2062,11 @@ fn a_storage_lane_that_delivers_completions_out_of_order_fails_stop() {
   // The endpoint's half of the same contract: even a lane that EXECUTES in order must deliver the
   // completions in order, because the endpoint's correlation decisions (publish this checkpoint,
   // retire that obligation) are sequenced against the issue order it minted.
-  let (mut e, mut wal, mut sb, mut blocks, first, second) = two_outstanding_block_jobs();
+  let (mut e, mut storage, mut blocks, first, second) = two_outstanding_block_jobs();
   let mut cursor = crate::BlockJobCursor::new();
   let d1 = crate::execute_block_job(&mut cursor, first, &mut blocks);
   let d2 = crate::execute_block_job(&mut cursor, second, &mut blocks);
-  e.on_block_done(Instant::ZERO, &mut wal, &mut sb, d2);
+  e.on_block_done(Instant::ZERO, &mut storage, d2);
   let _ = d1;
 }
 
@@ -2146,30 +2082,15 @@ fn a_block_job_completion_from_a_dead_incarnation_is_refused_and_counted() {
     let e = backup_checkpointing_every(2);
     (
       e,
-      TestWal::default(),
-      StepSb::default(),
+      Storage::new(TestWal::default(), StepSb::default()),
       crate::block_store::InMemoryBlockStore::new(),
     )
   };
-  let (mut dead, mut dead_wal, mut dead_sb, mut dead_blocks) = build();
-  let (mut live, mut live_wal, mut live_sb, mut live_blocks) = build();
+  let (mut dead, mut dead_storage, mut dead_blocks) = build();
+  let (mut live, mut live_storage, mut live_blocks) = build();
   let now = Instant::ZERO;
-  accept_and_commit(
-    &mut dead,
-    &mut dead_wal,
-    &mut dead_sb,
-    &mut dead_blocks,
-    1..=2,
-    2,
-  );
-  accept_and_commit(
-    &mut live,
-    &mut live_wal,
-    &mut live_sb,
-    &mut live_blocks,
-    1..=2,
-    2,
-  );
+  accept_and_commit(&mut dead, &mut dead_storage, &mut dead_blocks, 1..=2, 2);
+  accept_and_commit(&mut live, &mut live_storage, &mut live_blocks, 1..=2, 2);
   let dead_job = dead
     .poll_block_job()
     .expect("the dead instance's materialize");
@@ -2192,27 +2113,27 @@ fn a_block_job_completion_from_a_dead_incarnation_is_refused_and_counted() {
   let mut cursor = crate::BlockJobCursor::new();
   let foreign = crate::execute_block_job(&mut cursor, dead_job, &mut dead_blocks);
   assert_eq!(live.foreign_completions_rejected(), 0);
-  live.on_block_done(now, &mut live_wal, &mut live_sb, foreign);
+  live.on_block_done(now, &mut live_storage, foreign);
   assert_eq!(
     live.foreign_completions_rejected(),
     1,
     "the foreign completion was refused at the choke and counted"
   );
   assert!(
-    !live_sb.has_inflight(),
+    !live_storage.has_inflight(),
     "and it published nothing: no checkpoint write was submitted off it"
   );
   assert!(
-    live.has_inflight_storage(),
+    live.has_inflight_storage(&live_storage),
     "the live endpoint's own materialize is still owed — the refusal did not retire it"
   );
 
   // The live endpoint's OWN completion still lands, proving the refusal was surgical.
   let mut live_cursor = crate::BlockJobCursor::new();
   let own = crate::execute_block_job(&mut live_cursor, live_job, &mut live_blocks);
-  live.on_block_done(now, &mut live_wal, &mut live_sb, own);
+  live.on_block_done(now, &mut live_storage, own);
   assert!(
-    live_sb.has_inflight(),
+    live_storage.has_inflight(),
     "its own materialize publishes the checkpoint write"
   );
 }

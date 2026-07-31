@@ -159,7 +159,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (a voter lacking `gap` lacks the whole suffix above it) and is EVENT-DRIVEN on the `f+1`-th nack —
   /// no wall-clock deadline; candidates are re-solicited on the ordinary `repair_retry` cadence, which
   /// re-elicits nacks until the quorum is reached or a holder fills the hole.
-  pub(crate) fn on_nack<W: Wal>(&mut self, wal: &mut W, from: Peer, m: crate::Nack) {
+  pub(crate) fn on_nack<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    from: Peer,
+    m: crate::Nack,
+  ) {
     if !self.participates_as_primary() || self.pending_forfeit {
       return;
     }
@@ -212,7 +217,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.nack_from.get(&gap).map_or(0, |voters| voters.len())
       >= self.membership.quorum_nack_prepare()
     {
-      self.truncate_uncommitted_tail_from(wal, gap);
+      self.truncate_uncommitted_tail_from(storage, gap);
     }
   }
 
@@ -233,7 +238,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// clause — no committed op is ever dropped. The `f+1`-nack precondition the caller checked proves it:
   /// a committed op needs a write-quorum (`f+1`) to durably hold it, and every write-quorum member keeps
   /// at least a header (so never nacks), hence a committed op can never accrue `f+1` nacks.
-  fn truncate_uncommitted_tail_from<W: Wal>(&mut self, wal: &mut W, gap: u64) {
+  fn truncate_uncommitted_tail_from<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    gap: u64,
+  ) {
     let head = self.op.get();
     let floor = self.checkpoint_op.get();
     // Clients whose at-most-once request high-water was advanced by a now-truncated op: their watermark
@@ -302,8 +311,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // quiesces.
     self.deferred_appends.retain(|&op, _| op < gap);
     self.op = OpNumber::with(gap - 1);
-    let cancelled = wal.truncate(OpNumber::with(gap - 1));
-    self.absorb_wal_cancellations(wal, cancelled);
+    let cancelled = storage.truncate(OpNumber::with(gap - 1));
+    self.absorb_wal_cancellations(storage, cancelled);
     // The truncated ops no longer exist — drop their nack tallies so a late nack for one cannot re-fire.
     self.nack_from.retain(|&op, _| op < gap);
     if self.repair.is_empty() {
@@ -584,8 +593,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_repair_batch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     m: crate::RepairBatch,
   ) {
     let commit = m.commit();
@@ -622,7 +630,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       );
       // The SAME verify + durability core as the single-op path: `fill_repair` rejects this entry
       // (silently; re-solicited) or stages its own `Pending::RepairFill` — see the doc above.
-      self.fill_repair(now, wal, sb, &prepare);
+      self.fill_repair(now, storage, &prepare);
     }
   }
 
@@ -651,11 +659,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn fill_repair<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     p: &Prepare,
   ) -> bool {
-    let _ = (now, &mut *sb); // the apply/advance is deferred to on_wal_done; no commit here
+    let _ = (now, &mut *storage); // the apply/advance is deferred to on_wal_done; no commit here
     let op = p.op().get();
     if !self.repair.contains(&op) {
       return false; // placement: not a hole we are repairing — let on_prepare handle it normally
@@ -725,7 +732,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // hole deeper than a ring above this laggard's checkpoint must not physically wrap a committed,
     // un-pruned slot. Reject the fill and keep the hole open; the below-ring-window forced sync jumps
     // the checkpoint forward and subsumes (or re-exposes) the band.
-    if self.ring_append_would_wrap(wal, p.op().get()) {
+    if self.ring_append_would_wrap(storage, p.op().get()) {
       return false;
     }
     let entry = self.log_entry_from_prepare(p);
@@ -734,7 +741,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `RepairFill` so `on_wal_done` defers the apply + hole-clear to durability, and it owes NO
     // PrepareOk/own-vote (peer repair is not a vote).
     self.submit_or_defer_append(
-      wal,
+      storage,
       p.op(),
       header,
       p.body_bytes(),

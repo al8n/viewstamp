@@ -590,7 +590,7 @@ async fn validation_resets_the_redial_backoff_to_base() {
   // The remote replica (id 1): a stand-alone coordinator that accepts our conn and answers the
   // `Labeled` handshake.
   let peer_config = Config::try_new(CLUSTER, MemberId::new(1_u128)).unwrap();
-  let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
+  let (pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
   // Genesis: commit over the peer's own store (which it then pumps), so it is formatted exactly as a
   // real peer's store would be.
   let peer_endpoint = Endpoint::<_, SingleChange>::with_reconfig(
@@ -602,6 +602,7 @@ async fn validation_resets_the_redial_backoff_to_base() {
   )
   .commit(&pwal, &mut psb)
   .expect("genesis commit formats the peer store");
+  let mut pstorage = viewstamp_proto::Storage::new(pwal, psb);
   let mut peer = StreamCoordinator::new(peer_endpoint);
   let peer_conn = Conn::from_parts(Labeled::acceptor(
     Passthrough::new(),
@@ -617,14 +618,14 @@ async fn validation_resets_the_redial_backoff_to_base() {
     }
     while let Some((cid, bytes)) = driver.coord.poll_conn_transmit() {
       if cid == id {
-        peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb);
+        peer.handle_conn_data(pid, &bytes, false, now, &mut pstorage);
       }
     }
     while let Some((cid, bytes)) = peer.poll_conn_transmit() {
       if cid == pid {
         driver
           .coord
-          .handle_conn_data(id, &bytes, false, now, &mut driver.wal, &mut driver.sb);
+          .handle_conn_data(id, &bytes, false, now, &mut driver.storage);
       }
     }
   }
@@ -2038,10 +2039,10 @@ async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wak
   );
   driver
     .coord
-    .submit_client_request(now, &mut driver.wal, &mut driver.sb, request);
+    .submit_client_request(now, &mut driver.storage, request);
   driver
     .coord
-    .handle_storage_deferred(now, &mut driver.wal, &mut driver.sb);
+    .handle_storage_deferred(now, &mut driver.storage);
   driver.drive_block_lane(now);
 
   assert_eq!(
@@ -2130,7 +2131,10 @@ fn submit_one_append_in_flight<'h>(
   );
   drain_one_command(driver);
   assert!(
-    driver.coord.endpoint().has_inflight_storage(),
+    driver
+      .coord
+      .endpoint()
+      .has_inflight_storage(&driver.storage),
     "the submitted request must leave a WAL append in flight, or the drain has nothing to prove"
   );
   fut
@@ -2195,7 +2199,10 @@ async fn the_teardown_drain_completes_an_in_flight_append_stream() {
     "the shutdown enqueues its command and parks on the ack"
   );
   assert!(
-    driver.coord.endpoint().has_inflight_storage(),
+    driver
+      .coord
+      .endpoint()
+      .has_inflight_storage(&driver.storage),
     "the append is STILL in flight now the shutdown is queued: this is the moment the drain must \
      act on"
   );

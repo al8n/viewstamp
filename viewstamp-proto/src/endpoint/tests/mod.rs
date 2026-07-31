@@ -20,8 +20,7 @@ trait StorageStep {
   fn storage_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut crate::Storage<W, B>,
     blocks: &mut dyn BlockStore,
   );
 
@@ -34,8 +33,7 @@ trait StorageStep {
   fn block_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut crate::Storage<W, B>,
     blocks: &mut dyn BlockStore,
   );
 }
@@ -44,32 +42,30 @@ impl<S: StateMachine, R: Reconfig> StorageStep for Endpoint<S, R> {
   fn storage_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut crate::Storage<W, B>,
     blocks: &mut dyn BlockStore,
   ) {
     let mut cursor = crate::BlockJobCursor::new();
     loop {
-      self.handle_storage(now, wal, sb);
+      self.handle_storage(now, storage);
       let Some(job) = self.poll_block_job() else {
         break;
       };
       let done = crate::execute_block_job(&mut cursor, job, blocks);
-      self.on_block_done(now, wal, sb, done);
+      self.on_block_done(now, storage, done);
     }
   }
 
   fn block_step<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut crate::Storage<W, B>,
     blocks: &mut dyn BlockStore,
   ) {
     let mut cursor = crate::BlockJobCursor::new();
     while let Some(job) = self.poll_block_job() {
       let done = crate::execute_block_job(&mut cursor, job, blocks);
-      self.on_block_done(now, wal, sb, done);
+      self.on_block_done(now, storage, done);
     }
   }
 }
@@ -554,10 +550,9 @@ impl ReorderWal {
     self.staged.iter().map(|s| s.id).collect()
   }
 
-  /// Stage a write AS IF a previous endpoint over this storage had submitted it and the device still
-  /// held it across a restart in place: the id is the caller's (a dead incarnation's), and the bytes
-  /// are immaterial — the write either cancels via `truncate`/`prune` or lands like any staged append.
-  fn stage_predecessor_write(&mut self, id: WriteId, op: u64) {
+  /// The header/body a predecessor incarnation's staged append carries: the bytes are immaterial —
+  /// the write either cancels via `truncate`/`prune` or lands like any other staged append.
+  fn predecessor_append(op: u64) -> (Header, Bytes) {
     let body = Bytes::from_static(b"predecessor");
     let header = Header::new(
       OpNumber::with(op),
@@ -566,12 +561,7 @@ impl ReorderWal {
       RequestNumber::with(1),
       &body,
     );
-    self.staged.push(StagedAppend {
-      id,
-      op,
-      header,
-      body,
-    });
+    (header, body)
   }
 
   /// The LANDED body at `op` (the durable slot content), or `None` if no completed append holds it — the
@@ -1026,8 +1016,7 @@ fn new_primary_with_op2_candidate(
   membership: Membership,
 ) -> (
   Endpoint<NoopSm>,
-  TestWal,
-  TestSb,
+  Storage<TestWal, TestSb>,
   crate::block_store::InMemoryBlockStore,
 ) {
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
@@ -1037,18 +1026,14 @@ fn new_primary_with_op2_candidate(
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1061,8 +1046,7 @@ fn new_primary_with_op2_candidate(
   let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -1088,36 +1072,39 @@ fn new_primary_with_op2_candidate(
       ],
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
-  (e, wal, sb, blocks)
+  (e, storage, blocks)
 }
 
 /// Recover replica 1 of 3 from a WAL holding dense ops `1..=head` where the single NON-head
 /// committed slot `faulty_op` read back permanently faulty (bit-rot). Returns the recovered
-/// endpoint (now Normal, holding a peer-repair hole at `faulty_op`) + its wal/sb.
-fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, ScriptedWal, TestSb) {
+/// endpoint (now Normal, holding a peer-repair hole at `faulty_op`) + its storage session.
+fn recovering_with_hole(
+  head: u64,
+  faulty_op: u64,
+) -> (Endpoint<CountSm>, Storage<ScriptedWal, TestSb>) {
   assert!(faulty_op < head, "the hole must be below the head");
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX); // permanent: never clears on disk
   // A store that RAN (its op_head/body faulted), not a wipe: a FORMATTED root so recovery of this voter
   // exercises the read mechanics rather than the empty-voter fail-stop.
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
-  (r, wal, sb)
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
+  (r, storage)
 }
 
 /// Drive a `Recovering` replica to a terminal status, pumping BOTH storage completions AND the
@@ -1130,8 +1117,7 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
 /// returns rather than spins.
 fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
   r: &mut Endpoint<S>,
-  wal: &mut W,
-  sb: &mut B,
+  storage: &mut Storage<W, B>,
   blocks: &mut dyn BlockStore,
   now: Instant,
 ) {
@@ -1140,13 +1126,13 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
   // fire per step is enough to count a pending op's budget down to its exhaustion resolution.
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    r.storage_step(t, wal, sb, blocks);
+    r.storage_step(t, storage, blocks);
     if !r.status().is_recovering() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, wal, sb);
+      r.handle_timeout(t, storage);
     }
   }
   // Re-baseline every timer to the caller's `now`, so the terminal state is observably identical to a
@@ -1157,33 +1143,34 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
 }
 
 /// Drive a replica (replica 1 of 3) into `RecoveringHead` by permanently faulting its head op's
-/// read, returning the recovered endpoint + its (still-faulty) wal/sb. The head op is `head`.
-fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
+/// read, returning the recovered endpoint + its (still-faulty) storage session. The head op is
+/// `head`.
+fn recovering_head(head: u64) -> (Endpoint<NoopSm>, Storage<ScriptedWal, TestSb>) {
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(head), u8::MAX); // head read never clears → permanently faulty
   // A store that RAN (its head read faults), not a wipe: a FORMATTED root so recovery of this voter
   // reaches RecoveringHead rather than the empty-voter fail-stop.
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
     "setup: head faulty → RecoveringHead"
   );
-  (r, wal, sb)
+  (r, storage)
 }
 
 /// A `Request` from client 7 (request `rn`, body `[rn]`) — a FRESH client request, used to prove a
@@ -1207,6 +1194,29 @@ fn client_request(rn: u64) -> Message {
 /// over an empty (or op_head-corrupt) WAL and wants the RECOVERY MECHANICS, not the wipe fail-stop.
 fn sb_formatted() -> TestSb {
   sb_formatted_with(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX)
+}
+
+/// A durable root already at `checkpoint_op` (its commit at the same op), for a test that
+/// hand-builds an endpoint sitting on that checkpoint: the in-memory pointer and the durable one
+/// advance in LOCKSTEP on a live replica, so a fixture that raises only the in-memory half builds a
+/// state no replica can reach — and every durable-root writer now reads its checkpoint pair off the
+/// durable timeline, so the two halves must agree here as they do in production.
+fn sb_at_checkpoint(checkpoint_op: u64) -> TestSb {
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(checkpoint_op),
+    OpNumber::with(checkpoint_op),
+    0,
+    std::vec::Vec::new(),
+  )
+  .expect("a root whose commit sits at its checkpoint is valid")
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  TestSb {
+    state,
+    done: std::collections::VecDeque::new(),
+    checkpoint: None,
+  }
 }
 
 /// A FORMATTED-but-empty superblock whose genesis-shaped root records an EXPLICIT WAL-geometry pair —
@@ -1279,7 +1289,7 @@ fn wal_in_view(head: u64, view: u64) -> TestWal {
 /// completions (the AdoptVote append for op 2) are pumped so they do not muddy the window; the
 /// superblock write is left inflight (not flushed), so the view is NOT yet durable.
 #[cfg(test)]
-fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, StepSb) {
+fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, Storage<TestWal, StepSb>) {
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -1287,19 +1297,15 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Drive into ViewChange(view 1) (replica 1 is primary of view 1): own SVC + replica 0's SVC.
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1336,15 +1342,14 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
   // Now Normal primary of view 1, op 2 — but the durable-view write is inflight (StepSb has not
   // flushed it). Pump the WAL (so the op-2 AdoptVote append completes) WITHOUT flushing the SB, so
   // the window stays open. Discard anything emitted by the transition itself.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
@@ -1354,10 +1359,10 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     "the durable-view write must still be pending (the durable-view window is open)"
   );
   assert!(
-    sb.has_inflight(),
+    storage.sb_mut().has_inflight(),
     "the superblock view write is inflight (not yet durable)"
   );
-  (e, wal, sb)
+  (e, storage)
 }
 
 /// A superblock whose `state()` names a durable checkpoint at op 2 with a FIXED content id, and whose
@@ -1427,21 +1432,20 @@ impl ScriptedCheckpointSb {
 /// escalated replica stays Recovering (awaiting a peer checkpoint), so the loop runs its full budget there.
 fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
   r: &mut Endpoint<S>,
-  wal: &mut W,
-  sb: &mut ScriptedCheckpointSb,
+  storage: &mut Storage<W, ScriptedCheckpointSb>,
   blocks: &mut dyn BlockStore,
   now: Instant,
 ) {
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
-    sb.flush();
-    r.storage_step(t, wal, sb, blocks);
+    storage.sb_mut().flush();
+    r.storage_step(t, storage, blocks);
     if !r.status().is_recovering() && !r.status().is_recovering_head() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, wal, sb);
+      r.handle_timeout(t, storage);
     }
   }
 }
@@ -1449,11 +1453,11 @@ fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
 /// Drive a real 3-replica primary (replica 0) to a DURABLE checkpoint at `ckpt`, returning the
 /// endpoint + its storage so a test can read the checkpoint envelope back (the donor for sync apply
 /// tests). `checkpoint_ops == ckpt`, so committing `ckpt` ops takes exactly one checkpoint.
-fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb) {
+fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, Storage<TestWal, TestSb>) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -1463,19 +1467,13 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
       Bytes::from(std::vec![rn as u8]),
     ))
   };
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=ckpt {
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks); // primary's own append durable (own vote)
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable (own vote)
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -1491,23 +1489,24 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
         0,
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain checkpoint writes
+    e.storage_step(now, &mut storage, &mut blocks); // drain checkpoint writes
   }
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(ckpt),
     "donor checkpoint is durable"
   );
-  (e, wal, sb)
+  (e, storage)
 }
 
 /// Read the durable checkpoint envelope (+ its id) back from a donor's superblock.
-fn donor_envelope(sb: &TestSb) -> (Bytes, u128) {
-  let (_op, env) = sb
+fn donor_envelope<W: Wal>(storage: &Storage<W, TestSb>) -> (Bytes, u128) {
+  let (_op, env) = storage
+    .sb()
     .checkpoint
     .clone()
     .expect("donor has a durable checkpoint snapshot");
-  let id = sb.state().checkpoint_id();
+  let id = storage.sb().state().checkpoint_id();
   assert_eq!(
     crate::checkpoint_id(&env),
     id,
@@ -1540,13 +1539,14 @@ fn sync_backup() -> Endpoint<CountSm> {
 
 /// Trigger a sync on a laggard backup and deliver `m`, returning the post-delivery endpoint state.
 /// `donor_sb` provides the durable checkpoint snapshot the laggard re-persists to.
-fn sync_apply_harness(checkpoint_op: u64) -> (Endpoint<CountSm>, TestWal, TestSb, Bytes, u128) {
-  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(checkpoint_op);
-  let (env, id) = donor_envelope(&dsb);
+fn sync_apply_harness(
+  checkpoint_op: u64,
+) -> (Endpoint<CountSm>, Storage<TestWal, TestSb>, Bytes, u128) {
+  let (_donor, donor_storage) = donor_primary_at_checkpoint(checkpoint_op);
+  let (env, id) = donor_envelope(&donor_storage);
   let e = sync_backup();
-  let wal = TestWal::default();
-  let sb = TestSb::default();
-  (e, wal, sb, env, id)
+  let storage = Storage::new(TestWal::default(), TestSb::default());
+  (e, storage, env, id)
 }
 
 /// Seed `blocks` with BOTH content-addressed DAGs a `donor_primary_at_checkpoint(ckpt)` /
@@ -1560,7 +1560,7 @@ fn seed_donor_blocks(blocks: &mut crate::block_store::InMemoryBlockStore, ckpt: 
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -1569,19 +1569,13 @@ fn seed_donor_blocks(blocks: &mut crate::block_store::InMemoryBlockStore, ckpt: 
       Bytes::from(std::vec![rn as u8]),
     ))
   };
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=ckpt {
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, blocks);
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, blocks);
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -1597,7 +1591,7 @@ fn seed_donor_blocks(blocks: &mut crate::block_store::InMemoryBlockStore, ckpt: 
         0,
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, blocks);
+    e.storage_step(now, &mut storage, blocks);
   }
 }
 

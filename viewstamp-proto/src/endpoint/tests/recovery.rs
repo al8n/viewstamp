@@ -54,7 +54,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -64,18 +64,18 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -116,8 +116,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   // carried commit_max.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -127,7 +126,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
+  r.storage_step(now, &mut storage, &mut blocks); // complete the SendDoViewChange durable-view write
   // The recovered replica's OWN DVC must report its KNOWN committed frontier (commit_max == 2), not
   // commit_min == 0 — otherwise the laggard quorum loses op 2. Verify it on the wire.
   let own_dvc_commit = core::iter::from_fn(|| r.poll_message())
@@ -149,8 +148,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   // commit* == 2, so op 2 is a COMMITTED hole — repaired, NOT truncated.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -190,16 +188,10 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   // Pump the StartViewAsPrimary durable-view write, then a committed-vouching peer answers our
   // RequestPrepare for op 2 (commit 2 >= op 2) → fill the hole and resume the held commit to op 2. The
   // fill is a durability barrier: complete the repaired append before the hole clears.
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   while r.poll_message().is_some() {}
-  r.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    repair_prepare(0, 2, 2),
-  );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
+  r.handle_message(now, &mut storage, primary_peer(), repair_prepare(0, 2, 2));
+  r.storage_step(now, &mut storage, &mut blocks); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the known-committed hole"
@@ -257,7 +249,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -267,18 +259,18 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -313,8 +305,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // durable-view ROOT write while this replica is STILL held at commit_min 0 < commit_max 2.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -331,13 +322,13 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // Complete the durable-view root write — this is the write the fix changed. The persisted `VsrState`
   // must record the KNOWN-committed frontier `commit_max == 2`, NOT `commit_min == 0`. (FAIL-BEFORE:
   // `submit_durable_view` persisted `self.commit_min`, so the root's commit was 0.)
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   assert!(
     !r.pending_sb_for_test(),
     "the durable-view root write completed"
   );
   assert_eq!(
-    sb.state().commit(),
+    storage.sb_mut().state().commit(),
     OpNumber::with(2),
     "the durable-view ROOT persists the known-committed frontier commit_max == 2 \
      (FAIL-BEFORE: it persisted commit_min == 0, lowering the durable frontier)"
@@ -350,7 +341,9 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // STILL held (existence preserved into the band + the DVC), not left header-less. (FAIL-BEFORE the
   // sparse change ranged only up to commit_min, so the band was empty.)
   assert_eq!(
-    sb.state()
+    storage
+      .sb_mut()
+      .state()
       .committed_headers_slice()
       .iter()
       .map(|h| h.op().get())
@@ -374,24 +367,25 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   );
 
   // The crux: a SECOND `recover` from the persisted root reads back the frontier UNLOWERED. With the
-  // bug, `sb.state().commit() == 0`, so the re-recovered replica would forget op 2 was committed and its
+  // bug, `storage.sb_mut().state().commit() == 0`, so the re-recovered replica would forget op 2 was committed and its
   // DVC would under-report — re-opening the laggard-quorum truncation hazard the whole fix-chain closes.
   let mut wal2 = ScriptedWal::with_entries(3);
   wal2.script_read_fault(OpNumber::with(2), u8::MAX);
+  let (_, sb2) = storage.into_parts().ok().expect("the store is quiesced");
+  let mut storage2 = Storage::new(wal2, sb2);
   let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut r2 = Endpoint::recover(
     cfg2,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal2,
-    &mut sb,
+    &mut storage2,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r2.storage_step(now, &mut wal2, &mut sb, &mut blocks);
+    r2.storage_step(now, &mut storage2, &mut blocks);
     if !r2.status().is_recovering() {
       break;
     }
@@ -440,7 +434,7 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -450,19 +444,19 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -511,21 +505,15 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   while r.poll_event().is_some() {}
   // Drive commit toward op 1 so the commit path requests the body (advance_commit holds at the hole
   // and registers a repair request).
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 1));
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.handle_message(now, &mut storage, primary_peer(), prepare(1, 1));
+  r.storage_step(now, &mut storage, &mut blocks);
   assert!(
     r.has_repair_hole_for_test(1),
     "the commit path holds at the Repairing op and arms peer-repair for its body"
   );
   // The peer answers with the canonical body for op 1.
-  r.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    repair_prepare(0, 1, 1),
-  );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the RepairFill append lands → body Present, hole clears
+  r.handle_message(now, &mut storage, primary_peer(), repair_prepare(0, 1, 1));
+  r.storage_step(now, &mut storage, &mut blocks); // the RepairFill append lands → body Present, hole clears
   assert!(
     !r.has_repair_hole_for_test(1),
     "the repaired body fills the hole — the op is no longer repair-pending"
@@ -573,7 +561,7 @@ fn recover_drops_a_stale_committed_op_read_back_body_faulty_not_resurrected_as_r
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -584,19 +572,19 @@ fn recover_drops_a_stale_committed_op_read_back_body_faulty_not_resurrected_as_r
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -641,7 +629,7 @@ fn recover_drops_a_genuinely_absent_committed_op_as_today() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -654,18 +642,18 @@ fn recover_drops_a_genuinely_absent_committed_op_as_today() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -687,12 +675,13 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
   // recover() is now a metadata-only constructor: it returns in Recovering and only reaches
   // Normal after handle_storage drains the tail reads. (Was: synchronous → Normal immediately.)
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), sb_formatted());
+  let (wal, sb) = (TestWal::default(), sb_formatted());
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut storage, &mut blocks);
   drop(e);
 
   let mut r = Endpoint::recover(
@@ -700,8 +689,7 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -711,7 +699,7 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
     Status::Recovering,
     "recover is now a metadata-only constructor (Recovering)"
   );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads
+  r.storage_step(now, &mut storage, &mut blocks); // drain the tail reads
   assert_eq!(r.status(), Status::Normal, "tail consistent => Normal");
   assert_eq!(r.op(), OpNumber::with(2));
 }
@@ -722,16 +710,16 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
   // reaches Normal with the real body — a transient storage fault during recovery is tolerated.
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), 1);
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -739,7 +727,7 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
   assert_eq!(r.status(), Status::Recovering);
   // Pump storage + the recover-retry timer until the retry clears (bounded): the timer re-reads the
   // pending op additively and the next drain consumes the now-clean completion.
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -755,21 +743,21 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
   // head (a Recovery broadcast) but still casts no ack/vote in response to a re-delivered prepare.
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // exceeds the retry budget
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -783,7 +771,7 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
     );
   }
   // A RecoveringHead replica must not participate: it casts no PrepareOk on a re-delivered prepare.
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+  r.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
   assert!(
     r.poll_message().is_none(),
     "RecoveringHead replica emits no ack/vote in response to a prepare"
@@ -801,7 +789,7 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
   // at recovery time: a faulty slot above the checkpoint may be UNCOMMITTED, and registering it then
   // would be an unfillable hole after the repair restrictions; `advance_commit` requests it ON
   // DEMAND only when commit reaches it (which only happens once it is committed).
-  let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+  let (mut r, mut storage) = recovering_with_hole(3, 2);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -824,8 +812,7 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
   let now = Instant::ZERO;
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -943,26 +930,26 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
   };
   let cfg = Config::try_new(1, MemberId::new(2)).unwrap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -991,12 +978,12 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   // (recover dropped it only from the in-memory cache, not the durable WAL), and its slot is Clean —
   // the exact false-ack bait below.
   assert_eq!(
-    wal.entries.get(&3).map(|(_, b)| b.as_ref()),
+    storage.wal_mut().entries.get(&3).map(|(_, b)| b.as_ref()),
     Some(&[0xAAu8][..]),
     "precondition: the WAL slot 3 still holds the stale [0xAA] body (Clean), dropped only from the cache"
   );
   assert_eq!(
-    wal.status(OpNumber::with(3)),
+    storage.wal_mut().status(OpNumber::with(3)),
     SlotStatus::Clean,
     "precondition: the stale slot 3 is Clean (durably appended) — the op_durably_appended bait"
   );
@@ -1023,7 +1010,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     RequestNumber::with(3),
     Bytes::copy_from_slice(&[3]),
   ));
-  r.handle_message(now, &mut wal, &mut sb, primary1, canonical_retransmit);
+  r.handle_message(now, &mut storage, primary1, canonical_retransmit);
   // BEFORE the append completes (no handle_storage yet): NO PrepareOk(3) may have been emitted. The op was
   // missing/mismatched, so the fix (re)appends the canonical body and DEFERS the ack — it must NOT have
   // inline-acked off the stale slot. (FAIL-BEFORE: a PrepareOk(3) is emitted immediately here.)
@@ -1047,7 +1034,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     "the head is NOT rewound by the interior overwrite at op 3 (self.op stays 5)"
   );
   assert_eq!(
-    wal.entries.get(&3).map(|(_, b)| b.as_ref()),
+    storage.wal_mut().entries.get(&3).map(|(_, b)| b.as_ref()),
     Some(&[3u8][..]),
     "the canonical body [3] overwrote the stale [0xAA] in WAL slot 3 (append-before-ack: durable first)"
   );
@@ -1057,7 +1044,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   );
 
   // Now the append completes → on_wal_done clears `appending(3)` and sends EXACTLY ONE deferred PrepareOk(3).
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   let acks_after: std::vec::Vec<_> = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::PrepareOk(ok) if ok.op() == OpNumber::with(3) => Some(ok),
@@ -1075,8 +1062,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   // ack — applied [0xAA], a committed-state divergence from every replica that applied [3].
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary1,
     Message::Commit(Commit::new(
       View::with(1),
@@ -1086,7 +1072,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
       0,
     )),
   );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(3),
     "op 3 needs no repair — its canonical body was re-appended, so the commit applies it directly"
@@ -1118,7 +1104,7 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
   // Recover with an uncommitted interior faulty slot (checkpoint 0, head 3, faulty op 2, and NO
   // Commit ever raising commit_max past 0). After recovery `self.repair` must be EMPTY (fail-before:
   // it was `{2}`), so the apply path never wedges on an unfillable hole.
-  let (r, _wal, _sb) = recovering_with_hole(3, 2);
+  let (r, _storage) = recovering_with_hole(3, 2);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -1154,12 +1140,11 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
       CountSm::default(),
       u64::MAX,
     );
-    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let mut storage = Storage::new(TestWal::default(), TestSb::default());
     p.repair.insert(5); // simulate the old pre-registration of an uncommitted faulty slot
     p.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       mk_request(),
     );
@@ -1177,12 +1162,11 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
       CountSm::default(),
       u64::MAX,
     );
-    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let mut storage = Storage::new(TestWal::default(), TestSb::default());
     assert!(p.repair.is_empty(), "fresh primary has no repair holes");
     p.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       mk_request(),
     );
@@ -1199,7 +1183,7 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
 fn recovering_head_solicits_recovery_on_entry() {
   // On entering RecoveringHead the replica broadcasts a Recovery solicitation (it cannot recover
   // its head from its own disk) carrying its replica id + nonce.
-  let (mut r, _wal, _sb) = recovering_head(2);
+  let (mut r, _storage) = recovering_head(2);
   let mut saw_recovery = false;
   while let Some(out) = r.poll_message() {
     if let Message::Recovery(rec) = out.into_msg() {
@@ -1223,7 +1207,7 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
   // A replica stuck in RecoveringHead (head slot permanently lost) receives a StartView from the
   // view's primary; it adopts the canonical head + log, persists the view, and becomes Normal —
   // the committed op it could not read locally is restored from the canonical log.
-  let (mut r, mut wal, mut sb) = recovering_head(2);
+  let (mut r, mut storage) = recovering_head(2);
   while r.poll_message().is_some() {} // discard the solicitation
   let now = Instant::ZERO;
   // primary(view 1) of a 3-cluster is replica 1 — but THIS replica is replica 1, so use view 0's
@@ -1254,8 +1238,7 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartView(sv),
   );
@@ -1277,8 +1260,8 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
   // The recovery bookkeeping is cleared (structurally None in Normal).
   assert!(r.recover.is_none(), "recover state cleared on adoption");
   // The new view is persisted before participation; pump the durable-view write, then it re-acks.
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  assert_eq!(sb.state().view(), View::new());
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(storage.sb_mut().state().view(), View::new());
 }
 
 #[test]
@@ -1294,21 +1277,21 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
   let mut wal = ScriptedWal::with_entries(4);
   wal.script_read_fault(OpNumber::with(4), u8::MAX); // faulty HEAD → RecoveringHead
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // faulty NON-head committed slot (empty in cache)
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1342,8 +1325,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
   );
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartView(sv),
   );
@@ -1390,7 +1372,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
 fn recovering_head_adopts_recovery_response_from_primary() {
   // The full handshake: a RecoveringHead replica's Recovery is answered by the primary with a
   // RecoveryResponse carrying the canonical head; the replica adopts it and returns to Normal.
-  let (mut r, mut wal, mut sb) = recovering_head(2);
+  let (mut r, mut storage) = recovering_head(2);
   // Capture the nonce the replica solicited with (so we echo it in the primary's response).
   let mut nonce = 0;
   while let Some(out) = r.poll_message() {
@@ -1425,8 +1407,7 @@ fn recovering_head_adopts_recovery_response_from_primary() {
   );
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::RecoveryResponse(resp),
   );
@@ -1445,7 +1426,7 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
   // A RecoveryResponse with the WRONG nonce (a stale prior solicitation) is ignored, and a
   // response from a NON-primary (empty log) cannot re-establish a head — the replica stays
   // RecoveringHead in both cases, never adopting an unauthoritative head.
-  let (mut r, mut wal, mut sb) = recovering_head(2);
+  let (mut r, mut storage) = recovering_head(2);
   let mut nonce = 0;
   while let Some(out) = r.poll_message() {
     if let Message::Recovery(rec) = out.into_msg() {
@@ -1456,8 +1437,7 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
   // Wrong nonce → ignored.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::RecoveryResponse(RecoveryResponse::new(
       View::new(),
@@ -1483,8 +1463,7 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
   // A response from a non-primary (replica 2, with empty log) → ignored (no canonical head).
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::RecoveryResponse(RecoveryResponse::new(
       View::new(),
@@ -1509,14 +1488,13 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
   // The guard relaxation is SURGICAL: a RecoveringHead replica processes only StartView /
   // RecoveryResponse. A Prepare/Commit/PrepareOk must NOT be acted on (no vote/ack), and must NOT
   // pull it into a view change via the higher-view rule.
-  let (mut r, mut wal, mut sb) = recovering_head(2);
+  let (mut r, mut storage) = recovering_head(2);
   while r.poll_message().is_some() {} // discard the solicitation
   let now = Instant::ZERO;
   // A higher-view Prepare would normally trigger catch_up_to_view → ViewChange. It must be dropped.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::with(5),
@@ -1531,12 +1509,11 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
     )),
   );
   // A current-view Prepare for an op we hold would normally re-ack. It must be dropped too.
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  r.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
   // A Commit would normally advance commit. Dropped.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -1566,23 +1543,23 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
   // NOT resume Normal with an empty pipeline (which would freeze commit at checkpoint_op and risk
   // re-executing a retried request). Per TigerBeetle replica.zig open(), it abdicates: forces a
   // view change to view+1. Replica 0 is primary of view 0; the root names view 0 / log_view 0.
-  let mut wal = wal_in_view(2, 0);
-  let mut sb = sb_with_view(0, 0);
+  let wal = wal_in_view(2, 0);
+  let sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..16 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1603,8 +1580,7 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
   // no Prepare to backups, no Reply to the client (on_request returns early on status != Normal).
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     client_request(1),
   );
@@ -1621,23 +1597,23 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
 fn recovered_backup_resumes_normal_unchanged() {
   // A replica that is NOT the primary of its restored view resumes Normal (unchanged behaviour).
   // Replica 1 of 3 in view 0 is a backup (primary of view 0 is replica 0).
-  let mut wal = wal_in_view(2, 0);
-  let mut sb = sb_with_view(0, 0);
+  let wal = wal_in_view(2, 0);
+  let sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..16 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1660,23 +1636,23 @@ fn recovered_mid_view_change_redrives_the_in_progress_view_change() {
   // log_view < view: the durable view advanced (a view change was in progress) but the new log was
   // not yet installed. On recovery the replica re-drives VC(view) — it enters ViewChange AT `view`
   // (not view+1, not Normal). Root names view 1 / log_view 0; replica 2 of 3 (a backup of view 1).
-  let mut wal = wal_in_view(2, 0);
-  let mut sb = sb_with_view(1, 0);
+  let wal = wal_in_view(2, 0);
+  let sb = sb_with_view(1, 0);
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(2)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..16 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1699,23 +1675,23 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
   // quorum) — it must resume Normal, NOT abdicate (which would deadlock). It must also still make
   // progress: the recovered tail (ops the solo primary committed pre-crash, above the last
   // checkpoint) re-commits from the rebuilt pipeline rather than stalling on an empty inflight.
-  let mut wal = wal_in_view(2, 0);
-  let mut sb = sb_with_view(0, 0);
+  let wal = wal_in_view(2, 0);
+  let sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..16 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1735,13 +1711,12 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
   // at-most-once guarantee holds across the crash — no duplicate op is minted).
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     client_request(1),
   );
   for _ in 0..4 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     r.commit(),
@@ -1751,13 +1726,12 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
   // And it still serves the genuinely-NEXT request end-to-end (op 3 commits).
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     client_request(3),
   );
   for _ in 0..4 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     r.commit(),
@@ -1777,14 +1751,14 @@ fn normal_primary_answers_recovery_with_canonical_response() {
     EchoSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Give the primary one committed op so its response is non-trivial.
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1792,13 +1766,12 @@ fn normal_primary_answers_recovery_with_canonical_response() {
       Bytes::from_static(b"a"),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append durable → commit op 1 (quorum 2 in N=3? no)
+  e.storage_step(now, &mut storage, &mut blocks); // own append durable → commit op 1 (quorum 2 in N=3? no)
   while e.poll_message().is_some() {}
   // A peer (replica 2) solicits recovery.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::Recovery(Recovery::new(
       ReplicaId::new(2),
@@ -1834,17 +1807,16 @@ fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   assert!(
-    !e.has_inflight_storage(),
+    !e.has_inflight_storage(&storage),
     "a freshly-constructed endpoint owes no storage completion"
   );
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1855,14 +1827,14 @@ fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
   // Mid-flight: the append was submitted to the WAL but its `Appended` has NOT been drained, so the
   // proto still holds the in-flight `pending`/`appending` entry it owes an own-vote for.
   assert!(
-    e.has_inflight_storage(),
+    e.has_inflight_storage(&storage),
     "an outstanding WAL append must report in-flight storage"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   // Drained: `on_wal_done` cleared `pending`/`appending`; the lone own-vote is below quorum so no
   // commit/checkpoint/view write was started — the endpoint owes the driver nothing.
   assert!(
-    !e.has_inflight_storage(),
+    !e.has_inflight_storage(&storage),
     "after handle_storage drains the completion, no storage op is in flight"
   );
 }
@@ -1878,12 +1850,12 @@ fn normal_backup_answers_recovery_with_view_only() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::Recovery(Recovery::new(
       ReplicaId::new(1),
@@ -1913,21 +1885,21 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
   // fault, not adopted. With it as the head and permanently corrupt => RecoveringHead.
   let mut wal = ScriptedWal::with_entries(1);
   wal.script_corrupt_body(OpNumber::with(1)); // ReadOk with a body that fails verify, forever
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1974,7 +1946,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -2000,19 +1972,19 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -2039,8 +2011,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   // (only op 1 applies), and solicits op 2 via RequestPrepare (on-demand peer-repair).
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2078,14 +2049,8 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). This fills
   // the hole and resumes the held commit: op 2 applies with [2] (bodyY), NEVER [0xBB] (bodyX). The fill
   // is a durability barrier: complete the repaired append before the commit resumes.
-  r.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    repair_prepare(0, 2, 2),
-  );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
+  r.handle_message(now, &mut storage, primary_peer(), repair_prepare(0, 2, 2));
+  r.storage_step(now, &mut storage, &mut blocks); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -2098,7 +2063,11 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
      (FAIL-BEFORE: the old recover trusted the WAL and applied [0xBB], diverging)"
   );
   // The repaired canonical op 2 is durably (re)appended, so a subsequent restart reads it cleanly.
-  let (h2, b2) = wal.entries.get(&2).expect("op 2 present after repair");
+  let (h2, b2) = storage
+    .wal_mut()
+    .entries
+    .get(&2)
+    .expect("op 2 present after repair");
   assert_eq!(
     b2.as_ref(),
     &[2u8],
@@ -2138,7 +2107,7 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -2164,19 +2133,19 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -2194,8 +2163,7 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
   // The primary announces commit=2. advance_commit applies op 1 ([1]), HOLDS at the op-2 hole, solicits it.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2217,14 +2185,8 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
 
   // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). The fill is
   // a durability barrier: complete the repaired append before the commit resumes.
-  r.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    repair_prepare(0, 2, 2),
-  );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
+  r.handle_message(now, &mut storage, primary_peer(), repair_prepare(0, 2, 2));
+  r.storage_step(now, &mut storage, &mut blocks); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -2288,7 +2250,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
     "the durable root records a SPARSE canonical header for every HELD committed op (op 2 skipped)"
   );
 
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -2299,18 +2261,18 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -2351,8 +2313,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   // op 2 (the ONE op this replica did not hold). It must NOT skip op 2 to apply the held 3 + 4.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2376,14 +2337,8 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   // ONE hole and resumes the held commit straight through the LOCALLY-HELD ops 3 + 4 — the committed
   // tail (op 3 / op 4) was never lost. The fill is a durability barrier: complete the repaired
   // append before the commit resumes.
-  r.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    repair_prepare(0, 2, 4),
-  );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply the held suffix
+  r.handle_message(now, &mut storage, primary_peer(), repair_prepare(0, 2, 4));
+  r.storage_step(now, &mut storage, &mut blocks); // the repaired append completes → apply the held suffix
   assert_eq!(
     r.commit(),
     OpNumber::with(4),
@@ -2433,7 +2388,7 @@ fn recover_reads_the_deep_tail_when_a_mid_tail_read_resolves_only_via_timeout() 
   )
   .unwrap()
   .with_wal_geometry(crate::MAX_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -2445,13 +2400,13 @@ fn recover_reads_the_deep_tail_when_a_mid_tail_read_resolves_only_via_timeout() 
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -2461,13 +2416,13 @@ fn recover_reads_the_deep_tail_when_a_mid_tail_read_resolves_only_via_timeout() 
   // the continuation (from the timeout path) extends to the second batch, which reads K.
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 20) {
-    r.storage_step(t, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(t, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, &mut wal, &mut sb);
+      r.handle_timeout(t, &mut storage);
     }
   }
   assert_eq!(
@@ -2517,7 +2472,7 @@ fn recover_carries_a_faulting_interior_op_above_a_stale_commit_max_not_dropped_a
   // FORMATTED-empty root recording this test's geometry (a `MAX_CHECKPOINT_OPS` config over a ring-less
   // WAL), so recovery's geometry fence matches and this voter recovers rather than empty-fail-stops.
   .with_wal_geometry(crate::MAX_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -2527,26 +2482,26 @@ fn recover_carries_a_faulting_interior_op_above_a_stale_commit_max_not_dropped_a
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 20) {
-    r.storage_step(t, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(t, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, &mut wal, &mut sb);
+      r.handle_timeout(t, &mut storage);
     }
   }
   assert_eq!(
@@ -2599,7 +2554,7 @@ fn recovering_head_drops_the_uncommitted_faulty_head_but_keeps_a_committed_inter
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -2609,18 +2564,18 @@ fn recovering_head_drops_the_uncommitted_faulty_head_but_keeps_a_committed_inter
   wal.script_read_fault(OpNumber::with(4), u8::MAX); // uncommitted HEAD body faults permanently
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -2669,18 +2624,18 @@ fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_hea
   )
   .unwrap()
   .with_wal_geometry(2, 38);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
   let mut wal = ScriptedWal::with_entries(4); // real slots end at op 4
   wal.head = u64::MAX; // a bit-rotted head scalar
   wal.capacity = 38; // a BOUNDED ring → the read ceiling is checkpoint 2 + 38 = 40
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -2693,7 +2648,7 @@ fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_hea
   );
   // Drain the tail reads + exhaust the checkpoint budget → the peer fetch. The head settles at the
   // verified frontier as soon as the tail drains — well before the reply.
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "own checkpoint exhausted → fetching from a peer"
@@ -2724,8 +2679,7 @@ fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_hea
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -2740,8 +2694,8 @@ fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_hea
     )),
   );
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -2791,7 +2745,7 @@ fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
   let mut wal = ScriptedWal::with_entries(6);
   let (clean, body) = wal.entries.get(&6).cloned().expect("head entry");
   let mut rotted = clean.encode();
@@ -2799,20 +2753,20 @@ fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not
   let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
   wal.entries.insert(6, (rotted, body));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Exhaust both budgets: the unidentifiable head lands in `rec.faulty`; the checkpoint escalates to
   // the peer fetch. The awaiting gate holds recovery open BEFORE the faulty-head decision.
-  drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut r, &mut storage, &mut blocks, now);
   assert!(
     r.awaiting_peer_checkpoint_for_test(),
     "own checkpoint exhausted → fetching from a peer, the head decision preempted"
@@ -2832,8 +2786,7 @@ fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not
   let nonce = r.sync_nonce_for_test();
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -2848,8 +2801,8 @@ fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not
     )),
   );
   for _ in 0..3 {
-    sb.flush();
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    r.storage_step(now, &mut storage, &mut blocks);
   }
   // THE fix: the install completed (checkpoint 2 durable + restored) but the un-truthed head (6 > 2)
   // resumes the preempted decision — RecoveringHead, not Normal.
@@ -2902,8 +2855,7 @@ fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not
   );
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::RecoveryResponse(resp),
   );
@@ -2936,7 +2888,7 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
   let mut wal = ScriptedWal::with_entries(6);
   let (clean, body) = wal.entries.get(&6).cloned().expect("head entry");
   let mut rotted = clean.encode();
@@ -2944,18 +2896,18 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
   let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
   wal.entries.insert(6, (rotted, body));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut r, &mut storage, &mut blocks, now);
   assert!(
     r.awaiting_peer_checkpoint_for_test(),
     "own checkpoint exhausted → fetching from a peer"
@@ -2976,8 +2928,7 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
   let nonce = r.sync_nonce_for_test();
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -2991,7 +2942,7 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
       Bytes::new(),
     )),
   );
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   assert!(
     r.install_flush_retry_owed(),
     "the faulted flush retains the verified install for a local retry"
@@ -3005,10 +2956,10 @@ fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
   let later = r
     .poll_timeout()
     .expect("the recover-retry cadence stays armed while awaiting");
-  r.handle_timeout(later, &mut wal, &mut sb);
+  r.handle_timeout(later, &mut storage);
   for _ in 0..3 {
-    sb.flush();
-    r.storage_step(later, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    r.storage_step(later, &mut storage, &mut blocks);
   }
   assert_eq!(
     r.status(),
@@ -3059,7 +3010,7 @@ fn the_staged_install_carries_every_faulty_verdict_not_just_the_untruthed_head()
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
   let mut wal = ScriptedWal::with_entries(6);
   let (clean, body) = wal.entries.get(&6).cloned().expect("head entry");
   let mut rotted = clean.encode();
@@ -3067,19 +3018,19 @@ fn the_staged_install_carries_every_faulty_verdict_not_just_the_untruthed_head()
   let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
   wal.entries.insert(6, (rotted, body));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap(),
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   let now = Instant::ZERO;
-  drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut r, &mut storage, &mut blocks, now);
   assert!(
     r.awaiting_peer_checkpoint_for_test(),
     "own checkpoint exhausted → fetching from a peer"
@@ -3104,8 +3055,7 @@ fn the_staged_install_carries_every_faulty_verdict_not_just_the_untruthed_head()
   let nonce = r.sync_nonce_for_test();
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -3120,8 +3070,8 @@ fn the_staged_install_carries_every_faulty_verdict_not_just_the_untruthed_head()
     )),
   );
   for _ in 0..3 {
-    sb.flush();
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    r.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     r.status(),
@@ -3176,21 +3126,21 @@ fn recover_reads_a_committed_band_above_the_imposed_ring_on_a_ring_less_wal() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut wal = ScriptedWal::with_entries(commit_max); // ring-less (default capacity), holds 1..=commit_max
+  let wal = ScriptedWal::with_entries(commit_max); // ring-less (default capacity), holds 1..=commit_max
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -3201,7 +3151,7 @@ fn recover_reads_a_committed_band_above_the_imposed_ring_on_a_ring_less_wal() {
     "the ceiling is floored at the durable commit — the full committed band is materialized"
   );
   for _ in 0..(commit_max + 8) {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -3232,16 +3182,16 @@ fn recover_finds_a_committed_tail_above_a_stale_commit_when_the_head_scalar_unde
   let held = 600u64; // the written committed tail — within the proto-imposed ring, above every scalar witness
   let mut wal = ScriptedWal::with_entries(held); // holds 1..=600, each header durable
   wal.head = 10; // a corrupt-LOW head scalar, far below the real written extent
-  let mut sb = sb_formatted(); // FORMATTED-empty root: STALE durable commit == checkpoint_op == 0
+  let sb = sb_formatted(); // FORMATTED-empty root: STALE durable commit == checkpoint_op == 0
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -3252,7 +3202,7 @@ fn recover_finds_a_committed_tail_above_a_stale_commit_when_the_head_scalar_unde
     "the scan derives the written extent — neither the lying scalar nor the stale commit hides it"
   );
   for _ in 0..(held + 8) {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -3295,16 +3245,16 @@ fn recover_does_not_skip_a_written_head_whose_header_op_field_rotted() {
     "the op field rotted — placement no longer matches"
   );
   wal.entries.insert(held, (rotted, body));
-  let mut sb = sb_formatted(); // formatted-empty root: commit == 0, NO canonical band — the op is above every root witness
+  let sb = sb_formatted(); // formatted-empty root: commit == 0, NO canonical band — the op is above every root witness
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -3314,7 +3264,7 @@ fn recover_does_not_skip_a_written_head_whose_header_op_field_rotted() {
     OpNumber::with(held),
     "the occupied slot bounds the window — the rotted op field does not shrink the scanned extent"
   );
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -3358,7 +3308,7 @@ fn a_committed_head_whose_body_faulty_completion_carries_a_rotted_header_resolve
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -3376,18 +3326,18 @@ fn a_committed_head_whose_body_faulty_completion_carries_a_rotted_header_resolve
   wal.script_body_faulty(OpNumber::with(commit_max)); // reads answer BodyFaulty(rotted header)
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -3436,7 +3386,7 @@ fn a_committed_head_with_a_bit_rotted_header_resolves_via_the_root_not_recoverin
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -3462,18 +3412,18 @@ fn a_committed_head_with_a_bit_rotted_header_resolves_via_the_root_not_recoverin
   wal.entries.insert(commit_max, (rotted, body));
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -3521,7 +3471,7 @@ fn a_root_vouched_committed_head_whose_read_answers_absent_becomes_a_repair_hole
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -3530,18 +3480,18 @@ fn a_root_vouched_committed_head_whose_read_answers_absent_becomes_a_repair_hole
   wal.entries.remove(&commit_max); // the slot is GONE — its read answers a clean Absent
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -3590,31 +3540,31 @@ fn a_poisoned_sealed_commit_does_not_force_an_unbounded_recovery_read() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut wal = ScriptedWal::with_entries(held);
+  let wal = ScriptedWal::with_entries(held);
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   assert_eq!(
-    wal.done.len() as u64,
+    storage.wal_mut().done.len() as u64,
     held,
     "reads are bounded by the band's evidence — the poisoned commit scalar forces nothing"
   );
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -3663,7 +3613,7 @@ fn a_root_vouched_committed_head_with_no_wal_header_becomes_a_repair_hole_not_re
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -3673,18 +3623,18 @@ fn a_root_vouched_committed_head_with_no_wal_header_becomes_a_repair_hole_not_re
   wal.script_read_fault(OpNumber::with(commit_max), u8::MAX); // its reads fault, never a clean Absent
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -3733,7 +3683,7 @@ fn recover_reads_the_committed_band_when_the_op_head_scalar_under_reports() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -3742,13 +3692,13 @@ fn recover_reads_the_committed_band_when_the_op_head_scalar_under_reports() {
   wal.head = ring; // a corrupt-LOW head scalar, far below the durable committed frontier
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -3759,7 +3709,7 @@ fn recover_reads_the_committed_band_when_the_op_head_scalar_under_reports() {
     "the window floors at the durable commit despite the under-reporting head scalar"
   );
   for _ in 0..(commit_max + 8) {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -3822,24 +3772,24 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   )
   .unwrap()
   .with_wal_geometry(crate::MAX_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
   };
   // The WAL holds canonical ops 1..=commit_max (head == commit_max), each body [op] header-matched.
-  let mut wal = ScriptedWal::with_entries(commit_max);
+  let wal = ScriptedWal::with_entries(commit_max);
   // A checkpoint interval far above the window — the regime in which this hazard is reachable.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -3857,7 +3807,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   );
   // Drain the committed-band reads → Normal, every held op cached + verified.
   for _ in 0..(commit_max + 8) {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -3895,8 +3845,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   // ABSENT. Drive replica 1 to primary of view 1.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -3906,7 +3855,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
+  r.storage_step(now, &mut storage, &mut blocks); // complete the SendDoViewChange durable-view write
   // The recovered replica's OWN DVC reports the KNOWN committed frontier == commit_max, with a
   // log_slice carrying the held band up to commit_max — so `commit* == commit_max <= op_head ==
   // commit_max` and the fail-stop does NOT trip. (FAIL-BEFORE: the DVC reported op == RECOVER_TAIL_WINDOW
@@ -3941,8 +3890,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   // is THIS replica — adoption must NOT fail-stop and must NOT truncate the committed band.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -3982,28 +3930,28 @@ fn recover_bounds_the_read_window_for_a_ring_less_wal_with_a_corrupt_op_head() {
   // never a `u64::MAX` enumeration (which would hang/OOM `recover()` before the async fault handling
   // ever ran). Recovery completes at once holding nothing.
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: u64::MAX, // a bit-rotted head scalar on a ring-less backend — ignored by the scan
     done: VecDeque::new(),
   };
-  let mut sb = sb_formatted(); // formatted-empty: models a store that ran (op_head is corrupt, not wiped)
+  let sb = sb_formatted(); // formatted-empty: models a store that ran (op_head is corrupt, not wiped)
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Complete the genesis geometry-pin root write (the only storage completion outstanding).
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert_eq!(
-    wal.done.len(),
+    storage.wal_mut().done.len(),
     0,
     "the scan (bounded by the proto-imposed ring) found no written slot — NO reads"
   );
@@ -4044,21 +3992,21 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
     "the durable root has NO committed band above the checkpoint"
   );
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Complete the genesis geometry-pin root write (the only storage completion outstanding).
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert_eq!(
-    wal.done.len(),
+    storage.wal_mut().done.len(),
     0,
     "no written slot + no committed band → NO reads, regardless of the claimed head"
   );
@@ -4116,7 +4064,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -4150,19 +4098,19 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -4186,8 +4134,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   // and solicits op 2 via RequestPrepare (on-demand peer-repair).
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4222,8 +4169,8 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     RequestNumber::with(3),
     Bytes::copy_from_slice(&[2u8]),
   ));
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), canonical_repair);
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → resume
+  r.handle_message(now, &mut storage, primary_peer(), canonical_repair);
+  r.storage_step(now, &mut storage, &mut blocks); // the repaired append completes → resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -4286,28 +4233,28 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut wal = ScriptedWal::with_entries(3); // ops 1,2,3 all canonical [op]
+  let wal = ScriptedWal::with_entries(3); // ops 1,2,3 all canonical [op]
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -4330,8 +4277,7 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
   // Announce commit=2: both committed ops apply directly from the trusted WAL, no peer-repair needed.
   r.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4364,15 +4310,15 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
   // Recovering and emits nothing until its own storage loop completes.
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), 2); // keep it Recovering (not yet drained)
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4390,7 +4336,7 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
     RequestNumber::with(3),
     Bytes::from_static(b"z"),
   ));
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), higher);
+  r.handle_message(now, &mut storage, primary_peer(), higher);
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -4411,16 +4357,16 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
   // timeout fires the retry, the next read is clean, and we reach Normal.
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), 2);
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let mut now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4431,14 +4377,14 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
     "Recovering arms the recover_retry timer"
   );
   for _ in 0..8 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if r.status() == Status::Normal {
       break;
     }
     // Advance to the next timer deadline and fire it (re-submits pending/faulty reads).
     if let Some(t) = r.poll_timeout() {
       now = t;
-      r.handle_timeout(now, &mut wal, &mut sb);
+      r.handle_timeout(now, &mut storage);
     }
   }
   assert_eq!(
@@ -4485,7 +4431,7 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -4495,13 +4441,13 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4509,7 +4455,7 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   assert_eq!(r.status(), Status::Recovering);
 
   // Drain op 1's clean read (resolved); op 2 stays pending with NO completion (its read is held).
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -4519,7 +4465,7 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   // One recover-retry tick: `recover_timeouts` re-submits op 2 ADDITIVELY (a fresh id, prior id kept)
   // and decrements its absolute budget. op 2's read is STILL held, so this enqueues no completion.
   now = now + RECOVER_READ_RETRANSMIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -4529,12 +4475,12 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   // The original (slow) op-2 read now completes under its ORIGINAL id — the id a retire-on-retry
   // retransmit would already have discarded. With additive ids it is still live, so it resolves op 2.
   assert!(
-    wal.release_deferred(OpNumber::with(2)),
+    storage.wal_mut().release_deferred(OpNumber::with(2)),
     "op 2 had an outstanding (held) read to release",
   );
 
   // Drive to completion (pump storage + the retry timer); recovery reaches Normal with op 2 resolved.
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -4557,25 +4503,25 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
 
 #[test]
 fn recover_rebuilds_log_and_op_from_wal() {
-  // A backup appends ops 1,2 durably, then "crashes". recover() from the SAME wal/sb rebuilds
+  // A backup appends ops 1,2 durably, then "crashes". recover() over the SAME session rebuilds
   // op=2 with REAL bodies, view from the superblock. recover() is now metadata-only (returns
   // Recovering); a no-fault TestWal completes the tail reads in one handle_storage → Normal.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), sb_formatted());
+  let (wal, sb) = (TestWal::default(), sb_formatted());
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  // Drop `e` (crash). Recover a fresh endpoint from the SAME durable wal/sb.
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut storage, &mut blocks);
+  // Drop `e` (crash). Recover a fresh endpoint from the SAME durable wal/storage.sb_mut().
   drop(e);
   let mut recovered = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4585,7 +4531,7 @@ fn recover_rebuilds_log_and_op_from_wal() {
     Status::Recovering,
     "recover is a metadata-only constructor (Recovering)"
   );
-  recovered.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads → Normal
+  recovered.storage_step(now, &mut storage, &mut blocks); // drain the tail reads → Normal
   assert_eq!(
     recovered.op(),
     OpNumber::with(2),
@@ -4599,7 +4545,7 @@ fn recover_rebuilds_log_and_op_from_wal() {
   assert_eq!(recovered.status(), Status::Normal);
   // Recovery is read-only: the durable WAL head is unchanged.
   assert_eq!(
-    wal.op_head(),
+    storage.wal_mut().op_head(),
     OpNumber::with(2),
     "WAL head is intact after recovery"
   );
@@ -4614,14 +4560,15 @@ fn recover_restores_real_bodies() {
   // the primary announce commit=2 — the recovered backup re-applies both ops from its restored
   // WAL bodies, and the Committed events must carry the ORIGINAL bytes.
   let cfg = || Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let (mut wal, mut sb) = (TestWal::default(), sb_formatted());
+  let (wal, sb) = (TestWal::default(), sb_formatted());
   let now = Instant::ZERO;
 
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg(), genesis(3), 0, EchoSm, u64::MAX);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut storage, &mut blocks);
   drop(e); // crash
 
   let mut recovered = Endpoint::recover(
@@ -4629,19 +4576,17 @@ fn recover_restores_real_bodies() {
     genesis(3),
     0,
     EchoSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
-  recovered.storage_step(now, &mut wal, &mut sb, &mut blocks); // restore the tail bodies → Normal
+  recovered.storage_step(now, &mut storage, &mut blocks); // restore the tail bodies → Normal
   assert_eq!(recovered.status(), Status::Normal);
   recovered.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4669,7 +4614,7 @@ fn recover_restores_real_bodies() {
 fn recover_restores_a_nonzero_durable_view() {
   // A replica that advanced its view persists it; recover() restores it (no regression to view 0,
   // which would risk a cross-view double-vote). Drive a backup into ViewChange(view 1) so it writes
-  // the durable view, pump the write, then crash + recover from the SAME wal/sb.
+  // the durable view, pump the write, then crash + recover over the SAME session.
   use crate::StartViewChange;
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -4678,14 +4623,14 @@ fn recover_restores_a_nonzero_durable_view() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1 (own SVC bit)
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(later, &mut storage); // primary_idle → propose view 1 (own SVC bit)
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4694,14 +4639,14 @@ fn recover_restores_a_nonzero_durable_view() {
       0,
     )),
   ); // SVC quorum → ViewChange(view 1) → durable-view write submitted
-  e.storage_step(later, &mut wal, &mut sb, &mut blocks); // make the durable-view write complete
+  e.storage_step(later, &mut storage, &mut blocks); // make the durable-view write complete
   assert_eq!(
-    sb.state().view(),
+    storage.sb_mut().state().view(),
     View::with(1),
     "view 1 is durable before the crash"
   );
   assert_eq!(
-    sb.state().log_view(),
+    storage.sb_mut().state().log_view(),
     View::new(),
     "the view change did not complete: the durable log_view is still 0 (mid-view-change)"
   );
@@ -4712,8 +4657,7 @@ fn recover_restores_a_nonzero_durable_view() {
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4725,7 +4669,7 @@ fn recover_restores_a_nonzero_durable_view() {
   );
   // The pre-crash writer never observed its backend capacity (`Endpoint::new` takes no storage), so
   // its root left that half of the geometry pair unrecorded — recovery re-pins it before settling.
-  recovered.storage_step(later, &mut wal, &mut sb, &mut blocks);
+  recovered.storage_step(later, &mut storage, &mut blocks);
   // The durable root is `view 1 / log_view 0` — the replica crashed MID-VIEW-CHANGE (it had
   // escalated to ViewChange(1) and persisted the view, but never installed a view-1 log). Per the
   // Per TigerBeetle replica.zig open(), recovery RE-DRIVES the in-progress view change
@@ -4749,7 +4693,7 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
   // (The deterministic `TestSb` completes the checkpoint read on submit, so reproduce the superseded id
   // directly: re-mark `rec.checkpoint` to a fresh id before draining the original read's completion.)
   let cfg = || Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // ONE block store for the whole test — the SM checkpoint DAG must survive into recover().
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
@@ -4760,11 +4704,11 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
     CountSm::default(),
     u64::MAX,
   );
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2u64 {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       Message::Request(Request::new(
         ClientId::new(7),
@@ -4772,7 +4716,7 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
         Bytes::from(std::vec![rn as u8]),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -4786,8 +4730,7 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4806,7 +4749,7 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
   // restoring the SM and completing recovery. (FAIL-BEFORE the additive accept: the superseded id is
   // ignored, the SM is never restored, and recovery stays `Recovering`.)
   for _ in 0..4 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if r.status() != Status::Recovering {
       break;
     }
@@ -4861,11 +4804,11 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   .with_wal_geometry(2, u64::MAX);
   // The Phase-1 checkpoint read submitted by recover() carries the genuine snapshot, but it stays IN
   // FLIGHT (not flushed) while the fault storm arrives.
-  let mut sb = ScriptedCheckpointSb::new(
+  let sb = ScriptedCheckpointSb::new(
     state,
     VecDeque::from(std::vec![(OpNumber::with(2), good_env.clone())]),
   );
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
@@ -4877,13 +4820,13 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   // recover walks the local DAG and restores from it rather than escalating to a peer fetch.
   blocks.put(good_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -4896,7 +4839,7 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
 
   // A STORM of in-band checkpoint faults under arbitrary ids — none may decrement the budget or escalate.
   for k in 0..(4 * RECOVER_READ_RETRIES as u64) {
-    e.on_recover_sb_done(&mut sb, SuperblockDone::Fault(read_id(9000 + k)));
+    e.on_recover_sb_done(&mut storage, SuperblockDone::Fault(read_id(9000 + k)));
   }
   assert_eq!(
     e.status(),
@@ -4913,8 +4856,8 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   );
 
   // The still-in-flight valid read lands → SM restored LOCALLY, recovery completes. No peer was needed.
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -4939,7 +4882,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // (The implementation never prunes the WAL at this stage — so the WAL still holds ops [1..=head];
   //  the log cache is rebuilt for the tail (checkpoint_op..=head] only, the snapshot owns the rest.)
   let cfg = || Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -4958,15 +4901,10 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
     CountSm::default(),
     u64::MAX,
   );
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=2 {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      Peer::Client(ClientId::new(7)),
-      req(rn),
-    );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // append durable → commit → (at op 2) checkpoint
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks); // append durable → commit → (at op 2) checkpoint
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -4989,8 +4927,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -5013,7 +4950,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   );
   // commit_max is restored to checkpoint_op too (monotone bounds: op >= commit_max >= commit_min).
   assert_eq!(recovered.commit_max(), OpNumber::with(2));
-  recovered.storage_step(now, &mut wal, &mut sb, &mut blocks); // restore the SM snapshot + tail bodies → Normal
+  recovered.storage_step(now, &mut storage, &mut blocks); // restore the SM snapshot + tail bodies → Normal
   assert_eq!(recovered.status(), Status::Normal);
   // The SM was restored from the snapshot: it already reflects ops 1,2 (NOT re-applied → exactly 2).
   assert_eq!(
@@ -5062,7 +4999,7 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   // 2) and the ring-less test WAL's `u64::MAX` capacity so recovery sees a FORMATTED, geometry-recorded
   // solo store the fence accepts rather than fail-stopping.
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(
+  let sb = ScriptedCheckpointSb::new(
     state,
     VecDeque::from(std::vec![
       // (1) right op, WRONG bytes (hash mismatch) → rejected.
@@ -5075,7 +5012,7 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   );
   // An empty WAL with head == checkpoint_op (2): the recover tail range (3..=2) is empty, so the ONLY
   // outstanding read is the checkpoint read — isolating the verify-and-retry behaviour.
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
@@ -5087,13 +5024,13 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   // read restores from the local DAG.
   blocks.put(good_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -5106,8 +5043,8 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   );
 
   // Drain #1: the corrupt-bytes read is REJECTED — SM not restored, still Recovering, a new read armed.
-  sb.flush(); // release the Phase-1 checkpoint read (the corrupt one)
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush(); // release the Phase-1 checkpoint read (the corrupt one)
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.state_machine_ref().applied().len(),
     0,
@@ -5122,11 +5059,11 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   // Pump the recover-retry timer so the next checkpoint read is submitted (the timer is the sole
   // owner of the read-retry budget).
   let t = e.poll_timeout().expect("recover-retry timer armed");
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut storage);
 
   // Drain #2: the wrong-op read is REJECTED too — still no restore, still Recovering.
-  sb.flush(); // release the retry read submitted in drain #1 (the wrong-op one)
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush(); // release the retry read submitted in drain #1 (the wrong-op one)
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.state_machine_ref().applied().len(),
     0,
@@ -5140,11 +5077,11 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
 
   // Pump the recover-retry timer again so the genuine retry read is submitted.
   let t = e.poll_timeout().expect("recover-retry timer armed");
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut storage);
 
   // Drain #3: the genuine read is accepted → SM restored, recovery completes to Normal.
-  sb.flush(); // release the retry read submitted in drain #2 (the genuine one)
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush(); // release the retry read submitted in drain #2 (the genuine one)
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -5187,7 +5124,7 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   // 2) and the ring-less test WAL's `u64::MAX` capacity so recovery sees a FORMATTED, geometry-recorded
   // solo store the fence accepts rather than fail-stopping.
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(
+  let sb = ScriptedCheckpointSb::new(
     state,
     VecDeque::from(std::vec![
       // A 2-byte garbage snapshot: too short even for the 8-byte leading op → decode returns None.
@@ -5195,7 +5132,7 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
       (OpNumber::with(2), good_env.clone()),
     ]),
   );
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
@@ -5207,20 +5144,20 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   // read restores from the local DAG.
   blocks.put(good_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Drain #1: the truncated read does NOT panic — it is rejected; still Recovering.
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -5233,10 +5170,10 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   );
   // Pump the recover-retry timer so the genuine retry read is submitted.
   let t = e.poll_timeout().expect("recover-retry timer armed");
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut storage);
   // Drain #2: the genuine read completes recovery.
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -5266,21 +5203,21 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → always faults
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → always faults
   // Empty WAL with head == checkpoint_op (2): the tail range is empty, isolating the checkpoint path.
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -5290,7 +5227,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   // Drive well past the per-op retry budget (RECOVER_READ_RETRIES), pumping the recover-retry timer
   // each round (the timer is the sole owner of the read-retry budget). The CORE property: this NEVER
   // panics (the old `assert!` is gone).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   // After exhaustion the replica escalated to a peer fetch: still Recovering (SM not yet restored —
   // never silently Normal with a fresh SM at commit_min == 2), awaiting a peer checkpoint, with a
   // FORCED sync armed at our own checkpoint op and a RequestSync emitted.
@@ -5344,8 +5281,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -5361,8 +5297,8 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   );
   // apply_sync staged the durable re-persist (two superblock writes); drive them to completion.
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -5419,25 +5355,25 @@ fn a_quarantine_hint_does_not_escalate_a_checkpoint_exhausted_local_recovery() {
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
-  let mut wal = TestWal {
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   while e.poll_message().is_some() {}
   // Precondition: a checkpoint-exhausted local recovery — Recovering, awaiting a peer checkpoint, a
   // NON-crossing forced sync, and the SM unrestored (`commit_min == 2 > sm_at == 0`).
@@ -5456,8 +5392,7 @@ fn a_quarantine_hint_does_not_escalate_a_checkpoint_exhausted_local_recovery() {
   // A quarantined higher-epoch hint arms the probe ON TOP of the recovery (the crossing is NOT armed).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Member(MemberId::new(99)),
     Message::Commit(Commit::new(
       View::new(),
@@ -5477,8 +5412,7 @@ fn a_quarantine_hint_does_not_escalate_a_checkpoint_exhausted_local_recovery() {
   for ms in 1..=8 {
     e.handle_timeout(
       now + core::time::Duration::from_millis(ms * 200),
-      &mut wal,
-      &mut sb,
+      &mut storage,
     );
     while e.poll_message().is_some() {}
   }
@@ -5521,25 +5455,25 @@ fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → always faults
-  let mut wal = TestWal {
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → always faults
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
@@ -5560,8 +5494,7 @@ fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
   // authority in our membership, reaching the ingress cancel before the Recovering dispatch drop.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::Commit(Commit::new(
       View::new(),
@@ -5618,20 +5551,20 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
-  let mut wal = TestWal {
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -5643,7 +5576,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   assert_eq!(e.status(), Status::Recovering);
 
   // Exhaust the checkpoint-read budget → escalate to a peer fetch (still Recovering, SM not restored).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "the primary escalated to a peer fetch (its own checkpoint is unreadable)"
@@ -5671,8 +5604,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -5689,8 +5621,8 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   // Drive the staged re-persist to completion (flush the scripted superblock each round so the two staged
   // writes surface and `on_sb_done` lands the root, installing + completing recovery).
   for _ in 0..6 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
     if !e.status().is_recovering() {
       break;
     }
@@ -5779,25 +5711,25 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
   let corrupt_reads: VecDeque<(OpNumber, Bytes)> = (0..(RECOVER_READ_RETRIES as usize + 6))
     .map(|_| (OpNumber::with(2), Bytes::from_static(b"CORRUPT")))
     .collect();
-  let mut sb = ScriptedCheckpointSb::new(state, corrupt_reads);
-  let mut wal = TestWal {
+  let sb = ScriptedCheckpointSb::new(state, corrupt_reads);
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: 2,
     done: VecDeque::new(),
   };
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Drive the verify-failure exhaustion (pumping the recover-retry timer each round) → must NOT panic.
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -5808,8 +5740,7 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
   while e.poll_message().is_some() {}
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -5824,8 +5755,8 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
     )),
   );
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -5892,7 +5823,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   .with_wal_geometry(2, u64::MAX);
   // ScriptedCheckpointSb with an EMPTY read script → every own checkpoint read FAULTS (the op-1
   // snapshot is permanently unreadable, forcing the peer-fetch escalation).
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
 
   // WAL head 3 holds ops 2 and 3 with their canonical bodies; op-2's body read PERMANENTLY faults.
   let mut entries = BTreeMap::new();
@@ -5912,13 +5843,13 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
 
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -5932,7 +5863,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
 
   // Drive past the per-op + checkpoint retry budgets so op-2 classes permanently faulty AND the own
   // checkpoint read exhausts → escalation to a peer fetch (pumping the recover-retry timer each round).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -5964,8 +5895,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -5981,8 +5911,8 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   );
   // Drive the durable re-persist (two superblock writes) to completion → Normal.
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -6020,8 +5950,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   // commit, and (re-)solicits a RequestPrepare; it must NEVER apply op 2 with `&[]`.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -6060,8 +5989,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   // durable append; on_wal_done then applies op 2 with its REAL body and resumes the held commit.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -6075,7 +6003,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
       body2.clone(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repair-fill append lands → apply op 2 (real body)
+  e.storage_step(now, &mut storage, &mut blocks); // the repair-fill append lands → apply op 2 (real body)
   assert!(
     !e.has_repair_hole_for_test(2),
     "the op-2 hole is filled once the canonical Prepare's append is durable"
@@ -6146,11 +6074,11 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
   let mut entries = BTreeMap::new();
   entries.insert(2u64, (h2, body2.clone()));
   entries.insert(3u64, (h3, body3.clone()));
-  let mut wal = ScriptedWal {
+  let wal = ScriptedWal {
     entries,
     head: 3,
     capacity: u64::MAX,
@@ -6162,20 +6090,20 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation
   // (pumping the recover-retry timer each round).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
@@ -6231,14 +6159,13 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   // `Present(empty)` entry.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -6304,11 +6231,11 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
   let mut entries = BTreeMap::new();
   entries.insert(2u64, (h2, body2.clone()));
   entries.insert(3u64, (h3, body3.clone()));
-  let mut wal = ScriptedWal {
+  let wal = ScriptedWal {
     entries,
     head: 3,
     capacity: u64::MAX,
@@ -6320,18 +6247,18 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
@@ -6375,14 +6302,13 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   // canonical cross-check).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
   for _ in 0..3 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -6398,8 +6324,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   // with `&[]`. (FAIL-BEFORE: op 3's Present(empty) survived and advance_commit applied op 3 empty.)
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -6462,11 +6387,11 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   )
   .unwrap()
   .with_wal_geometry(2, u64::MAX);
-  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
   let mut entries = BTreeMap::new();
   entries.insert(2u64, (h2, body2.clone()));
   entries.insert(3u64, (h3_stale, stale3.clone()));
-  let mut wal = ScriptedWal {
+  let wal = ScriptedWal {
     entries,
     head: 3,
     capacity: u64::MAX,
@@ -6478,18 +6403,18 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     done: VecDeque::new(),
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     5,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch"
@@ -6530,16 +6455,15 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     .insert(3, RECOVER_READ_RETRIES);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
   // Stage the re-persist (the node stays Recovering), then drive the scripted superblock to land the
   // SyncRepersist root, which installs + completes recovery.
   for _ in 0..6 {
-    sb.flush();
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
     if !e.status().is_recovering() {
       break;
     }
@@ -6603,7 +6527,7 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -6627,13 +6551,13 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -6644,8 +6568,11 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
     "precondition: Phase-1 seeded op 2's placeholder with the STALE H1 identity (client 99)",
   );
   // The in-model header resolution now agrees with the canonical band: op 2's durable header becomes H2.
-  wal.entries.insert(2u64, (h2_canon, canon2.clone()));
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  storage
+    .wal_mut()
+    .entries
+    .insert(2u64, (h2_canon, canon2.clone()));
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -6715,7 +6642,7 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -6739,18 +6666,18 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   // THE PLACEMENT GUARD: op 2 is NOT promoted to Repairing off the misplaced (op-99-stamped) header — it
   // is dropped to a peer-repaired hole. (FAIL-BEFORE the placement check: classify accepted the
@@ -6773,7 +6700,7 @@ fn recover_with_no_checkpoint_is_unchanged() {
   // Backward-compat guard: with checkpoint_op == 0 (no checkpoint yet), recover() behaves EXACTLY
   // as the no-checkpoint path — commit_min == commit_max == 0, a fresh SM (0 applied), log cache [1..=head].
   let cfg = || Config::try_new(1, MemberId::new(1)).unwrap();
-  let (mut wal, mut sb) = (TestWal::default(), sb_formatted());
+  let (wal, sb) = (TestWal::default(), sb_formatted());
   let now = Instant::ZERO;
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     cfg(),
@@ -6783,9 +6710,10 @@ fn recover_with_no_checkpoint_is_unchanged() {
     u64::MAX,
   );
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.checkpoint_op(), OpNumber::with(0), "no checkpoint taken");
   drop(e);
 
@@ -6794,14 +6722,13 @@ fn recover_with_no_checkpoint_is_unchanged() {
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
-  recovered.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads → Normal
+  recovered.storage_step(now, &mut storage, &mut blocks); // drain the tail reads → Normal
   assert_eq!(recovered.status(), Status::Normal);
   assert_eq!(recovered.op(), OpNumber::with(2), "op from the WAL head");
   assert_eq!(
@@ -6838,23 +6765,23 @@ fn recover_bounds_the_read_window_for_a_huge_op_head() {
     .clone()
     .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, RECOVER_TAIL_WINDOW);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Complete the genesis geometry-pin root write (the only storage completion outstanding).
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   // The scan found no written slot and there is nothing committed → nothing to read, no phantom
   // read storm, and recovery completes once the geometry pin lands.
   assert_eq!(
-    wal.done.len(),
+    storage.wal_mut().done.len(),
     0,
     "a corrupt head scalar over an empty ring submits NO reads — the scan found no written slot"
   );
@@ -6889,32 +6816,32 @@ fn recover_does_not_overflow_with_a_checkpoint_op_near_u64_max() {
   )
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None, // the checkpoint read will fault (no snapshot) — not under test here
   };
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries: BTreeMap::new(),
     head: near_max, // head == checkpoint_op → empty tail range
     done: VecDeque::new(),
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   // The CORE assertion is simply that this does not overflow-panic.
+  let mut storage = Storage::new(wal, sb);
   let e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
-    wal.done.len(),
+    storage.wal_mut().done.len(),
     0,
     "head == checkpoint_op → the tail range is empty, no tail reads submitted"
   );
@@ -6971,12 +6898,12 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
     );
     entries.insert(op, (h, Bytes::from(std::vec![op as u8])));
   }
-  let mut wal = TestWal {
+  let wal = TestWal {
     entries,
     head,
     done: VecDeque::new(),
   };
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: Some((OpNumber::with(checkpoint_op), env)),
@@ -6988,13 +6915,13 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   // restores from the local DAG.
   blocks.put(donor_snap.clone());
   super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -7009,7 +6936,7 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   );
   // Drive the in-window tail reads + the checkpoint read to completion → Normal.
   while e.status() != Status::Normal {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   // THE core assertion: the recovered head is the VERIFIED read frontier, NOT the raw (pathological) head —
   // the phantom `(frontier, head]` read ABSENT and `recover_progress` capped `self.op` at the highest
@@ -7042,14 +6969,14 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
     RequestNumber::with(danger),
     Bytes::from(std::vec![0xAB]),
   );
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), Message::Prepare(p));
+  e.handle_message(now, &mut storage, primary_peer(), Message::Prepare(p));
   assert_eq!(
     e.op(),
     OpNumber::with(danger),
     "a Prepare above the frontier is APPENDED (op advances), not blind-re-acked",
   );
   assert!(
-    wal.entries.contains_key(&danger),
+    storage.wal_mut().entries.contains_key(&danger),
     "the durable WAL gained the appended op (append-before-ack honored)",
   );
   // No PrepareOk for `danger` is emitted yet — it is deferred until the WAL append completes (a blind
@@ -7100,26 +7027,26 @@ fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
   // RESTORE: the WAL retained the whole band (head 3 >= floor 2) → the floor restores verbatim.
-  let mut sb = TestSb {
+  let sb = TestSb {
     state: state.clone(),
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut wal = ScriptedWal::with_entries(3);
+  let wal = ScriptedWal::with_entries(3);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, Instant::ZERO);
+  drive_recovery(&mut r, &mut storage, &mut blocks, Instant::ZERO);
   assert_eq!(
     r.log_floor,
     OpNumber::with(2),
@@ -7142,26 +7069,26 @@ fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
   .with_log_floor(OpNumber::with(2))
   .unwrap()
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb2 = TestSb {
+  let sb2 = TestSb {
     state: sparse,
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let mut wal2 = ScriptedWal::with_entries(1);
+  let wal2 = ScriptedWal::with_entries(1);
   let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
+  let mut storage2 = Storage::new(wal2, sb2);
   let mut r2 = Endpoint::recover(
     cfg2,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal2,
-    &mut sb2,
+    &mut storage2,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r2, &mut wal2, &mut sb2, &mut blocks2, Instant::ZERO);
+  drive_recovery(&mut r2, &mut storage2, &mut blocks2, Instant::ZERO);
   assert_eq!(
     r2.log_floor,
     OpNumber::with(1),
@@ -7182,17 +7109,17 @@ fn a_durable_root_write_carries_the_live_log_floor() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut storage = Storage::new(TestWal::default(), sb_at_checkpoint(2));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.force_state_for_test(0, 6, 6, 2, &[]);
   e.log_floor = OpNumber::with(4); // an adoption-learned floor above the own checkpoint (2)
   assert!(
-    e.seal_committed_frontier(&mut sb),
+    e.seal_committed_frontier(&mut storage),
     "a Normal node with no in-flight storage seals"
   );
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert_eq!(
-    sb.state.log_floor(),
+    storage.sb_mut().state.log_floor(),
     OpNumber::with(4),
     "the durable root carries the live floor, not the checkpoint restart value"
   );
@@ -7208,15 +7135,15 @@ fn recover_derives_the_head_when_the_op_head_scalar_under_reports_zero() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut wal = ScriptedWal::with_entries(3);
   wal.head = 0; // the under-reporting scalar — hides all three written slots if trusted
-  let mut sb = sb_formatted(); // a FORMATTED root (the store ran); only the op_head scalar rotted
+  let sb = sb_formatted(); // a FORMATTED root (the store ran); only the op_head scalar rotted
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -7227,7 +7154,7 @@ fn recover_derives_the_head_when_the_op_head_scalar_under_reports_zero() {
     "the head derives from the durable headers, never the advisory scalar"
   );
   // Complete the tail reads.
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert_eq!(e.status(), Status::Normal, "the tail verifies clean");
   assert_eq!(
     e.op(),
@@ -7246,22 +7173,22 @@ fn recover_fails_stops_a_virgin_voter_even_with_surviving_wal_headers() {
   // view re-decide an already-committed op number. (A voter's genesis always writes a durable format
   // root via `Genesis::commit`, so a virgin voter root can only mean a wipe.)
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let mut wal = ScriptedWal::with_entries(3); // committed headers survive the wipe of the root
-  let mut sb = TestSb::default(); // the WIPED root: empty `VsrState::new()`, geometry gone
+  let wal = ScriptedWal::with_entries(3); // committed headers survive the wipe of the root
+  let sb = TestSb::default(); // the WIPED root: empty `VsrState::new()`, geometry gone
+  let mut storage = Storage::new(wal, sb);
   let err = Endpoint::recover(
     cfg,
     genesis(3), // member 1 of 3 is a VOTER
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
   .expect_err("a virgin voter with surviving WAL headers must fail-stop, not recover the tail");
   assert_eq!(err, RecoverError::UnformattedVoter);
   assert!(
-    wal.done.is_empty(),
+    storage.wal_mut().done.is_empty(),
     "the refusal is fail-fast: no storage read was submitted"
   );
 }
@@ -7281,15 +7208,15 @@ fn recover_resumes_a_virgin_learner_with_surviving_wal_headers() {
     0,
   )
   .expect("valid 3-voter + 1-learner genesis membership");
-  let mut wal = ScriptedWal::with_entries(3);
-  let mut sb = TestSb::default(); // virgin root — a learner may resume over it
+  let wal = ScriptedWal::with_entries(3);
+  let sb = TestSb::default(); // virgin root — a learner may resume over it
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::recover(
     cfg,
     membership,
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("a virgin learner resumes (it never votes)");
@@ -7332,14 +7259,13 @@ fn genesis_commit_writes_a_durable_root_so_the_voter_recovers() {
   );
   // Recover over that committed store: the durable format root means this voter RESUMES rather than
   // fail-stopping — the counterpoint to `recover_fails_stops_a_virgin_voter_even_with_surviving_wal_headers`.
-  let mut wal2 = wal;
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::<CountSm, RestartOnly>::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal2,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("a formatted voter store recovers, never fail-stops");
@@ -7389,19 +7315,19 @@ fn recover_refuses_a_changed_checkpoint_ops() {
   // The WAL-GEOMETRY fence: the recovery scan window is derived from `checkpoint_ops`, so a restart
   // under a different interval than the durable root pinned could clip a committed tail out of the
   // window. Recovery refuses fail-fast instead.
-  let mut wal = ScriptedWal::with_entries(0);
-  let mut sb = TestSb {
+  let wal = ScriptedWal::with_entries(0);
+  let sb = TestSb {
     state: VsrState::new().with_wal_geometry(32, u64::MAX),
     ..Default::default()
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 16).unwrap();
+  let mut storage = Storage::new(wal, sb);
   let err = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -7414,7 +7340,7 @@ fn recover_refuses_a_changed_checkpoint_ops() {
     }
   );
   assert!(
-    wal.done.is_empty(),
+    storage.wal_mut().done.is_empty(),
     "the refusal is fail-fast: no storage read was submitted"
   );
 }
@@ -7424,19 +7350,19 @@ fn recover_refuses_a_changed_wal_capacity() {
   // The other half of the geometry pair: a bounded backend reopened under a different capacity
   // relocates every ring slot (op → slot placement is capacity-derived) and moves the scan ceiling,
   // so recovery refuses the mismatch; an explicit offline migration is the supported path.
-  let mut wal = ScriptedWal::with_entries(0); // reports u64::MAX (ring-less)
-  let mut sb = TestSb {
+  let wal = ScriptedWal::with_entries(0); // reports u64::MAX (ring-less)
+  let sb = TestSb {
     state: VsrState::new().with_wal_geometry(32, 1000),
     ..Default::default()
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // checkpoint_ops 32 matches
+  let mut storage = Storage::new(wal, sb);
   let err = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -7459,7 +7385,7 @@ fn recover_refuses_a_non_virgin_root_with_unrecorded_geometry() {
   // offline to a root recording its verified geometry. This is the belt to the
   // construction-time suspenders (every live endpoint stamps a nonzero pair): the fence still refuses a
   // residual unstamped root rather than blessing the live geometry as if it were the writer's.
-  let mut wal = ScriptedWal::with_entries(0); // reports u64::MAX (ring-less), well above the floor
+  let wal = ScriptedWal::with_entries(0); // reports u64::MAX (ring-less), well above the floor
   let unstamped = VsrState::try_new(
     View::with(1),
     View::with(1),
@@ -7479,18 +7405,18 @@ fn recover_refuses_a_non_virgin_root_with_unrecorded_geometry() {
     (0, 0),
     "precondition: the un-stamped root records no geometry"
   );
-  let mut sb = TestSb {
+  let sb = TestSb {
     state: unstamped,
     ..Default::default()
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut storage = Storage::new(wal, sb);
   let err = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -7503,7 +7429,7 @@ fn recover_refuses_a_non_virgin_root_with_unrecorded_geometry() {
     }
   );
   assert!(
-    wal.done.is_empty(),
+    storage.wal_mut().done.is_empty(),
     "the refusal is fail-fast: no storage read was submitted"
   );
 }
@@ -7514,16 +7440,16 @@ fn recover_refuses_a_wal_below_the_liveness_floor() {
   // mid-interval), wedging the primary — refused fail-fast with the published floor in the error.
   let mut wal = ScriptedWal::with_entries(0);
   wal.capacity = 16; // below the floor for interval 32
-  let mut sb = TestSb::default();
+  let sb = TestSb::default();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 32).unwrap();
   assert_eq!(cfg.minimum_wal_capacity(), 33, "interval + 1");
+  let mut storage = Storage::new(wal, sb);
   let err = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -7554,13 +7480,13 @@ fn format_pins_geometry_and_fences_a_shrunk_restart() {
     "format pins the live geometry pair into the genesis root"
   );
   // Recovery over the formatted store settles synchronously (empty WAL, nothing to read).
+  let mut storage = Storage::new(wal, sb);
   let e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("the formatted store recovers")
@@ -7578,8 +7504,7 @@ fn format_pins_geometry_and_fences_a_shrunk_restart() {
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -7600,16 +7525,16 @@ fn a_formatted_genesis_store_resumes_the_view_0_primary() {
   // startup view change. The format witness is what makes this SOUND: it is a durable marker a wipe
   // cannot forge, so only a genuinely-created cluster's primary takes this path.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap(); // slot 0 leads view 0
-  let mut wal = ScriptedWal::with_entries(0);
+  let wal = ScriptedWal::with_entries(0);
   let mut sb = TestSb::default();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("a virgin store formats");
+  let mut storage = Storage::new(wal, sb);
   let e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("the formatted store recovers")
@@ -7636,14 +7561,13 @@ fn a_wiped_multi_node_voter_fails_stop_rather_than_participating() {
   // genesis test above is the absent `format` call.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap(); // slot 0, a voter
   let wal = ScriptedWal::with_entries(0); // wiped: empty WAL
-  let mut sb = TestSb::default(); // wiped: empty root (VsrState::new())
+  let sb = TestSb::default(); // wiped: empty root (VsrState::new())
   let err = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut { wal },
-    &mut sb,
+    &mut Storage::new(wal, sb),
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -7657,23 +7581,23 @@ fn a_recovered_formatted_primary_with_any_appended_op_still_abdicates() {
   // op — one appended op means a pipeline/session state the restart lost, so resuming as the
   // established primary is unsafe. The exemption is only the literally-empty formatted-genesis state.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap(); // slot 0 leads view 0
-  let mut wal = ScriptedWal::with_entries(1); // one appended (uncommitted) op
+  let wal = ScriptedWal::with_entries(1); // one appended (uncommitted) op
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("formats");
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   // Complete the op-1 tail read; the terminal decision then abdicates despite the format witness.
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert_eq!(
     e.status(),
     Status::ViewChange,
@@ -7738,16 +7662,16 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
   let wal0 = ScriptedWal::with_entries(0);
   let mut sb0 = TestSb::default();
   crate::format(&cfg, &genesis(3), &wal0, &mut sb0).expect("format the genesis store");
-  let mut wal = wal0;
-  let mut sb = sb0;
+  let wal = wal0;
+  let sb = sb0;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts the formatted store")
@@ -7763,8 +7687,7 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
   // quorum {replica 0, own}, so `enter_view_change` submits the SendDoViewChange durable-view root.
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -7791,9 +7714,11 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
   for seq in 1..=4 {
     r.on_sb_done(
       Instant::ZERO,
-      &mut wal,
-      &mut sb,
-      crate::storage::SuperblockDone::Wrote(crate::WriteId::new(foreign, seq)),
+      &mut storage,
+      crate::storage::SbPolled {
+        done: crate::storage::SuperblockDone::Wrote(crate::WriteId::new(foreign, seq)),
+        landed_root: None,
+      },
     );
   }
   assert_eq!(
@@ -7812,7 +7737,7 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
   );
 
   // The REAL durable-view completion still releases it normally.
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert!(
     !r.pending_sb_for_test(),
     "the actual durable-view root write completes and releases the DoViewChange"
@@ -7828,34 +7753,28 @@ fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
   // incarnation rule the completion routers enforce — not treated as a backend-contract violation
   // by the unknown-id assertion, and never keyed into the successor's correlation tables.
   let cfg = Config::try_new(1, MemberId::new(2)).unwrap(); // member 2: a backup of views 0 and 1
-  let mut wal = ReorderWal::new().cancelling();
+  let wal = ReorderWal::new().cancelling();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
 
   // The predecessor stages an op-1 append (the ReorderWal withholds its completion — the write is
   // with the device) and is dropped WITHOUT a drain: the restart-in-place shape.
+  let mut storage = Storage::new(wal, sb);
   let mut dead = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover the formatted store")
   .expect_active();
   assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
-  dead.handle_message(
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    prepare(1, 0),
-  );
+  dead.handle_message(Instant::ZERO, &mut storage, primary_peer(), prepare(1, 0));
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "the predecessor's append is staged, its completion withheld"
   );
@@ -7867,8 +7786,7 @@ fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover over the live storage")
@@ -7879,8 +7797,7 @@ fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
   // synchronously cancels the dead incarnation's staged write and returns ITS id.
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(StartView::new(
       View::with(1),
@@ -7899,15 +7816,15 @@ fn a_cancellation_naming_a_dead_incarnations_write_is_refused_at_the_choke() {
     "the dead incarnation's cancelled id was REFUSED at the incarnation choke"
   );
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![] as std::vec::Vec<u64>,
     "the backend genuinely discarded the dead write — nothing can land late"
   );
   // Drain the adoption's durable-view write: with the dead id refused (and its write proven
   // cancelled by the backend), the successor owes and is owed nothing.
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert!(
-    !r.has_inflight_storage(),
+    !r.has_inflight_storage(&storage),
     "no bookkeeping exists for the dead incarnation's write"
   );
 }
@@ -7922,17 +7839,17 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
   // slot-quiescence fence exists to prevent), and a graceful-shutdown drain would read quiesced
   // while a write the cluster may act on is still with the device.
   let cfg = Config::try_new(1, MemberId::new(2)).unwrap(); // member 2: a backup of views 0 and 1
-  let mut wal = ReorderWal::new().cancelling();
+  let wal = ReorderWal::new().cancelling();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover the formatted store")
@@ -7941,26 +7858,28 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
 
   // The successor's own live write: a view-0 Prepare for op 1 stages an append whose completion
   // the device still owes.
-  r.handle_message(
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  let own = *wal.staged_ids().first().expect("op 1's append is staged");
+  r.handle_message(Instant::ZERO, &mut storage, primary_peer(), prepare(1, 0));
+  let own = *storage
+    .wal_mut()
+    .staged_ids()
+    .first()
+    .expect("op 1's append is staged");
   // The dead incarnation's leftover, still with the device across a restart in place: its id
   // carries the live write's SEQUENCE under a DIFFERENT incarnation. Staged at op 2 so the
   // truncate below cancels IT while the live op-1 write survives.
   let foreign = crate::WriteId::new(own.incarnation().wrapping_add(1), own.seq());
-  wal.stage_predecessor_write(foreign, 2);
+  let (header, body) = ReorderWal::predecessor_append(2);
+  assert_eq!(
+    storage.submit_append(foreign, OpNumber::with(2), header, body),
+    crate::storage::AppendSubmission::Submitted,
+    "the predecessor's append went to the device through the session that outlives it"
+  );
 
   // Adopt view 1 at canonical head 1 (op 1 committed): the truncate above op 1 cancels ONLY the
   // foreign op-2 write and reports its colliding id; the live op-1 write stays with the device.
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(StartView::new(
       View::with(1),
@@ -7978,14 +7897,14 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
     )),
   );
   assert_eq!(r.view(), View::with(1), "the adoption completed");
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // drain the durable-view write
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks); // drain the durable-view write
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "the live op-1 write is still with the device"
   );
   assert!(
-    r.has_inflight_storage(),
+    r.has_inflight_storage(&storage),
     "the live write's fence witness is INTACT — the colliding foreign id retired nothing"
   );
   assert_eq!(
@@ -7996,10 +7915,13 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
 
   // The kept witness then drains through the write's OWN completion, exactly once: the abandoned
   // append lands, its completion retires the witness, and the endpoint quiesces.
-  assert!(wal.release_latest_for(1), "the live write lands");
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   assert!(
-    !r.has_inflight_storage(),
+    storage.wal_mut().release_latest_for(1),
+    "the live write lands"
+  );
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  assert!(
+    !r.has_inflight_storage(&storage),
     "the witness retires via the write's own completion"
   );
 }
@@ -8025,14 +7947,11 @@ fn a_foreign_cancellation_cannot_retire_a_live_writes_fence_witness() {
 /// and a fence that defers the successor's re-append until the predecessor's write settles: under
 /// either, once nothing is staged, the durable identity at op 1 must equal the voted identity.
 #[test]
-#[ignore = "pins an open defect: a rebuilt endpoint starts with an empty slot-quiescence fence, so \
-            a predecessor's un-cancelled write lands over the slot its successor re-appended and \
-            voted; un-ignore when the fence survives an in-place rebuild"]
 fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
   let cfg = Config::try_new(1, MemberId::new(2)).unwrap(); // member 2: a backup of views 0 and 1
   // NON-cancelling: `truncate`/`prune` keep staged writes in flight (un-cancellable device writes),
   // and completions release only when the test lands them — newest-first per op.
-  let mut wal = ReorderWal::new();
+  let wal = ReorderWal::new();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   crate::format(&cfg, &genesis(3), &wal, &mut sb).expect("format the genesis store");
@@ -8040,27 +7959,21 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
   // The predecessor stages an op-1 append (completion withheld — the write is with the device) and
   // is dropped WITHOUT a drain: the restart-in-place shape. Append-before-ack holds, so it never
   // voted for op 1 — no other replica knows the op exists.
+  let mut storage = Storage::new(wal, sb);
   let mut dead = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover the formatted store")
   .expect_active();
   assert_eq!(dead.status(), Status::Normal, "resumes Normal as a backup");
-  dead.handle_message(
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    prepare(1, 0),
-  );
+  dead.handle_message(Instant::ZERO, &mut storage, primary_peer(), prepare(1, 0));
   assert_eq!(
-    wal.staged_ops(),
+    storage.wal_mut().staged_ops(),
     std::vec![1],
     "the predecessor's append is staged, its completion withheld, when the endpoint is replaced"
   );
@@ -8073,8 +7986,7 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
     genesis(3),
     1,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover over the live storage")
@@ -8088,8 +8000,7 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
   let replacement = bytes::Bytes::from_static(b"replacement");
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(StartView::new(
       View::with(1),
@@ -8107,7 +8018,7 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
     )),
   );
   assert_eq!(r.view(), View::with(1), "the adoption completed");
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // drain the durable-view write
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks); // drain the durable-view write
 
   // Land every staged write for op 1, newest-first — the completion order the `Wal` contract
   // permits and the one that lands the abandoned predecessor bytes LAST. Each landing's completion
@@ -8115,14 +8026,14 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
   // re-enters the staged set and is landed too. Capture the vote the successor emits along the way.
   let mut voted: Option<u128> = None;
   let mut landings = 0;
-  while wal.staged_len() > 0 {
+  while storage.wal_mut().staged_len() > 0 {
     landings += 1;
     assert!(landings <= 8, "the release loop settles");
     assert!(
-      wal.release_latest_for(1),
+      storage.wal_mut().release_latest_for(1),
       "every write staged by this schedule targets op 1"
     );
-    r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
     while let Some(out) = r.poll_message() {
       if let Message::PrepareOk(ok) = out.msg_ref()
         && ok.op() == OpNumber::with(1)
@@ -8146,7 +8057,10 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
   // THE INVARIANT: every write to op 1 has quiesced, so the durable slot must hold exactly the
   // identity the vote named. A mismatch is the predecessor's abandoned operation sitting,
   // self-consistent, where the voted replacement was — committed-value loss on the next recovery.
-  let header = wal.header(OpNumber::with(1)).expect("op 1 is durable");
+  let header = storage
+    .wal_mut()
+    .header(OpNumber::with(1))
+    .expect("op 1 is durable");
   let durable =
     crate::storage::prepare_identity(header.client(), header.request(), header.body_checksum());
   assert_eq!(
@@ -8155,7 +8069,7 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
      successor's PrepareOk named — the predecessor's late landing evicted the voted operation"
   );
   assert_eq!(
-    wal.durable_body(1),
+    storage.wal_mut().durable_body(1),
     Some(replacement),
     "the durable body at op 1 is the voted replacement"
   );
@@ -8170,14 +8084,13 @@ fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
   // of the only copy is beyond the fault budget and must be surfaced (re-format or restore).
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
   let wal = ScriptedWal::with_entries(0); // wiped: empty WAL
-  let mut sb = TestSb::default(); // wiped: unformatted superblock
+  let sb = TestSb::default(); // wiped: unformatted superblock
   let err = Endpoint::recover(
     cfg,
     genesis(1),
     0,
     CountSm::default(),
-    &mut { wal },
-    &mut sb,
+    &mut Storage::new(wal, sb),
     crate::BlockLaneOccupancy::empty(),
   )
   .map(|_| ())
@@ -8192,8 +8105,7 @@ fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
     genesis(1),
     0,
     CountSm::default(),
-    &mut { wal2 },
-    &mut sb2,
+    &mut Storage::new(wal2, sb2),
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("a formatted solo store recovers")

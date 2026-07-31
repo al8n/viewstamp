@@ -76,8 +76,8 @@ pub use state_machine::{RestoreError, StateMachine};
 pub use status::Status;
 pub use storage::{
   BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, JobId, OpId, ReadId,
-  ReadOk, SUPERBLOCK_VERSION, SlotStatus, Superblock, SuperblockDone, VsrState, VsrStateError, Wal,
-  WalDone, WriteId, checkpoint_id,
+  ReadOk, SUPERBLOCK_VERSION, SlotStatus, Storage, Superblock, SuperblockDone, VsrState,
+  VsrStateError, Wal, WalDone, WriteId, checkpoint_id,
 };
 pub use time::Instant;
 #[cfg(feature = "quic")]

@@ -12,6 +12,7 @@
 //! staged) and PASSES once the choke point suppresses any ack of an in-flight op.
 
 use bytes::Bytes;
+use viewstamp_proto::Storage;
 use viewstamp_proto::{
   ClientId, Config, Endpoint, Epoch, Instant, MemberId, Membership, Message, OpNumber, Peer,
   Prepare, ReplicaId, RequestNumber, StateMachine, View, Wal,
@@ -47,12 +48,13 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   .expect("valid membership");
   // ASYNC WAL: an append stays in flight for a few polls (the append-before-ack window). The superblock
   // is the ordinary synchronous sim superblock — only the WAL append timing matters here.
-  let mut wal = InMemoryWal::with_async_appends(4);
+  let wal = InMemoryWal::with_async_appends(4);
   let mut sb = InMemorySuperblock::new();
   // Genesis: commit over this backup's own store (formats it), yielding the runnable endpoint.
   let mut backup = Endpoint::new(cfg, membership, 0, LogSm::default(), u64::MAX)
     .commit(&wal, &mut sb)
     .expect("genesis commit formats the store");
+  let mut storage = Storage::new(wal, sb);
   let now = Instant::ZERO;
 
   let primary = Peer::Replica(ReplicaId::new(0));
@@ -72,15 +74,15 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   };
 
   // (1) First delivery: the backup appends op 1 — but the append is ASYNC, so op 1 is NOT yet durable.
-  backup.handle_message(now, &mut wal, &mut sb, primary, Message::Prepare(prepare()));
+  backup.handle_message(now, &mut storage, primary, Message::Prepare(prepare()));
   assert_eq!(backup.op(), op1, "the head advanced to op 1 on the append");
   assert_eq!(
-    wal.staged_len(),
+    storage.wal().staged_len(),
     1,
     "precondition: op 1's append is genuinely in flight (staged, not durable)"
   );
   assert_eq!(
-    wal.status(op1),
+    storage.wal().status(op1),
     viewstamp_proto::SlotStatus::Dirty,
     "precondition: op 1's WAL slot is Dirty (not durably appended)"
   );
@@ -93,17 +95,17 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   // (2) The primary RETRANSMITS the same current-view Prepare(1) BEFORE the append completes — this
   // is what `primary_timeouts` does every PREPARE_RETRANSMIT. The append is STILL in flight here.
   assert_eq!(
-    wal.staged_len(),
+    storage.wal().staged_len(),
     1,
     "the append is still in flight at retransmit time"
   );
-  backup.handle_message(now, &mut wal, &mut sb, primary, Message::Prepare(prepare()));
+  backup.handle_message(now, &mut storage, primary, Message::Prepare(prepare()));
 
   // (3) THE LOAD-BEARING ASSERT (append-before-ack): while op 1's append is in flight, the backup
   // must emit NO PrepareOk(1). On the pre-fix proto the re-ack branch fires INLINE here → FAIL.
   let acks_while_in_flight = drain_prepare_oks(&mut backup, op1);
   assert!(
-    wal.staged_len() >= 1,
+    storage.wal().staged_len() >= 1,
     "sanity: op 1 is still in flight when we check for a premature ack"
   );
   assert_eq!(
@@ -115,14 +117,14 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   // (4) Now let the append complete (becomes durable) and drive the deferred ack.
   let mut total_acks = 0;
   for _ in 0..16 {
-    backup.handle_storage(now, &mut wal, &mut sb);
+    backup.handle_storage(now, &mut storage);
     total_acks += drain_prepare_oks(&mut backup, op1);
-    if wal.staged_len() == 0 {
+    if storage.wal().staged_len() == 0 {
       break;
     }
   }
   assert_eq!(
-    wal.status(op1),
+    storage.wal().status(op1),
     viewstamp_proto::SlotStatus::Clean,
     "op 1 is durable after the append completes"
   );

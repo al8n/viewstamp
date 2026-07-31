@@ -38,7 +38,7 @@ use std::{
 use bytes::Bytes;
 use viewstamp_proto::{
   ClientId, Config, Endpoint, Epoch, Event, Instant, MemberId, Membership, Recovered, Request,
-  RequestNumber, SingleChange, StateMachine, Superblock, Wal,
+  RequestNumber, SingleChange, StateMachine, Storage, Superblock, Wal,
 };
 
 use crate::{Command, DriverError};
@@ -113,16 +113,17 @@ where
 /// with wall-clock nanos captured here: every construction is a distinct incarnation by
 /// derivation, not by an embedder-supplied value that could repeat.
 ///
-/// Storage completions are separately fenced. Each call pairs ONE fresh endpoint with the storage
-/// handles the driver takes ownership of, and the driver never rebuilds an endpoint over live
-/// handles. An embedder that does must drain the predecessor's in-flight storage to quiescence
-/// FIRST — that drain is load-bearing for safety, not shutdown hygiene. The incarnation stamped
-/// into every [`viewstamp_proto::OpId`] makes a completion predating this endpoint INERT on the
-/// correlation plane (it lands on nothing rather than aliasing one of this endpoint's ops), but
-/// the refusal cancels no write: the predecessor's bytes can still land, and an endpoint built
-/// over an un-quiesced medium lacks the slot-quiescence witnesses to defer its conflicting
-/// re-appends. (Distinct from the recovery nonce above: that fences stale RECOVERY RESPONSES
-/// between peers, this fences stale STORAGE COMPLETIONS within one process.)
+/// Storage completions are fenced on two separate planes, and the [`Storage`] session is what
+/// carries the physical one. The incarnation stamped into every [`viewstamp_proto::OpId`] makes a
+/// completion predating this endpoint INERT on the CORRELATION plane (it lands on nothing rather
+/// than aliasing one of this endpoint's ops), but the refusal cancels no write: the predecessor's
+/// bytes can still land. The slot-quiescence witnesses that defer a conflicting re-append until
+/// those bytes settle therefore live in the session, whose lifetime is the medium's — so an
+/// endpoint rebuilt over the SAME session inherits every fence and needs no pre-rebuild drain for
+/// SAFETY (a drain is then shutdown hygiene, which is all [`crate::drain_storage`] claims), while a
+/// session rebuilt over live handles is unrepresentable: the handles are inside the first session
+/// until it proves the medium quiet. (Distinct from the recovery nonce above: that fences stale
+/// RECOVERY RESPONSES between peers, this fences stale STORAGE COMPLETIONS within one process.)
 ///
 /// What that fence does NOT cover is the block lane's DEPTH, which is why `lane` is required: the
 /// endpoint's block-job admission quotas (one image capture, the serve cap) bound the lane, the
@@ -135,8 +136,7 @@ pub fn build_endpoint<S, W, B>(
   config: Config,
   membership: Membership,
   sm: S,
-  wal: &mut W,
-  sb: &mut B,
+  storage: &mut Storage<W, B>,
   lane: viewstamp_proto::BlockLaneOccupancy,
 ) -> Result<Endpoint<S, SingleChange>, DriverError>
 where
@@ -159,7 +159,7 @@ where
   // capability so the coordinators can call `propose_membership` without the embedder opting in
   // per-instance.
   match Endpoint::<S, SingleChange>::recover_with_reconfig(
-    config, membership, seed, sm, wal, sb, lane,
+    config, membership, seed, sm, storage, lane,
   )? {
     Recovered::Active(endpoint) => Ok(endpoint),
     Recovered::Retired(retired) => Err(DriverError::Retired {

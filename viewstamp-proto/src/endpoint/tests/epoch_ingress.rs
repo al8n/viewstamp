@@ -28,13 +28,13 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
     EchoSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -42,7 +42,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
       Bytes::from_static(b"a"),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote (bit 0)
+  e.storage_step(now, &mut storage, &mut blocks); // own append durable → own vote (bit 0)
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(
     e.commit(),
@@ -59,8 +59,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -72,7 +71,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
       0,
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -82,8 +81,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
   // Positive control: the SAME vote at the primary's epoch 0 DOES count → quorum (2) → op 1 commits.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -95,7 +93,7 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
       0,
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -109,20 +107,20 @@ fn foreign_config_id_commit_is_not_adopted() {
   // NOT advance the commit — it is authority from a configuration not in our lineage. A same-config
   // Commit then DOES advance it, proving the drop is the config gate and not some other guard.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold op 1 (so a commit=1 is appliable).
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(e.commit(), OpNumber::new());
 
   // Foreign-config Commit: dropped for authority.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -132,7 +130,7 @@ fn foreign_config_id_commit_is_not_adopted() {
       FOREIGN_CONFIG_ID,
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -142,8 +140,7 @@ fn foreign_config_id_commit_is_not_adopted() {
   // Positive control: the SAME Commit at our config_id 0 advances the commit to 1.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -153,7 +150,7 @@ fn foreign_config_id_commit_is_not_adopted() {
       0,
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -167,20 +164,20 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
   // solicitation) with the carrying `Prepare` — but only when the request's `config_id` is in our
   // lineage. A foreign-config_id request draws NO reply; the same request at our config_id 0 does.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {} // discard acks
 
   // Foreign-config_id RequestPrepare for op 1: rejected at the lineage gate — no serve.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -197,8 +194,7 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
   // Positive control: the same request at our config_id 0 is admitted → the holder serves the Prepare.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -226,15 +222,14 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
   // committed-op hole at op 2 must ignore a foreign-config_id batch (the hole stays open) and adopt an
   // in-lineage one (the hole is filled). `RepairBatch` carries `config_id` but no `epoch`, so only the
   // lineage gate applies.
-  let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+  let (mut r, mut storage) = recovering_with_hole(3, 2);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the repair solicitation
   // Learn commit up to 3 → applies op 1, then registers the op-2 hole as it tries to cross it. The
   // commit is in-lineage (config_id 0), so the new gate admits it.
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -260,8 +255,7 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
   // `on_repair_batch` never runs and the hole stays open.
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::RepairBatch(crate::RepairBatch::new(
       View::new(),
@@ -280,8 +274,7 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
   // and the hole is closed.
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::RepairBatch(crate::RepairBatch::new(
       View::new(),
@@ -291,7 +284,7 @@ fn agnostic_repair_batch_fills_a_hole_only_in_lineage() {
       std::vec![entry],
     )),
   );
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(2),
     "an in-lineage RepairBatch is admitted → the op-2 hole is filled",
@@ -304,17 +297,18 @@ fn same_config_prepare_happy_path_still_appends_and_acks() {
   // a backup admits the primary's `Prepare`, appends it, and emits a `PrepareOk` — the STRICT
   // normal-arm path under a matching `(epoch, config_id)`.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // `prepare(1, 0)` carries `Epoch::new(0)` + config_id 0 (the fixture lineage).
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
   assert_eq!(
     e.op(),
     OpNumber::with(1),
     "the same-config Prepare is appended"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // pump WAL → PrepareOk
+  e.storage_step(now, &mut storage, &mut blocks); // pump WAL → PrepareOk
   match e
     .poll_message()
     .expect("a PrepareOk is emitted for the admitted Prepare")
@@ -339,7 +333,7 @@ fn recovering_with_hole_at_epoch(
   head: u64,
   faulty_op: u64,
   epoch: u64,
-) -> (Endpoint<CountSm>, ScriptedWal, TestSb) {
+) -> (Endpoint<CountSm>, Storage<ScriptedWal, TestSb>) {
   let membership = Membership::from_durable_parts(
     Epoch::new(epoch),
     3,
@@ -352,22 +346,22 @@ fn recovering_with_hole_at_epoch(
   wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX);
   // A store that RAN at this epoch (its non-head slot faults), not a wipe: a FORMATTED root so this
   // voter recovers rather than empty-fail-stops.
-  let mut sb = sb_formatted();
+  let sb = sb_formatted();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     membership,
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
-  (r, wal, sb)
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
+  (r, storage)
 }
 
 #[test]
@@ -382,7 +376,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
   //
   // Repair arm (agnostic): a foreign-EPOCH (lower) Prepare for the op-2 hole still fills it — the
   // repair path runs before the normal-arm epoch check.
-  let (mut r, mut wal, mut sb) = recovering_with_hole_at_epoch(3, 2, 1);
+  let (mut r, mut storage) = recovering_with_hole_at_epoch(3, 2, 1);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert_eq!(
     r.membership.epoch(),
@@ -394,8 +388,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
   // cross it (a same-epoch Commit, admitted by the strict arm, drives the commit frontier).
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -411,8 +404,7 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
   );
   r.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -426,21 +418,21 @@ fn foreign_epoch_prepare_normal_arm_is_dropped_but_repair_arm_is_agnostic() {
       Bytes::copy_from_slice(&[2u8]),
     )),
   );
-  r.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(2),
     "a foreign-epoch repair-serve Prepare fills the hole — the repair arm is epoch-agnostic",
   );
 
   // Normal arm (strict): a backup at the head must NOT append a foreign-epoch head-advancing Prepare.
-  let (mut e, mut wal2, mut sb2) = recovering_with_hole_at_epoch(3, 2, 1);
+  let (mut e, _storage2) = recovering_with_hole_at_epoch(3, 2, 1);
   while e.poll_message().is_some() {}
   let head_before = e.op();
   let now = Instant::ZERO;
+  let mut storage2 = Storage::new(TestWal::default(), TestSb::default());
   e.handle_message(
     now,
-    &mut wal2,
-    &mut sb2,
+    &mut storage2,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -490,13 +482,13 @@ fn a_non_normal_laggard_routes_a_higher_epoch_heartbeat_into_the_recovery_peer_f
   // `Commit`/`Prepare`, dropped at the authority ingress, must route it into the RECOVERY peer-fetch
   // (`awaiting_peer_checkpoint`): it solicits a cross-epoch `SyncCheckpoint` and ends Normal at E+1.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Drive the backup into a ViewChange at the OLD epoch via a higher-view (same-epoch) catch-up.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -523,8 +515,7 @@ fn a_non_normal_laggard_routes_a_higher_epoch_heartbeat_into_the_recovery_peer_f
   // epoch gate is what drops it into the cross-epoch catch-up.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -574,21 +565,25 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   // slot-quiescence fence defers every future append to that ring slot permanently. The completion
   // must instead retire the witness on the spot — and cast nothing (the action was abandoned).
   let mut e = backup();
-  let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
+  let (wal, sb) = (ReorderWal::new(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // A view-0 Prepare stages the backup's append; its completion is HELD (the async in-flight window).
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  assert_eq!(wal.staged_len(), 1, "the append is physically in flight");
-  assert!(e.has_inflight_storage());
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  assert_eq!(
+    storage.wal_mut().staged_len(),
+    1,
+    "the append is physically in flight"
+  );
+  assert!(e.has_inflight_storage(&storage));
   while e.poll_message().is_some() {}
 
   // A same-epoch higher-view Commit catches the backup into ViewChange: the append's action is
   // abandoned, its physical write stays in flight.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -604,8 +599,7 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   // A strictly-higher-epoch Commit routes the stranded laggard into the recovery peer-fetch.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -618,7 +612,7 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   assert!(e.status().is_recovering());
   while e.poll_message().is_some() {}
   assert_eq!(
-    wal.staged_len(),
+    storage.wal_mut().staged_len(),
     1,
     "the abandoned append is STILL physically in flight across both transitions"
   );
@@ -626,10 +620,13 @@ fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
   // The abandoned append's completion lands WHILE RECOVERING. The witness retires on delivery;
   // nothing else is owed (the action was abandoned at the transition), so storage is fully
   // quiescent — the drain signal settles instead of wedging forever.
-  assert!(wal.release_latest_for(1), "the held append lands");
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert!(
-    !e.has_inflight_storage(),
+    storage.wal_mut().release_latest_for(1),
+    "the held append lands"
+  );
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    !e.has_inflight_storage(&storage),
     "the quiescence witness retired on delivery while Recovering — nothing leaks"
   );
   // And the abandoned completion cast nothing.
@@ -648,18 +645,18 @@ fn a_pending_durable_view_write_defers_the_cross_epoch_peer_fetch() {
   // regress a view it is vouching for. The transition DEFERS until the write settles; a later
   // higher-epoch heartbeat re-triggers it.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Self-driven view change via SVC quorum (own idle-timeout SVC + one peer SVC), which issues a
   // SendDoViewChange durable-view write. We do NOT pump `handle_storage`, so the write stays in flight
   // (the initial DoViewChange is deferred until the view is durable) and `pending_durable_view` holds.
-  e.handle_timeout(now, &mut wal, &mut sb); // bootstrap primary_idle
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now, &mut storage); // bootstrap primary_idle
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle due → own SVC(view 1)
+  e.handle_timeout(later, &mut storage); // primary_idle due → own SVC(view 1)
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -678,8 +675,7 @@ fn a_pending_durable_view_write_defers_the_cross_epoch_peer_fetch() {
   // which then DEFERS on the pending durable-view write rather than tearing it down.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::with(3),
@@ -724,15 +720,15 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
   // checkpoint_op}` back to that `from`, acting on NONE of the stale message's content (the SVC is then
   // dropped at the authority ingress, casting no vote / driving no view change).
   let mut e = settled_voter_at(1);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   assert!(e.status().is_normal() && e.membership.epoch() == Epoch::new(1));
   let from = Peer::Replica(ReplicaId::new(2)); // an active member of our 3-voter config
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     from,
     // A stranded laggard's OLD-epoch (epoch 0) StartViewChange at some view, self-identifying replica 2.
     Message::StartViewChange(StartViewChange::new(
@@ -781,8 +777,7 @@ fn a_settled_voter_answers_a_lower_epoch_message_with_a_single_epoch_ahead_hint(
   let mut backup_at_e0 = backup(); // Normal at epoch 0 — a LOWER-epoch message is not below it, no hint
   backup_at_e0.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -809,14 +804,14 @@ fn a_stranded_laggard_triggers_the_cross_epoch_peer_fetch_on_an_epoch_ahead_hint
   // behind-but-operational): the speculative arm leaves status/op/commit/view untouched and the replica
   // crosses only when the verified crossing checkpoint installs.
   let mut e = backup(); // Normal at epoch 0
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   assert!(e.status().is_normal() && e.membership.epoch() == Epoch::new(0));
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(), // a retained voter (slot 0) the laggard already binds
     Message::EpochAhead(EpochAhead::new(Epoch::new(1), OpNumber::with(9))),
   );
@@ -851,7 +846,7 @@ fn a_higher_epoch_hint_from_a_non_member_slot_does_not_trigger_catch_up() {
   // from a RETAINED voter (a member of our config — a single-voter change always retains at least one),
   // pinned by the sibling tests above; a non-member hint is dropped here BEFORE it can poison.
   let mut e = backup(); // Normal at epoch 0, node_count 3
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   assert_eq!(
     e.membership.node_count(),
@@ -859,10 +854,10 @@ fn a_higher_epoch_hint_from_a_non_member_slot_does_not_trigger_catch_up() {
     "slot 5 is beyond our config (a non-member)"
   );
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(5)), // a NON-member slot beyond our config — misrouted/forged
     Message::Commit(Commit::new(
       View::with(2),

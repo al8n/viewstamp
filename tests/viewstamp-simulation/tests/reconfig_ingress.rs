@@ -19,6 +19,7 @@
 //! oracle rests on.
 
 use bytes::Bytes;
+use viewstamp_proto::Storage;
 use viewstamp_proto::{
   ClientId, Commit, Config, Endpoint, Epoch, Instant, MemberId, Membership, Message, OpNumber,
   Peer, Prepare, PrepareOk, ReplicaId, RequestNumber, StartViewChange, Superblock, View,
@@ -46,8 +47,7 @@ fn genesis(n: u8) -> Membership {
 /// A fresh backup (replica 1 of 3) with its own WAL + superblock — the receiver under test.
 fn backup() -> (
   Endpoint<viewstamp_simulation::sm::LogSm>,
-  InMemoryWal,
-  InMemorySuperblock,
+  Storage<InMemoryWal, InMemorySuperblock>,
 ) {
   // The sim's `SimSm` is private; build the plain `LogSm` the cluster wraps. (Re-exported below.)
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid config");
@@ -63,7 +63,7 @@ fn backup() -> (
   )
   .commit(&wal, &mut sb)
   .expect("genesis commit formats the store");
-  (e, wal, sb)
+  (e, Storage::new(wal, sb))
 }
 
 /// The observable consensus state used for the byte-identity comparison: the head, the applied +
@@ -80,14 +80,14 @@ struct Accumulators {
 
 fn snapshot(
   e: &Endpoint<viewstamp_simulation::sm::LogSm>,
-  sb: &InMemorySuperblock,
+  storage: &Storage<InMemoryWal, InMemorySuperblock>,
 ) -> Accumulators {
   Accumulators {
     op: e.op().get(),
     commit_min: e.commit().get(),
     commit_max: e.commit_max().get(),
     view: e.view().get(),
-    durable_view: sb.state().view().get(),
+    durable_view: storage.sb().state().view().get(),
   }
 }
 
@@ -112,21 +112,19 @@ fn prepare(op: u64, commit: u64) -> Message {
 /// WAL appends complete and the accumulators settle.
 fn drive_workload(
   e: &mut Endpoint<viewstamp_simulation::sm::LogSm>,
-  wal: &mut InMemoryWal,
-  sb: &mut InMemorySuperblock,
+  storage: &mut Storage<InMemoryWal, InMemorySuperblock>,
   _blocks: &mut MemBlockStore,
 ) {
   let now = Instant::ZERO;
   let primary = Peer::Replica(ReplicaId::new(0));
   for op in 1..=3u64 {
-    e.handle_message(now, wal, sb, primary, prepare(op, op.saturating_sub(1)));
-    e.handle_storage(now, wal, sb);
+    e.handle_message(now, storage, primary, prepare(op, op.saturating_sub(1)));
+    e.handle_storage(now, storage);
   }
   // Commit up to 3 (same config) — advances commit_max and applies the held prefix.
   e.handle_message(
     now,
-    wal,
-    sb,
+    storage,
     primary,
     Message::Commit(Commit::new(
       View::new(),
@@ -136,39 +134,37 @@ fn drive_workload(
       0,
     )),
   );
-  e.handle_storage(now, wal, sb);
+  e.handle_storage(now, storage);
   while e.poll_message().is_some() {} // drain emitted acks (observation-only)
 }
 
 #[test]
 fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
   // CONTROL: the clean workload.
-  let (mut control, mut cw, mut cs) = backup();
+  let (mut control, mut cstorage) = backup();
   let mut cb = MemBlockStore::new();
-  drive_workload(&mut control, &mut cw, &mut cs, &mut cb);
-  let clean = snapshot(&control, &cs);
+  drive_workload(&mut control, &mut cstorage, &mut cb);
+  let clean = snapshot(&control, &cstorage);
 
   // WITNESS: the same workload, but with a FOREIGN-EPOCH strict message interleaved at every step —
   // a PrepareOk (a commit-quorum vote) and a head-advancing Prepare, both stamped epoch 9. The strict
   // authority gate drops each for authority, so the accumulators must end BYTE-IDENTICAL to the clean
   // run (the foreign configuration's voter contributed nothing).
-  let (mut witness, mut ww, mut ws) = backup();
+  let (mut witness, mut wstorage) = backup();
   let now = Instant::ZERO;
   let primary = Peer::Replica(ReplicaId::new(0));
   for op in 1..=3u64 {
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       primary,
       prepare(op, op.saturating_sub(1)),
     );
-    witness.handle_storage(now, &mut ww, &mut ws);
+    witness.handle_storage(now, &mut wstorage);
     // Foreign-epoch head-advancing Prepare (would advance `op` if admitted) from the claimed primary.
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       primary,
       Message::Prepare(Prepare::new(
         View::new(),
@@ -185,8 +181,7 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
     // Foreign-epoch PrepareOk (a vote) from a peer — would feed the vote map if admitted.
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       Peer::Replica(ReplicaId::new(2)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -198,12 +193,11 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
         0,
       )),
     );
-    witness.handle_storage(now, &mut ww, &mut ws);
+    witness.handle_storage(now, &mut wstorage);
   }
   witness.handle_message(
     now,
-    &mut ww,
-    &mut ws,
+    &mut wstorage,
     primary,
     Message::Commit(Commit::new(
       View::new(),
@@ -213,9 +207,9 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
       0,
     )),
   );
-  witness.handle_storage(now, &mut ww, &mut ws);
+  witness.handle_storage(now, &mut wstorage);
   while witness.poll_message().is_some() {}
-  let witnessed = snapshot(&witness, &ws);
+  let witnessed = snapshot(&witness, &wstorage);
 
   assert_eq!(
     clean, witnessed,
@@ -237,29 +231,27 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
   // The DIVERGENT-ROLLOUT witness: a strict message at the SAME epoch (0) but a FOREIGN `config_id`
   // (two memberships claiming epoch 0 — a partially-applied rollout) is ALSO dropped for authority, so
   // it cannot advance the commit or the head.
-  let (mut control, mut cw, mut cs) = backup();
+  let (mut control, mut cstorage) = backup();
   let mut cb = MemBlockStore::new();
-  drive_workload(&mut control, &mut cw, &mut cs, &mut cb);
-  let clean = snapshot(&control, &cs);
+  drive_workload(&mut control, &mut cstorage, &mut cb);
+  let clean = snapshot(&control, &cstorage);
 
-  let (mut witness, mut ww, mut ws) = backup();
+  let (mut witness, mut wstorage) = backup();
   let now = Instant::ZERO;
   let primary = Peer::Replica(ReplicaId::new(0));
   for op in 1..=3u64 {
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       primary,
       prepare(op, op.saturating_sub(1)),
     );
-    witness.handle_storage(now, &mut ww, &mut ws);
+    witness.handle_storage(now, &mut wstorage);
     // Same-epoch, FOREIGN-config_id head-advancing Prepare + a foreign-config Commit (would advance
     // the commit if admitted). Both dropped by the lineage gate.
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       primary,
       Message::Prepare(Prepare::new(
         View::new(),
@@ -275,8 +267,7 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
     );
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       primary,
       Message::Commit(Commit::new(
         View::new(),
@@ -286,12 +277,11 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
         FOREIGN_CONFIG_ID,
       )),
     );
-    witness.handle_storage(now, &mut ww, &mut ws);
+    witness.handle_storage(now, &mut wstorage);
   }
   witness.handle_message(
     now,
-    &mut ww,
-    &mut ws,
+    &mut wstorage,
     primary,
     Message::Commit(Commit::new(
       View::new(),
@@ -301,9 +291,9 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
       0,
     )),
   );
-  witness.handle_storage(now, &mut ww, &mut ws);
+  witness.handle_storage(now, &mut wstorage);
   while witness.poll_message().is_some() {}
-  let witnessed = snapshot(&witness, &ws);
+  let witnessed = snapshot(&witness, &wstorage);
 
   assert_eq!(
     clean, witnessed,
@@ -317,16 +307,15 @@ fn foreign_epoch_start_view_change_does_not_perturb_the_view() {
   // A foreign-epoch view-change DRIVER (a `StartViewChange`) must not move the backup's view: a
   // different configuration's view-change campaign cannot recruit this node. The control never sees
   // it; the witness sees one per step. Views (in-memory + durable) end byte-identical.
-  let (control, _cw, cs) = backup();
-  let clean = snapshot(&control, &cs);
+  let (control, cstorage) = backup();
+  let clean = snapshot(&control, &cstorage);
 
-  let (mut witness, mut ww, mut ws) = backup();
+  let (mut witness, mut wstorage) = backup();
   let now = Instant::ZERO;
   for v in 1..=3u64 {
     witness.handle_message(
       now,
-      &mut ww,
-      &mut ws,
+      &mut wstorage,
       Peer::Replica(ReplicaId::new(2)),
       Message::StartViewChange(StartViewChange::new(
         View::with(v),
@@ -335,10 +324,10 @@ fn foreign_epoch_start_view_change_does_not_perturb_the_view() {
         0,
       )),
     );
-    witness.handle_storage(now, &mut ww, &mut ws);
+    witness.handle_storage(now, &mut wstorage);
   }
   while witness.poll_message().is_some() {}
-  let witnessed = snapshot(&witness, &ws);
+  let witnessed = snapshot(&witness, &wstorage);
   assert_eq!(
     clean.view, witnessed.view,
     "a foreign-epoch StartViewChange must not advance the in-memory view"

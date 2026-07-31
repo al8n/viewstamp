@@ -51,19 +51,19 @@ fn recover_resolves_self_by_member_id_and_returns_active() {
   let members = std::vec![MemberId::new(5), MemberId::new(6), MemberId::new(7)];
   let membership = Membership::from_durable_parts(Epoch::new(0), 3, 0, members, 0).unwrap();
   let state = v4_root(membership, 0);
-  let mut wal = TestWal::default();
-  let mut sb = sb_with_state(state);
+  let wal = TestWal::default();
+  let sb = sb_with_state(state);
   // The Config's local member is MemberId::new(7) (the `1` is the legacy ctor index, irrelevant to
   // membership resolution now).
   let cfg = Config::try_new(1, MemberId::new(7)).unwrap();
 
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
@@ -86,18 +86,18 @@ fn recover_returns_retired_when_self_absent() {
   let members = std::vec![MemberId::new(5), MemberId::new(6), MemberId::new(7)];
   let membership = Membership::from_durable_parts(Epoch::new(4), 3, 0, members, 0).unwrap();
   let state = v4_root(membership, 0);
-  let mut wal = TestWal::default();
-  let mut sb = sb_with_state(state);
+  let wal = TestWal::default();
+  let sb = sb_with_state(state);
   // Local member 99 is absent from the durable membership.
   let cfg = Config::try_new(1, MemberId::new(99)).unwrap();
 
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
@@ -112,7 +112,7 @@ fn recover_returns_retired_when_self_absent() {
     "retired at the recovered membership's epoch",
   );
   assert_eq!(
-    wal.poll(),
+    storage.wal_mut().poll(),
     None,
     "a retired node submits no reads (the WAL completion queue is empty)",
   );
@@ -146,17 +146,17 @@ fn recover_bridges_a_legacy_root_to_the_passed_genesis() {
     VsrState::new(),
     "a ran legacy root is not the empty wiped-store shape"
   );
-  let mut wal = TestWal::default();
-  let mut sb = sb_with_state(legacy);
+  let wal = TestWal::default();
+  let sb = sb_with_state(legacy);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
 
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
@@ -179,19 +179,19 @@ fn recover_prefers_the_root_membership_over_the_passed_param() {
   let members = std::vec![MemberId::new(1), MemberId::new(2), MemberId::new(3)];
   let durable = Membership::from_durable_parts(Epoch::new(0), 3, 0, members, 0).unwrap();
   let state = v4_root(durable, 0);
-  let mut wal = TestWal::default();
-  let mut sb = sb_with_state(state);
+  let wal = TestWal::default();
+  let sb = sb_with_state(state);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
 
   // Pass a DIFFERENT genesis (the standard `genesis(3)`, MemberId(i) at slot i → MemberId(1) at slot
   // 1). The durable root places MemberId(1) at slot 0, so the resolved slot proves which won.
+  let mut storage = Storage::new(wal, sb);
   let e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -210,17 +210,17 @@ fn recover_resolves_a_learner_self_to_active() {
   let members = std::vec![MemberId::new(10), MemberId::new(11), MemberId::new(12)];
   let membership = Membership::from_durable_parts(Epoch::new(0), 2, 1, members, 0).unwrap();
   let state = v4_root(membership, 0);
-  let mut wal = TestWal::default();
-  let mut sb = sb_with_state(state);
+  let wal = TestWal::default();
+  let sb = sb_with_state(state);
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap();
 
+  let mut storage = Storage::new(wal, sb);
   let e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -289,17 +289,17 @@ fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() 
     "the successor durable root persists the predecessor config_id in its lineage",
   );
 
-  let mut wal = TestWal::default();
-  let mut sb = sb_with_state(succ_state);
+  let wal = TestWal::default();
+  let sb = sb_with_state(succ_state);
   // The local member (MemberId 3) is the newly-added voter in the successor — present → Active.
   let cfg = Config::try_new(2, MemberId::new(3)).unwrap();
+  let mut storage = Storage::new(wal, sb);
   let e = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -364,7 +364,8 @@ fn successor_membership() -> Membership {
 /// with the HEAD (op 2) permanently faulty, so recovery cannot trust its head → `RecoveringHead`. The
 /// successor's `(epoch, config_id)` are returned so a test can mint peer `Recovery` messages that pass
 /// the strict ingress gate.
-fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Epoch, u128) {
+fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, Storage<ScriptedWal, TestSb>, Epoch, u128)
+{
   let successor = successor_membership();
   let (epoch, config_id) = (successor.epoch(), successor.config_id());
   // The predecessor v4 root (genesis epoch), then the successor root chained off it. `prepare_restart`
@@ -383,22 +384,22 @@ fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Ep
   );
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // head read never clears → permanently faulty
-  let mut sb = sb_with_state(succ_state);
+  let sb = sb_with_state(succ_state);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // local = MemberId 1 → slot 1 (a voter)
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -408,7 +409,7 @@ fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Ep
     r.membership.epoch() > r.prev_epoch,
     "the recovered endpoint is on-axis: membership epoch > prev_epoch",
   );
-  (r, wal, sb, epoch, config_id)
+  (r, storage, epoch, config_id)
 }
 
 /// A peer `Recovery` solicitation from voter `slot`, carrying the successor `(epoch, config_id)` so it
@@ -430,11 +431,11 @@ fn recovering_head_tally_of_a_peer_recovery_emits_nothing_but_sets_the_bit() {
   // The G2 tally arm: a peer `Recovery` delivered to a `RecoveringHead` voter records the sender's
   // voter slot in `peers_recovering` with ZERO egress (it has no canonical head to hand out, and the
   // tally must be byte-identity-safe — off the `emit` chokepoint).
-  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
+  let (mut r, mut storage, epoch, config_id) = recovering_head_post_reconfig();
   while r.poll_message().is_some() {} // discard the entry-time solicitation
   let now = Instant::ZERO;
   let (from, msg) = peer_recovery(0, epoch, config_id); // replica 0 is a co-recovering voter
-  r.handle_message(now, &mut wal, &mut sb, from, msg);
+  r.handle_message(now, &mut storage, from, msg);
   assert_eq!(
     r.poll_message(),
     None,
@@ -458,13 +459,13 @@ fn over_fire_guard_no_co_recovering_peers_never_escalates() {
   // The G2 guard: a single voter in `RecoveringHead` with `epoch > prev_epoch` true and `G1` long
   // matured, but NO co-recovering peers (`peers_recovering` stays 0 every window), must NOT escalate —
   // the gate stays false because the co-recovering-quorum evidence (G2) is absent. Many ticks, no SVC.
-  let (mut r, mut wal, mut sb, _epoch, _config_id) = recovering_head_post_reconfig();
+  let (mut r, mut storage, _epoch, _config_id) = recovering_head_post_reconfig();
   while r.poll_message().is_some() {}
   let mut now = Instant::ZERO;
   // Tick far past RECOVER_HEAD_REFORM_ATTEMPTS windows; never feed a peer Recovery.
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 8) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     // Every tick re-broadcasts our OWN Recovery solicitation (drained) but must never emit an SVC.
     while let Some(out) = r.poll_message() {
       assert!(
@@ -510,22 +511,22 @@ fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
   );
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // head read never clears → permanently faulty
-  let mut sb = sb_with_state(succ);
+  let sb = sb_with_state(succ);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(0, MemberId::new(0)).unwrap(); // local = MemberId 0 → slot 0 (the only voter)
   let mut now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(1),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -535,7 +536,7 @@ fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
   // Drive far past `RECOVER_HEAD_REFORM_ATTEMPTS` windows; the solo guard must hold every tick.
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 8) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while let Some(out) = r.poll_message() {
       assert!(
         !matches!(out.msg_ref(), Message::StartViewChange(_)),
@@ -571,17 +572,17 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
   assert!(succ.epoch() > succ.prev_epoch(), "the successor is on-axis");
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
-  let mut sb = sb_with_state(succ);
+  let sb = sb_with_state(succ);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap(); // local = the LEARNER at slot 2
   let mut now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -590,7 +591,7 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
     r.is_learner(),
     "the local node is a learner (slot 2 in 2v+1l)"
   );
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -600,9 +601,9 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
   while r.poll_message().is_some() {}
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 8) {
     let (from, msg) = peer_recovery(0, epoch, config_id); // a co-recovering VOTER → satisfies G2
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while let Some(out) = r.poll_message() {
       assert!(
         !matches!(out.msg_ref(), Message::StartViewChange(_)),
@@ -623,17 +624,17 @@ fn a_self_looped_recovery_does_not_count_toward_g2() {
   // its own bit, else a node could satisfy the OTHER-voters quorum alone (decisive for a 2-voter set
   // where `quorum - 1 == 1`). Feed a `RecoveringHead` voter its OWN `Recovery`; `peers_recovering`
   // stays 0. A DIFFERENT voter's `Recovery` then sets its bit, confirming the tally still works.
-  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig(); // 3v, local slot 1
+  let (mut r, mut storage, epoch, config_id) = recovering_head_post_reconfig(); // 3v, local slot 1
   let now = Instant::ZERO;
   let (from_self, msg_self) = peer_recovery(1, epoch, config_id); // slot 1 == the local slot — a self-loop
-  r.handle_message(now, &mut wal, &mut sb, from_self, msg_self);
+  r.handle_message(now, &mut storage, from_self, msg_self);
   assert_eq!(
     r.recover.as_ref().map(|rec| rec.peers_recovering),
     Some(0),
     "a self-looped Recovery is not tallied (only OTHER voters count toward G2)",
   );
   let (from_other, msg_other) = peer_recovery(0, epoch, config_id); // slot 0 — a genuine OTHER voter
-  r.handle_message(now, &mut wal, &mut sb, from_other, msg_other);
+  r.handle_message(now, &mut storage, from_other, msg_other);
   assert_eq!(
     r.recover.as_ref().map(|rec| rec.peers_recovering),
     Some(1u64 << 0),
@@ -647,7 +648,7 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   // co-recovering voting quorum (`peers_recovering` reaches quorum-1 via tallied peer `Recovery`)
   // escalates into a view change at `view + 1` and (on the next solicitation window) broadcasts a
   // StartViewChange. Every wedged voter recovered the same durable view, so all converge on view+1.
-  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
+  let (mut r, mut storage, epoch, config_id) = recovering_head_post_reconfig();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {}
   let start_view = r.view();
@@ -658,7 +659,7 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   // windows are left for the co-recovering feed — G2 is a TWO-window intersection (freshness guard).
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while r.poll_message().is_some() {}
     assert_eq!(
       r.status(),
@@ -671,10 +672,10 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   // with the still-empty PRIOR window is 0, so the gate does NOT fire yet — one window is not enough.
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
   }
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   while r.poll_message().is_some() {}
   assert_eq!(
     r.status(),
@@ -685,10 +686,10 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   // holds the quorum (co-recovering across BOTH windows) → G2 met, G1 matured → escalate.
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
   }
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   assert_eq!(
     r.status(),
     Status::ViewChange,
@@ -716,10 +717,10 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   );
   // The durable-view write is staged before participation; complete it, then the SVC retransmit
   // window broadcasts a StartViewChange for view + 1.
-  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
   while r.poll_message().is_some() {} // discard the deferred DVC / transition chatter
   now = now + VC_MESSAGE_RETRANSMIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   let svc = core::iter::from_fn(|| r.poll_message())
     .find_map(|out| match out.into_msg() {
       Message::StartViewChange(svc) => Some(svc),
@@ -734,25 +735,25 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
 
   // A2 re-arm: a FRESH recover() resets the counters, re-enters RecoveringHead at the new view, and the
   // gate can fire AGAIN (epoch > prev_epoch is still true) — re-formation is not one-shot.
-  let succ_state = sb.state(); // the durable root now names view + 1 (the escalation persisted it)
+  let succ_state = storage.sb_mut().state(); // the durable root now names view + 1 (the escalation persisted it)
   let mut wal2 = ScriptedWal::with_entries(2);
   wal2.script_read_fault(OpNumber::with(2), u8::MAX);
-  let mut sb2 = sb_with_state(succ_state);
+  let sb2 = sb_with_state(succ_state);
   let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now2 = Instant::ZERO;
+  let mut storage2 = Storage::new(wal2, sb2);
   let mut r2 = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal2,
-    &mut sb2,
+    &mut storage2,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r2, &mut wal2, &mut sb2, &mut blocks2, now2);
+  drive_recovery(&mut r2, &mut storage2, &mut blocks2, now2);
   assert_eq!(
     r2.status(),
     Status::RecoveringHead,
@@ -770,17 +771,17 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   let mut t = Instant::ZERO;
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
     t = t + RECOVER_HEAD_SOLICIT;
-    r2.handle_timeout(t, &mut wal2, &mut sb2);
+    r2.handle_timeout(t, &mut storage2);
     while r2.poll_message().is_some() {}
   }
   // Two consecutive windows of the co-recovering quorum (the two-window intersection), then it fires.
   for _ in 0..2 {
     for slot in [0u16, 2] {
       let (from, msg) = peer_recovery(slot, epoch, config_id);
-      r2.handle_message(t, &mut wal2, &mut sb2, from, msg);
+      r2.handle_message(t, &mut storage2, from, msg);
     }
     t = t + RECOVER_HEAD_SOLICIT;
-    r2.handle_timeout(t, &mut wal2, &mut sb2);
+    r2.handle_timeout(t, &mut storage2);
     while r2.poll_message().is_some() {}
   }
   assert_eq!(
@@ -802,14 +803,14 @@ fn a_single_window_stale_recovery_does_not_escalate() {
   // TWO-window intersection (`peers_recovering & peers_recovering_prev`), so a single-window bit is
   // dropped and never reaches the co-recovering quorum. With the OLD single-window snapshot this would
   // escalate (G1 matured + the quorum present this window); the intersection makes it inert.
-  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
+  let (mut r, mut storage, epoch, config_id) = recovering_head_post_reconfig();
   while r.poll_message().is_some() {}
   let mut now = Instant::ZERO;
   // Mature G1 well past the bound with EMPTY windows — so only the missing two-window evidence can hold
   // the gate, not an unmet G1.
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 4) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while r.poll_message().is_some() {}
     assert_eq!(
       r.status(),
@@ -821,10 +822,10 @@ fn a_single_window_stale_recovery_does_not_escalate() {
   // intersection is 0 → NO escalation despite G1 long matured and the quorum present this window.
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
   }
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   while let Some(out) = r.poll_message() {
     assert!(
       !matches!(out.msg_ref(), Message::StartViewChange(_)),
@@ -843,21 +844,21 @@ fn a_since_recovered_peer_drops_out_of_the_two_window_intersection() {
   // The complement: a voter co-recovering in window N-1 but NOT in window N (it recovered to Normal and
   // stopped broadcasting) is dropped by the intersection — the prev-window bit ALONE is insufficient.
   // This confirms G2 is an AND of two windows, not an OR-accumulator, and models the exact R5 timeline.
-  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
+  let (mut r, mut storage, epoch, config_id) = recovering_head_post_reconfig();
   while r.poll_message().is_some() {}
   let mut now = Instant::ZERO;
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 1) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while r.poll_message().is_some() {}
   }
   // Window N-1: the quorum is co-recovering (tallied), then tick (it becomes `prev`).
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
   }
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   while r.poll_message().is_some() {}
   assert_eq!(
     r.status(),
@@ -867,7 +868,7 @@ fn a_since_recovered_peer_drops_out_of_the_two_window_intersection() {
   // Window N: the peers have recovered — NOTHING is tallied — then tick. fresh = 0 (empty) & prev (Q) =
   // 0 → no escalation. The prev-window evidence does not linger.
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   while let Some(out) = r.poll_message() {
     assert!(
       !matches!(out.msg_ref(), Message::StartViewChange(_)),
@@ -906,22 +907,22 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   let mut wal = ScriptedWal::with_entries(3);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // committed interior → kept as Repairing
   wal.script_read_fault(OpNumber::with(3), u8::MAX); // uncommitted head → RecoveringHead
-  let mut sb = sb_with_state(successor);
+  let sb = sb_with_state(successor);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -946,16 +947,16 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   // Mature G1, then feed a co-recovering voting quorum across two windows — the exact `under_fire...` inputs.
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while r.poll_message().is_some() {}
   }
   for _window in 0..2 {
     for slot in [0u16, 2] {
       let (from, msg) = peer_recovery(slot, epoch, config_id);
-      r.handle_message(now, &mut wal, &mut sb, from, msg);
+      r.handle_message(now, &mut storage, from, msg);
     }
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
   }
   assert_eq!(
     r.status(),
@@ -1002,22 +1003,22 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   let (epoch, config_id) = (successor.epoch(), successor.membership().config_id());
   let mut wal = ScriptedWal::with_entries(2);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // head → RecoveringHead
-  let mut sb = sb_with_state(successor);
+  let sb = sb_with_state(successor);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1034,7 +1035,7 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   // Mature G1 (no co-recovering peers — each window's intersection is empty).
   for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
     now = now + RECOVER_HEAD_SOLICIT;
-    r.handle_timeout(now, &mut wal, &mut sb);
+    r.handle_timeout(now, &mut storage);
     while r.poll_message().is_some() {}
     assert_eq!(
       r.status(),
@@ -1046,15 +1047,15 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   // window is still 0).
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
   }
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   while r.poll_message().is_some() {}
   // Window 2: feed the SAME quorum. The two-window intersection now holds the quorum — G2 IS satisfied.
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    r.handle_message(now, &mut storage, from, msg);
   }
   let g2 = r
     .recover
@@ -1068,7 +1069,7 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   // The deciding tick: G1 matured + G2 satisfied — the SAME inputs `under_fire...` escalates on. The ONLY
   // thing withholding the escalation here is the unvouchable committed op (committed_band_intact == false).
   now = now + RECOVER_HEAD_SOLICIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut storage);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1146,10 +1147,10 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
   // Force the held-frontier shape: in-memory `commit_max == op == K`, `checkpoint_op == 0`. The durable
   // root (`TestSb::default()` → `VsrState::new()`) still names the STALE commit C0 == 0 — the lag.
   e.force_state_for_test(0, k, k, 0, &[]);
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(ScriptedWal::with_entries(0), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert_eq!(
-    sb.state().commit(),
+    storage.sb().state().commit(),
     OpNumber::new(),
     "precondition: the durable root commit is the STALE C0 == 0 (below commit_max == K)"
   );
@@ -1161,7 +1162,7 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
 
   let now = Instant::ZERO;
   assert!(
-    e.seal_committed_frontier(&mut sb),
+    e.seal_committed_frontier(&mut storage),
     "the seal fired (the node is Normal with no durable work in flight)"
   );
   assert!(
@@ -1172,12 +1173,11 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
   // load-bearing protection against a seal racing or landing behind other outstanding durable work
   // (a queued checkpoint root, an append) and reverting it.
   assert!(
-    !e.seal_committed_frontier(&mut sb),
+    !e.seal_committed_frontier(&mut storage),
     "a seal is refused while a durable-root write is in flight"
   );
   // Drive the seal's superblock write to completion, exactly as a recover/view-change test drains it.
-  let mut wal = ScriptedWal::with_entries(0);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert!(
     !e.pending_sb_for_test(),
     "the seal's durable-root write completed"
@@ -1185,7 +1185,7 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
   // THE CORE assertion: the durable root now names the known-committed frontier K, not the stale C0.
   // (FAIL-BEFORE: with `seal_committed_frontier` a no-op the root stays at C0 == 0.)
   assert_eq!(
-    sb.state().commit(),
+    storage.sb_mut().state().commit(),
     OpNumber::with(k),
     "the seal persisted commit_max == K into the durable root (FAIL-BEFORE: stayed at C0 == 0)"
   );
@@ -1225,18 +1225,18 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
 
   // The WAL holds canonical ops 1..=K (head == K), each body [op] header-matched, so recover reads the
   // full sealed band back. A large checkpoint interval matches the regime in which the hazard is reachable.
-  let mut wal = ScriptedWal::with_entries(k);
-  let mut sb = sb_with_state(successor);
+  let wal = ScriptedWal::with_entries(k);
+  let sb = sb_with_state(successor);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -1250,7 +1250,7 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
     "recover off the SEALED successor reads the full committed band (self.op == K), so K is not stranded"
   );
   for _ in 0..(k + 8) {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1321,18 +1321,18 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
   // The WAL HOLDS the committed op K (head == K, every body header-matched) — the bytes are durably on
   // disk — but the root vouches NO commit above C0, so recover cannot know K is committed and the window
   // bounds the read.
-  let mut wal = ScriptedWal::with_entries(k);
-  let mut sb = sb_with_state(successor);
+  let wal = ScriptedWal::with_entries(k);
+  let sb = sb_with_state(successor);
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -1345,7 +1345,7 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
     "recover reads the full held tail (self.op == K) regardless of the stale durable commit"
   );
   for _ in 0..(k + 8) {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1730,7 +1730,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   // effect from any slot shift.
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert!(e.is_primary(), "MemberId 0 at slot 0 is the view-0 primary");
@@ -1739,10 +1739,10 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   // Commit op 1 (a stand-in for the committed reconfigure-prefix) on the OLD quorum of 3 — own vote
   // (slot 0) + a retained backup (slot 1) + the soon-removed voter (slot 3). This advances commit_min
   // to 1, so op 2 below is the post-reconfiguration TAIL op (minted strictly after the prefix).
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -1752,7 +1752,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   );
   assert_eq!(e.op(), OpNumber::with(1), "op 1 (prefix) is minted");
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the durable own append records the primary's own vote
+    e.storage_step(now, &mut storage, &mut blocks); // the durable own append records the primary's own vote
   }
   let id_op1 = crate::storage::prepare_identity(
     ClientId::new(9),
@@ -1762,8 +1762,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   for backup in [1u16, 3] {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(backup)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -1785,8 +1784,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   // Mint the TAIL op 2 (client 9, request 2). Pump storage so the primary's own vote (slot 0) lands.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -1800,7 +1798,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
     "op 2 (the post-reconfig tail) is minted"
   );
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   let id_op2 = crate::storage::prepare_identity(
     ClientId::new(9),
@@ -1811,8 +1809,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   // bits, still BELOW the old quorum of 3, so it does NOT commit yet.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -1862,7 +1859,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
     Some(1u64 << 0),
     "the swap dropped the demotee's slot-3 bit — only the primary's own vote remains"
   );
-  e.try_commit(now, &mut sb);
+  e.try_commit(now, &mut storage);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -1874,8 +1871,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   // voice is structurally gone from the commit quorum on BOTH sides of the swap.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -1902,8 +1898,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
   // own(slot 0) + slot 1 = 2 bits == the new quorum of 2 → the tail op commits on a CURRENT-config quorum.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),

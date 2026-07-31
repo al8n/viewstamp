@@ -13,14 +13,14 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
   let mut e =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=4u64 {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       Message::Request(Request::new(
         ClientId::new(7),
@@ -28,11 +28,10 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
         Bytes::from(std::vec![rn as u8]),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -54,14 +53,13 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
   assert_eq!(e.commit_max(), OpNumber::with(4), "no unapplied prefix");
   assert!(!e.has_repair_hole_for_test(3), "no repair hole");
   // Arm the forfeit via the sync-step-down path (primary receiving a valid forced SyncCheckpoint).
-  let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
-  let (env, id) = donor_envelope(&dsb);
+  let (_d, dstorage) = donor_primary_at_checkpoint(6);
+  let (env, id) = donor_envelope(&dstorage);
   e.arm_forced_sync_for_test(6);
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -83,8 +81,7 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
   // A fresh client request arrives while the forfeit is pending: it MUST be dropped (no op assigned).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -118,7 +115,7 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   // unilateral view jump (it stays in its own view until a real SVC quorum forms).
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary());
   // Two peers report checkpoint_op = 8 (a quorum of 2-of-3 incl. neither self) → the primary's
   // own checkpoint (0) lags the quorum checkpoint (8) by 8 >= the bound 4.
@@ -131,7 +128,8 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   );
   // First primary timeout ARMS the grace timer but does NOT forfeit yet (anti-storm: a transient
   // lag must persist for the grace window before the primary steps down).
-  ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  ep.handle_timeout(Instant::ZERO, &mut storage);
   assert!(
     ep.forfeit_armed_for_test(),
     "the lagging primary armed the forfeit grace timer"
@@ -155,7 +153,7 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   );
   // Advance past the grace period (300ms) and tick again → forfeit: it proposes view 1 (SVC).
   let later = Instant::ZERO + core::time::Duration::from_millis(400);
-  ep.handle_timeout(later, &mut wal, &mut sb);
+  ep.handle_timeout(later, &mut storage);
   let mut saw_svc_view1 = false;
   while let Some(out) = ep.poll_message() {
     if let Message::StartViewChange(svc) = out.into_msg()
@@ -181,7 +179,7 @@ fn a_healthy_primary_never_forfeits() {
   // arms and no view change is ever proposed — the anti-storm guarantee in steady state.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary());
   // A consistent durable state at the checkpoint (commit_min == op == checkpoint_op == 8): a real
   // checkpoint snapshots the SM at `commit_min`, so `checkpoint_op <= commit_min` always — set them
@@ -189,11 +187,11 @@ fn a_healthy_primary_never_forfeits() {
   ep.force_state_for_test(0, 8, 8, 8, &[]);
   ep.inject_peer_checkpoint_for_test(1, 8);
   ep.inject_peer_checkpoint_for_test(2, 8); // quorum checkpoint 8 == own 8 → lag 0 < bound 4
+  let mut storage = Storage::new(wal, sb);
   for ms in [0u64, 400, 800] {
     ep.handle_timeout(
       Instant::ZERO + core::time::Duration::from_millis(ms),
-      &mut wal,
-      &mut sb,
+      &mut storage,
     );
     assert!(
       !ep.forfeit_armed_for_test(),
@@ -220,15 +218,15 @@ fn a_backup_never_forfeits_even_when_behind() {
   // only on the primary path (primary_timeouts), so the backup never arms it.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(!ep.is_primary());
   ep.inject_peer_checkpoint_for_test(0, 8);
   ep.inject_peer_checkpoint_for_test(2, 8);
+  let mut storage = Storage::new(wal, sb);
   for ms in [0u64, 400, 800] {
     ep.handle_timeout(
       Instant::ZERO + core::time::Duration::from_millis(ms),
-      &mut wal,
-      &mut sb,
+      &mut storage,
     );
   }
   assert!(
@@ -251,7 +249,7 @@ fn solo_primary_with_a_permanent_repair_hole_stays_normal_and_does_not_view_chan
   // ViewChange / climbs views.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary(), "a solo replica is always its own primary");
   // A permanent committed-but-faulty repair hole at op 3 (no peer exists to serve it); head at op 5,
   // commit HELD at 2 below the hole. This is the unrecoverable solo precondition.
@@ -269,11 +267,11 @@ fn solo_primary_with_a_permanent_repair_hole_stays_normal_and_does_not_view_chan
   // Drive primary_timeouts WELL past FORFEIT_GRACE (300ms) + VIEW_CHANGE_STATUS (500ms): a buggy solo
   // replica would arm the grace timer, forfeit, satisfy its own 1-of-1 VC quorum, enter ViewChange, and
   // then climb views via view_change_status. The fixed solo replica never forfeits → stays Normal.
+  let mut storage = Storage::new(wal, sb);
   for ms in [0u64, 100, 350, 700, 1000, 1500, 2000] {
     ep.handle_timeout(
       Instant::ZERO + core::time::Duration::from_millis(ms),
-      &mut wal,
-      &mut sb,
+      &mut storage,
     );
     assert_eq!(
       ep.status(),
@@ -316,11 +314,12 @@ fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
   // checkpoint, then checkpointed in step with the cluster within the grace window.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary());
   ep.inject_peer_checkpoint_for_test(1, 8);
   ep.inject_peer_checkpoint_for_test(2, 8); // quorum 8, own 0 → lag 8 >= 4 → arms
-  ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  ep.handle_timeout(Instant::ZERO, &mut storage);
   assert!(ep.forfeit_armed_for_test(), "the lag armed the grace timer");
   // The primary catches its own checkpoint up to the quorum BEFORE the grace elapses. A real catch-up
   // checkpoints at the (now-advanced) `commit_min`, so move commit/op/checkpoint together to 8 — a
@@ -328,14 +327,14 @@ fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
   // leaves the armed grace timer intact, which the next tick disarms once the lag is 0.)
   ep.force_state_for_test(0, 8, 8, 8, &[]); // lag now 0 < bound 4
   let mid = Instant::ZERO + core::time::Duration::from_millis(100); // still within the 300ms grace
-  ep.handle_timeout(mid, &mut wal, &mut sb);
+  ep.handle_timeout(mid, &mut storage);
   assert!(
     !ep.forfeit_armed_for_test(),
     "catching up disarms the grace timer (the transient lag does not forfeit)"
   );
   // Even well past the original grace deadline, no forfeit fires.
   let later = Instant::ZERO + core::time::Duration::from_millis(400);
-  ep.handle_timeout(later, &mut wal, &mut sb);
+  ep.handle_timeout(later, &mut storage);
   assert_eq!(
     ep.view().get(),
     0,
@@ -364,7 +363,7 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   // OTHER forfeit condition is off), so this isolates the unfillable-hole trigger.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary());
   // Head 10, commit HELD at 1 below a committed hole at op 2, own checkpoint 1 == quorum (no
   // checkpoint-lag). Checkpoint == commit_min (a real checkpoint snapshots the SM at `commit_min`, so
@@ -375,7 +374,8 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   ep.inject_peer_checkpoint_for_test(1, 1);
   ep.inject_peer_checkpoint_for_test(2, 1); // quorum 1 == own 1 → lag 0 (the lag trigger is OFF)
   // First primary tick ARMS the grace timer (the hole is outstanding) but does NOT forfeit yet.
-  ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  ep.handle_timeout(Instant::ZERO, &mut storage);
   assert!(
     ep.forfeit_armed_for_test(),
     "an outstanding committed repair hole arms the forfeit grace timer"
@@ -384,7 +384,7 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   while ep.poll_message().is_some() {}
   // Past the grace window, with the hole STILL unfilled (no peer answered) → forfeit (propose view 1).
   let later = Instant::ZERO + core::time::Duration::from_millis(400);
-  ep.handle_timeout(later, &mut wal, &mut sb);
+  ep.handle_timeout(later, &mut storage);
   let mut saw_svc_view1 = false;
   while let Some(out) = ep.poll_message() {
     if let Message::StartViewChange(svc) = out.into_msg()
@@ -408,13 +408,14 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
   // committed-vouching Prepare (commit 2 >= op 2) before the grace elapses.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(ep.is_primary());
   // Head 2, commit 1, a committed hole at op 2, own checkpoint 0 (no checkpoint-lag peers injected).
   ep.force_state_for_test(0, 2, 1, 0, &[2]);
   // First tick arms the grace timer (the hole is outstanding).
-  ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  ep.handle_timeout(Instant::ZERO, &mut storage);
   assert!(
     ep.forfeit_armed_for_test(),
     "the outstanding committed hole arms the grace timer"
@@ -424,25 +425,24 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
   // repaired append is durable — the durability barrier).
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  ep.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear the hole
+  ep.storage_step(Instant::ZERO, &mut storage, &mut blocks); // the repaired append completes → clear the hole
   assert!(
     !ep.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the hole"
   );
   // Next tick within the grace window: the hole is gone → the grace timer DISARMS, no forfeit.
   let mid = Instant::ZERO + core::time::Duration::from_millis(100);
-  ep.handle_timeout(mid, &mut wal, &mut sb);
+  ep.handle_timeout(mid, &mut storage);
   assert!(
     !ep.forfeit_armed_for_test(),
     "filling the hole disarms the grace timer (a fillable hole does not forfeit)"
   );
   let later = Instant::ZERO + core::time::Duration::from_millis(400);
-  ep.handle_timeout(later, &mut wal, &mut sb);
+  ep.handle_timeout(later, &mut storage);
   let mut saw_svc = false;
   while let Some(out) = ep.poll_message() {
     if let Message::StartViewChange(_) = out.into_msg() {
@@ -470,15 +470,15 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   // `..._rate_limits_its_svc_rebroadcast_...` ticks at SUB-cadence spacing to pin the rate limit.)
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
   // Enter the force-sync strand → the primary flags a deferred forfeit (a committed hole at op 2 a
   // peer has already checkpointed+pruned past).
   ep.force_state_for_test(0, 10, 1, 0, &[2]);
+  let mut storage = Storage::new(wal, sb);
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -501,7 +501,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   // is ever emitted. The view never changes (the lone SVC forms no quorum), and the flag persists.
   for i in 0..5u64 {
     let now = Instant::ZERO + core::time::Duration::from_millis(100 * (i + 1));
-    ep.handle_timeout(now, &mut wal, &mut sb);
+    ep.handle_timeout(now, &mut storage);
     let mut saw_svc_view1 = false;
     let mut saw_commit_heartbeat = false;
     while let Some(out) = ep.poll_message() {
@@ -537,8 +537,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   let now = Instant::ZERO + core::time::Duration::from_millis(700);
   ep.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -581,15 +580,15 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
   // test above; this one isolates the rate limit.)
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
   let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
   // Enter the force-sync strand → the primary flags a deferred forfeit (a committed hole at op 2 a
   // peer has already checkpointed + pruned past), mirroring the sibling persistence test's setup.
   ep.force_state_for_test(0, 10, 1, 0, &[2]);
+  let mut storage = Storage::new(wal, sb);
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -615,7 +614,7 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
     // Times 10ms, 20ms, .. 100ms — all at or before the first retransmit deadline (armed at entry +
     // 100ms). The 100ms tick is the boundary where exactly one re-broadcast is allowed.
     let now = Instant::ZERO + core::time::Duration::from_millis(10 * (i + 1));
-    ep.handle_timeout(now, &mut wal, &mut sb);
+    ep.handle_timeout(now, &mut storage);
     while let Some(out) = ep.poll_message() {
       if let Message::StartViewChange(svc) = out.into_msg()
         && svc.view().get() == 1
@@ -637,7 +636,7 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
 
   // After the cadence elapses, the next due tick DOES re-broadcast (still stepping down under loss).
   let past_window = Instant::ZERO + core::time::Duration::from_millis(250);
-  ep.handle_timeout(past_window, &mut wal, &mut sb);
+  ep.handle_timeout(past_window, &mut storage);
   let mut saw_svc_after_window = false;
   while let Some(out) = ep.poll_message() {
     if let Message::StartViewChange(svc) = out.into_msg()

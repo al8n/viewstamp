@@ -39,7 +39,7 @@ use bytes::Bytes;
 use crate::{
   AcceptReducedFaultTolerance, BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber,
   Outgoing, Peer, Recipient, ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine,
-  Superblock, Wal, decode_message, endpoint::ProposeMembershipError,
+  Superblock, Wal, decode_message, endpoint::ProposeMembershipError, storage::Storage,
 };
 
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`.
@@ -69,8 +69,8 @@ fn sni_for(peer: Peer, cluster: u128) -> String {
 ///
 /// The coordinator is the driver surface: it consumes UDP datagrams (`handle_udp`), fires timers
 /// (`handle_timeout`), and produces outbound datagrams (`poll_transmit`) — quinn and the consensus
-/// endpoint stay I/O-free underneath. Storage (`W`/`B`) is the third orthogonal axis, threaded into
-/// every `handle_*` call.
+/// endpoint stay I/O-free underneath. Storage (the [`Storage`] session over `W`/`B`) is the third
+/// orthogonal axis, threaded into every `handle_*` call.
 ///
 /// # Identity
 ///
@@ -271,14 +271,14 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   ///
   /// Delegates directly to [`Endpoint::propose_membership`]. The coordinator owns `&mut self.endpoint`
   /// so the call is sequenced after any in-progress pump — no concurrent borrow is possible.
-  pub fn propose_membership<W: Wal>(
+  pub fn propose_membership<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     delta: SingleVoterDelta,
     ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
-    self.endpoint.propose_membership(now, wal, delta, ack)
+    self.endpoint.propose_membership(now, storage, delta, ack)
   }
 
   /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the
@@ -395,12 +395,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     remote: SocketAddr,
     ecn: Option<EcnCodepoint>,
     data: &[u8],
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_datagram(std_now, remote, ecn, data);
-    self.drain_bridge(now, wal, sb);
+    self.drain_bridge(now, storage);
     // The just-completed drain may have delivered a frame that INSTALLED a new membership; reconcile
     // routing against it BEFORE the pump routes this pass's outputs, so they never ride a stale slot.
     self.reconcile_routing(now);
@@ -408,11 +407,15 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   }
 
   /// Fire all QUIC + consensus timers at `now`, then drain the bridge and pump.
-  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+  pub fn handle_timeout<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_timeout(std_now);
-    self.endpoint.handle_timeout(now, wal, sb);
-    self.drain_bridge(now, wal, sb);
+    self.endpoint.handle_timeout(now, storage);
+    self.drain_bridge(now, storage);
     // A timeout-driven advance (or a frame the drain delivered) may have installed a new membership;
     // reconcile routing against it BEFORE the pump, so no current-config output rides a stale slot.
     self.reconcile_routing(now);
@@ -430,17 +433,16 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   fn drain_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     blocks: &mut dyn BlockStore,
   ) {
     loop {
-      self.endpoint.handle_storage(now, wal, sb);
+      self.endpoint.handle_storage(now, storage);
       let Some(job) = self.endpoint.poll_block_job() else {
         break;
       };
       let done = crate::execute_block_job(&mut self.block_lane, job, blocks);
-      self.endpoint.on_block_done(now, wal, sb, done);
+      self.endpoint.on_block_done(now, storage, done);
     }
   }
 
@@ -448,12 +450,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn handle_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     blocks: &mut dyn BlockStore,
   ) {
-    self.drain_storage(now, wal, sb, blocks);
-    self.settle(now, wal, sb);
+    self.drain_storage(now, storage, blocks);
+    self.settle(now, storage);
   }
 
   /// Drive WAL/superblock completions through the consensus endpoint and pump, leaving the block
@@ -468,11 +469,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn handle_storage_deferred<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
-    self.endpoint.handle_storage(now, wal, sb);
-    self.settle(now, wal, sb);
+    self.endpoint.handle_storage(now, storage);
+    self.settle(now, storage);
   }
 
   /// Takes the next block job the endpoint has queued, for a caller running an external storage
@@ -488,20 +488,19 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn on_block_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     done: crate::BlockJobDone<S>,
   ) {
-    self.endpoint.on_block_done(now, wal, sb, done);
-    self.settle(now, wal, sb);
+    self.endpoint.on_block_done(now, storage, done);
+    self.settle(now, storage);
   }
 
   /// The tail every storage-advancing entry point shares: drain the bridge (a completion can
   /// release consensus messages that arrive as frames), reconcile routing against a membership the
   /// advance may have installed — BEFORE the pump, so this pass's outputs use the new slots — then
   /// pump the endpoint's outputs.
-  fn settle<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    self.drain_bridge(now, wal, sb);
+  fn settle<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
+    self.drain_bridge(now, storage);
     self.reconcile_routing(now);
     self.pump(now);
   }
@@ -654,8 +653,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn submit_client_request<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     request: Request,
   ) {
     if request.body().len() > crate::transport::frame::max_request_body_len() {
@@ -667,8 +665,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     };
     self.endpoint.handle_message(
       now,
-      wal,
-      sb,
+      storage,
       Peer::Client(request.client()),
       Message::Request(request.clone()),
     );
@@ -697,7 +694,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   ///   stream bytes still readable defers the connection to the NEXT pump, so a buffered receive window
   ///   drains one budget per pump rather than all at once;
   /// - `lost` → reap the closed connection.
-  fn drain_bridge<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+  fn drain_bridge<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
     let std_now = self.quinn_now(now);
     while let Some(h) = self.bridge.take_connected() {
       // Open the send stream and write our control preface as frame-0. `Hello` writes the hello
@@ -766,7 +763,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
             self.bridge.bound_peer_of(h),
             decode_message(Bytes::from(payload)),
           ) {
-            self.deliver_decoded(now, wal, sb, from, msg);
+            self.deliver_decoded(now, storage, from, msg);
           }
         } else {
           // `Closed` (or otherwise no longer routable): drop the remaining frames.
@@ -783,7 +780,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
             self.bridge.bound_peer_of(h),
             decode_message(Bytes::from(payload)),
           ) {
-            self.deliver_decoded(now, wal, sb, from, msg);
+            self.deliver_decoded(now, storage, from, msg);
           }
         }
       }
@@ -822,8 +819,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   fn deliver_decoded<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     msg: Message,
   ) {
@@ -832,7 +828,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     {
       return;
     }
-    self.endpoint.handle_message(now, wal, sb, from, msg);
+    self.endpoint.handle_message(now, storage, from, msg);
     #[cfg(test)]
     {
       self.consensus_frames_delivered += 1;
@@ -1079,12 +1075,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub(crate) fn inject_message_for_test<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     msg: Message,
   ) {
-    self.deliver_decoded(now, wal, sb, from, msg);
+    self.deliver_decoded(now, storage, from, msg);
     self.pump(now);
   }
 
@@ -1145,10 +1140,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub(crate) fn receive_pump_for_test<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
-    self.drain_bridge(now, wal, sb);
+    self.drain_bridge(now, storage);
     self.pump(now);
   }
 

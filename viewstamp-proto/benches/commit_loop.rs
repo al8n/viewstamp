@@ -278,8 +278,7 @@ impl BlockStore for BenchBlocks {
 
 struct Replica<S: StateMachine> {
   ep: Endpoint<S>,
-  wal: BenchWal,
-  sb: BenchSb,
+  storage: viewstamp_proto::Storage<BenchWal, BenchSb>,
   blocks: BenchBlocks,
   /// The execution-order witness of this replica's inline storage lane.
   block_lane: viewstamp_proto::BlockJobCursor,
@@ -324,8 +323,7 @@ where
       .expect("genesis commit formats the fresh bench store");
       Replica {
         ep,
-        wal,
-        sb,
+        storage: viewstamp_proto::Storage::new(wal, sb),
         blocks: BenchBlocks::default(),
         block_lane: viewstamp_proto::BlockJobCursor::new(),
       }
@@ -362,8 +360,7 @@ where
         let r = &mut reps[0];
         r.ep.handle_message(
           now,
-          &mut r.wal,
-          &mut r.sb,
+          &mut r.storage,
           Peer::Client(cl.id),
           Message::Request(req),
         );
@@ -417,18 +414,18 @@ where
       while let Some((to, from, msg)) = inbox.pop_front() {
         moved = true;
         let r = &mut reps[to];
-        r.ep.handle_message(now, &mut r.wal, &mut r.sb, from, msg);
+        r.ep.handle_message(now, &mut r.storage, from, msg);
       }
       for r in &mut reps {
         // The bench's inline storage lane: drain the WAL/superblock completions, then execute one
         // queued block job and feed its completion back, until neither side produces work.
         loop {
-          r.ep.handle_storage(now, &mut r.wal, &mut r.sb);
+          r.ep.handle_storage(now, &mut r.storage);
           let Some(job) = r.ep.poll_block_job() else {
             break;
           };
           let done = viewstamp_proto::execute_block_job(&mut r.block_lane, job, &mut r.blocks);
-          r.ep.on_block_done(now, &mut r.wal, &mut r.sb, done);
+          r.ep.on_block_done(now, &mut r.storage, done);
         }
         while r.ep.poll_event().is_some() {}
       }
@@ -440,7 +437,7 @@ where
     // Fire timers at the advanced instant (heartbeat / retransmit cadence), as a
     // real driver would each tick.
     for r in &mut reps {
-      r.ep.handle_timeout(now, &mut r.wal, &mut r.sb);
+      r.ep.handle_timeout(now, &mut r.storage);
     }
   }
 

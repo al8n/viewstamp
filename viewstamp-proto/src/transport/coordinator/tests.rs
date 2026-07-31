@@ -36,8 +36,7 @@ fn labeled_conn(cluster: u128, me: u16, accept: bool) -> Conn<Labeled<Passthroug
 /// `try_note_established_member` fires without needing a real inbound frame.
 fn register_and_validate_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
-  wal: &mut TestWal,
-  sb: &mut TestSb,
+  storage: &mut Storage<TestWal, TestSb>,
   _blocks: &mut crate::block_store::InMemoryBlockStore,
   member_idx: u128,
 ) -> ConnId {
@@ -46,15 +45,14 @@ fn register_and_validate_member(
     Peer::Replica(ReplicaId::new(member_idx as u16)),
     Conn::from_parts(MockRecords::new(false, Some(Peer::Member(member)))),
   );
-  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb);
+  coord.handle_conn_data(id, &[], false, Instant::ZERO, storage);
   id
 }
 
 #[test]
 fn inbound_request_produces_outbound_to_a_backup() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // replica 0 = primary of view 0
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -66,12 +64,11 @@ fn inbound_request_produces_outbound_to_a_backup() {
     ));
   // Register backup conns attesting Peer::Member so try_note_established_member validates them
   // through note_established_member (the production path that stores the stable MemberId).
-  register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
-  register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
+  register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
+  register_and_validate_member(&mut coord, &mut storage, &mut blocks, 2);
   coord.inject_message_for_test(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     req(),
   );
@@ -83,8 +80,8 @@ fn inbound_request_produces_outbound_to_a_backup() {
       break;
     }
     now = now + core::time::Duration::from_millis(50);
-    coord.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-    coord.handle_timeout(now, &mut wal, &mut sb);
+    coord.handle_storage(now, &mut storage, &mut blocks);
+    coord.handle_timeout(now, &mut storage);
     produced = coord.poll_conn_transmit().is_some();
   }
   assert!(
@@ -106,8 +103,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
 
   // Replica 0 is the primary of view 0, so an admitted relayed Request would be served.
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -119,8 +115,8 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
     ));
   // Two backup conns validated through the coordinator seal, so a served Prepare HAS somewhere to
   // route — proving the over-max case routes NOTHING, not merely that no conn was available.
-  register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
-  register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
+  register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
+  register_and_validate_member(&mut coord, &mut storage, &mut blocks, 2);
   assert_eq!(coord.endpoint().op().get(), 0, "no op before any request");
 
   // A relayed Request (from a configured REPLICA — the replica-relayed ingress this gate guards)
@@ -133,8 +129,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
   ));
   coord.inject_message_for_test(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     over,
   );
@@ -145,7 +140,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
   let mut now = Instant::ZERO;
   for _ in 0..5 {
     now = now + core::time::Duration::from_millis(50);
-    coord.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    coord.handle_storage(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     coord.endpoint().op().get(),
@@ -167,13 +162,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
     max_request_body_len() < MAX_FRAME_LEN as usize,
     "the deliverable max is under the frame cap by the request overhead"
   );
-  coord.inject_message_for_test(
-    now,
-    &mut wal,
-    &mut sb,
-    Peer::Replica(ReplicaId::new(1)),
-    at_max,
-  );
+  coord.inject_message_for_test(now, &mut storage, Peer::Replica(ReplicaId::new(1)), at_max);
   assert_eq!(
     coord.endpoint().op().get(),
     1,
@@ -187,7 +176,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
       break;
     }
     now = now + core::time::Duration::from_millis(50);
-    coord.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    coord.handle_storage(now, &mut storage, &mut blocks);
     routed = coord.poll_conn_transmit().is_some();
   }
   assert!(
@@ -203,8 +192,7 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
 fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
   use crate::transport::frame::encode_frame;
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -215,13 +203,13 @@ fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
       u64::MAX,
     ));
   // Register and validate the conn through the coordinator seal, then feed inbound frames.
-  let id = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
+  let id = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
   // Build more than one 64 KiB STAGE_CHUNK worth of framed messages so the read spans chunks.
   let mut frames = Vec::new();
   while frames.len() <= 64 * 1024 {
     encode_frame(&encode_message(&req()), &mut frames);
   }
-  coord.handle_conn_data(id, &frames, false, Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_conn_data(id, &frames, false, Instant::ZERO, &mut storage);
   assert!(
     coord.router_ref().conn(id).is_some(),
     "a large valid multi-chunk read keeps the conn open"
@@ -256,8 +244,7 @@ fn max_outbound_backlog_is_twice_the_router_outbound_cap() {
 #[test]
 fn wrong_cluster_conn_is_reaped() {
   let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -279,7 +266,7 @@ fn wrong_cluster_conn_is_reaped() {
   );
   let mut hello = Vec::new();
   wrong.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut storage);
   assert!(
     coord.router_ref().conn(id).is_none(),
     "wrong-cluster conn must be reaped"
@@ -294,8 +281,7 @@ fn wrong_cluster_conn_is_reaped() {
 #[test]
 fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -319,7 +305,7 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   );
   let mut hello = Vec::new();
   wrong.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut storage);
   assert!(
     coord.router_ref().conn(id).is_none(),
     "the wrong-cluster conn is reaped"
@@ -342,8 +328,7 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
 #[test]
 fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -354,12 +339,12 @@ fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
       u64::MAX,
     ));
   // Register and validate through the coordinator seal so the garbage frame reaches decode.
-  let id = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
+  let id = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
   assert_eq!(coord.poll_conn_closed(), None, "no closed conn initially");
   // A well-formed frame header carrying an undecodable payload: decode fails, the conn closes.
   let mut frames = Vec::new();
   crate::transport::frame::encode_frame(&[0xFF; 8], &mut frames);
-  coord.handle_conn_data(id, &frames, false, Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_conn_data(id, &frames, false, Instant::ZERO, &mut storage);
   assert!(
     coord.router_ref().conn(id).is_none(),
     "the bad-frame conn is reaped"
@@ -377,8 +362,7 @@ fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
 #[test]
 fn a_redial_is_registered_but_not_authoritative_until_validated() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -398,7 +382,7 @@ fn a_redial_is_registered_but_not_authoritative_until_validated() {
   );
   let mut hello = Vec::new();
   wrong.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(a, &hello, false, Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_conn_data(a, &hello, false, Instant::ZERO, &mut storage);
   assert!(coord.router_ref().conn(a).is_none(), "A reaped");
   let b = coord.register_dialed(p, labeled_conn(0xABCD, 0, false));
   assert!(
@@ -416,8 +400,7 @@ fn a_redial_is_registered_but_not_authoritative_until_validated() {
 #[test]
 fn route_skips_a_handshaking_conn() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
@@ -440,16 +423,15 @@ fn route_skips_a_handshaking_conn() {
   );
   coord.inject_message_for_test(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     req(),
   );
   let mut now = Instant::ZERO;
   for _ in 0..5 {
     now = now + core::time::Duration::from_millis(50);
-    coord.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-    coord.handle_timeout(now, &mut wal, &mut sb);
+    coord.handle_storage(now, &mut storage, &mut blocks);
+    coord.handle_timeout(now, &mut storage);
   }
   assert!(
     coord.poll_conn_transmit().is_none(),
@@ -467,8 +449,7 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
   use crate::{GetView, View, transport::frame::encode_frame};
   // Replica 0 is the primary of view 0, so it answers a GetView(view 0) synchronously.
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -482,8 +463,8 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
   // Two conns validated through the coordinator seal for the same peer (member 1 = slot 1):
   // the first becomes a live standby, the second (last-established via note_established_member)
   // is authoritative.
-  let standby = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
-  let authoritative = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
+  let standby = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
+  let authoritative = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
   assert_eq!(
     coord.router_ref().authoritative(peer),
     Some(authoritative),
@@ -499,14 +480,7 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
   ));
   let mut framed = Vec::new();
   encode_frame(&encode_message(&get_view), &mut framed);
-  coord.handle_conn_data(
-    authoritative,
-    &framed,
-    true,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-  );
+  coord.handle_conn_data(authoritative, &framed, true, Instant::ZERO, &mut storage);
   // The peer-finished conn was reaped and the standby promoted BEFORE the StartView was routed.
   assert!(
     coord.router_ref().conn(authoritative).is_none(),
@@ -765,7 +739,7 @@ fn with_outbound_cap_scales_the_backlog_threshold() {
 #[test]
 fn propose_membership_delegates_to_the_endpoint() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // primary of view 0, Normal
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -777,7 +751,7 @@ fn propose_membership_delegates_to_the_endpoint() {
   let op = coord
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       crate::SingleVoterDelta::AddLearner(MemberId::new(5)),
       None,
     )
@@ -901,8 +875,7 @@ fn a_dialed_member_that_no_longer_resolves_is_rejected_not_quarantined() {
 #[test]
 fn a_settling_client_handshake_is_validated_through_try_note_established_member() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -931,7 +904,7 @@ fn a_settling_client_handshake_is_validated_through_try_note_established_member(
   );
   let mut hello = Vec::new();
   dialer.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut storage);
   assert!(
     coord.is_conn_validated(id),
     "the settled Client handshake is validated via note_established (Client is never blocked)"
@@ -947,8 +920,7 @@ fn a_settling_client_handshake_is_validated_through_try_note_established_member(
 fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
   use crate::transport::frame::max_request_body_len;
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -962,7 +934,7 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
     RequestNumber::with(1),
     Bytes::from(vec![0u8; max_request_body_len() + 1]),
   );
-  coord.submit_client_request(Instant::ZERO, &mut wal, &mut sb, over);
+  coord.submit_client_request(Instant::ZERO, &mut storage, over);
   assert_eq!(
     coord.endpoint().op().get(),
     0,
@@ -984,15 +956,13 @@ fn commit_and_install_a_voter_departure(
   who: u128,
 ) -> (
   StreamCoordinator<CountSm, MockRecords>,
-  TestWal,
-  TestSb,
+  Storage<TestWal, TestSb>,
   crate::block_store::InMemoryBlockStore,
   ConnId,
   ConnId,
 ) {
   let cfg = Config::try_new(0xABCD, MemberId::new(local)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -1002,10 +972,10 @@ fn commit_and_install_a_voter_departure(
       CountSm::default(),
       u64::MAX,
     ));
-  let conn1 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
-  let conn2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
-  drive_voter_departure_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, local, who);
-  (coord, wal, sb, blocks, conn1, conn2)
+  let conn1 = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 1);
+  let conn2 = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 2);
+  drive_voter_departure_to_installed(&mut coord, &mut storage, &mut blocks, local, who);
+  (coord, storage, blocks, conn1, conn2)
 }
 
 /// Drives an already-built 3-voter primary `coord` (local = `local`, primary of view 0, durable
@@ -1018,8 +988,7 @@ fn commit_and_install_a_voter_departure(
 /// `reconcile_routing` inside each install's `handle_storage` runs against each successive membership.
 fn drive_voter_departure_to_installed(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
-  wal: &mut TestWal,
-  sb: &mut TestSb,
+  storage: &mut Storage<TestWal, TestSb>,
   blocks: &mut crate::block_store::InMemoryBlockStore,
   local: u128,
   who: u128,
@@ -1033,20 +1002,19 @@ fn drive_voter_departure_to_installed(
   let op = coord
     .propose_membership(
       Instant::ZERO,
-      wal,
+      storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(who)),
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the demote Reconfigure op");
-  coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote
+  coord.handle_storage(Instant::ZERO, storage, blocks); // own append durable -> own vote
   // Every voter but the local one acks: a voter-set shrink commits only once the SUCCESSOR quorum
   // is among the acks (for a demoted self that is BOTH other voters), and the extra ack is inert
   // for any other demotion.
   for acker in (0..3u128).filter(|&m| m != local) {
     coord.inject_message_for_test(
       Instant::ZERO,
-      wal,
-      sb,
+      storage,
       Peer::Replica(ReplicaId::new(acker as u16)),
       Message::PrepareOk(crate::PrepareOk::new(
         View::new(),
@@ -1068,7 +1036,7 @@ fn drive_voter_departure_to_installed(
   // Extra pumps drain the install's forced post-swap checkpoint, freeing the superblock (and the
   // new-op admission gate) for the GC swap.
   for _ in 0..6 {
-    coord.handle_storage(Instant::ZERO, wal, sb, blocks);
+    coord.handle_storage(Instant::ZERO, storage, blocks);
   }
   let e1 = coord.live_membership().clone();
   assert_eq!(
@@ -1087,12 +1055,12 @@ fn drive_voter_departure_to_installed(
     let gc_op = coord
       .propose_membership(
         Instant::ZERO,
-        wal,
+        storage,
         SingleVoterDelta::RemoveLearner(MemberId::new(who)),
         None,
       )
       .expect("the retained primary mints the GC Reconfigure op");
-    coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote
+    coord.handle_storage(Instant::ZERO, storage, blocks); // own append durable -> own vote
     for acker in (0..3u128).filter(|&m| m != local && m != who) {
       // The E+1 slot of a retained acking voter (the demote may have shifted it).
       let slot = e1
@@ -1100,8 +1068,7 @@ fn drive_voter_departure_to_installed(
         .expect("a retained voter resolves in E+1");
       coord.inject_message_for_test(
         Instant::ZERO,
-        wal,
-        sb,
+        storage,
         Peer::Replica(slot),
         Message::PrepareOk(crate::PrepareOk::new(
           View::new(),
@@ -1124,8 +1091,7 @@ fn drive_voter_departure_to_installed(
     let gc_op = OpNumber::with(op.get() + 1);
     coord.inject_message_for_test(
       Instant::ZERO,
-      wal,
-      sb,
+      storage,
       Peer::Replica(ReplicaId::new(0)),
       Message::Prepare(crate::Prepare::new(
         View::new(),
@@ -1139,11 +1105,10 @@ fn drive_voter_departure_to_installed(
         gc_payload.encode_body(),
       )),
     );
-    coord.handle_storage(Instant::ZERO, wal, sb, blocks); // the learner's append lands (no counted ack)
+    coord.handle_storage(Instant::ZERO, storage, blocks); // the learner's append lands (no counted ack)
     coord.inject_message_for_test(
       Instant::ZERO,
-      wal,
-      sb,
+      storage,
       Peer::Replica(ReplicaId::new(0)),
       Message::Commit(crate::Commit::new(
         View::new(),
@@ -1157,7 +1122,7 @@ fn drive_voter_departure_to_installed(
   // Land the GC's SwapEpoch root -> install the final successor (the seat is gone); extra pumps
   // drain its forced post-swap checkpoint on the surviving-voter path (a retired node forces none).
   for _ in 0..6 {
-    coord.handle_storage(Instant::ZERO, wal, sb, blocks);
+    coord.handle_storage(Instant::ZERO, storage, blocks);
   }
   assert_eq!(
     coord.live_membership().config_id(),
@@ -1172,8 +1137,7 @@ fn drive_voter_departure_to_installed(
 /// `None`). Returns its `ConnId`.
 fn register_and_quarantine_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
-  wal: &mut TestWal,
-  sb: &mut TestSb,
+  storage: &mut Storage<TestWal, TestSb>,
   _blocks: &mut crate::block_store::InMemoryBlockStore,
   out_idx: u128,
 ) -> ConnId {
@@ -1182,7 +1146,7 @@ fn register_and_quarantine_member(
     Peer::Member(member),
     Conn::from_parts(MockRecords::new(false, Some(Peer::Member(member)))),
   );
-  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb);
+  coord.handle_conn_data(id, &[], false, Instant::ZERO, storage);
   id
 }
 
@@ -1193,7 +1157,7 @@ fn a_removed_local_member_routes_nothing_gracefully() {
   // installed, local_slot_opt() is None: pump() (driven by the trailing
   // pump inside handle_storage's own install) and submit_client_request() must each route nothing
   // rather than panic on an absent local slot.
-  let (mut coord, mut wal, mut sb, _blocks, _conn1, _conn2) =
+  let (mut coord, mut storage, _blocks, _conn1, _conn2) =
     commit_and_install_a_voter_departure(0, 0);
   assert!(
     coord.endpoint().local_slot_opt().is_none(),
@@ -1201,8 +1165,7 @@ fn a_removed_local_member_routes_nothing_gracefully() {
   );
   coord.submit_client_request(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Request::new(
       ClientId::new(1),
       RequestNumber::with(1),
@@ -1222,7 +1185,7 @@ fn reconcile_routing_closes_a_removed_member_and_leaves_an_unshifted_survivor_bo
   // reconcile_routing (driven automatically inside handle_storage, right after the installing pump)
   // must therefore close member 2's conn (slot_of(2) is now None) while leaving member 1's conn
   // untouched (still slot 1, so no churn for the unmoved retained member).
-  let (coord, _wal, _sb, _blocks, conn1, conn2) = commit_and_install_a_voter_departure(0, 2);
+  let (coord, _storage, _blocks, conn1, conn2) = commit_and_install_a_voter_departure(0, 2);
   assert_eq!(
     coord.membership_config_id(),
     coord.live_membership().config_id(),
@@ -1249,8 +1212,7 @@ fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_
   // re-dials into quarantine). The pre-change `None => close` arm would close the quarantined conn too,
   // severing the learn lane the moment any unrelated config installed — the falsifier this pins.
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -1262,8 +1224,8 @@ fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_
     ));
   // A validated replica (member 2, slot 2) the removal will drop, plus a QUARANTINED member (id 5,
   // never in genesis(3)) riding the learn lane.
-  let replica2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
-  let quarantined = register_and_quarantine_member(&mut coord, &mut wal, &mut sb, &mut blocks, 5);
+  let replica2 = register_and_validate_member(&mut coord, &mut storage, &mut blocks, 2);
+  let quarantined = register_and_quarantine_member(&mut coord, &mut storage, &mut blocks, 5);
   assert!(
     coord.router_ref().validated_member_conns().contains(&(
       quarantined,
@@ -1274,7 +1236,7 @@ fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_
   );
 
   // Remove member 2: the config_id changes, but member 5 is STILL not in the membership.
-  drive_voter_departure_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, 0, 2);
+  drive_voter_departure_to_installed(&mut coord, &mut storage, &mut blocks, 0, 2);
 
   assert!(
     coord.router_ref().conn(replica2).is_none(),
@@ -1301,8 +1263,7 @@ fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_
 #[test]
 fn the_quarantine_population_is_capped_evicting_the_oldest_for_a_newcomer() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -1324,7 +1285,7 @@ fn the_quarantine_population_is_capped_evicting_the_oldest_for_a_newcomer() {
   // Fill the quarantine to its cap with out-of-membership members. `register_and_quarantine_member`
   // allocates ConnIds monotonically, so `ids[0]` is the oldest (lowest-id) quarantined conn.
   let ids: Vec<ConnId> = (0..cap as u128)
-    .map(|m| register_and_quarantine_member(&mut coord, &mut wal, &mut sb, &mut blocks, 100 + m))
+    .map(|m| register_and_quarantine_member(&mut coord, &mut storage, &mut blocks, 100 + m))
     .collect();
   assert_eq!(
     quarantined_count(&coord),
@@ -1333,13 +1294,8 @@ fn the_quarantine_population_is_capped_evicting_the_oldest_for_a_newcomer() {
   );
 
   // A further quarantine must evict the OLDEST (lowest ConnId) to admit the newcomer (newest-wins).
-  let newcomer = register_and_quarantine_member(
-    &mut coord,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    100 + cap as u128,
-  );
+  let newcomer =
+    register_and_quarantine_member(&mut coord, &mut storage, &mut blocks, 100 + cap as u128);
   assert!(
     coord
       .router_ref()
@@ -1366,8 +1322,7 @@ fn the_quarantine_population_is_capped_evicting_the_oldest_for_a_newcomer() {
 #[test]
 fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1378,7 +1333,7 @@ fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
     ));
   // A brand-new endpoint has no timer armed yet; the first handle_timeout bootstraps the Normal
   // primary's cadence (its own commit-heartbeat / prepare-retransmit deadline).
-  coord.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  coord.handle_timeout(Instant::ZERO, &mut storage);
   assert!(
     coord.poll_timeout().is_some(),
     "a bootstrapped Normal primary has a scheduled timer deadline (poll_timeout delegates to the endpoint)"

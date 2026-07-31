@@ -92,7 +92,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ));
   }
 
-  pub(crate) fn view_change_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn view_change_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     if self.timers.svc_message.is_some_and(|d| d <= now) {
       self.push_svc(self.svc_target); // re-broadcast the live SVC target (drives escalation under loss)
       self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
@@ -151,7 +155,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           return;
         }
       }
-      self.propose_next_view(now, sb);
+      self.propose_next_view(now, storage);
       self.arm_timers(now);
     }
   }
@@ -232,10 +236,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// in kind — it ADOPTS a view off ONE unvalidated normal-traffic scalar with no quorum behind
   /// it — and stays plausibility-clamped there: see [`Self::catch_up_to_view`] /
   /// [`MAX_VIEW_JUMP`].)
-  pub(crate) fn on_start_view_change<B: Superblock>(
+  pub(crate) fn on_start_view_change<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     m: crate::StartViewChange,
   ) {
     if self.is_learner() {
@@ -259,13 +263,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     if target.get() == self.svc_target.get() {
       self.svc_from |= 1u64 << m.replica().get();
-      self.maybe_start_view_change(now, sb);
+      self.maybe_start_view_change(now, storage);
     }
   }
 
-  pub(crate) fn maybe_start_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn maybe_start_view_change<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     if (self.svc_from.count_ones() as usize) >= self.membership.quorum_view_change() {
-      self.transition_to_view_change_status(now, sb, self.svc_target);
+      self.transition_to_view_change_status(now, storage, self.svc_target);
     }
   }
 
@@ -275,10 +283,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// advance the view). The recovery path enters via [`Self::enter_view_change_from_recovery`], which
   /// permits `view_new == self.view` (re-driving an in-progress view change after a crash) — it shares
   /// the identical body through `enter_view_change`.
-  fn transition_to_view_change_status<B: Superblock>(
+  fn transition_to_view_change_status<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     view_new: View,
   ) {
     if self.sync_repersist_root_staged() {
@@ -292,7 +300,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       view_new.get() > self.view.get(),
       "view change must strictly advance the view"
     );
-    self.enter_view_change(now, sb, view_new);
+    self.enter_view_change(now, storage, view_new);
   }
 
   /// Recovery-only `ViewChange` entry (faithful port of TigerBeetle `replica.zig` open()): a
@@ -302,10 +310,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// uses a relaxed `view_new >= self.view` (and `> self.view` whenever `log_view == view`, the
   /// abdication case — a Normal primary must move OFF its own view). Everything else (the pipeline /
   /// quorum / pending resets, the deferred durable-view write) is identical via `enter_view_change`.
-  pub(crate) fn enter_view_change_from_recovery<B: Superblock>(
+  pub(crate) fn enter_view_change_from_recovery<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     view_new: View,
   ) {
     debug_assert!(
@@ -316,7 +324,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       view_new.get() > self.view.get() || self.log_view.get() < self.view.get(),
       "an abdicating recovered primary (log_view == view) must advance OFF its own view"
     );
-    self.enter_view_change(now, sb, view_new);
+    self.enter_view_change(now, storage, view_new);
   }
 
   /// THE SINGLE CHOKEPOINT for tearing down the OLD-GENERATION in-flight state that EVERY
@@ -511,7 +519,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// The shared `ViewChange`-entry body (no view-advance assert — the callers assert their own
   /// contract). Resets the pipeline + quorums and defers the DoViewChange until the new view is durable.
-  fn enter_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B, view_new: View) {
+  fn enter_view_change<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+    view_new: View,
+  ) {
     self.view = view_new;
     self.set_status(Status::ViewChange);
     self.svc_target = view_new; // collect future escalations above this view
@@ -528,7 +541,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.buffer.clear();
     self.arm_timers(now);
     // DVC deferred to on_sb_done: persist the new view before voting in it.
-    self.submit_durable_view(PendingSbAction::SendDoViewChange, sb);
+    self.submit_durable_view(PendingSbAction::SendDoViewChange, storage);
   }
 
   /// Send our full log + position to the prospective primary of the current view.
@@ -627,8 +640,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_do_view_change<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     m: crate::DoViewChange,
   ) {
     // NOTE (deferred to a later milestone): we do not yet validate incoming DVC well-formedness
@@ -688,7 +700,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.dvc_from_mut().insert(m.replica(), m);
     }
     if self.dvc_from().len() >= self.membership.quorum_view_change() {
-      self.start_view_as_new_primary(now, wal, sb);
+      self.start_view_as_new_primary(now, storage);
     }
   }
 
@@ -915,8 +927,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn start_view_as_new_primary<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
     // No NEW checkpoint starts when forming a new primary's view (`maybe_checkpoint` is gated on Normal
     // status). An ORDINARY checkpoint kept in flight ACROSS the transition is permitted: it completes
@@ -968,7 +979,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (checkpoints only start in Normal) — no NEW checkpoint starts. An ordinary checkpoint kept in flight
     // across the transition is carried forward verbatim by the StartViewAsPrimary durable-view write below
     // (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
-    self.advance_commit(now, sb, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
+    self.advance_commit(now, storage, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
 
     // truncate the uncommitted suffix at the FIRST interior gap above commit*. The
     // adopted canonical log is the offset-union `(min_floor .. op_head]` and may still have an interior
@@ -1019,8 +1030,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Retire the appends the backend could cancel synchronously; any it could NOT cancel stay in
     // `wal_writes` as un-quiesced writes, and the adopt-append loop below defers every re-append
     // whose slot one of them still holds (the slot-quiescence fence).
-    let cancelled = wal.truncate(self.op);
-    self.absorb_wal_cancellations(wal, cancelled);
+    let cancelled = storage.truncate(self.op);
+    self.absorb_wal_cancellations(storage, cancelled);
 
     // Backfill the client-session request high-water from the adopted in-memory log tail. This is a
     // fallback that only covers the ops still cached in `self.log` (the offset tail `(floor .. op]`).
@@ -1160,18 +1171,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           prepare_checksum,
         },
       );
-      self.adopt_append(wal, op, Pending::AdoptVote(OpNumber::with(op)));
+      self.adopt_append(storage, op, Pending::AdoptVote(OpNumber::with(op)));
     }
 
     // Defer participation (StartView broadcast + arm_timers + try_commit) to on_sb_done. The own votes
     // accrue independently as the AdoptVote appends complete; a StartView/own-vote never outruns its
     // WAL append (for replica_count > 1 the lone own vote is below quorum, and backups only ack after
     // this StartView, so no adopted op can commit before BOTH its append and the durable-view land).
-    self.submit_durable_view(PendingSbAction::StartViewAsPrimary, sb);
+    self.submit_durable_view(PendingSbAction::StartViewAsPrimary, storage);
   }
 
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
-  pub(crate) fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn start_view_participate<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
     // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
     // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised
@@ -1205,7 +1220,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ));
 
     self.arm_timers(now);
-    self.try_commit(now, sb);
+    self.try_commit(now, storage);
   }
 
   /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`, floored at
@@ -1348,8 +1363,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_start_view<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     m: crate::StartView,
   ) {
     // Adopt only a strictly newer view, or the current view while we have not yet returned to Normal
@@ -1373,14 +1387,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     self.adopt_canonical_head(
       now,
-      sb,
+      storage,
       m.view(),
       m.op(),
       m.commit(),
       m.checkpoint_op(),
       m.log_slice(),
     );
-    self.truncate_wal_above_adopted_head(wal);
+    self.truncate_wal_above_adopted_head(storage);
   }
 
   /// Drop any WAL tail strictly ABOVE the head this replica just adopted. Run by
@@ -1394,14 +1408,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `self.op` drops ONLY uncommitted ops, so there is no durability dip; the uncommitted tail is simply
   /// re-fetched from the primary as `Prepare`s. (`adopt_canonical_head` never lowers `self.op`, so this is
   /// exactly the adopted head; done in the caller because it owns the `wal` handle.)
-  pub(crate) fn truncate_wal_above_adopted_head<W: Wal>(&mut self, wal: &mut W) {
+  pub(crate) fn truncate_wal_above_adopted_head<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+  ) {
     // Committed-survival backstop on the BOUNDARY freed WAL slot `self.op + 1`: the adopted head is the
     // view's authoritative head, so nothing strictly above it is committed (the uncommitted clause).
     self.assert_committed_survives(self.op.get() + 1, self.checkpoint_op.get());
     // Retire what the backend could cancel synchronously; the rest stay in `wal_writes`, fencing
     // every re-append to their slots until they quiesce.
-    let cancelled = wal.truncate(self.op);
-    self.absorb_wal_cancellations(wal, cancelled);
+    let cancelled = storage.truncate(self.op);
+    self.absorb_wal_cancellations(storage, cancelled);
   }
 
   /// Adopt an authoritative primary's canonical head + log for `view` and return to `Normal`.
@@ -1433,10 +1450,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   // `log` — both callers unpack the same accessors of a `StartView`/`RecoveryResponse`), so the arity
   // mirrors the wire shape rather than an over-wide ad-hoc surface.
   #[allow(clippy::too_many_arguments)]
-  pub(crate) fn adopt_canonical_head<B: Superblock>(
+  pub(crate) fn adopt_canonical_head<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     view: View,
     op: OpNumber,
     commit: OpNumber,
@@ -1481,7 +1498,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // tail is a no-op (checkpoints only start in Normal) — no NEW checkpoint starts; an ordinary
     // checkpoint kept in flight is carried forward verbatim by the AdoptedStartView durable-view write
     // below (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
-    self.advance_commit(now, sb, commit.get());
+    self.advance_commit(now, storage, commit.get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;
     self.set_status(Status::Normal);
@@ -1533,7 +1550,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // WAL-(re-)append each adopted uncommitted-tail op before its PrepareOk. The adopted
     // entries are in-memory only until then; the deferred ack gates on both the view write (here) and
     // the per-op append (in `start_view_acks`) completing, so no PrepareOk precedes either.
-    self.submit_durable_view(PendingSbAction::AdoptedStartView, sb);
+    self.submit_durable_view(PendingSbAction::AdoptedStartView, storage);
   }
 
   /// Runs once the adopted-StartView superblock write is durable: re-ack held uncommitted-tail ops —
@@ -1559,10 +1576,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// hundreds of redundant AdoptAck appends per view change and starving the repair fills that actually
   /// advance the commit. Bounding the re-append to `(commit_max .. op]` keeps it at the pipeline-depth
   /// tail it is meant to cover.
-  pub(crate) fn start_view_acks<W: Wal>(&mut self, wal: &mut W) {
+  pub(crate) fn start_view_acks<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>) {
     let lo = self.commit_min.get().max(self.commit_max.get());
     for op in (lo + 1)..=self.op.get() {
-      self.adopt_append(wal, op, Pending::AdoptAck(OpNumber::with(op)));
+      self.adopt_append(storage, op, Pending::AdoptAck(OpNumber::with(op)));
     }
   }
 
@@ -1594,13 +1611,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// advance is not lost: the durable-view completion itself re-drives (a backup re-runs the full
   /// loop via [`Self::start_view_acks`]; the new primary re-runs this sweep from its
   /// `StartViewAsPrimary` completion arm).
-  pub(crate) fn retry_unappended_adopted_tail<W: Wal>(&mut self, wal: &mut W) {
+  pub(crate) fn retry_unappended_adopted_tail<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+  ) {
     if !self.status.is_normal() || self.pending_durable_view() {
       return;
     }
     let lo = self.commit_min.get().max(self.commit_max.get());
     for op in (lo + 1)..=self.op.get() {
-      if self.appending.contains(&op) || self.op_durably_appended(wal, op) {
+      if self.appending.contains(&op) || self.op_durably_appended(storage, op) {
         continue;
       }
       let kind = if self.is_primary() {
@@ -1608,7 +1628,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       } else {
         Pending::AdoptAck(OpNumber::with(op))
       };
-      self.adopt_append(wal, op, kind);
+      self.adopt_append(storage, op, kind);
     }
   }
 
@@ -1618,7 +1638,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// mirroring `append_prepare`, but for the already-installed adopted entry rather than an incoming
   /// `Prepare`. Header is written under the current (new) view, as `on_request` does for a fresh op.
   /// No-op if the op is not held (a committed op the canonical log omitted is peer-repaired instead).
-  fn adopt_append<W: Wal>(&mut self, wal: &mut W, op: u64, kind: Pending) {
+  fn adopt_append<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    op: u64,
+    kind: Pending,
+  ) {
     let Some(entry) = self.log.get(&op).cloned() else {
       return; // not held — `advance_commit`/`request_repair` recovers a committed gap; nothing to ack
     };
@@ -1639,7 +1664,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // never advertised as durably held). The skip is NOT terminal: every `checkpoint_op` advance
     // re-runs the still-unappended tail through [`Self::retry_unappended_adopted_tail`], and applying
     // the adopted committed band keeps those checkpoints firing until the window admits the whole tail.
-    if self.ring_append_would_wrap(wal, op) {
+    if self.ring_append_would_wrap(storage, op) {
       return;
     }
     let header = Header::new(
@@ -1653,7 +1678,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // re-append targets the SAME op a just-truncated old-view write may still hold in flight, and
     // completion reordering must not let the abandoned bytes land over the canonical value after
     // this replica's vote/ack named it.
-    self.submit_or_defer_append(wal, OpNumber::with(op), header, body, kind);
+    self.submit_or_defer_append(storage, OpNumber::with(op), header, body, kind);
     // Append-before-ack: the adopted op is in flight until `on_wal_done`. Both adoption kinds
     // (AdoptVote → own vote, AdoptAck → PrepareOk) defer their cast to completion; tracking the op
     // here keeps the durable predicate uniform so the choke-point gate covers the adoption path too.

@@ -17,8 +17,8 @@ use viewstamp_proto::Instant;
 // the driver's owned per-connection unit (`crate::bridge::Conn`).
 use viewstamp_proto::{
   ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership, Peer,
-  ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock,
-  Wal,
+  ReplicaId, Request, RequestNumber, StateMachine, Storage, StreamCoordinator, StreamTransport,
+  Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -122,8 +122,7 @@ pub(crate) type AcceptorFactory<R> = Rc<dyn Fn() -> TransportConn<R>>;
 /// holds, so dropping the `Conn` is the connection's single complete teardown.
 pub struct CompioStreamDriver<S: StateMachine, R, W, B> {
   coord: StreamCoordinator<S, R>,
-  wal: W,
-  sb: B,
+  storage: Storage<W, B>,
   /// The embedder-provided block-storage lane, the peer of `wal`/`sb` in the node's durable store:
   /// large bodies (state-sync chunks, snapshots) are addressed by content hash there while the
   /// WAL/superblock hold the consensus log and durable root. The lane owns the store; the run loop
@@ -237,11 +236,12 @@ where
   /// while ANY durable state reconstructs the endpoint via `Endpoint::recover`, resuming the
   /// durable view in `Recovering` status and re-verifying the WAL tail through the normal run-loop
   /// pumps (recovery needs no special-casing there). A restart therefore can never silently
-  /// discard the durable view/log — the VSR amnesia hazard. The supplied handles MUST carry no
-  /// in-flight storage ops from a prior endpoint incarnation (the [`viewstamp_proto::OpId`]
-  /// lifetime contract: the id sequence restarts per endpoint, so a stale completion could alias a
-  /// fresh op's id): a real crash satisfies this by construction — in-flight ops die with the
-  /// process — and an embedder that re-opens storage in-process must drain or cancel first. The
+  /// discard the durable view/log — the VSR amnesia hazard. The constructor opens the
+  /// [`Storage`](viewstamp_proto::Storage) session over the pair and keeps it for the driver's
+  /// whole life, so the handles MUST be QUIESCED here — freshly formatted, or freshly opened after
+  /// a process start, where in-flight ops died with the process. Handles carrying a live
+  /// predecessor's un-quiesced writes can only come out of another session, which releases them
+  /// only once it has proven the medium quiet. The
   /// endpoint's recovery nonce is derived fresh per construction (wall-clock-mixed), as recovery
   /// freshness requires.
   ///
@@ -313,8 +313,8 @@ where
     config: Config,
     membership: Membership,
     state_machine: S,
-    mut wal: W,
-    mut sb: B,
+    wal: W,
+    sb: B,
     blocks: BlockLane<S>,
     client: ClientId,
     first_request: u64,
@@ -353,12 +353,17 @@ where
     let listener = TcpListener::bind(bind_addr)
       .await
       .map_err(DriverError::Bind)?;
+    // The session that owns these handles and every physical write fact over them for the rest of
+    // this driver's life: built ONCE, here, over handles a `format` or a process start left
+    // quiesced, and threaded by `&mut` into every call from then on. Its ledgers — the
+    // slot-quiescence fence, the root timeline, the in-flight envelopes — outlive any endpoint
+    // built over it.
+    let mut storage = Storage::new(wal, sb);
     let endpoint = build_endpoint(
       config,
       membership,
       state_machine,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       // The lane's own accounting: what it still holds for a dead predecessor endpoint, if an
       // embedder handed this driver a surviving lane clone; empty on a fresh lane.
       blocks.occupancy(),
@@ -393,8 +398,7 @@ where
     let retired = Retirement::new();
     let driver = Self {
       coord,
-      wal,
-      sb,
+      storage,
       block_lane: blocks,
       listener,
       clock,
@@ -776,11 +780,9 @@ where
     drain_storage(
       || {
         let now = self.clock.now();
-        self
-          .coord
-          .handle_storage_deferred(now, &mut self.wal, &mut self.sb);
+        self.coord.handle_storage_deferred(now, &mut self.storage);
         self.drive_block_lane(now);
-        !self.coord.endpoint().has_inflight_storage()
+        !self.coord.endpoint().has_inflight_storage(&self.storage)
       },
       compio::time::sleep,
     )
@@ -823,9 +825,7 @@ where
   /// advances the endpoint (a checkpoint publishing its durable root), which can install a new
   /// membership.
   fn feed_block_completion(&mut self, now: Instant, done: viewstamp_proto::BlockJobDone<S>) {
-    self
-      .coord
-      .on_block_done(now, &mut self.wal, &mut self.sb, done);
+    self.coord.on_block_done(now, &mut self.storage, done);
     self.rekey_if_needed(now);
   }
 
@@ -839,7 +839,7 @@ where
       BridgeInbound::Bytes { id, bytes } => {
         self
           .coord
-          .handle_conn_data(id, &bytes, false, now, &mut self.wal, &mut self.sb);
+          .handle_conn_data(id, &bytes, false, now, &mut self.storage);
         // An inbound frame can install a new membership; refresh the dial-map immediately so a
         // close/redial that follows this feed (this iteration's `reconcile_closed_conns` /
         // `reconcile_auth_deadlines`, or a `close_conn`) reads the current projection, never a
@@ -953,7 +953,7 @@ where
         );
         self
           .coord
-          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+          .submit_client_request(now, &mut self.storage, request);
         false
       }
       Command::Shutdown { ack } => {
@@ -1033,7 +1033,7 @@ where
     let outcome = job.advance(now, live, fresh, &mut |delta, ack| {
       self
         .coord
-        .propose_membership(now, &mut self.wal, delta, ack)
+        .propose_membership(now, &mut self.storage, delta, ack)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
       self.reconfigure = Some(job);
@@ -1127,7 +1127,7 @@ where
     let removed = self.conns.remove(&id); // drop cancels the task(s) (connect or both halves) + out_tx
     self
       .coord
-      .handle_conn_data(id, &[], true, now, &mut self.wal, &mut self.sb); // reap in coordinator
+      .handle_conn_data(id, &[], true, now, &mut self.storage); // reap in coordinator
     if let Some(Conn {
       redial: Some(redial),
       ..
@@ -1305,7 +1305,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        .submit_client_request(now, &mut self.storage, request);
     }
   }
 
@@ -1349,9 +1349,7 @@ where
     let backlog_cap = self.coord.max_outbound_backlog();
 
     loop {
-      self
-        .coord
-        .handle_storage_deferred(now, &mut self.wal, &mut self.sb);
+      self.coord.handle_storage_deferred(now, &mut self.storage);
       self.rekey_if_needed(now);
       let mut produced = self.drive_block_lane(now);
       let mut to_close: Vec<(ConnId, CloseCause)> = Vec::new();
@@ -1433,7 +1431,7 @@ where
       .poll_timeout()
       .is_none_or(|deadline| deadline <= now)
     {
-      self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+      self.coord.handle_timeout(now, &mut self.storage);
       self.rekey_if_needed(now);
     }
   }

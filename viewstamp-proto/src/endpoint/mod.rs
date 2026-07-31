@@ -8,6 +8,7 @@ use crate::{
   PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status,
   Superblock, SuperblockDone, View, Wal, WalDone,
   block_job::{BlockJobKind, BlockJobOutput, RecoveredCheckpoint, RestorePurpose, WalkPurpose},
+  storage::Storage,
 };
 
 pub(crate) mod block_sync;
@@ -1416,20 +1417,9 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   block_serves_refused: u64,
   /// Outstanding storage submissions awaiting completion.
   pending: BTreeMap<u64, Pending>,
-  /// EVERY in-flight physical WAL append (write-id sequence → op), entered at submit and removed ONLY
-  /// when the write QUIESCES: its completion arrives ([`WalDone::Appended`]/[`WalDone::Cancelled`] —
-  /// an append has no other ending) or a [`Wal::truncate`]/[`Wal::prune`] reports it synchronously
-  /// cancelled. Deliberately NOT generation state: view transitions, nack truncation, and GC clear
-  /// `pending`/`appending` (abandoning the append LOGICALLY) but leave this map intact, because the
-  /// PHYSICAL write is still with the device and its bytes can land at any moment until the backend
-  /// says otherwise. This is the fence's witness set: `submit_or_defer_append` refuses to put a
-  /// second write in flight for any ring slot listed here (same op, or its ring alias
-  /// `op ± k·capacity`), so completion reordering can never let abandoned old bytes land OVER a
-  /// replacement this replica already acked — the durable slot always ends holding the value the
-  /// vote named.
-  wal_writes: BTreeMap<u64, u64>,
   /// Appends held back by the slot-quiescence fence, keyed by op: the full submission (deferred
-  /// action + exact bytes) waiting for the blocking older write in [`Self::wal_writes`] to quiesce.
+  /// action + exact bytes) waiting for the blocking older write in the [`Storage`] session's
+  /// append ledger to quiesce.
   /// Usually one waiter per slot exists (the fence admits one in-flight + one deferred) — but on a
   /// bounded ring TWO waiters per slot CLASS are constructible (ops `K` and `K + capacity` both
   /// deferred behind one blocker, when the local checkpoint leads the quorum floor so `K` is already
@@ -1460,6 +1450,22 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// is in flight at a time; a newer transition supersedes by overwriting this field.
   /// `on_sb_done` runs the action only when the completed `WriteId` matches the stored one.
   pending_sb: Option<(crate::WriteId, PendingSbAction)>,
+  /// A durable checkpoint frontier a PREDECESSOR endpoint's root write established past this
+  /// endpoint's own — the owed catch-up an inherited root landing leaves behind.
+  ///
+  /// Set when the [`Storage`] session settles a root landing whose `checkpoint_op` exceeds
+  /// `self.checkpoint_op` and the id names a dead incarnation (an own root's advance runs through
+  /// its own `on_sb_done` arm instead). The durable pointer now legitimately LEADS the in-memory
+  /// one: the landed envelope and its DAG are durable (the flush gate ordered them before the root
+  /// submit), but this endpoint's SM has not necessarily applied through the frontier, and
+  /// `commit_min >= checkpoint_op` is load-bearing for GC's log trim — so the pointer cannot be
+  /// adopted until the applied frontier reaches it. [`Self::maybe_adopt_inherited_frontier`] runs
+  /// at the settle site and at every commit-advance tail, adopting (and clearing this) as soon as
+  /// `commit_min` catches up — which the cluster guarantees it does, since a checkpoint at the
+  /// frontier proves the cluster committed through it. While set, it is the third excluded window
+  /// of the settled-lockstep assertion in [`Self::handle_storage`], exactly parallel to
+  /// `pending_checkpoint` (an own advance mid-flight) and `sm_reconstruct` (own content owed).
+  inherited_frontier: Option<OpNumber>,
   /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
   /// (their ids never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
   pending_checkpoint: Option<PendingCheckpoint>,
@@ -2156,12 +2162,12 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       block_serves_outstanding: 0,
       block_serves_refused: 0,
       pending: BTreeMap::new(),
-      wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
       wal_pruned: 0,
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
+      inherited_frontier: None,
       // Genesis runs over a store formatted virgin in the same call, so no storage lane over it can
       // hold anything yet: the lane quotas (this and `block_serves_outstanding` above) start empty
       // BY CONSTRUCTION here, where `recover` must be TOLD what a possibly-surviving lane holds.
@@ -2683,11 +2689,11 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// advanced in memory yet. `reconfigure_op` is captured here (where `commit_min` is exactly at it) so
   /// the install-time `MembershipChanged` names the reconfigure op even after `commit_min` advances past
   /// it through the SwapEpoch window.
-  fn stage_epoch_swap(
+  fn stage_epoch_swap<W: Wal, B: Superblock>(
     &mut self,
     reconfigure_op: OpNumber,
     successor: Membership,
-    sb: &mut impl Superblock,
+    storage: &mut Storage<W, B>,
   ) where
     S: StateMachine,
     R: Reconfig,
@@ -2715,7 +2721,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     }
     self.reconfigure_inflight = None;
     self.pending_swap = Some(EpochSwap::new(reconfigure_op, successor));
-    self.maybe_swap_epoch(sb);
+    self.maybe_swap_epoch(storage);
   }
 
   /// Is a committed-but-not-installed epoch swap outstanding — the COMMIT→INSTALL window of a live
@@ -2780,7 +2786,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// durable-view write. This also covers the `start_view_as_new_primary` formation, where `advance_commit`
   /// can re-commit a carried `Reconfigure` op while status is still ViewChange — the swap defers here and
   /// fires once the new view is durable.
-  fn maybe_swap_epoch(&mut self, sb: &mut impl Superblock)
+  fn maybe_swap_epoch<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>)
   where
     S: StateMachine,
     R: Reconfig,
@@ -2823,7 +2829,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       return; // nothing staged
     };
     let (reconfigure_op, successor) = swap.into_parts();
-    self.submit_swap_epoch(reconfigure_op, successor, sb);
+    self.submit_swap_epoch(reconfigure_op, successor, storage);
   }
 
   /// Mint the SwapEpoch durable root carrying `successor` — a v4 root whose scalar epoch is the
@@ -2835,33 +2841,39 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// (`view`/`log_view`/`commit_max`/`checkpoint_op`/`checkpoint_id` + the committed-band headers) is
   /// carried UNCHANGED — a reconfiguration changes ONLY the configuration, never the replicated log.
   ///
-  /// The checkpoint pair is `self.checkpoint_op` + the durable `checkpoint_id`: the install advances
-  /// `self.checkpoint_op` in lockstep with its durable root, so it always equals
-  /// `sb.state().checkpoint_op()` and this root can never rewind the durable checkpoint (structural
-  /// no-rewind).
-  fn submit_swap_epoch(
+  /// The checkpoint pair comes off the session's EFFECTIVE root — both halves from one root value
+  /// on one timeline — so this root can never rewind the durable checkpoint or pair one
+  /// checkpoint's op with another's id, even when an inherited in-flight root (a dead
+  /// incarnation's, across a restart in place) lands between this endpoint's reads (structural
+  /// no-rewind; the session asserts monotonicity at submit).
+  fn submit_swap_epoch<W: Wal, B: Superblock>(
     &mut self,
     reconfigure_op: OpNumber,
     successor: Membership,
-    sb: &mut impl Superblock,
+    storage: &mut Storage<W, B>,
   ) where
     S: StateMachine,
     R: Reconfig,
   {
-    let checkpoint_id = sb.state().checkpoint_id();
+    let (checkpoint_op, checkpoint_id) = storage.effective_checkpoint_pair();
     // The lineage this root carries is the POST-swap ring: the predecessor `config_id` (the current
     // membership, which the successor chains off) shifted onto the front of the current ring — exactly
     // what `install_membership`'s `push_lineage` will build at `on_sb_done`. So a node recovering off this
     // SwapEpoch root restores the same lineage the live install would have, keeping a retained old-epoch
     // laggard's cross-epoch catch-up admissible after the new-epoch donors restart.
     let prior_config_ids = self.lineage_after_push(self.membership.config_id());
+    // `commit >= checkpoint_op` must hold on the root. The effective checkpoint may lead this
+    // endpoint's own `commit_max` while an inherited checkpoint root is still in flight — a
+    // checkpoint at that op proves the cluster committed through it, so lifting the persisted
+    // commit to it states a true fact (the same lift `submit_durable_view` applies).
+    let commit = OpNumber::with(self.commit_max.get().max(checkpoint_op.get()));
     let state = crate::VsrState::try_new_v4(
       self.view,
       self.log_view,
-      self.commit_max,
-      self.checkpoint_op,
+      commit,
+      checkpoint_op,
       checkpoint_id,
-      self.committed_band_headers(self.checkpoint_op),
+      self.committed_band_headers(checkpoint_op),
       successor.epoch(),
       self.membership.epoch(),
       successor.clone(),
@@ -2886,7 +2898,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // legitimately-reconfigured node behind an offline migration for no reason.
     .with_wal_geometry(self.config.checkpoint_ops(), self.wal_capacity);
     let id = self.mint_write_id();
-    sb.submit_write(id, state);
+    storage.submit_root(id, state);
     self.pending_sb = Some((
       id,
       PendingSbAction::SwapEpoch(EpochSwap::new(reconfigure_op, successor)),
@@ -3743,37 +3755,33 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// Whether this replica has ANY storage op (WAL append or superblock write/read) still in flight —
   /// a submitted [`Wal`]/[`Superblock`] op whose completion the driver still owes.
   ///
-  /// `true` iff at least one of the durability-relevant pending sets is non-empty: the outstanding WAL
-  /// appends (`pending`, plus its `appending` append-before-ack gate — a subset of `pending`, ORed for
-  /// explicitness), the in-flight durable-view superblock write (`pending_sb`), the in-flight
-  /// checkpoint write sequence (`pending_checkpoint`, and its deferred-install staging
-  /// `pending_install` — which structurally implies `pending_checkpoint`), and the in-flight
-  /// checkpoint READS this replica issued to serve peers' `RequestSync`s (`sync_serving` — a
-  /// `submit_read_checkpoint` whose completion is still owed). It deliberately covers BOTH writes we
-  /// owe durability for AND the serve-reads we issued, since both are storage completions the driver is
-  /// still holding for this endpoint.
+  /// `true` iff at least one durability-relevant set is non-empty. On the SESSION (the medium's
+  /// facts, whichever endpoint incarnation submitted them): every in-flight physical WAL append,
+  /// root write, and checkpoint-envelope write. On the ENDPOINT (this incarnation's logical
+  /// pendings): the outstanding append actions (`pending`, plus its `appending` append-before-ack
+  /// gate — a subset of `pending`, ORed for explicitness), the in-flight durable-view superblock
+  /// write (`pending_sb`), the in-flight checkpoint write sequence (`pending_checkpoint`, and its
+  /// deferred-install staging `pending_install` — which structurally implies
+  /// `pending_checkpoint`), and the in-flight checkpoint READS this replica issued to serve peers'
+  /// `RequestSync`s (`sync_serving` — a `submit_read_checkpoint` whose completion is still owed).
+  /// It deliberately covers BOTH writes we owe durability for AND the serve-reads we issued, since
+  /// both are storage completions the driver is still holding for this endpoint.
   ///
-  /// A real driver uses this for graceful shutdown (do not tear down the proactor while a write the
-  /// cluster may have acted on is un-acked) and for the restart-in-place drain — and for a rebuild
-  /// over the same live storage handles that drain is load-bearing for SAFETY, exactly as the
-  /// `wal_writes` term below says. The incarnation choke makes a dead instance's completion INERT
-  /// on the correlation plane (it releases no ack and retires no table entry — the
-  /// [`OpId`](crate::OpId) contract), but it cancels no write, so the dead instance's bytes can
-  /// still land. A successor built while this method reads `true` starts without the
-  /// physical-write witnesses those entries carry and cannot defer the conflicting re-appends the
-  /// slot-quiescence fence exists to hold. The
-  /// in-flight RECOVERY reads (`recover`) are deliberately NOT included: they belong to a
-  /// `Recovering`/`RecoveringHead` endpoint that is itself the product of `recover()` (not a quiesce
-  /// target for a shutdown of a participating replica), and they resolve via `handle_storage`.
+  /// Taking the session is what makes the answer TRUE ACROSS REBUILDS: the physical terms live in
+  /// the session's ledgers, which no endpoint replacement can reset — an endpoint rebuilt over a
+  /// live medium reports its predecessors' un-quiesced writes here exactly as its own, so a driver
+  /// draining on this signal can never read quiescence off a reborn-empty witness set. A real
+  /// driver uses it for graceful shutdown (do not tear down the proactor while a write the cluster
+  /// may have acted on is un-acked) and for the restart-in-place drain. The in-flight RECOVERY
+  /// reads (`recover`) are deliberately NOT included: they belong to a
+  /// `Recovering`/`RecoveringHead` endpoint that is itself the product of `recover()` (not a
+  /// quiesce target for a shutdown of a participating replica), and they resolve via
+  /// `handle_storage`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn has_inflight_storage(&self) -> bool {
-    !self.pending.is_empty()
+  pub fn has_inflight_storage<W: Wal, B: Superblock>(&self, storage: &Storage<W, B>) -> bool {
+    storage.has_inflight()
+      || !self.pending.is_empty()
       || !self.appending.is_empty()
-      // Physical writes the backend still owes a completion for — including appends the logical
-      // layer ABANDONED (their `pending` entry cleared by a view transition / truncation): the
-      // OpId-lifetime drain contract requires the driver to hold teardown until these quiesce, or a
-      // recreated endpoint could observe their late effects under recycled correlation ids.
-      || !self.wal_writes.is_empty()
       // Appends parked behind the slot-quiescence fence: not yet with the backend, but durability
       // work this endpoint still owes (each releases and submits when its blocking write quiesces).
       || !self.deferred_appends.is_empty()
@@ -4680,8 +4688,8 @@ impl<S: StateMachine, R> Endpoint<S, R> {
 
   /// This WAL's [`effective_wal_capacity`] under this endpoint's checkpoint interval — see the free
   /// function for the geometry contract.
-  fn effective_wal_capacity<W: Wal>(&self, wal: &W) -> u64 {
-    effective_wal_capacity(wal.capacity(), self.config.checkpoint_ops())
+  fn effective_wal_capacity<W: Wal, B: Superblock>(&self, storage: &Storage<W, B>) -> u64 {
+    effective_wal_capacity(storage.wal().capacity(), self.config.checkpoint_ops())
   }
 
   /// Whether durably appending `op` would physically WRAP an un-pruned ring slot: `op` reuses slot
@@ -4692,8 +4700,12 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// append, owing no vote/ack/fill off an append that never ran — since a deep laggard can be handed a
   /// canonical view-change log or a repair body whose band exceeds its own ring, and appending it would
   /// evict a committed, un-pruned op (the committed-op-loss class the ring-residency oracle checks).
-  fn ring_append_would_wrap<W: Wal>(&self, wal: &W, op: u64) -> bool {
-    op.saturating_sub(self.checkpoint_op.get()) > self.effective_wal_capacity(wal)
+  fn ring_append_would_wrap<W: Wal, B: Superblock>(
+    &self,
+    storage: &Storage<W, B>,
+    op: u64,
+  ) -> bool {
+    op.saturating_sub(self.checkpoint_op.get()) > self.effective_wal_capacity(storage)
   }
 
   /// Whether `a` and `b` occupy the SAME physical WAL slot under `capacity`: the same op, or — on a
@@ -4705,31 +4717,24 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     a == b || (capacity != u64::MAX && a % capacity == b % capacity)
   }
 
-  /// Whether some in-flight physical write ([`Self::wal_writes`]) targets `op`'s ring slot. The
-  /// fence predicate: while true, a new append to `op` must be DEFERRED — append completions may
-  /// reorder, so submitting now could let the OLD bytes land LAST and leave the durable slot holding
-  /// a value this replica's ack/vote never named (the truncate-reuse and ring-wrap flavors of the
-  /// same hazard). The map is pipeline-bounded, so the scan is cheap.
-  fn slot_write_in_flight<W: Wal>(&self, wal: &W, op: u64) -> bool {
-    let capacity = wal.capacity();
-    self
-      .wal_writes
-      .values()
-      .any(|&v| Self::slots_alias(capacity, v, op))
-  }
-
   /// The single WAL-append submission choke: every durable append routes here (the normal-path mint
   /// and backup appends, the interior canonical re-append, the view-change adoption re-appends, the
   /// peer-repair fill, and the fault re-submit), so the slot-quiescence fence cannot be bypassed by
-  /// a new call site. If `op`'s ring slot has an un-quiesced older write, the FULL submission (the
-  /// deferred action `kind` + the exact bytes) parks in [`Self::deferred_appends`] until that
-  /// write's completion proves the slot quiesced ([`Self::release_deferred_append`]); otherwise it
-  /// submits now, entering the write in [`Self::wal_writes`] and its action in `pending`. Callers
-  /// keep their own `appending` bookkeeping (identical for the submitted and deferred shapes, so
-  /// the append-before-ack gate and duplicate-append guards treat a deferred append as in flight).
-  fn submit_or_defer_append<W: Wal>(
+  /// a new call site. The fence itself is the [`Storage`] session's — the verdict of
+  /// [`Storage::submit_append`], the only route to the backend, judged against EVERY in-flight
+  /// write over this medium, whichever endpoint incarnation submitted it — so a new append to a
+  /// slot with an un-quiesced older write cannot be submitted at all: append completions may
+  /// reorder, and submitting would let the OLD bytes land LAST, leaving the durable slot holding a
+  /// value this replica's ack/vote never named (the truncate-reuse, ring-wrap, and
+  /// rebuild-in-place flavors of the same hazard). On `SlotFenced` the FULL submission (the
+  /// deferred action `kind` + the exact bytes, handed back by the verdict) parks in
+  /// [`Self::deferred_appends`] until the blocking write's completion proves the slot quiesced
+  /// ([`Self::release_deferred_append`]); on `Submitted` the action enters `pending`. Callers keep
+  /// their own `appending` bookkeeping (identical for the submitted and deferred shapes, so the
+  /// append-before-ack gate and duplicate-append guards treat a deferred append as in flight).
+  fn submit_or_defer_append<W: Wal, B: Superblock>(
     &mut self,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     op: OpNumber,
     header: Header,
     body: Bytes,
@@ -4740,20 +4745,24 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       op,
       "a deferred action must name the op it appends"
     );
-    if self.slot_write_in_flight(wal, op.get()) {
-      // At most one in-flight write per slot exists (this fence's own guarantee), and a second
-      // deferral for the same op supersedes the first — the newer submission carries the newer
-      // canonical bytes/action for that op (its predecessor was abandoned by the transition that
-      // re-drove it, or is the same fill retried).
-      self
-        .deferred_appends
-        .insert(op.get(), DeferredAppend { kind, header, body });
-      return;
-    }
+    // The id is minted before the verdict is known; a fenced submission discards it. Ids are
+    // correlation-only (never on disk or the wire) and every table keys sparsely, so a skipped
+    // sequence costs nothing.
     let id = self.mint_write_id();
-    wal.submit_append(id, op, header, body);
-    self.wal_writes.insert(id.seq(), op.get());
-    self.pending.insert(id.seq(), kind);
+    match storage.submit_append(id, op, header, body) {
+      crate::storage::AppendSubmission::Submitted => {
+        self.pending.insert(id.seq(), kind);
+      }
+      crate::storage::AppendSubmission::SlotFenced { header, body } => {
+        // At most one in-flight write per slot exists (this fence's own guarantee), and a second
+        // deferral for the same op supersedes the first — the newer submission carries the newer
+        // canonical bytes/action for that op (its predecessor was abandoned by the transition that
+        // re-drove it, or is the same fill retried).
+        self
+          .deferred_appends
+          .insert(op.get(), DeferredAppend { kind, header, body });
+      }
+    }
   }
 
   /// Submit a deferred append whose blocking write (to `quiesced`'s ring slot) has just quiesced.
@@ -4764,8 +4773,12 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// whose fresh write then blocks the higher one via the re-check, so the LIVE (highest) op is the
   /// one that lands LAST in the slot. The re-check also guards the otherwise-impossible second
   /// in-flight blocker.
-  fn release_deferred_append<W: Wal>(&mut self, wal: &mut W, quiesced: u64) {
-    let capacity = wal.capacity();
+  fn release_deferred_append<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    quiesced: u64,
+  ) {
+    let capacity = storage.wal().capacity();
     let Some(op) = self
       .deferred_appends
       .keys()
@@ -4774,56 +4787,62 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     else {
       return;
     };
-    if self.slot_write_in_flight(wal, op) {
-      return;
-    }
     let d = self
       .deferred_appends
       .remove(&op)
       .expect("the found key is present");
     let id = self.mint_write_id();
-    wal.submit_append(id, OpNumber::with(op), d.header, d.body);
-    self.wal_writes.insert(id.seq(), op);
-    self.pending.insert(id.seq(), d.kind);
+    match storage.submit_append(id, OpNumber::with(op), d.header, d.body) {
+      crate::storage::AppendSubmission::Submitted => {
+        self.pending.insert(id.seq(), d.kind);
+      }
+      crate::storage::AppendSubmission::SlotFenced { header, body } => {
+        // The otherwise-impossible second in-flight blocker (or, on a bounded ring, the released
+        // waiter's own aliased sibling submitted first): the waiter goes back to waiting on the
+        // fence it just hit.
+        self.deferred_appends.insert(
+          op,
+          DeferredAppend {
+            kind: d.kind,
+            header,
+            body,
+          },
+        );
+      }
+    }
   }
 
   /// Retire the appends a [`Wal::truncate`]/[`Wal::prune`] reports SYNCHRONOUSLY cancelled: the
   /// backend proves these writes will now neither land nor complete, so their quiescence is
-  /// immediate — clear their write entries (and any still-pending action: a synchronously-cancelled
-  /// append belongs to an op the endpoint just RELEASED, so its action owes nothing) and release any
-  /// deferred append their slots were blocking. Keeping this in the same call that truncated/pruned
-  /// means the common backend (one that can discard its own queue synchronously) never even opens a
-  /// deferral window — behavior is byte-identical to the pre-fence code there.
-  ///
-  /// A synchronously-cancelled id is COMPLETION-EQUIVALENT data, so the incarnation rule the
-  /// completion routers enforce applies here too: after a restart in place the backend may still
-  /// hold — and now cancel — writes a PREVIOUS endpoint submitted, and sequences restart at 1 in
-  /// every incarnation, so keying the tables by a foreign id's sequence could retire a fence
-  /// witness belonging to a LIVE write of this endpoint. A foreign id is refused (and counted)
-  /// before any table is touched; the unknown-id assertion below therefore only ever fires for an
-  /// id this endpoint itself minted — a real backend-contract violation.
-  fn absorb_wal_cancellations<W: Wal>(
+  /// immediate. The [`Storage`] session already settled each one in the medium ledger — foreign or
+  /// own, keyed by the full id, so a dead incarnation's cancellation can never retire a fence
+  /// witness belonging to a LIVE write of this endpoint even though sequences restart at 1 — and
+  /// each freed slot releases any deferred append it was blocking, whichever incarnation's write
+  /// held it. What is judged per incarnation here is only the CORRELATION half: a
+  /// synchronously-cancelled id is completion-equivalent data, so a foreign id is refused (and
+  /// counted) before any table is touched, while an own id also drops its still-pending action (a
+  /// synchronously-cancelled append belongs to an op the endpoint just RELEASED, so its action
+  /// owes nothing). Keeping this in the same call that truncated/pruned means the common backend
+  /// (one that can discard its own queue synchronously) never even opens a deferral window.
+  fn absorb_wal_cancellations<W: Wal, B: Superblock>(
     &mut self,
-    wal: &mut W,
-    cancelled: std::vec::Vec<crate::WriteId>,
+    storage: &mut Storage<W, B>,
+    cancelled: std::vec::Vec<crate::storage::SettledCancellation>,
   ) {
-    for id in cancelled {
-      if self.is_foreign_completion(id.op_id()) {
-        continue;
-      }
-      let Some(op) = self.wal_writes.remove(&id.seq()) else {
-        debug_assert!(false, "a backend cancelled an unknown append id {id:?}");
-        continue;
-      };
-      if let Some(p) = self.pending.remove(&id.seq()) {
-        // The action dies with the write — but the `appending` mark may now be OWNED by a deferred
-        // replacement for the same op (deferral keeps the mark), so only clear it when no waiter
-        // holds the slot.
+    for c in cancelled {
+      if !self.is_foreign_completion(c.id.op_id())
+        && let Some(p) = self.pending.remove(&c.id.seq())
+      {
+        // The action dies with the write — but the `appending` mark may now be OWNED by a
+        // deferred replacement for the same op (deferral keeps the mark), so only clear it when
+        // no waiter holds the slot.
         if !self.deferred_appends.contains_key(&p.op().get()) {
           self.appending.remove(&p.op().get());
         }
       }
-      self.release_deferred_append(wal, op);
+      if let Some(op) = c.freed_slot {
+        self.release_deferred_append(storage, op);
+      }
     }
   }
 
@@ -5572,12 +5591,11 @@ where
   pub fn handle_message<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     msg: Message,
   ) {
-    self.handle_message_inner(now, wal, sb, from, msg);
+    self.handle_message_inner(now, storage, from, msg);
     #[cfg(debug_assertions)]
     self.assert_invariants();
   }
@@ -5650,8 +5668,7 @@ where
   fn handle_message_inner<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     msg: Message,
   ) {
@@ -5755,8 +5772,8 @@ where
     // member is tallied; it is NOT on the `emit` egress path (zero emission → byte-identity safe).
     if self.status.is_recovering_head() {
       match msg {
-        Message::StartView(m) => self.on_start_view(now, wal, sb, m),
-        Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
+        Message::StartView(m) => self.on_start_view(now, storage, m),
+        Message::RecoveryResponse(m) => self.on_recovery_response(now, storage, m),
         Message::Recovery(m) => {
           // Tally a co-recovering OTHER VOTER (only another voter counts toward the voting-quorum
           // evidence G2), with ZERO emission. `sender_matches` already bound `from` to `m.replica()`
@@ -5783,25 +5800,25 @@ where
       return;
     }
     match msg {
-      Message::Request(r) => self.on_request(now, wal, from, r),
-      Message::Prepare(p) => self.on_prepare(now, wal, sb, p),
-      Message::PrepareBatch(m) => self.on_prepare_batch(now, wal, sb, m),
-      Message::PrepareOk(ok) => self.on_prepare_ok(now, sb, ok),
-      Message::Commit(c) => self.on_commit(now, sb, c),
-      Message::StartViewChange(m) => self.on_start_view_change(now, sb, m),
-      Message::DoViewChange(m) => self.on_do_view_change(now, wal, sb, m),
-      Message::StartView(m) => self.on_start_view(now, wal, sb, m),
+      Message::Request(r) => self.on_request(now, storage, from, r),
+      Message::Prepare(p) => self.on_prepare(now, storage, p),
+      Message::PrepareBatch(m) => self.on_prepare_batch(now, storage, m),
+      Message::PrepareOk(ok) => self.on_prepare_ok(now, storage, ok),
+      Message::Commit(c) => self.on_commit(now, storage, c),
+      Message::StartViewChange(m) => self.on_start_view_change(now, storage, m),
+      Message::DoViewChange(m) => self.on_do_view_change(now, storage, m),
+      Message::StartView(m) => self.on_start_view(now, storage, m),
       Message::GetView(m) => self.on_get_view(now, m),
       Message::RequestPrepare(m) => self.on_request_prepare(now, from, m),
       Message::RequestPrepareRange(m) => self.on_request_prepare_range(now, from, m),
       Message::Recovery(m) => self.on_recovery(now, m),
-      Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
+      Message::RecoveryResponse(m) => self.on_recovery_response(now, storage, m),
       // State-sync: a peer's sync solicitation is answered from our durable checkpoint
       // (`on_request_sync`); a sync response is verified, its SM checkpoint DAG fetched, then applied
       // (`on_sync_checkpoint`).
-      Message::RequestSync(m) => self.on_request_sync(now, sb, from, m),
+      Message::RequestSync(m) => self.on_request_sync(now, storage, from, m),
       Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, from, m),
-      Message::RepairBatch(m) => self.on_repair_batch(now, wal, sb, m),
+      Message::RepairBatch(m) => self.on_repair_batch(now, storage, m),
       // A learner's NON-VOTING progress report: record the durable frontier in `peer_progress` (touches
       // no quorum/vote state). It is a liveness HINT for a later `propose_membership(PromoteLearner)`.
       Message::LearnerStatus(m) => self.on_learner_status(m),
@@ -5828,7 +5845,7 @@ where
       Message::BlockResponse(m) => self.on_block_response(now, from, m),
       // The negative repair answer: count the sender's durable LACK of a repair-or-truncate candidate op
       // toward the nack quorum that truncates the uncommitted tail (a new-primary-only tally).
-      Message::Nack(m) => self.on_nack(wal, from, m),
+      Message::Nack(m) => self.on_nack(storage, from, m),
     }
   }
 
@@ -6066,7 +6083,11 @@ where
   /// cannot exceed `op_head` (an op above the head is not yet held, so cannot be applied), so it SUBSUMES
   /// the `durable_op` tail-gap cap the `on_learner_status` backstop also applies. `durable_op` stays
   /// `wal.op_head()` (the durable WAL head) for that backstop.
-  fn learner_status_timeouts<W: Wal>(&mut self, now: Instant, wal: &mut W) {
+  fn learner_status_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // Only a non-voting learner reports; a voter participates directly. (The call site already gates on
     // Normal; this gates on learner — together they match `serviceable_now(LearnerStatus)`.)
     if !self.is_learner() {
@@ -6086,7 +6107,7 @@ where
     // The contiguous applied frontier (hole-free, durably recoverable) — the honest catch-up metric the
     // promote gate needs; see the rationale on this fn. NOT the durable `commit_max`.
     let durable_commit_min = self.commit();
-    let durable_op = wal.op_head();
+    let durable_op = storage.wal().op_head();
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(self.membership.primary(self.view))),
       Message::LearnerStatus(crate::LearnerStatus::new(
@@ -6101,7 +6122,11 @@ where
   }
 
   /// Fires any timers due at `now`, dispatching by status/role.
-  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+  pub fn handle_timeout<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // BOUNDED QUARANTINE PROBE — checked FIRST, before the status dispatch, on a wall-clock deadline
     // INDEPENDENT of `sync_solicit` (which a quarantined higher-epoch heartbeat keeps re-soliciting, so a
     // solicit-gated probe would never expire under sustained heartbeats). On disarm the speculative
@@ -6109,11 +6134,11 @@ where
     // recovery peer-fetch and escalates to the next view change (resuming the old-epoch view change it was
     // driving); a Normal or ViewChange node just drops the disarmed crossing and keeps its posture.
     if self.advance_quarantine_probe(now) && self.status.is_recovering() {
-      self.retire_recover_and_escalate(now, sb);
+      self.retire_recover_and_escalate(now, storage);
     }
     match self.status {
       Status::Normal if self.is_primary() => {
-        self.primary_timeouts(now, sb);
+        self.primary_timeouts(now, storage);
         // Pay down a SwapEpoch checkpoint debt on the heartbeat tick. A new-epoch primary that forced its
         // post-swap checkpoint and hit a TRANSIENT block-store flush fault left `config_install_op >
         // checkpoint_op` owed; while QUIESCENT (no client traffic) no commit-advance tail re-forces it, and
@@ -6122,7 +6147,11 @@ where
         // re-forces the owed checkpoint and the successor-serve gate opens, with no client commit or restart
         // needed. Self-gating (no debt owed / mid-transition / a write in flight) makes this a no-op
         // otherwise, so the steady-state heartbeat is unchanged.
-        self.maybe_pay_checkpoint_debt(now, sb);
+        // Adopt an owed INHERITED checkpoint frontier on the same heartbeat cadence: a quiescent
+        // replica has no commit-advance tail to re-drive the adoption, and the settled-lockstep
+        // assertion holds its excluded window open until this clears it.
+        self.maybe_adopt_inherited_frontier();
+        self.maybe_pay_checkpoint_debt(now, storage);
         // Re-attempt a due ORDINARY checkpoint a prior commit-tail tried but whose block-store flush
         // faulted: a backup re-fires the cadence off the primary's Commit heartbeats, but a QUIESCENT
         // primary has no commit-advance tail to re-drive `maybe_checkpoint`, so without this a transient
@@ -6140,7 +6169,7 @@ where
           self.arm_primary_idle(now);
         }
         if self.timers.primary_idle.is_some_and(|d| d <= now) {
-          self.on_primary_idle(now, sb);
+          self.on_primary_idle(now, storage);
           self.arm_primary_idle(now);
         }
         // Once this backup has PROPOSED a view change off
@@ -6163,12 +6192,12 @@ where
           self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
         }
       }
-      Status::ViewChange => self.view_change_timeouts(now, sb),
+      Status::ViewChange => self.view_change_timeouts(now, storage),
       // Recovering re-submits any still-outstanding/faulty reads on its timer (termination under a
       // dropped completion / slow-clearing transient). RecoveringHead re-broadcasts its Recovery
       // solicitation until a peer hands it the canonical head.
-      Status::Recovering => self.recover_timeouts(now, wal, sb),
-      Status::RecoveringHead => self.recover_head_timeouts(now, sb),
+      Status::Recovering => self.recover_timeouts(now, storage),
+      Status::RecoveringHead => self.recover_head_timeouts(now, storage),
       // A Retired (removed) replica fires NO timer — it is no longer a cluster member.
       Status::Retired => {}
     }
@@ -6183,7 +6212,7 @@ where
       self.sync_timeouts(now);
       // Learner progress report likewise runs only in Normal, and only for a non-voting learner — it
       // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
-      self.learner_status_timeouts(now, wal);
+      self.learner_status_timeouts(now, storage);
     }
     // No-orphan-due invariant: after dispatch, NO serviceable timer may remain armed-and-due
     // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so
@@ -6214,33 +6243,46 @@ where
   /// Block work is NOT drained here: the endpoint holds no store, so the block jobs it issues are
   /// taken by [`Self::poll_block_job`] and answered through [`Self::on_block_done`] on whatever
   /// execution context the driver gives its storage lane.
-  pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    while let Some(done) = wal.poll() {
-      self.on_wal_done(now, wal, sb, done);
+  pub fn handle_storage<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
+    while let Some(polled) = storage.poll_wal() {
+      self.on_wal_done(now, storage, polled);
     }
-    while let Some(done) = sb.poll() {
-      self.on_sb_done(now, wal, sb, done);
+    while let Some(polled) = storage.poll_sb() {
+      self.on_sb_done(now, storage, polled);
     }
     // Re-check the (status × sub-state-flag) coupling at every storage-drain exit (see
     // `assert_invariants`) — the async superblock/WAL completions are where the flag transitions land.
     #[cfg(debug_assertions)]
     self.assert_invariants();
-    // The no-rewind invariant as a single typed assertion rather than N per-writer floors: when the
-    // checkpoint frontier is SETTLED (no in-flight checkpoint root, no owed SM-content reconstruction), the
-    // in-memory `self.checkpoint_op` EQUALS the durable `sb.state().checkpoint_op()`. The state-sync install
-    // advances the pointer in lockstep with its durable root, so the durable pointer never leads the
-    // in-memory one — which is why no durable-root writer can rewind the durable checkpoint (each reads
-    // `self.checkpoint_op == durable`). Excluded windows: a checkpoint root in flight (both sit at the OLD
-    // value until it lands); an owed reconstruction (`self.checkpoint_op` is already M while the SM catches
-    // up, still consistent with the durable root that names M).
+    // The checkpoint-lockstep invariant as a single typed assertion rather than N per-writer
+    // floors: when the checkpoint frontier is SETTLED, the in-memory `self.checkpoint_op` EQUALS
+    // the durable `sb.state().checkpoint_op()`. No-rewind itself no longer rests on this equality —
+    // every durable-root writer sources its checkpoint pair from the session's effective root, and
+    // the session asserts monotonicity at submit — so this is the lockstep's OWN witness: any path
+    // that advances one side without the other (or without recording the owed catch-up that
+    // explains the lead) trips here rather than surfacing as a divergent pointer three views later.
+    // Excluded windows, each a TRACKED owed catch-up: an own checkpoint mid-flight
+    // (`pending_checkpoint` — both sides sit at the OLD value until its root lands); an owed
+    // SM-content reconstruction (`sm_reconstruct` — `self.checkpoint_op` is already M while the SM
+    // catches up, still consistent with the durable root that names M); and an owed INHERITED
+    // frontier (`inherited_frontier` — a dead incarnation's landed root advanced the durable
+    // pointer past this endpoint's own across a restart in place, and the pointer is adopted the
+    // moment `commit_min` reaches it, `maybe_adopt_inherited_frontier`).
     #[cfg(debug_assertions)]
-    if self.pending_checkpoint.is_none() && self.sm_reconstruct.is_none() {
+    if self.pending_checkpoint.is_none()
+      && self.sm_reconstruct.is_none()
+      && self.inherited_frontier.is_none()
+    {
       debug_assert_eq!(
         self.checkpoint_op,
-        sb.state().checkpoint_op(),
+        storage.sb().state().checkpoint_op(),
         "settled in-memory checkpoint_op {} != durable {}",
         self.checkpoint_op.get(),
-        sb.state().checkpoint_op().get(),
+        storage.sb().state().checkpoint_op().get(),
       );
     }
   }
@@ -6271,8 +6313,7 @@ where
   pub fn on_block_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     done: BlockJobDone<S>,
   ) {
     if self.is_foreign_completion(done.id.op_id()) {
@@ -6313,8 +6354,10 @@ where
         sm_root,
         sessions_root,
         flush,
-      } => self.on_checkpoint_materialized(done.id, sb, sm_root, sessions_root, flush),
-      BlockJobOutput::Flushed(flush) => self.on_checkpoint_blocks_flushed(now, done.id, sb, flush),
+      } => self.on_checkpoint_materialized(done.id, storage, sm_root, sessions_root, flush),
+      BlockJobOutput::Flushed(flush) => {
+        self.on_checkpoint_blocks_flushed(now, done.id, storage, flush)
+      }
       // The sweep reports nothing: retention is the store's obligation, and the roots it was handed
       // were already durable when the job was issued.
       BlockJobOutput::Gced => {}
@@ -6328,7 +6371,7 @@ where
       // cold-start probe that owns no transfer) drains the slot too: a retained pin must never outlive
       // the walk it was waiting on.
       BlockJobOutput::Walked(walked) => {
-        self.on_walked(now, wal, done.id, walked);
+        self.on_walked(now, storage, done.id, walked);
         self.redeliver_deferred_pin(now);
       }
       BlockJobOutput::Restored { purpose, result } => match purpose {
@@ -6339,7 +6382,7 @@ where
             self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
             return;
           }
-          self.on_sm_restored(now, wal, sb, result);
+          self.on_sm_restored(now, storage, result);
         }
         // This replica's OWN durable checkpoint, read back at cold start. The recovery bookkeeping
         // carries the token the same way; a superseded reconstruct installs nothing.
@@ -6348,7 +6391,7 @@ where
             self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
             return;
           }
-          self.on_recovered_checkpoint_restored(now, sb, checkpoint, result);
+          self.on_recovered_checkpoint_restored(now, storage, checkpoint, result);
         }
       },
     }

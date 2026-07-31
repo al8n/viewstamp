@@ -1,5 +1,5 @@
 //! The super-state-machine: the consensus [`Endpoint`] composed with per-peer conns + the router.
-//! Storage stays external (the third orthogonal axis) — `handle_*` take `&mut W, &mut B`.
+//! Storage stays external (the third orthogonal axis) — `handle_*` take `&mut Storage<W, B>`.
 
 #[cfg(not(feature = "std"))]
 use std::vec::Vec;
@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use crate::{
   AcceptReducedFaultTolerance, BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber,
   Outgoing, Peer, Recipient, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
-  endpoint::ProposeMembershipError, message::Request,
+  endpoint::ProposeMembershipError, message::Request, storage::Storage,
 };
 
 use super::{
@@ -96,14 +96,14 @@ where
   ///
   /// Delegates directly to [`Endpoint::propose_membership`]. The coordinator owns `&mut self.endpoint`
   /// so the call is sequenced after any in-progress pump — no concurrent borrow is possible.
-  pub fn propose_membership<W: Wal>(
+  pub fn propose_membership<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     delta: SingleVoterDelta,
     ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
-    self.endpoint.propose_membership(now, wal, delta, ack)
+    self.endpoint.propose_membership(now, storage, delta, ack)
   }
 
   /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the
@@ -146,8 +146,7 @@ where
     bytes: &[u8],
     eof: bool,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
     // Feed the driver read in bounded chunks, decoding and draining between each, so the transport's
     // per-conn intake memory (record staging, the frame decoder's complete-frame queue) stays
@@ -171,7 +170,7 @@ where
         let _ = conn.poll_decoded(&mut decoded);
       }
       for (from, msg) in decoded {
-        self.deliver_inbound(now, wal, sb, from, msg);
+        self.deliver_inbound(now, storage, from, msg);
       }
       // Finalize a peer-finished conn BEFORE pumping the output its final frames produced. A final
       // chunk can carry a complete request AND EOF; the endpoint's response to that request is now in
@@ -279,8 +278,7 @@ where
   pub fn submit_client_request<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     request: Request,
   ) {
     if request.body().len() > super::frame::max_request_body_len() {
@@ -292,8 +290,7 @@ where
     };
     self.endpoint.handle_message(
       now,
-      wal,
-      sb,
+      storage,
       Peer::Client(request.client()),
       Message::Request(request.clone()),
     );
@@ -318,8 +315,7 @@ where
   fn deliver_inbound<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     msg: Message,
   ) {
@@ -328,12 +324,16 @@ where
     {
       return;
     }
-    self.endpoint.handle_message(now, wal, sb, from, msg);
+    self.endpoint.handle_message(now, storage, from, msg);
   }
 
   /// Drives timers, then pumps.
-  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    self.endpoint.handle_timeout(now, wal, sb);
+  pub fn handle_timeout<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
+    self.endpoint.handle_timeout(now, storage);
     // A timeout-driven advance may have installed a new membership; reconcile routing against it
     // BEFORE the pump, so no current-config output rides a stale slot table.
     self.reconcile_routing();
@@ -351,17 +351,16 @@ where
   fn drain_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     blocks: &mut dyn BlockStore,
   ) {
     loop {
-      self.endpoint.handle_storage(now, wal, sb);
+      self.endpoint.handle_storage(now, storage);
       let Some(job) = self.endpoint.poll_block_job() else {
         break;
       };
       let done = crate::execute_block_job(&mut self.block_lane, job, blocks);
-      self.endpoint.on_block_done(now, wal, sb, done);
+      self.endpoint.on_block_done(now, storage, done);
     }
   }
 
@@ -369,11 +368,10 @@ where
   pub fn handle_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     blocks: &mut dyn BlockStore,
   ) {
-    self.drain_storage(now, wal, sb, blocks);
+    self.drain_storage(now, storage, blocks);
     self.settle();
   }
 
@@ -389,10 +387,9 @@ where
   pub fn handle_storage_deferred<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
-    self.endpoint.handle_storage(now, wal, sb);
+    self.endpoint.handle_storage(now, storage);
     self.settle();
   }
 
@@ -409,11 +406,10 @@ where
   pub fn on_block_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     done: crate::BlockJobDone<S>,
   ) {
-    self.endpoint.on_block_done(now, wal, sb, done);
+    self.endpoint.on_block_done(now, storage, done);
     self.settle();
   }
 
@@ -618,12 +614,11 @@ where
   pub(crate) fn inject_message_for_test<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     from: Peer,
     msg: Message,
   ) {
-    self.deliver_inbound(now, wal, sb, from, msg);
+    self.deliver_inbound(now, storage, from, msg);
     self.pump();
   }
 }

@@ -46,7 +46,7 @@ fn single_change_backup() -> Endpoint<CountSm, SingleChange> {
 #[test]
 fn propose_membership_on_the_primary_mints_a_reconfigure_op_and_latches_inflight() {
   let mut e = single_change_primary();
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
   // The successor the delta produces — the SAME membership `propose_membership` derives via
@@ -61,7 +61,7 @@ fn propose_membership_on_the_primary_mints_a_reconfigure_op_and_latches_inflight
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None,
     )
@@ -110,11 +110,11 @@ fn propose_membership_on_the_primary_mints_a_reconfigure_op_and_latches_inflight
 #[test]
 fn propose_membership_on_a_backup_is_rejected_not_primary() {
   let mut e = single_change_backup();
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None
     ),
@@ -129,11 +129,11 @@ fn propose_membership_while_not_normal_is_rejected_not_normal() {
   let mut e = single_change_primary();
   // A primary mid-recovery is not Normal — it must not mint a reconfiguration op.
   e.status = Status::Recovering;
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None
     ),
@@ -146,13 +146,13 @@ fn propose_membership_while_not_normal_is_rejected_not_normal() {
 #[test]
 fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
   let mut e = single_change_primary();
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None,
     )
@@ -162,7 +162,7 @@ fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
       None
     ),
@@ -184,11 +184,11 @@ fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
 #[test]
 fn an_invalid_delta_is_rejected_with_the_underlying_membership_error() {
   let mut e = single_change_primary();
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   // Demoting a voter that is not a member is structurally invalid — surfaced as `Invalid`.
   match e.propose_membership(
     Instant::ZERO,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::DemoteVoter(MemberId::new(99)),
     None,
   ) {
@@ -244,14 +244,13 @@ fn reconfigure_ack_at(
 /// dispatched by a LATER `handle_storage` — so on return the epoch is NOT yet swapped (the fence).
 fn proposed_and_committed_swap() -> (
   Endpoint<CountSm, SingleChange>,
-  TestWal,
-  TestSb,
+  Storage<TestWal, TestSb>,
   OpNumber,
   Membership,
   ReconfigurePayload,
 ) {
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -261,26 +260,26 @@ fn proposed_and_committed_swap() -> (
     .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None,
     )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
   // The primary's own WAL append lands → its own vote is recorded (1 of 3).
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   // One backup ack reaches the 2-of-3 commit quorum → the op commits and stages SwapEpoch.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
-  (e, wal, sb, op, successor, payload)
+  (e, storage, op, successor, payload)
 }
 
 #[test]
@@ -304,7 +303,7 @@ fn at_commit_the_swap_is_staged_but_the_epoch_is_not_yet_swapped() {
   // The DURABLE-EPOCH-BEFORE-PARTICIPATE FENCE: at commit the node recognizes the Reconfigure op,
   // clears the in-flight latch, and STAGES a SwapEpoch root — but does NOT advance its epoch /
   // voter-set in memory. The membership stays the OLD one until the root is durable.
-  let (e, _wal, _sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let (e, _storage, op, _successor, _payload) = proposed_and_committed_swap();
 
   assert_eq!(
     e.commit(),
@@ -360,8 +359,7 @@ fn single_change_primary_of(n: u8) -> Endpoint<CountSm, SingleChange> {
 /// and a superfluous token on an f-preserving shrink is ignored.
 fn propose_shrink_with_own_vote(
   e: &mut Endpoint<CountSm, SingleChange>,
-  wal: &mut TestWal,
-  sb: &mut TestSb,
+  storage: &mut Storage<TestWal, TestSb>,
   blocks: &mut crate::block_store::InMemoryBlockStore,
   delta: SingleVoterDelta,
 ) -> (OpNumber, ReconfigurePayload) {
@@ -373,21 +371,20 @@ fn propose_shrink_with_own_vote(
   let op = e
     .propose_membership(
       Instant::ZERO,
-      wal,
+      storage,
       delta,
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the shrink op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.storage_step(Instant::ZERO, wal, sb, blocks); // own append lands → own vote
+  e.storage_step(Instant::ZERO, storage, blocks); // own append lands → own vote
   (op, payload)
 }
 
 /// Deliver backup `slot`'s content-addressed `PrepareOk` for the shrink op.
 fn deliver_shrink_ack(
   e: &mut Endpoint<CountSm, SingleChange>,
-  wal: &mut TestWal,
-  sb: &mut TestSb,
+  storage: &mut Storage<TestWal, TestSb>,
   _blocks: &mut crate::block_store::InMemoryBlockStore,
   op: OpNumber,
   payload: &ReconfigurePayload,
@@ -395,8 +392,7 @@ fn deliver_shrink_ack(
 ) {
   e.handle_message(
     Instant::ZERO,
-    wal,
-    sb,
+    storage,
     Peer::Replica(ReplicaId::new(slot)),
     reconfigure_ack(op.get(), payload, slot),
   );
@@ -442,21 +438,21 @@ fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() 
   // is implied and adds no wait, even when the quorum includes the DEMOTEE's own ack and one retained
   // voter never acked.
   let mut e = single_change_primary_of(4);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let (op, payload) = propose_shrink_with_own_vote(
     &mut e,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     &mut blocks,
     SingleVoterDelta::DemoteVoter(MemberId::new(3)),
   );
 
   // Own vote + slot 1 + the DEMOTEE slot 3 = a predecessor quorum whose retained subset {0,1} is
   // already a successor majority: commits with NO ack from slot 2.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 3);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 3);
   assert_shrink_held(&e, op); // two acks: not even a predecessor quorum yet.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 1);
   assert_shrink_committed(&e, op);
 }
 
@@ -466,23 +462,23 @@ fn a_five_to_four_shrink_needs_a_successor_quorum_beyond_the_predecessor_one() {
   // ack holds only TWO retained voters — below the successor quorum (3-of-4) — so the demote waits
   // for a third retained voter even though the uniform threshold was already met.
   let mut e = single_change_primary_of(5);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let (op, payload) = propose_shrink_with_own_vote(
     &mut e,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     &mut blocks,
     SingleVoterDelta::DemoteVoter(MemberId::new(4)),
   );
 
   // Own vote + slot 1 + the demotee slot 4 = 3-of-5 base quorum, retained {0,1} = 2 < 3: held.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 4);
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 4);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 1);
   assert_shrink_held(&e, op);
 
   // A third RETAINED voter's ack completes the successor quorum {0,1,2}: commits.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 2);
   assert_shrink_committed(&e, op);
 }
 
@@ -494,22 +490,22 @@ fn a_three_to_two_demote_holds_until_both_successor_voters_ack() {
   // primary's own vote plus the DEMOTEE's ack form a predecessor quorum (2-of-3), but no successor
   // majority has processed the demote: held. It commits the moment retained voter 1 acks.
   let mut e = single_change_primary_of(3);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
   let (op, payload) = propose_shrink_with_own_vote(
     &mut e,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     &mut blocks,
     SingleVoterDelta::DemoteVoter(MemberId::new(2)),
   );
 
   // Own vote + the demotee's ack = a predecessor quorum WITHOUT any successor majority: held.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 2);
   assert_shrink_held(&e, op);
 
   // Retained voter 1's ack completes the successor quorum {0,1}: the demote commits.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  deliver_shrink_ack(&mut e, &mut storage, &mut blocks, op, &payload, 1);
   assert_shrink_committed(&e, op);
   assert_eq!(
     e.membership.replica_count(),
@@ -525,10 +521,10 @@ fn a_three_to_two_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() 
   // mints once the caller names the acceptance.
   let delta = SingleVoterDelta::DemoteVoter(MemberId::new(2));
   let mut e = single_change_primary_of(3);
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let head = e.op();
   assert_eq!(
-    e.propose_membership(Instant::ZERO, &mut wal, delta.clone(), None),
+    e.propose_membership(Instant::ZERO, &mut storage, delta.clone(), None),
     Err(ProposeMembershipError::ReducedFaultToleranceUnacknowledged { from: 1, to: 0 }),
     "an f-reducing {} is refused without the acknowledgement",
     delta.as_str(),
@@ -539,7 +535,7 @@ fn a_three_to_two_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() 
   let op = e
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       delta,
       Some(crate::AcceptReducedFaultTolerance),
     )
@@ -561,11 +557,11 @@ fn a_five_to_four_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() 
   // 5 voters tolerate two crashes (f = 2); 4 tolerate one (f = 1): EVERY voter-count decrement from
   // an odd count is f-reducing, not just the acute 3 → 2 — and the refusal names the actual pair.
   let mut e = single_change_primary_of(5);
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(4)),
       None,
     ),
@@ -574,7 +570,7 @@ fn a_five_to_four_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() 
   );
   e.propose_membership(
     Instant::ZERO,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::DemoteVoter(MemberId::new(4)),
     Some(crate::AcceptReducedFaultTolerance),
   )
@@ -586,10 +582,10 @@ fn an_even_to_odd_shrink_proposal_is_ungated() {
   // 4 → 3 keeps f = 1: the gate guards crash tolerance, not shrinking per se, so a bare even-to-odd
   // demote mints.
   let mut e = single_change_primary_of(4);
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   e.propose_membership(
     Instant::ZERO,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::DemoteVoter(MemberId::new(3)),
     None,
   )
@@ -598,10 +594,10 @@ fn an_even_to_odd_shrink_proposal_is_ungated() {
   // A superfluous acknowledgement on a non-reducing delta is accepted and ignored, so a driver may
   // thread an operator's token through unconditionally.
   let mut e = single_change_primary_of(3);
-  let mut wal = TestWal::default();
+  let _wal = TestWal::default();
   e.propose_membership(
     Instant::ZERO,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::AddLearner(MemberId::new(9)),
     Some(crate::AcceptReducedFaultTolerance),
   )
@@ -614,11 +610,11 @@ fn structural_validation_precedes_the_reduced_tolerance_gate() {
   // `Invalid` — never the acknowledgement demand. The sole-voter demote refuses as
   // `WouldRemoveLastVoter` even though bare…
   let mut e = single_change_primary_of(1);
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(0)),
       None
     ),
@@ -630,11 +626,11 @@ fn structural_validation_precedes_the_reduced_tolerance_gate() {
 
   // …and an unknown member on an odd-sized cluster surfaces `UnknownMember`, not the gate.
   let mut e = single_change_primary_of(3);
-  let mut wal = TestWal::default();
+  let _wal = TestWal::default();
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(99)),
       None,
     ),
@@ -653,19 +649,21 @@ fn the_swap_epoch_root_durably_records_the_reconfigure_op_as_committed() {
   // durably proves the reconfigure op committed. On the PRIMARY commit path `commit_max` is raised
   // only AFTER the `try_commit` loop, but the swap stages DURING the loop — so the root's `commit`
   // must be lifted to cover the just-committed op at stage time.
-  let (_e, _wal, sb, op, _successor, _payload) = proposed_and_committed_swap();
-  // The synchronous `TestSb` publishes the SwapEpoch root state at `submit_write`, so `sb.state()` IS
+  let (_e, storage, op, _successor, _payload) = proposed_and_committed_swap();
+  // The synchronous `TestSb` publishes the SwapEpoch root state at `submit_write`, so `storage.sb().state()` IS
   // the durable root the primary just minted. Its `commit` proves the reconfigure op committed.
   assert!(
-    sb.state().commit() >= op,
+    storage.sb().state().commit() >= op,
     "the durable SwapEpoch root records the reconfigure op (op {}) as committed, but its commit is {}",
     op.get(),
-    sb.state().commit().get(),
+    storage.sb().state().commit().get(),
   );
   // And the root's committed-band headers reach the reconfigure op: a recovering node cross-checks the
   // band against its WAL, so an omitted header would leave the committed reconfigure op unproven.
   assert!(
-    sb.state()
+    storage
+      .sb()
+      .state()
       .committed_headers_slice()
       .iter()
       .any(|h| h.op() == op),
@@ -677,7 +675,7 @@ fn the_swap_epoch_root_durably_records_the_reconfigure_op_as_committed() {
   // is reachable, so recovery off THIS root must see a FORMATTED store: without the geometry it would
   // read as unformatted, skip the geometry fence, AND fail-stop this legitimately-reconfigured voter.
   assert_ne!(
-    sb.state().checkpoint_ops(),
+    storage.sb().state().checkpoint_ops(),
     0,
     "the SwapEpoch root pins the WAL-geometry witness (a crash in the swap window stays recoverable)"
   );
@@ -690,16 +688,14 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
   // The recovered node holds the predecessor membership (the swap was never installed), and the
   // committed reconfigure op sits durably in its log — so re-reaching it re-stages the swap. The
   // load-bearing property here is that the recovered `commit_max` covers the op (no committed-loss).
-  let (_e, wal, sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let (_e, mut storage, op, _successor, _payload) = proposed_and_committed_swap();
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  let (mut rwal, mut rsb) = (wal, sb);
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut rwal,
-    &mut rsb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
@@ -719,9 +715,9 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
 fn the_reconfigure_op_is_never_delivered_to_the_state_machine() {
   // A Reconfigure op is consensus-layer: it must NOT reach `S::apply`. Drive it to commit AND make
   // the SwapEpoch root durable, then assert the CountSm applied NOTHING for it.
-  let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, _op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land the SwapEpoch root → install
   assert!(
     e.sm_for_test().applied().is_empty(),
     "the Reconfigure op was never applied to the state machine"
@@ -737,9 +733,9 @@ fn e_epoch_ops_sit_at_or_below_commit_max_after_a_swap_so_are_never_nack_candida
   // candidate is STRICTLY above `commit_max`, so no E-epoch op is ever a candidate in E+1, and `on_nack`'s
   // candidate re-check drops any nack for it regardless of the successor voter set / quorum. This pins the
   // invariant that keeps the counting-proof truncation safe across any epoch swap.
-  let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install E+1
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land the SwapEpoch root → install E+1
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -766,12 +762,12 @@ fn e_epoch_ops_sit_at_or_below_commit_max_after_a_swap_so_are_never_nack_candida
 fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
   // Once the SwapEpoch root lands, `install_membership` runs: epoch == old+1, prev_epoch == old, the
   // successor membership is active, and a `MembershipChanged` event is emitted.
-  let (mut e, mut wal, mut sb, op, successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, op, successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Drain any pre-swap events (the committed-op band, etc.) so the swap event is observable cleanly.
   while e.poll_event().is_some() {}
 
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land the SwapEpoch root
 
   assert_eq!(
     e.membership.epoch(),
@@ -832,7 +828,7 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
   // epoch begins at a checkpoint that EMBEDS the reconfigure op N and carries the E+1 membership. That
   // makes the cross-epoch state-sync serve gate `checkpoint_op (M) >= config_install_op (N)` true BY
   // CONSTRUCTION — a quiescent donor can never withhold the E+1 membership from a cross-epoch laggard.
-  let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -846,14 +842,14 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
 
   // Land the SwapEpoch root → `install_membership` sets `config_install_op = N`, then `force_checkpoint`
   // submits the owed checkpoint at `commit_min` (== N here).
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.config_install_op, op,
     "the install recorded the reconfigure op as config_install_op = N"
   );
   // Drain the two-write forced checkpoint (snapshot → durable root) to completion.
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
 
   assert!(
@@ -878,7 +874,7 @@ fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat
   // (no client traffic) has no commit-advance tail to re-force it, so it must SELF-HEAL off its heartbeat:
   // the debt-pay path is armed from the primary timer, and once the flush recovers it re-forces the owed
   // checkpoint, opening the cross-epoch serve gate — with NO subsequent client commit or restart.
-  let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // The SwapEpoch arm's forced checkpoint hits a flush fault (1 fault, then durable).
   blocks.script_flush_fault(1);
@@ -886,7 +882,7 @@ fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat
 
   // Land the SwapEpoch root: `install_membership` sets `config_install_op = N`, then `force_checkpoint`
   // FAILS the flush → no checkpoint is submitted and the debt is owed.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.config_install_op, op,
     "the install recorded the reconfigure op as config_install_op = N"
@@ -894,7 +890,7 @@ fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat
   // Drain any in-flight storage. The forced checkpoint never staged (the flush faulted), so the durable
   // checkpoint stays at 0 and the debt (`config_install_op N > checkpoint_op 0`) is owed + WITHHELD.
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -915,8 +911,8 @@ fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat
   let mut later = now;
   for _ in 0..8 {
     later = later + core::time::Duration::from_millis(60);
-    e.handle_timeout(later, &mut wal, &mut sb);
-    e.storage_step(later, &mut wal, &mut sb, &mut blocks);
+    e.handle_timeout(later, &mut storage);
+    e.storage_step(later, &mut storage, &mut blocks);
   }
 
   // The debt is paid with no client commit: the checkpoint now embeds N and the serve gate holds.
@@ -933,7 +929,7 @@ fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat
     "the self-retried forced checkpoint landed at M == N"
   );
   assert_eq!(
-    sb.state().checkpoint_op(),
+    storage.sb_mut().state().checkpoint_op(),
     op,
     "the self-retried forced checkpoint is durable"
   );
@@ -972,14 +968,15 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
 
   // STAGE the node's own E+1 swap → it submits the SwapEpoch durable root (queued on the synchronous
   // `TestSb`, dispatched only by a later `handle_storage`), so `pending_sb` is the in-flight SwapEpoch root.
-  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut storage);
   assert!(
     e.pending_swap_for_test(),
     "the node's own E+1 swap is staged awaiting its durable root"
@@ -1027,12 +1024,11 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   };
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     cross_msg(nonce),
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
   assert!(
     e.pending_install.is_none(),
     "the sync answer was DEFERRED while the SwapEpoch root is in flight — nothing staged (no orphaned install)"
@@ -1054,14 +1050,14 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   );
 
   // --- Land the SwapEpoch root → install E+1 → its UNCONDITIONAL forced checkpoint at M1 == N1 lands. ---
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // SwapEpoch root → install_membership(N1) + force_checkpoint
+  e.storage_step(now, &mut storage, &mut blocks); // SwapEpoch root → install_membership(N1) + force_checkpoint
   assert_eq!(
     e.membership.epoch(),
     successor_e1.epoch(),
     "the node's own swap installed E+1"
   );
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the forced checkpoint (snapshot -> root)
+    e.storage_step(now, &mut storage, &mut blocks); // drain the forced checkpoint (snapshot -> root)
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -1077,18 +1073,17 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   let nonce2 = e.sync_nonce_for_test(); // the still-armed sync's (unchanged) nonce
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     cross_msg(nonce2),
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
   assert!(
     e.pending_install.is_some(),
     "with the root cleared, the re-solicited reply STAGED the crossing install (no longer deferred)"
   );
   for _ in 0..3 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the two-write re-persist -> durable root -> install
+    e.storage_step(now, &mut storage, &mut blocks); // the two-write re-persist -> durable root -> install
   }
   assert_eq!(
     e.state_syncs_applied(),
@@ -1146,13 +1141,14 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
 
   // STAGE the node's OWN E0->E1 swap (submits the SwapEpoch root; `pending_swap` latched).
-  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut storage);
   assert!(
     e.pending_swap_for_test(),
     "the node's own E1 swap is staged"
@@ -1204,8 +1200,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
     ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -1219,7 +1214,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
       membership_body.clone(),
     )),
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
   assert!(
     e.pending_install.is_some(),
     "the crossing reply STAGED the install (a forced crossing-required sync admits it)",
@@ -1229,7 +1224,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   // E1)` (the crossing) and (the FIX) consumes the stale `pending_swap`; then `on_sb_done`'s tail
   // `maybe_swap_epoch` runs against the now-E1 membership.
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
 
   // The crossing landed: E1 is installed, the sync completed exactly once.
@@ -1319,11 +1314,12 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
-  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut storage);
 
   // A higher-epoch heartbeat routes the non-Normal laggard into the recovery peer-fetch.
   e.enter_cross_epoch_peer_fetch(now, OpNumber::with(n1));
@@ -1363,12 +1359,11 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   };
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     cross_msg(nonce),
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
   assert!(
     e.pending_install.is_some(),
     "the crossing reply STAGED the re-persist install (frontier drained, root not yet durable)"
@@ -1383,7 +1378,7 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   // `handle_storage` runs `assert_invariants` at exit — a `pending_install` held without an in-flight
   // SyncRepersist would PANIC here.
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
 
   // The install FAILED, but the node did NOT strand and the sub-state invariant holds:
@@ -1420,12 +1415,11 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   // The recovery cadence (`recover_timeouts`, driven by `recover_retry`) is the SERVICED ARQ while
   // Recovering — fire it to confirm it re-broadcasts the solicitation (it would be a no-op / spin if the
   // retry had stranded on `sync_solicit`).
-  e.handle_timeout(now, &mut wal, &mut sb);
+  e.handle_timeout(now, &mut storage);
   let nonce2 = e.sync_nonce_for_test(); // the still-armed sync's (unchanged) nonce
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     cross_msg(nonce2),
   );
@@ -1436,9 +1430,9 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
     e.sm_reconstruct_owed(),
     "the reply re-issued the reconstruct; the obligation stays owed until the job runs"
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   // The reconstruct ran off the pump and the obligation cleared — no second `SyncRepersist` write was
   // started.
@@ -1518,21 +1512,21 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // Recover replica 1 — a BACKUP of view 0 in the successor (slot 0 leads), so `complete_recovery`
   // resumes Normal (NOT the abdicate-to-view-change primary branch) and pays the debt immediately.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let mut wal = ScriptedWal::with_entries(n); // ops 1..=N held, clean reads
-  let mut sb = TestSb {
+  let wal = ScriptedWal::with_entries(n); // ops 1..=N held, clean reads
+  let sb = TestSb {
     state: swap_root,
     done: std::collections::VecDeque::new(),
     checkpoint: None, // checkpoint_op == 0 → no snapshot; recover restores the genesis SM
   };
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::<CountSm>::recover(
     cfg,
     genesis_mem,
     9,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
@@ -1548,7 +1542,7 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // Drive the recovery reads to completion — this reaches Normal AND runs `maybe_pay_checkpoint_debt`
   // from `complete_recovery`, which proactively advances the band and forces the owed checkpoint. After
   // this point there is NO further traffic: ONLY recovery storage completions are pumped.
-  drive_recovery(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  drive_recovery(&mut e, &mut storage, &mut blocks, now);
   assert_eq!(e.status(), Status::Normal, "the backup resumed Normal");
 
   // With ZERO messages/heartbeats, the band was driven to >= N (the debt-pay's proactive advance_commit).
@@ -1561,7 +1555,7 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // Pump the forced checkpoint's two superblock writes (snapshot → root) to durability — still NO
   // messages. The debt clears the instant `checkpoint_op >= config_install_op` is durable.
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert!(
     e.checkpoint_op() >= e.config_install_op,
@@ -1579,7 +1573,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   // here must STILL be refused: if it committed before the first installed, `stage_epoch_swap` would
   // overwrite the first's staged successor and the first `on_sb_done` would clear the second — losing
   // the second committed swap across the epoch boundary.
-  let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, _op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -1598,7 +1592,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
       None
     ),
@@ -1607,7 +1601,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   );
 
   // Once the swap INSTALLS (the SwapEpoch root lands), the window closes and a new proposal succeeds.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+  e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install
   assert!(
     !e.pending_swap_for_test(),
     "the swap installed — the window is closed"
@@ -1620,7 +1614,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   // A fresh single change is now proposable. (Member 4 is a fresh learner id on the E+1 config.)
   let next = e.propose_membership(
     now,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::AddLearner(MemberId::new(4)),
     None,
   );
@@ -1647,7 +1641,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -1661,15 +1655,11 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
 
   // (1) Drive replica 1 into ViewChange(1): its idle timer proposes, one peer's SVC reaches the SVC
   // quorum (2 of 3).
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -1708,8 +1698,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -1747,13 +1736,13 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
 
   // Drain the new-primary storage so it is a settled Normal primary (the durable-view write lands), then
   // a fresh proposal MUST be refused — the carried change is still in flight (TODAY this wrongly succeeds).
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(e.is_primary() && e.status().is_normal());
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
       None
     ),
@@ -1774,7 +1763,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
 /// `primed_new_primary_in_pending_view_window`, with the `SingleChange` capability so `propose_membership`
 /// is in scope.
 fn single_change_primed_new_primary_pending_view()
--> (Endpoint<CountSm, SingleChange>, TestWal, StepSb) {
+-> (Endpoint<CountSm, SingleChange>, Storage<TestWal, StepSb>) {
   let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -1782,18 +1771,14 @@ fn single_change_primed_new_primary_pending_view()
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -1829,12 +1814,11 @@ fn single_change_primed_new_primary_pending_view()
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // op-2 AdoptVote append completes; the view write stays inflight
+  e.storage_step(now, &mut storage, &mut blocks); // op-2 AdoptVote append completes; the view write stays inflight
   while e.poll_message().is_some() {}
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
@@ -1842,7 +1826,7 @@ fn single_change_primed_new_primary_pending_view()
     e.pending_durable_view_for_test(),
     "the durable-view write is still pending (the window is open)"
   );
-  (e, wal, sb)
+  (e, storage)
 }
 
 #[test]
@@ -1854,7 +1838,7 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   // The verdict is RETRYABLE (`Busy`), so the caller retries once the view is durable, NOT a permanent
   // rejection. (Op 2 is an uncommitted plain client op here, NOT a reconfiguration, so the refusal is the
   // admission fence — not `AlreadyInFlight`.)
-  let (mut e, mut wal, mut sb) = single_change_primed_new_primary_pending_view();
+  let (mut e, mut storage) = single_change_primed_new_primary_pending_view();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let head_before = e.op();
@@ -1862,7 +1846,7 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None
     ),
@@ -1881,8 +1865,8 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
 
   // Once the durable-view write LANDS (the window closes), a fresh proposal is admitted — proving the
   // `Busy` verdict was a transient retry signal, not a permanent rejection. Flush the SB then drain.
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(
     !e.pending_durable_view_for_test(),
@@ -1892,16 +1876,15 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   // drive op 2 to commit (a backup ack) so the proposal is unambiguously admitted on the open path.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     client_ack(2, 2),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   let admitted = e.propose_membership(
     now,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::AddLearner(MemberId::new(3)),
     None,
   );
@@ -1928,7 +1911,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // backups would decode it cleanly into a real membership swap), so the test exercises the genuine
   // hazard, not a malformed-body short-circuit.
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -1950,10 +1933,10 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   );
 
   // (1) DIRECT client path: a client sends the reserved-id request straight to the primary.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::RECONFIGURATION),
     Message::Request(Request::new(
       ClientId::RECONFIGURATION,
@@ -1984,8 +1967,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // mesh-relay ingress, tagged with the relaying replica's id, not the client's). Same drop.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::Request(Request::new(
       ClientId::RECONFIGURATION,
@@ -2010,7 +1992,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // No membership change was committed OR staged from either request: the epoch/config_id are unchanged
   // and the committed log holds no Reconfigure op (drive any queued storage first so a would-be staged
   // swap would have surfaced).
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(
     e.membership.epoch(),
@@ -2032,8 +2014,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // wedged/closed mint path.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -2091,13 +2072,13 @@ fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
   // capacity 0`), so the proposal is refused — RETRYABLY (`AtCapacity`), since the stall self-releases as
   // the quorum checkpoints forward. A bare mint would have ignored this back-pressure entirely.
   let mut e = single_change_primary();
-  let mut wal = ZeroCapWal::default();
+  let mut storage = Storage::new(ZeroCapWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None
     ),
@@ -2108,7 +2089,7 @@ fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
   assert_eq!(e.reconfigure_inflight, None, "no latch was set");
   // The admission gate ran BEFORE delta validation, so even with capacity free the same proposal is fine
   // — proving the refusal was the capacity fence, not the delta. (An unbounded WAL has room for op 1.)
-  let mut roomy = TestWal::default();
+  let mut roomy = Storage::new(TestWal::default(), TestSb::default());
   assert!(
     e.propose_membership(
       now,
@@ -2127,7 +2108,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
   // it via the backup apply loop, and installs the IDENTICAL successor (same epoch, same config_id) at
   // its OWN durable root — convergence, since every replica chains from the identical OLD membership.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -2139,10 +2120,10 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
   let op = 1u64;
 
   // The primary's Prepare for the Reconfigure op (flat wire body = the encoded successor), commit 0.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -2162,15 +2143,14 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     Body::Reconfigure(payload.clone()),
     "the backup stores a typed Body::Reconfigure, not Body::Present",
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands (deferred PrepareOk)
+  e.storage_step(now, &mut storage, &mut blocks); // the backup's append lands (deferred PrepareOk)
   while e.poll_message().is_some() {}
 
   // The primary's Commit advances the backup's commit to the Reconfigure op → it commits + stages
   // SwapEpoch. The epoch is still old here (the fence holds on the backup too).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2190,7 +2170,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     "the backup staged its own SwapEpoch root"
   );
 
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the backup's SwapEpoch root → install
+  e.storage_step(now, &mut storage, &mut blocks); // land the backup's SwapEpoch root → install
   assert_eq!(
     e.membership, successor,
     "the backup installed the IDENTICAL successor (same epoch + config_id) as the primary"
@@ -2212,7 +2192,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // still-old-epoch backup commit that op, stage its OWN swap, and converge. (Before the fence was
   // decoupled from the SwapEpoch, that heartbeat was suppressed — the backup never learned the op
   // committed, and a later failover re-minted its op number as a client op: op-number reuse.)
-  let (mut primary, mut pwal, mut psb, op, successor, payload) = proposed_and_committed_swap();
+  let (mut primary, mut pstorage, op, successor, payload) = proposed_and_committed_swap();
   let now = Instant::ZERO;
 
   // The primary committed the Reconfigure op and is now in the SwapEpoch window: a SwapEpoch root is in
@@ -2240,7 +2220,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // gates `primary_timeouts`/`try_commit` on this epoch write, so the primary emits its commit-advertise
   // `Commit` AT epoch E carrying the committed Reconfigure op — the message a backup needs.
   while primary.poll_message().is_some() {} // clear any residue
-  primary.handle_timeout(now + COMMIT_HEARTBEAT, &mut pwal, &mut psb);
+  primary.handle_timeout(now + COMMIT_HEARTBEAT, &mut pstorage);
   let commit_msg = core::iter::from_fn(|| primary.poll_message())
     .map(|out| out.into_msg())
     .find(|m| matches!(m, Message::Commit(_)))
@@ -2265,12 +2245,11 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // A fresh backup that already holds the Reconfigure op in its log (via the primary's earlier Prepare)
   // receives that exact `Commit` — and converges: it commits the op and stages its OWN SwapEpoch.
   let mut backup = single_change_backup();
-  let (mut bwal, mut bsb) = (TestWal::default(), TestSb::default());
+  let mut bstorage = Storage::new(TestWal::default(), TestSb::default());
   let mut bblocks = crate::block_store::InMemoryBlockStore::new();
   backup.handle_message(
     now,
-    &mut bwal,
-    &mut bsb,
+    &mut bstorage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -2284,11 +2263,11 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
       payload.encode_body(),
     )),
   );
-  backup.storage_step(now, &mut bwal, &mut bsb, &mut bblocks); // the backup's append lands
+  backup.storage_step(now, &mut bstorage, &mut bblocks); // the backup's append lands
   while backup.poll_message().is_some() {}
 
   // Deliver the PRIMARY'S OWN heartbeat Commit (not a hand-rolled one) — the convergence signal.
-  backup.handle_message(now, &mut bwal, &mut bsb, primary_peer(), commit_msg);
+  backup.handle_message(now, &mut bstorage, primary_peer(), commit_msg);
   assert_eq!(
     backup.commit(),
     op,
@@ -2305,7 +2284,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   );
 
   // Land the backup's SwapEpoch root → it installs the IDENTICAL successor the primary staged.
-  backup.storage_step(now, &mut bwal, &mut bsb, &mut bblocks);
+  backup.storage_step(now, &mut bstorage, &mut bblocks);
   assert_eq!(
     backup.membership, successor,
     "the backup installed the identical successor — the live single change converges cluster-wide"
@@ -2385,18 +2364,22 @@ fn client_ack(o: u64, replica: u16) -> Message {
 fn committed_op_then_swapped(
   delta: SingleVoterDelta,
   ack_backup: u16,
-) -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, u64) {
+) -> (
+  Endpoint<CountSm, SingleChange>,
+  Storage<TestWal, TestSb>,
+  u64,
+) {
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let o = 1u64;
 
   // (1) Commit the client op `o` under E=0: mint + own append (own vote) + one backup ack (2-of-3).
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -2405,11 +2388,10 @@ fn committed_op_then_swapped(
     )),
   );
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // primary's own append durable → own vote
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(ack_backup)),
     client_ack(o, ack_backup),
   );
@@ -2418,7 +2400,7 @@ fn committed_op_then_swapped(
     OpNumber::with(o),
     "the client op committed under E=0"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain any commit-tail superblock work
+  e.storage_step(now, &mut storage, &mut blocks); // drain any commit-tail superblock work
   while e.poll_message().is_some() {}
 
   // (2) Propose + commit + durably-swap the reconfiguration (op r == 2). The successor is chained off
@@ -2431,17 +2413,16 @@ fn committed_op_then_swapped(
   let r = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       delta,
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // primary's own append durable → own vote
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(ack_backup)),
     reconfigure_ack(r.get(), &payload, ack_backup),
   );
@@ -2451,20 +2432,19 @@ fn committed_op_then_swapped(
   let other_backup = if ack_backup == 1 { 2u16 } else { 1u16 };
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(other_backup)),
     reconfigure_ack(r.get(), &payload, other_backup),
   );
   assert_eq!(e.commit(), r, "the Reconfigure op committed under E=0");
   // Make the SwapEpoch root durable → install the successor. `self.membership` is now E+1.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.membership, successor, "the E+1 successor is installed");
   assert!(!e.pending_swap_for_test(), "the staged swap was consumed");
   while e.poll_event().is_some() {}
   while e.poll_message().is_some() {}
 
-  (e, wal, sb, o)
+  (e, storage, o)
 }
 
 #[test]
@@ -2481,7 +2461,7 @@ fn cp_overlap_3_to_2_demote_in_the_old_write_quorum() {
   // durably committing the Reconfigure op (op 2), so it holds the full prefix `<= 2` — including the
   // client op `o == 1` — and must vouch for `o` at the view change.
   let ack_backup = 2u16; // slot 2 (the voter being demoted) acks both `o` and the Reconfigure op
-  let (mut e, _wal, _sb, o) =
+  let (mut e, _storage, o) =
     committed_op_then_swapped(SingleVoterDelta::DemoteVoter(MemberId::new(2)), ack_backup);
 
   // The post-swap config is the 2-voter E+1 membership; the demotee (slot 2, one of `o`'s
@@ -2621,7 +2601,7 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   // — every E+1 voter (retained OR promoted) durably committed the Reconfigure op, so it holds the full
   // prefix `<= o`.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let learner = MemberId::new(3);
@@ -2638,10 +2618,10 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   // (1) Commit the client op `o == 1` under the OLD 3-voter E=0 quorum: mint + own append (own vote) +
   // one voter ack (2-of-3). This is the pre-grow committed op the transition must preserve.
   let o = 1u64;
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -2650,11 +2630,10 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
     )),
   );
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // primary's own append durable → own vote
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     client_ack(o, 1),
   );
@@ -2663,7 +2642,7 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
     OpNumber::with(o),
     "the client op committed under the 3-voter E=0 config",
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // drain the commit-tail superblock work
+  e.storage_step(now, &mut storage, &mut blocks); // drain the commit-tail superblock work
   while e.poll_message().is_some() {}
 
   // (2) Promote the learner through the REAL gate. The first propose has no fresh proof → it emits a
@@ -2673,7 +2652,7 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -2688,15 +2667,14 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, o), // the learner's fresh proof covers the head → it validates
   );
   let promote_op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None,
     )
@@ -2719,11 +2697,10 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   // durable → INSTALL the 4-voter E=1 config. By commit-first, every replica that votes to install it —
   // the promoted learner included — durably holds the whole prefix `[1..=promote_op]` ⊇ `o`.
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // primary's own append durable → own vote
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(promote_op.get(), &promote_payload, 1),
   );
@@ -2732,7 +2709,7 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
     promote_op,
     "the promote op committed under the 3-voter E=0 config",
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install E=1
+  e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install E=1
   assert_eq!(
     e.membership.replica_count(),
     4,
@@ -2895,14 +2872,12 @@ fn learner_status(replica: u16, durable_commit_min: u64) -> Message {
 /// `self.op` on append.
 fn mint_one_client_op(
   e: &mut Endpoint<CountSm, SingleChange>,
-  wal: &mut TestWal,
-  sb: &mut TestSb,
+  storage: &mut Storage<TestWal, TestSb>,
   _blocks: &mut dyn BlockStore,
 ) {
   e.handle_message(
     Instant::ZERO,
-    wal,
-    sb,
+    storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -2960,7 +2935,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
   // challenging), NOT the safety input — the promote gate consumes a FRESH proof round-trip instead — so
   // this test pins the accumulation + the no-vote-state property, not any gating decision.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let learner = MemberId::new(3);
 
   assert!(
@@ -2969,10 +2944,10 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
   );
 
   // A report of durable frontier 5 from the learner (slot 3) is recorded under its MemberId.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 5),
   );
@@ -2997,8 +2972,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
   // A REORDERED lower report (durable frontier 2) does NOT lower the recorded 5 — monotone.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 2),
   );
@@ -3011,8 +2985,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
   // A higher report (7) DOES advance it.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 7),
   );
@@ -3031,19 +3004,20 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
   // the retry MINTS the Reconfigure op. By commit-first, the learner that durably commits it then holds
   // the entire E-committed prefix.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
 
   // Advance the head to op 1 so the gate's threshold (`>= self.op`) is a non-trivial 1.
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
 
   // Phase 2: no fresh proof → ProofPending + a challenge emitted; nothing minted.
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3067,8 +3041,7 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
   // Deliver a FRESH proof covering the head (frontier 1 == head). The proof now validates.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -3077,7 +3050,7 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
   let op = e
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None,
     )
@@ -3110,17 +3083,18 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
   // SECOND propose precedes the reply; it must reuse the first nonce, and a reply answering that
   // (reused) nonce then mints.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
 
   // First propose: a challenge is emitted (nonce N1), ProofPending.
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3133,7 +3107,7 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3150,8 +3124,7 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
   // nonce. Had the second propose re-drawn, this reply would arrive stale-nonce and be dropped.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&first, 3, 1),
   );
@@ -3160,7 +3133,7 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
   let op = e
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None,
     )
@@ -3182,16 +3155,16 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   // the primary re-solicits at propose time and the learner answers with its REGRESSED frontier, so the
   // gate refuses to mint.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
 
   // Advance the head to op 2 so the regressed frontier (1) is strictly below it.
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -3205,8 +3178,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   // The learner once reported covering the head — the stale-high accumulator the OLD gate trusted.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 2),
   );
@@ -3220,7 +3192,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3237,8 +3209,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   // It answers the challenge with that REGRESSED frontier (what a real learner's `commit()` returns).
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -3248,7 +3219,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3292,7 +3263,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -3350,10 +3321,10 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
   // The primary announces commit == 2 (op N committed cluster-wide). `on_commit` -> `advance_commit(2)`
   // walks ops in order from commit_min: it reaches op 1 FIRST, finds its body absent, and must HOLD —
   // peer-repair the hole and stop — so it NEVER reaches op 2 to commit+stage the swap.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -3403,8 +3374,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
   // so `is_voter()` flips to true ONLY here, proving the gate was the hole, not some unrelated block.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -3420,7 +3390,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
   );
   // Drive storage to settle the repair append + the commit advance + the staged SwapEpoch root install.
   for _ in 0..8 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
   }
   assert!(
@@ -3543,15 +3513,16 @@ fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
   // `ProofPending` persists, and no promotion ever mints (fail-closed). Re-proposing just re-challenges
   // (a fresh nonce); it never silently promotes.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
 
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3564,7 +3535,7 @@ fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3580,15 +3551,16 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   // wrong TARGET slot, or a foreign `(epoch, config_id)` is DROPPED — `proof` stays `None`, so the retry
   // still returns `ProofPending` and never mints. Only the exactly-matching fresh proof validates.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
 
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3600,8 +3572,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   // (a) WRONG NONCE: a reply for a different/replayed challenge (covering the head) is dropped.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(3),
@@ -3614,7 +3585,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3628,8 +3599,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   // voter (a current member, so `sender_matches` admits the binding) but is NOT the challenge target.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(1), // a member, but not the target (slot 3)
@@ -3642,7 +3612,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3655,8 +3625,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   // foreign-config proof is dropped at ingress (`epoch_authority_admits`) before it can fill the proof.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(3),
@@ -3669,7 +3638,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3686,15 +3655,14 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   let challenge = take_proof_challenge(&mut e, 3);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
   assert!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     )
@@ -3709,17 +3677,18 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   // it is stale for the new head. The gate re-validates `at_op >= self.op` at mint and falls through to
   // re-challenge against the new head — a fresh proof covering the NEW head then mints.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "head at op 1");
 
   // Challenge at head 1; the learner answers covering head 1 (frontier 1).
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3734,8 +3703,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   );
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -3743,8 +3711,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   // The head ADVANCES to op 2 before the promote retry — the validated proof (for head 1) is now stale.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -3759,7 +3726,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3780,15 +3747,14 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   // A fresh proof covering the NEW head (frontier 2) mints.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 2),
   );
   assert!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     )
@@ -3804,15 +3770,16 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
   // a forced reset the challenge is gone, and re-proposing starts a fresh challenge (a fresh nonce), so a
   // reply minted against the OLD challenge cannot satisfy the new one.
   let mut e = single_change_primary_with_learner();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
 
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3834,15 +3801,14 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
   e.force_state_for_test(0, 1, 1, 0, &[]);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&stale_challenge, 3, 1), // the OLD nonce
   );
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(learner),
       None
     ),
@@ -3869,7 +3835,7 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   // Arm an outstanding promote challenge under the CURRENT configuration (any target/nonce — the swap
@@ -3887,17 +3853,18 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
 
   // Drive an AddLearner reconfiguration to commit + install (the sole voter is the whole quorum, so its
   // own durable append commits the op; landing the SwapEpoch root installs the successor epoch).
+  let mut storage = Storage::new(wal, sb);
   e.propose_membership(
     Instant::ZERO,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::AddLearner(MemberId::new(1)),
     None,
   )
   .expect("AddLearner on a single-voter cluster is admitted");
-  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  e.handle_timeout(Instant::ZERO, &mut storage);
   while e.poll_message().is_some() {}
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // own append durable → own vote → commit
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install_membership
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // own append durable → own vote → commit
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land the SwapEpoch root → install_membership
   assert_eq!(
     e.membership.learner_count(),
     1,
@@ -3915,12 +3882,12 @@ fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
   // learner) mints WITHOUT any `peer_progress` entry — the catch-up-then-promote gate never engages for
   // it, since there is no promotion to prove a durable prefix for.
   let mut e = single_change_primary_with_learner();
-  let mut wal = TestWal::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   assert!(e.peer_progress.is_empty(), "no progress recorded");
   let op = e
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
       None,
     )
@@ -3947,15 +3914,16 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let newcomer = MemberId::new(1);
 
   // (1) AddLearner is admitted (no voter-count change, no catch-up gate) and mints the op.
+  let mut storage = Storage::new(wal, sb);
   let add_learner_op = e
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(newcomer),
       None,
     )
@@ -3969,10 +3937,10 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   // Commit + install the AddLearner so the new node is an actual learner under the successor epoch.
   // The sole voter (slot 0, this primary) is the whole commit quorum, so its own durable append
   // commits the op; landing the SwapEpoch root installs the successor (now 1 voter + 1 learner).
-  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  e.handle_timeout(Instant::ZERO, &mut storage);
   while e.poll_message().is_some() {}
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // own append durable → own vote → commit
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // own append durable → own vote → commit
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land the SwapEpoch root → install
   assert_eq!(
     e.membership.learner_count(),
     1,
@@ -3989,7 +3957,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
     .expect("the learner occupies a slot");
 
   // Advance the head so the catch-up gate's threshold is a non-trivial value.
-  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
+  mint_one_client_op(&mut e, &mut storage, &mut blocks);
   let head = e.op();
   assert!(head.get() >= 1, "the head advanced");
 
@@ -3999,7 +3967,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(newcomer),
       None
     ),
@@ -4017,15 +3985,14 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   // commit-first, the learner that durably commits the promote op then holds the entire prefix.
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(learner_slot),
     answer_proof(&challenge, learner_slot.get(), head.get()),
   );
   let promote_op = e
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(newcomer),
       None,
     )
@@ -4058,9 +4025,13 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
 /// (slots 1 and 2) ack: a voter-set shrink commits only with a successor quorum among the acks, and
 /// for a self-removal that quorum is exactly the two survivors. The removed node's own
 /// Prepare-retransmit/commit-heartbeat timers were armed by the proposal mint.
-fn demoted_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
+fn demoted_self_primary() -> (
+  Endpoint<CountSm, SingleChange>,
+  Storage<TestWal, TestSb>,
+  Membership,
+) {
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -4069,23 +4040,23 @@ fn demoted_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(0)))
     .expect("demoting one of three voters is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(0)),
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the self-demotion Reconfigure op");
   // Drive the commit/prepare cadence once so the Normal-primary timers are armed (the thing the
   // abdication must retire). `handle_timeout` on a Normal primary bootstraps + arms `commit`.
-  e.handle_timeout(now, &mut wal, &mut sb);
+  e.handle_timeout(now, &mut storage);
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // own append durable → own vote
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -4094,8 +4065,7 @@ fn demoted_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
   // set), so slot 2's ack completes it.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     reconfigure_ack(op.get(), &payload, 2),
   );
@@ -4108,13 +4078,13 @@ fn demoted_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     e.commit_or_prepare_timer_armed_for_test(),
     "the Normal-primary cadence is armed before the swap (the abdication must retire it)",
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install the successor
-  (e, wal, sb, successor)
+  e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install the successor
+  (e, storage, successor)
 }
 
 #[test]
 fn a_demoted_primary_retires_its_normal_primary_cadence_on_the_swap() {
-  let (e, _wal, _sb, successor) = demoted_self_primary();
+  let (e, _storage, successor) = demoted_self_primary();
 
   // The swap installed the 2-voter successor in which member 0 (this node) is a NON-VOTING learner.
   assert_eq!(
@@ -4167,7 +4137,7 @@ fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
   // Model the survivor as a fresh endpoint in the E+1 membership {member1→slot0, member2→slot1,
   // demoted member0→learner slot 2}: member 2 is slot 1, the BACKUP under view 0 (whose primary is
   // slot 0). Its idle timer then fires and it proposes view 1 (whose primary is slot 1 = itself).
-  let (_demoted, _wal, _sb, successor) = demoted_self_primary();
+  let (_demoted, _storage, successor) = demoted_self_primary();
   assert!(
     successor
       .slot_of(MemberId::new(2))
@@ -4182,7 +4152,7 @@ fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
 
   // It starts Normal as a backup; its idle timer has not yet fired.
   assert_eq!(survivor.status(), Status::Normal);
@@ -4190,9 +4160,10 @@ fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
     !survivor.is_primary(),
     "member 2 (slot 1) is a backup under view 0"
   );
-  survivor.handle_timeout(Instant::ZERO, &mut wal, &mut sb); // bootstrap primary_idle (not yet due)
+  let mut storage = Storage::new(wal, sb);
+  survivor.handle_timeout(Instant::ZERO, &mut storage); // bootstrap primary_idle (not yet due)
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
-  survivor.handle_timeout(later, &mut wal, &mut sb); // idle due → propose view 1, broadcast SVC
+  survivor.handle_timeout(later, &mut storage); // idle due → propose view 1, broadcast SVC
 
   // The survivor broadcast a StartViewChange for the next view — the election the silent demoted
   // primary no longer suppresses.
@@ -4220,7 +4191,11 @@ fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
 /// `self.membership` is the successor; the GC'd node — its seat gone entirely (`slot_of == None`) —
 /// must transition to the structural `Retired` state and go fully silent, the case distinct from a
 /// DEMOTION (`demoted_self_primary`, which keeps the seat and stays Normal-as-learner).
-fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
+fn gc_removed_self_learner() -> (
+  Endpoint<CountSm, SingleChange>,
+  Storage<TestWal, TestSb>,
+  Membership,
+) {
   let cfg = Config::try_new(3, MemberId::new(3)).expect("slot 3 learner of the 3-voter+1 set");
   let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     cfg,
@@ -4229,7 +4204,7 @@ fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestS
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -4245,10 +4220,10 @@ fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestS
 
   // The primary's Prepare for the Reconfigure op (flat wire body = the encoded successor) → the
   // learner appends and stores a typed Body::Reconfigure (it emits no counted ack).
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -4262,15 +4237,14 @@ fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestS
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands (deferred PrepareOk)
+  e.storage_step(now, &mut storage, &mut blocks); // the backup's append lands (deferred PrepareOk)
   while e.poll_message().is_some() {}
 
   // The primary's Commit advances the node's commit to the Reconfigure op → it commits + stages its
   // own SwapEpoch root (still at the OLD epoch — the fence holds on the follower lane).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4284,8 +4258,8 @@ fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestS
     e.pending_swap_for_test(),
     "the learner staged its own SwapEpoch root"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install the successor
-  (e, wal, sb, successor)
+  e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install the successor
+  (e, storage, successor)
 }
 
 #[test]
@@ -4294,7 +4268,7 @@ fn a_gc_removed_learner_retires_and_stays_fully_silent() {
   // `RemoveLearner` installs, the node's seat is gone entirely (`slot_of == None`), so it transitions
   // to the structural `Retired` state — it arms/services no timer, proposes nothing, and must NOT
   // panic on a `local_slot()` that no longer exists.
-  let (mut e, mut wal, mut sb, successor) = gc_removed_self_learner();
+  let (mut e, mut storage, successor) = gc_removed_self_learner();
 
   // The swap installed the 2-voter successor in which member 2 (this node) is absent.
   assert_eq!(
@@ -4337,7 +4311,7 @@ fn a_gc_removed_learner_retires_and_stays_fully_silent() {
   );
   let view_before = e.view();
   let later = Instant::ZERO + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb); // far past PRIMARY_IDLE — must not arm/fire a VC, must not panic
+  e.handle_timeout(later, &mut storage); // far past PRIMARY_IDLE — must not arm/fire a VC, must not panic
   assert_eq!(
     e.status(),
     Status::Retired,
@@ -4379,10 +4353,10 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
   // Walk a node through two consecutive single-change swaps so its lineage ring holds the two prior
   // config_ids. `in_lineage` admits the current id AND the retained prior ids; a forked/unknown id is
   // rejected (config_id is the lineage discriminator).
-  let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, _op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let genesis_config_id = 0u128; // the fixture genesis carries config_id 0 (see the `genesis` helper)
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land swap #1 → E=1 install
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land swap #1 → E=1 install
   let config_1 = e.membership.config_id();
   assert_ne!(
     config_1, genesis_config_id,
@@ -4421,13 +4395,13 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
   let op2 = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(1)),
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the second Reconfigure op");
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // own append → own vote
   // Commit under the E=1 3-voter quorum (2 of {0,1,2}), which for this shrink also carries the
   // successor quorum (both retained voters {0,2}): the primary (slot 0, via its own durable vote)
   // + the retained-voter ack (slot 2). Slot 1 is the voter being demoted; slot 3 is the learner, whose
@@ -4435,8 +4409,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
   // CURRENT configuration — or the strict ingress gate drops it.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     reconfigure_ack_at(op2.get(), &payload2, 2, crate::Epoch::new(1), config_1),
   );
@@ -4445,7 +4418,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     op2,
     "the second Reconfigure op committed under E=1"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land swap #2 → E=2 install
+  e.storage_step(now, &mut storage, &mut blocks); // land swap #2 → E=2 install
   let config_2 = e.membership.config_id();
   assert_eq!(e.membership.epoch(), crate::Epoch::new(2), "swapped to E=2");
 
@@ -4472,9 +4445,9 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   // vote/lead message, so a removed server's stale E-epoch SVC cannot pull the survivor into a view
   // change. The same SVC at the survivor's CURRENT epoch DOES register (proving the drop is the epoch
   // gate, not some other guard).
-  let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let (mut e, mut storage, _op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
-  e.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the swap → the survivor is now at E=1
+  e.storage_step(Instant::ZERO, &mut storage, &mut blocks); // land the swap → the survivor is now at E=1
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -4507,8 +4480,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   // A stale OLD-epoch (E=0) SVC for view 1 from a removed/forked server: dropped at the strict gate.
   backup.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -4526,8 +4498,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   // Positive control: the SAME SVC at the survivor's CURRENT epoch (E=1) is admitted and counts.
   backup.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -4559,7 +4530,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
 #[test]
 fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.reconfigure_inflight, None, "no change in flight at rest");
@@ -4569,10 +4540,11 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
     .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None,
     )
@@ -4588,7 +4560,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
       None
     ),
@@ -4604,11 +4576,10 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   // Drive the first op to commit → `stage_epoch_swap` CLEARS the latch (before the durable root even
   // lands — the swap is staged the instant the op commits).
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // own append → own vote
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -4624,7 +4595,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
 
   // Land the SwapEpoch root so the swap installs and the superblock is free again (a mint cannot emit
   // a Prepare while a durable root write is in flight — the durable-view-before-participate fence).
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert!(!e.pending_swap_for_test(), "the swap installed");
   assert_eq!(
     e.membership.epoch(),
@@ -4639,7 +4610,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   let op2 = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
       None,
     )
@@ -4659,14 +4630,15 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
   // proposal that never committed (the proposed-but-never-committed deadlock). `stage_epoch_swap` (which
   // clears the latch) only runs at COMMIT, so the release must come from `reset_for_view_transition`.
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
   // Propose on the view-0 primary → the latch is set on the uncommitted op (it is NOT driven to commit).
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None,
     )
@@ -4686,8 +4658,7 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
   // reset. The uncommitted op is abandoned with the old generation.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::Commit(Commit::new(
       View::with(1),
@@ -4731,7 +4702,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -4742,10 +4713,10 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
     .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -4759,7 +4730,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the append lands
+  e.storage_step(now, &mut storage, &mut blocks); // the append lands
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -4775,11 +4746,10 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
   // the catching_up discriminant are set correctly. Inject a DVC quorum whose canonical generation
   // reports commit 0 / op 0 — NONE carry op 1 — so the nack-truncation drops it.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  e.handle_timeout(later, &mut storage); // primary_idle → propose view 1, own SVC bit
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -4837,7 +4807,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -4853,11 +4823,11 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   // vouching commit 0 (uncommitted tail — it re-commits under the new view). With the new primary's
   // own DVC, the 2-of-3 quorum forms and the canonical generation (log_view 0) unions in op 1.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(later, &mut storage); // primary_idle → propose view 1, own SVC bit
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -4880,8 +4850,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(crate::DoViewChange::new(
       View::with(1),
@@ -4906,15 +4875,14 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     e.has_repair_hole_for_test(1),
     "the header-only Reconfigure op is a repair hole awaiting its body",
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the durable-view write → start_view_participate
+  e.storage_step(now, &mut storage, &mut blocks); // land the durable-view write → start_view_participate
   while e.poll_message().is_some() {}
 
   // Answer the new primary's RequestPrepare for op 1 with the canonical RECONFIGURATION body (a holder
   // serves it; commit >= op vouches it). The fill must rebuild a typed Body::Reconfigure.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::Prepare(Prepare::new(
       View::with(1),
@@ -4928,7 +4896,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the RepairFill append lands → the body is in the log
+  e.storage_step(now, &mut storage, &mut blocks); // the RepairFill append lands → the body is in the log
   assert!(
     e.log.get(&1).expect("op 1 is filled").body.is_reconfigure(),
     "the repaired RECONFIGURATION op is rebuilt as a typed Body::Reconfigure (not an opaque Present)",
@@ -4939,8 +4907,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   // one backup ack reaches the 2-of-3 quorum → the op commits → the commit-first swap STAGES.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(crate::PrepareOk::new(
       View::with(1),
@@ -4970,7 +4937,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     e.sm_for_test().applied().is_empty(),
     "the re-committed Reconfigure op was not applied to the state machine",
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+  e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -5003,7 +4970,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -5014,10 +4981,10 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   let op = 1u64;
 
   // (1) The view-0 primary's Prepare for the Reconfigure op (flat wire body = encoded successor).
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -5031,9 +4998,9 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands
-  sb.flush(); // the append is durable
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks); // the backup's append lands
+  storage.sb_mut().flush(); // the append is durable
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
 
   // (2) The primary's Commit advances the backup's commit to the Reconfigure op → it commits (commit_min
@@ -5041,8 +5008,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   // flight across the view change to come.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -5071,11 +5037,10 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   // Drive it via the real SVC path so status + the catching_up discriminant are set correctly; the
   // SendDoViewChange durable-view root SUPERSEDES the in-flight SwapEpoch root on the superblock.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  e.handle_timeout(later, &mut storage); // primary_idle → propose view 1, own SVC bit
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -5117,8 +5082,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   );
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(peer_dvc),
   );
@@ -5138,8 +5102,8 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   // (5) Drain storage: the SendDoViewChange / StartViewAsPrimary durable-view root lands, `on_sb_done`
   // re-submits the staged SwapEpoch (`maybe_swap_epoch`), and that root then installs the successor.
   for _ in 0..8 {
-    sb.flush();
-    e.storage_step(later, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(later, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
     if !e.pending_swap_for_test() {
       break;
@@ -5172,7 +5136,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
   // until a view change happens to truncate it. The body the retransmit carries must content-address the
   // successor membership, so a backup replaying it through `on_prepare` rebuilds a typed `Body::Reconfigure`.
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -5182,10 +5146,11 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
     .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
       None,
     )
@@ -5194,7 +5159,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
   while e.poll_message().is_some() {}
   // The primary's own append lands (its own vote), but with the Prepare dropped no quorum forms — the
   // Reconfigure op is stuck uncommitted in the un-acked window.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert!(
     e.commit() < op,
     "the Reconfigure op is uncommitted (its only Prepare was dropped, so no quorum acked it)"
@@ -5202,7 +5167,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
 
   // Fire the prepare-retransmit tick: it MUST re-ship the Reconfigure op (TODAY it skips the op because
   // its body is `Body::Reconfigure`, not `Body::Present` — the op is never resent and the change stalls).
-  e.handle_timeout(now + super::super::PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  e.handle_timeout(now + super::super::PREPARE_RETRANSMIT, &mut storage);
   let mut retransmitted_body: Option<bytes::Bytes> = None;
   while let Some(out) = e.poll_message() {
     match out.into_msg() {
@@ -5236,8 +5201,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
   // change commits + stages its swap (the retransmit actually unblocks ordered commit, not just re-emits).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -5250,7 +5214,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
     e.pending_swap_for_test(),
     "the commit-first swap staged — the retransmitted reconfiguration op was recognized at commit"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+  e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -5281,7 +5245,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -5293,10 +5257,10 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 
   // (1) Replica 1 (a view-0 backup) receives the view-0 primary's Prepares: a client op at op 1, then the
   // reconfiguration op at op 2. It now holds op 2 LOCALLY as a typed `Body::Reconfigure`.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -5312,8 +5276,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -5327,7 +5290,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(
     e.log.get(&2).expect("op 2 is held locally").body,
@@ -5337,15 +5300,10 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 
   // (2) Drive replica 1 into ViewChange(1): its idle timer proposes a view change, one peer's SVC reaches
   // the 2-of-3 SVC quorum.
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -5387,8 +5345,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -5418,7 +5375,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
   // (4) Drive the new primary to settle + recommit the carried reconfiguration: drain its durable-view
   // write, then feed it the acks for op 2 under view 1 so it commits + stages the swap, and install.
   for _ in 0..8 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
     if e.commit() >= OpNumber::with(2) {
       break;
@@ -5426,8 +5383,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     // The new primary re-commits op 2 once a quorum re-acks it under view 1.
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(2)),
       Message::PrepareOk(crate::PrepareOk::new(
         View::with(1),
@@ -5450,7 +5406,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     "the carried reconfiguration op re-committed under the new view (its preserved body let it commit)"
   );
   for _ in 0..8 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
     if !e.pending_swap_for_test() {
       break;
@@ -5473,9 +5429,13 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 /// demotee is the learner at slot 3) and FORCES
 /// a checkpoint embedding the reconfigure op `N`. The donor `MemberId 0` keeps slot 0 (still primary); the
 /// retained `MemberId 2` SHIFTED from old slot 2 to new slot 1 — the cross-epoch slot-shifted laggard.
-/// Returns `(donor, wal, sb, predecessor_config_id, checkpoint_op)`.
-fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, u128, u64)
-{
+/// Returns `(donor, storage, predecessor_config_id, checkpoint_op)`.
+fn donor_at_e1_with_shifted_member() -> (
+  Endpoint<CountSm, SingleChange>,
+  Storage<TestWal, TestSb>,
+  u128,
+  u64,
+) {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     cfg,
@@ -5484,7 +5444,7 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let predecessor_config_id = e.membership.config_id();
@@ -5498,28 +5458,28 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   // Propose + commit under E (quorum 3 of 4: the primary's own vote + acks from slots 1 and 2).
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(1)),
       None,
     )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the primary's own append lands (own vote)
+  e.storage_step(now, &mut storage, &mut blocks); // the primary's own append lands (own vote)
   for acker in [1u16, 2u16] {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(acker)),
       reconfigure_ack(op.get(), &payload, acker),
     );
   }
   // Drain the SwapEpoch root + its forced checkpoint (snapshot -> durable root) to completion.
   for _ in 0..8 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
   }
   assert_eq!(
@@ -5535,7 +5495,7 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
     op.get(),
   );
   let checkpoint_op = e.checkpoint_op().get();
-  (e, wal, sb, predecessor_config_id, checkpoint_op)
+  (e, storage, predecessor_config_id, checkpoint_op)
 }
 
 #[test]
@@ -5548,7 +5508,7 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // receive the crossing checkpoint. The relaxed binding admits it on `from`'s member identity (the claimed
   // slot carries no authority — a RequestSync is a pure solicitation answered only by a committed-vouched
   // checkpoint), and the donor serves the reply ADDRESSED TO `from`'s CURRENT slot so it routes back.
-  let (mut donor, mut wal, mut sb, predecessor_config_id, checkpoint_op) =
+  let (mut donor, mut storage, predecessor_config_id, checkpoint_op) =
     donor_at_e1_with_shifted_member();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
@@ -5578,12 +5538,11 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // authenticated `from` = the laggard's CURRENT slot 1.
   donor.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     from,
     request_sync(old_claimed_slot, predecessor_config_id),
   );
-  donor.storage_step(now, &mut wal, &mut sb, &mut blocks); // drive the serve-read completion → ship the SyncCheckpoint
+  donor.storage_step(now, &mut storage, &mut blocks); // drive the serve-read completion → ship the SyncCheckpoint
 
   // The donor SERVED it: a SyncCheckpoint (or its over-frame announce) addressed to the laggard's CURRENT
   // slot, carrying the donor's E+1 membership (the cross-epoch crossing payload). It was NOT dropped at the
@@ -5617,17 +5576,16 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // GUARD: the strict binding still bites for the no-shift forge surface. A RequestSync whose claimed slot
   // DISAGREES with `from` AND whose config_id is the donor's CURRENT (E+1) config — i.e. NOT a cross-epoch
   // ancestor solicitation, just a mismatched self-id — is DROPPED (no relaxation).
-  let (mut d2, mut w2, mut s2, _pred, _ck) = donor_at_e1_with_shifted_member();
+  let (mut d2, mut storage2, _pred, _ck) = donor_at_e1_with_shifted_member();
   let mut s2blocks = crate::block_store::InMemoryBlockStore::new();
   let current_config = d2.membership.config_id();
   d2.handle_message(
     now,
-    &mut w2,
-    &mut s2,
+    &mut storage2,
     Peer::Replica(ReplicaId::new(2)),                // from = slot 2
     request_sync(ReplicaId::new(0), current_config), // claims slot 0, CURRENT config (not an ancestor)
   );
-  d2.storage_step(now, &mut w2, &mut s2, &mut s2blocks);
+  d2.storage_step(now, &mut storage2, &mut s2blocks);
   assert!(
     !d2
       .poll_message()
@@ -5661,7 +5619,7 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, 0, 0, 0, &[]);
@@ -5692,10 +5650,10 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
     shifted_claimed_slot, routeable_from_slot,
     "the donor's self-claimed (shifted) slot DIFFERS from the slot the laggard routes to"
   );
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(routeable_from_slot),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -5709,7 +5667,7 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
       membership_body.clone(),
     )),
   );
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
 
   // The block-fetch is pinned to the AUTHENTICATED `from` slot (the routeable donor), NOT the shifted
   // self-claimed slot.
@@ -5746,8 +5704,7 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
   blocks.put(cross_snap.clone()); // the donor's BlockResponse lands the block
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(routeable_from_slot),
     Message::BlockResponse(crate::BlockResponse::new(
       crate::block_address(&cross_snap),
@@ -5755,7 +5712,7 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
     )),
   );
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // two-write re-persist -> durable root -> install
+    e.storage_step(now, &mut storage, &mut blocks); // two-write re-persist -> durable root -> install
   }
   assert_eq!(
     e.state_syncs_applied(),
@@ -5777,7 +5734,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
   // the `Prepare` to `from`'s CURRENT slot — so a slot-shifted laggard repairs predecessor-log bodies from
   // current-epoch donors. (The chunked SYNC leg is pinned by
   // `a_slot_shifted_cross_epoch_chunk_pull_is_served_and_the_chunk_routes_to_the_current_slot`.)
-  let (mut donor, mut wal, mut sb, predecessor_config_id, _checkpoint_op) =
+  let (mut donor, mut storage, predecessor_config_id, _checkpoint_op) =
     donor_at_e1_with_shifted_member();
   let now = Instant::ZERO;
   // MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from` binds to in the E+1 [0,2,3]).
@@ -5789,8 +5746,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
   // (ancestor) config_id — admitted via the shared binding, answered with the body routed to CURRENT slot.
   donor.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     from,
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -5820,8 +5776,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
   let e1_config = donor.membership.config_id();
   donor.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(current_slot),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -5874,7 +5829,7 @@ fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
   // quorum of compliant acks, which is what keeps the commit-time fence unreachable in a compliant
   // cluster.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -5895,10 +5850,10 @@ fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
     );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -5919,10 +5874,10 @@ fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
   );
   assert_eq!(e.op().get(), 0, "the head did not advance");
   assert!(
-    wal.entries.is_empty(),
+    storage.wal_mut().entries.is_empty(),
     "no WAL append was submitted for the dropped prepare"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while let Some(out) = e.poll_message() {
     assert!(
       !matches!(out.msg_ref(), Message::PrepareOk(_)),
@@ -5940,7 +5895,7 @@ fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
   // one backup ack completes the 2-of-3 quorum, `try_commit` recognizes the Reconfigure op, and the
   // commit-time fence refuses BEFORE any swap is staged or made durable.
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (mut wal, sb) = (TestWal::default(), TestSb::default());
 
   let successor = e
     .membership
@@ -5991,10 +5946,10 @@ fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
     },
   );
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(1, &payload, 1),
   );
@@ -6009,7 +5964,7 @@ fn committing_a_direct_voter_add_panics_on_the_backup_recommit_lane() {
   // directly — still cannot install: the shared commit recognition (`advance_commit` →
   // `commit_reconfigure`) hits the fence the moment a Commit advances past the op.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
 
   let successor = e
     .membership
@@ -6034,10 +5989,10 @@ fn committing_a_direct_voter_add_panics_on_the_backup_recommit_lane() {
     LogEntry::reconfigure(ClientId::RECONFIGURATION, RequestNumber::with(1), payload),
   );
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -6099,7 +6054,7 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
   )
   .expect("a root recording the committed reconfigure op is valid")
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -6107,13 +6062,13 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
     cfg,
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
@@ -6124,11 +6079,10 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
 
   // Re-commit the recovered band above the checkpoint through the ordinary commit path.
   let now = Instant::ZERO;
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -6200,7 +6154,8 @@ fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
       CountSm::default(),
       u64::MAX,
     );
-    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let (wal, sb) = (TestWal::default(), TestSb::default());
+    let mut storage = Storage::new(wal, sb);
     let mut blocks = crate::block_store::InMemoryBlockStore::new();
     let now = Instant::ZERO;
 
@@ -6211,8 +6166,7 @@ fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
 
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       primary_peer(),
       Message::Prepare(Prepare::new(
         View::new(),
@@ -6231,13 +6185,12 @@ fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
       "the {} prepare passed the append screen",
       delta.as_str(),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the append (deferred PrepareOk)
+    e.storage_step(now, &mut storage, &mut blocks); // land the append (deferred PrepareOk)
     while e.poll_message().is_some() {}
 
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       primary_peer(),
       Message::Commit(Commit::new(
         View::new(),
@@ -6254,7 +6207,7 @@ fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
     );
     while e.poll_event().is_some() {} // drain pre-swap events so the install event is observable
 
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+    e.storage_step(now, &mut storage, &mut blocks); // land the SwapEpoch root → install
     assert_eq!(
       e.membership,
       successor,
@@ -6289,7 +6242,7 @@ fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
   // canonical-held branch (identity match + durable), which acks WITHOUT crossing the append-seam
   // screen — the `send_prepare_ok` mint screen is what refuses the vouch.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (mut wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -6329,10 +6282,10 @@ fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
   wal.entries.insert(1, (header, body));
   wal.head = 1;
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -6346,7 +6299,7 @@ fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while let Some(out) = e.poll_message() {
     assert!(
       !matches!(out.msg_ref(), Message::PrepareOk(_)),
@@ -6361,7 +6314,7 @@ fn a_matching_durable_legitimate_reconfigure_prepare_is_re_acked() {
   // the identical held-durable shape IS re-acked — the mint screen refuses only a brand-new voter
   // admission, never a legitimate reconfiguration.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (mut wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
   let successor = e
@@ -6389,10 +6342,10 @@ fn a_matching_durable_legitimate_reconfigure_prepare_is_re_acked() {
   wal.entries.insert(1, (header, body));
   wal.head = 1;
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -6425,7 +6378,7 @@ fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
   // on the log + WAL state, which only this seam guards: the ack mint would independently refuse
   // the vouch, so an ack assertion alone could not witness this screen.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -6456,10 +6409,10 @@ fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
     ),
   );
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -6479,10 +6432,10 @@ fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
     "the direct-add interior op takes no log entry"
   );
   assert!(
-    wal.entries.is_empty(),
+    storage.wal_mut().entries.is_empty(),
     "no interior WAL overwrite was submitted for the dropped prepare"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while let Some(out) = e.poll_message() {
     assert!(
       !matches!(out.msg_ref(), Message::PrepareOk(_)),
@@ -6507,7 +6460,7 @@ fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -6528,10 +6481,10 @@ fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
     );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(crate::StartView::new(
       View::with(1),
@@ -6557,8 +6510,8 @@ fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
     )),
   );
   // Land the durable-view root, then the AdoptAck re-appends it schedules.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   let (mut acked_1, mut acked_2) = (false, false);
   while let Some(out) = e.poll_message() {
     if let Message::PrepareOk(ok) = out.msg_ref() {
@@ -6589,7 +6542,7 @@ fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -6599,10 +6552,10 @@ fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
     .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(crate::StartView::new(
       View::with(1),
@@ -6619,8 +6572,8 @@ fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
       )],
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   let mut acked = false;
   while let Some(out) = e.poll_message() {
     if let Message::PrepareOk(ok) = out.msg_ref() {
@@ -6644,7 +6597,7 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
   // fence panic is unreachable, and the cluster survives the poison op un-committed rather than
   // fail-stopping.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -6667,15 +6620,11 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
 
   // Idle-timeout into the view change, then a second StartViewChange completes the view-change
   // quorum for view 1 (this replica leads it).
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -6689,8 +6638,7 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
   // new primary adopts it (`oks: 0`) and re-appends it tagged for its own vote.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -6708,8 +6656,8 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
       )],
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(
     e.log.contains_key(&1),
@@ -6719,8 +6667,7 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
   // The forged, content-matched ack — the single in-model corrupted message.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(crate::PrepareOk::new(
       View::with(1),
@@ -6755,7 +6702,7 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   // screen classifies it). A forged content-matched PrepareOk then leaves the op at 1 of the
   // required 2 votes: never committed, no swap, no fail-stop.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -6777,15 +6724,11 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let body_checksum = Body::Reconfigure(payload.clone()).body_checksum();
 
-  e.handle_timeout(
-    now + core::time::Duration::from_millis(300),
-    &mut wal,
-    &mut sb,
-  );
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -6799,8 +6742,7 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   // HEADER-ONLY — its durable canonical identity (client, request, body checksum) without bytes.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -6826,8 +6768,8 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
       ],
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(
     e.log.get(&2).is_some_and(|entry| entry.body.is_repairing()),
@@ -6842,8 +6784,7 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   // kept identity (client, request, body checksum) and stages the durable fill.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::Prepare(Prepare::new(
       View::with(1),
@@ -6857,7 +6798,7 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(
     e.log
@@ -6869,8 +6810,7 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   // The forged, content-matched ack — the single in-model corrupted message.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(crate::PrepareOk::new(
       View::with(1),
@@ -6931,7 +6871,7 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
   )
   .expect("an empty-frontier root is valid")
   .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
-  let mut sb = TestSb {
+  let sb = TestSb {
     state,
     done: VecDeque::new(),
     checkpoint: None,
@@ -6939,13 +6879,13 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let mut storage = Storage::new(wal, sb);
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
     cfg,
     genesis(1),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store");
@@ -6954,8 +6894,8 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
     Recovered::Retired(_) => panic!("the solo voter recovers Active"),
   };
   let now = Instant::ZERO;
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
 
   assert!(e.status.is_normal(), "the solo voter resumed Normal");
   assert_eq!(
@@ -6978,17 +6918,17 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
   // NO entry and must let the report through: the op is committed (the commit-time fence already
   // ruled on it) and the report's identity stamp matches no live inflight entry.
   let mut e = single_change_backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -6999,12 +6939,12 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
     )),
   );
   e.force_checkpoint();
-  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks);
   assert!(
     e.pending_checkpoint.is_some(),
     "the committed+applied boundary is checkpointable"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(
     e.checkpoint_op.get(),
@@ -7020,8 +6960,7 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
   // entry (its identity stamp is the absent-entry zero — inert at the primary's vote ingress).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -7062,14 +7001,13 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
 /// installed successor.
 fn installed_demote_primary() -> (
   Endpoint<CountSm, SingleChange>,
-  TestWal,
-  TestSb,
+  Storage<TestWal, TestSb>,
   crate::block_store::InMemoryBlockStore,
   OpNumber,
   Membership,
 ) {
   let mut e = single_change_primary();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -7078,21 +7016,21 @@ fn installed_demote_primary() -> (
     .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(2)))
     .expect("demoting one of three voters is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(2)),
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the demote op");
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote
+  e.storage_step(now, &mut storage, &mut blocks); // own append durable → own vote
   for slot in [1u16, 2] {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(slot)),
       reconfigure_ack(op.get(), &payload, slot),
     );
@@ -7101,7 +7039,7 @@ fn installed_demote_primary() -> (
   // Land the SwapEpoch root (install) and drain the post-swap forced checkpoint so the superblock —
   // and with it the new-op admission gate — is free again.
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.membership, successor, "the demote successor installed");
   assert!(
@@ -7110,7 +7048,7 @@ fn installed_demote_primary() -> (
   );
   while e.poll_message().is_some() {}
   while e.poll_event().is_some() {}
-  (e, wal, sb, blocks, op, successor)
+  (e, storage, blocks, op, successor)
 }
 
 /// A 3-voter `SingleChange` BACKUP voter (slot 2, member 2) that learns + commits its OWN demotion
@@ -7120,8 +7058,7 @@ fn installed_demote_primary() -> (
 /// still forces). Returns the demoted endpoint, its storage, and the installed successor.
 fn demoted_self_backup() -> (
   Endpoint<CountSm, SingleChange>,
-  TestWal,
-  TestSb,
+  Storage<TestWal, TestSb>,
   crate::block_store::InMemoryBlockStore,
   Membership,
 ) {
@@ -7133,7 +7070,7 @@ fn demoted_self_backup() -> (
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -7143,10 +7080,10 @@ fn demoted_self_backup() -> (
     .expect("demoting one of three voters is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -7160,12 +7097,11 @@ fn demoted_self_backup() -> (
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands
+  e.storage_step(now, &mut storage, &mut blocks); // the backup's append lands
   while e.poll_message().is_some() {}
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -7177,12 +7113,12 @@ fn demoted_self_backup() -> (
   );
   // Land the SwapEpoch root (install) and drain the demotee's own post-swap forced checkpoint.
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.membership, successor, "the demote successor installed");
   while e.poll_message().is_some() {}
   while e.poll_event().is_some() {}
-  (e, wal, sb, blocks, successor)
+  (e, storage, blocks, successor)
 }
 
 #[test]
@@ -7202,14 +7138,15 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Sole-owner regression: poke a STALE learner-status deadline onto the still-VOTER backup (as if
   // left over from a prior learner stint) and tick — the voter path must CLEAR it, not service it.
   e.timers.learner_status = Some(now);
-  e.handle_timeout(now, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now, &mut storage);
   assert_eq!(
     e.timers.learner_status, None,
     "a voter's tick clears any stale learner-status deadline (the sole-owner discipline)",
@@ -7224,8 +7161,7 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -7239,12 +7175,11 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -7255,7 +7190,7 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
     )),
   );
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   while e.poll_message().is_some() {}
   while e.poll_event().is_some() {}
@@ -7278,7 +7213,7 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
 
   // Tick far ahead: NO view-change proposal (the demotee is off the voter plane for good)…
   let t1 = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(t1, &mut wal, &mut sb);
+  e.handle_timeout(t1, &mut storage);
   let mut first_tick_reports = 0usize;
   while let Some(out) = e.poll_message() {
     assert!(
@@ -7305,7 +7240,7 @@ fn a_demoted_backup_retires_the_voter_cadence_and_bootstraps_learner_status_like
 
   // The next due tick emits exactly one report, addressed to the E+1 primary (slot 0).
   let t2 = t1 + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(t2, &mut wal, &mut sb);
+  e.handle_timeout(t2, &mut storage);
   let mut reports = std::vec::Vec::new();
   while let Some(out) = e.poll_message() {
     if let Message::LearnerStatus(ls) = out.msg_ref() {
@@ -7355,7 +7290,7 @@ fn a_learner_observer_installs_a_demote_of_another_member_and_keeps_its_role() {
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -7364,10 +7299,10 @@ fn a_learner_observer_installs_a_demote_of_another_member_and_keeps_its_role() {
     .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(1)))
     .expect("demoting voter 1 is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -7381,12 +7316,11 @@ fn a_learner_observer_installs_a_demote_of_another_member_and_keeps_its_role() {
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -7397,7 +7331,7 @@ fn a_learner_observer_installs_a_demote_of_another_member_and_keeps_its_role() {
     )),
   );
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
 
   assert_eq!(e.membership, successor, "the observer installed the demote");
@@ -7425,7 +7359,7 @@ fn a_demoted_node_serves_repair_and_answers_the_promote_proof_as_a_live_donor() 
   // participant. Post-install it (a) serves a committed op to a repairing peer — the repair-donor
   // duty — and (b) answers the primary's promote-proof challenge with its fresh contiguous applied
   // frontier, so it is immediately re-promotable without re-seating.
-  let (mut e, mut wal, mut sb, mut blocks, successor) = demoted_self_backup();
+  let (mut e, mut storage, mut blocks, successor) = demoted_self_backup();
   let now = Instant::ZERO;
   let (epoch1, config1) = (successor.epoch(), successor.config_id());
 
@@ -7435,8 +7369,7 @@ fn a_demoted_node_serves_repair_and_answers_the_promote_proof_as_a_live_donor() 
   // would still pull from the log.)
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -7450,11 +7383,10 @@ fn a_demoted_node_serves_repair_and_answers_the_promote_proof_as_a_live_donor() 
       Bytes::from(std::vec![9u8]),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -7475,8 +7407,7 @@ fn a_demoted_node_serves_repair_and_answers_the_promote_proof_as_a_live_donor() 
   // serves the Prepare back — the repair-donor duty.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -7505,8 +7436,7 @@ fn a_demoted_node_serves_repair_and_answers_the_promote_proof_as_a_live_donor() 
   // the full committed head — proving it log-current and re-promotable.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::RequestLearnerProof(crate::RequestLearnerProof::new(
       ReplicaId::new(0),
@@ -7538,7 +7468,7 @@ fn a_demoted_node_cold_recovers_as_a_learner() {
   // own seat is a learner slot. `recover` classifies from the DURABLE root (never the compiled-in
   // genesis fallback), so the node comes back Active — a Normal, non-voting learner — not a voter
   // and not Retired.
-  let (e, mut wal, mut sb, mut blocks, successor) = demoted_self_backup();
+  let (e, mut storage, mut blocks, successor) = demoted_self_backup();
   drop(e); // the crash: only the durable storage survives
 
   let cfg = Config::try_new(2, MemberId::new(2)).expect("the demotee's stable identity");
@@ -7547,15 +7477,14 @@ fn a_demoted_node_cold_recovers_as_a_learner() {
     genesis(3),
     0,
     CountSm::default(),
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts the demoted store")
   .expect_active();
   let now = Instant::ZERO;
   for _ in 0..32 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -7584,7 +7513,7 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, 0, 0, 0, &[]);
@@ -7612,10 +7541,10 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
     ReconfigurePayload::from_membership(&successor, genesis(3).config_id()).encode_body();
 
   // The donor (member 0 — slot 0 in BOTH configs) answers with the verified E+1 crossing.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -7630,7 +7559,7 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
     )),
   );
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // two-write re-persist → durable root → install
+    e.storage_step(now, &mut storage, &mut blocks); // two-write re-persist → durable root → install
   }
 
   assert_eq!(
@@ -7660,9 +7589,9 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
   // And it takes up the learner duties: the cadence bootstraps (arm, then report to the primary).
   while e.poll_message().is_some() {}
   let t1 = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(t1, &mut wal, &mut sb);
+  e.handle_timeout(t1, &mut storage);
   let t2 = t1 + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(t2, &mut wal, &mut sb);
+  e.handle_timeout(t2, &mut storage);
   let mut reported = false;
   while let Some(out) = e.poll_message() {
     if matches!(out.msg_ref(), Message::LearnerStatus(_)) {
@@ -7687,15 +7616,16 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   //       `AlreadyInFlight`.
   // Walked as one lifecycle: never-demoted → proposed → committed-but-not-installed → installed.
   let mut e = single_change_primary_of(3);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // (1) x is a VOTER: the GC is structurally invalid — the vocabulary leg, independent of any latch.
+  let mut storage = Storage::new(wal, sb);
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::RemoveLearner(MemberId::new(2)),
       None
     ),
@@ -7714,7 +7644,7 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(2)),
       Some(crate::AcceptReducedFaultTolerance),
     )
@@ -7723,7 +7653,7 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::RemoveLearner(MemberId::new(2)),
       None
     ),
@@ -7734,12 +7664,11 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   // (3) The demote is COMMITTED but its SwapEpoch root has not landed (`swap_in_flight`): still
   // refused. The membership is STILL the predecessor here, so the vocabulary leg would refuse too —
   // the two legs overlap across the whole window.
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own vote
+  e.storage_step(now, &mut storage, &mut blocks); // own vote
   for slot in [1u16, 2] {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(slot)),
       reconfigure_ack(op.get(), &payload, slot),
     );
@@ -7752,7 +7681,7 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::RemoveLearner(MemberId::new(2)),
       None
     ),
@@ -7763,13 +7692,13 @@ fn the_gc_is_unmintable_until_the_demote_installs() {
   // (4) The demote INSTALLS: the gate opens, and the GC mints — against the successor in which x
   // already IS a learner.
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.membership, successor, "the demote successor installed");
   let gc = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::RemoveLearner(MemberId::new(2)),
       None,
     )
@@ -7791,7 +7720,7 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
     CountSm::default(),
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let (wal, sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -7802,10 +7731,10 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
   let op = 1u64;
 
   // The view-0 primary's Prepare for the demote op; the backup appends it durably.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -7819,17 +7748,16 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
       payload.encode_body(),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  sb.flush();
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
 
   // The primary's Commit → the backup commits + stages its swap; the SwapEpoch root stays IN FLIGHT
   // on the async superblock across the coming view change.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -7843,11 +7771,10 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
 
   // A view change to view 1 fires (slot 1 leads it): idle proposal + a peer SVC + the peer's DVC.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -7859,8 +7786,7 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
   while e.poll_message().is_some() {}
   e.handle_message(
     later,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(crate::DoViewChange::new(
       View::with(1),
@@ -7891,7 +7817,7 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
   assert_eq!(
     e.propose_membership(
       later,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::RemoveLearner(MemberId::new(2)),
       None
     ),
@@ -7902,8 +7828,8 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
   // Drain storage: the durable-view root lands, the staged swap re-submits and installs, and the
   // post-swap forced checkpoint clears.
   for _ in 0..12 {
-    sb.flush();
-    e.storage_step(later, &mut wal, &mut sb, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(later, &mut storage, &mut blocks);
     while e.poll_message().is_some() {}
   }
   assert_eq!(
@@ -7915,7 +7841,7 @@ fn the_gc_stays_unmintable_across_a_view_change_until_the_carried_swap_installs(
   // Only NOW does the GC mint — the new primary's membership has crossed the demote.
   e.propose_membership(
     later,
-    &mut wal,
+    &mut storage,
     SingleVoterDelta::RemoveLearner(MemberId::new(2)),
     None,
   )
@@ -7932,7 +7858,7 @@ fn gc_cannot_commit_while_the_successor_quorum_is_dead() {
   // never counted. With the sole other successor voter DEAD, the GC PARKS uncommitted — the shrink's
   // second step never completes against a dead successor — and commits the moment that voter
   // revives.
-  let (mut e, mut wal, mut sb, mut blocks, demote_op, successor) = installed_demote_primary();
+  let (mut e, mut storage, mut blocks, demote_op, successor) = installed_demote_primary();
   let now = Instant::ZERO;
   let (epoch1, config1) = (successor.epoch(), successor.config_id());
 
@@ -7944,13 +7870,13 @@ fn gc_cannot_commit_while_the_successor_quorum_is_dead() {
   let gc = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::RemoveLearner(MemberId::new(2)),
       None,
     )
     .expect("the GC mints against the installed successor");
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append → own vote (1 of 2)
+  e.storage_step(now, &mut storage, &mut blocks); // own append → own vote (1 of 2)
 
   // Successor voter 1 is DEAD: the GC parks uncommitted behind the successor quorum (2-of-2).
   assert_eq!(
@@ -7969,8 +7895,7 @@ fn gc_cannot_commit_while_the_successor_quorum_is_dead() {
   // the GC.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(gc.get(), &gc_payload, 1), // stamped (E0, genesis config)
   );
@@ -7983,8 +7908,7 @@ fn gc_cannot_commit_while_the_successor_quorum_is_dead() {
   // The DEMOTEE's own current-epoch ack is a LEARNER's ack — never counted toward any quorum.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     reconfigure_ack_at(gc.get(), &gc_payload, 2, epoch1, config1),
   );
@@ -7998,8 +7922,7 @@ fn gc_cannot_commit_while_the_successor_quorum_is_dead() {
   // parked GC commits + stages its swap.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack_at(gc.get(), &gc_payload, 1, epoch1, config1),
   );
@@ -8026,15 +7949,14 @@ fn banked_ack_demote_installs(
   bank_acks: &[u16],
 ) -> (
   Endpoint<CountSm, SingleChange>,
-  TestWal,
-  TestSb,
+  Storage<TestWal, TestSb>,
   crate::block_store::InMemoryBlockStore,
   OpNumber,
   Membership,
 ) {
   let mut e = single_change_primary_of(n);
-  let mut sb = TestSb::default();
-  let mut wal = TestWal::default();
+  let sb = TestSb::default();
+  let wal = TestWal::default();
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
@@ -8045,10 +7967,11 @@ fn banked_ack_demote_installs(
     ))))
     .expect("the demote is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let mut storage = Storage::new(wal, sb);
   let op = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::DemoteVoter(MemberId::new(u128::from(demotee))),
       Some(crate::AcceptReducedFaultTolerance),
     )
@@ -8059,8 +7982,7 @@ fn banked_ack_demote_installs(
   for &slot in bank_acks {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(slot)),
       reconfigure_ack(op.get(), &payload, slot),
     );
@@ -8068,8 +7990,7 @@ fn banked_ack_demote_installs(
   // The demotee acks too (its bit never counts toward the successor conjunction).
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(demotee)),
     reconfigure_ack(op.get(), &payload, demotee),
   );
@@ -8078,7 +7999,7 @@ fn banked_ack_demote_installs(
   // bank_acks[0] CRASHES here — nothing more will arrive from it. The primary's own lagged append
   // then completes and the commit fires on its banked bit. (The same storage pump may also land the
   // just-staged SwapEpoch root, so only the commit itself is asserted here.)
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.commit(),
     op,
@@ -8092,12 +8013,12 @@ fn banked_ack_demote_installs(
   // The SwapEpoch root lands and the shrunk successor installs with bank_acks[0] dead; drain the
   // post-swap forced checkpoint.
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.membership, successor, "the smaller voting set installed");
   while e.poll_message().is_some() {}
   while e.poll_event().is_some() {}
-  (e, wal, sb, blocks, op, successor)
+  (e, storage, blocks, op, successor)
 }
 
 #[test]
@@ -8111,7 +8032,7 @@ fn a_banked_ack_three_to_two_demote_installs_a_stall_with_a_live_demotee_and_hea
   // test), and the durable witness means the cluster HEALS LOSSLESSLY the moment the crashed voter
   // restarts. The stall itself is the same as before the demote-first design; nothing here claims
   // otherwise.
-  let (mut e, mut wal, mut sb, mut blocks, demote_op, successor) =
+  let (mut e, mut storage, mut blocks, demote_op, successor) =
     banked_ack_demote_installs(3, 2, &[1]);
   let now = Instant::ZERO;
   let (epoch1, config1) = (successor.epoch(), successor.config_id());
@@ -8131,8 +8052,7 @@ fn a_banked_ack_three_to_two_demote_installs_a_stall_with_a_live_demotee_and_hea
   // quorum(2) needs the dead voter 1.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -8146,7 +8066,7 @@ fn a_banked_ack_three_to_two_demote_installs_a_stall_with_a_live_demotee_and_hea
     demote_op.get() + 1,
     "the client op minted above the demote"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append → own vote only
+  e.storage_step(now, &mut storage, &mut blocks); // own append → own vote only
   assert_eq!(
     e.commit(),
     demote_op,
@@ -8157,8 +8077,7 @@ fn a_banked_ack_three_to_two_demote_installs_a_stall_with_a_live_demotee_and_hea
   // successor losslessly) and acks the parked client op under the live config — commit resumes.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(crate::PrepareOk::new(
       View::new(),
@@ -8188,7 +8107,7 @@ fn a_three_to_two_stall_cannot_be_recovered_by_re_promoting_the_demotee() {
   // dead 2-voter successor. The promote MINTS fine (the demotee is log-current and answers the
   // fresh-proof challenge immediately — that much the demote bought), but it PARKS exactly like any
   // op; only the crashed voter's restart releases it, after which the demotee is a voter again.
-  let (mut e, mut wal, mut sb, mut blocks, demote_op, successor) =
+  let (mut e, mut storage, mut blocks, demote_op, successor) =
     banked_ack_demote_installs(3, 2, &[1]);
   let now = Instant::ZERO;
   let (epoch1, config1) = (successor.epoch(), successor.config_id());
@@ -8197,7 +8116,7 @@ fn a_three_to_two_stall_cannot_be_recovered_by_re_promoting_the_demotee() {
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(MemberId::new(2)),
       None,
     ),
@@ -8207,21 +8126,20 @@ fn a_three_to_two_stall_cannot_be_recovered_by_re_promoting_the_demotee() {
   let challenge = take_proof_challenge(&mut e, 2);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     answer_proof(&challenge, 2, demote_op.get()),
   );
   let promote = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(MemberId::new(2)),
       None,
     )
     .expect("the log-current demotee passes the promote challenge — it mints");
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append → own vote only
+  e.storage_step(now, &mut storage, &mut blocks); // own append → own vote only
 
   // …but the minted promote PARKS: committing it needs the dead 2-voter successor's quorum. The
   // stall is NOT recoverable from inside the stalled configuration.
@@ -8241,14 +8159,13 @@ fn a_three_to_two_stall_cannot_be_recovered_by_re_promoting_the_demotee() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack_at(promote.get(), &promote_payload, 1, epoch1, config1),
   );
   assert_eq!(e.commit(), promote, "the restart releases the promote");
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.membership.replica_count(),
@@ -8264,7 +8181,7 @@ fn a_banked_ack_demote_at_five_voters_recovers_by_immediate_re_promote() {
   // reachable on {0,2,3}, so the cluster is NOT stalled, and the live log-current demotee can be
   // re-promoted IMMEDIATELY, committing under the surviving successor voters without the crashed
   // one. This is the recovery the retained learner seat exists to enable.
-  let (mut e, mut wal, mut sb, mut blocks, demote_op, successor) =
+  let (mut e, mut storage, mut blocks, demote_op, successor) =
     banked_ack_demote_installs(5, 4, &[1, 2]);
   let now = Instant::ZERO;
   let (epoch1, config1) = (successor.epoch(), successor.config_id());
@@ -8282,7 +8199,7 @@ fn a_banked_ack_demote_at_five_voters_recovers_by_immediate_re_promote() {
   assert_eq!(
     e.propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(MemberId::new(4)),
       None,
     ),
@@ -8292,21 +8209,20 @@ fn a_banked_ack_demote_at_five_voters_recovers_by_immediate_re_promote() {
   let challenge = take_proof_challenge(&mut e, 4);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(4)),
     answer_proof(&challenge, 4, demote_op.get()),
   );
   let promote = e
     .propose_membership(
       now,
-      &mut wal,
+      &mut storage,
       SingleVoterDelta::PromoteLearner(MemberId::new(4)),
       None,
     )
     .expect("the log-current demotee mints the re-promote");
   while e.poll_message().is_some() {}
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own vote (1 of the needed 3)
+  e.storage_step(now, &mut storage, &mut blocks); // own vote (1 of the needed 3)
 
   // The SURVIVING successor voters {2,3} complete quorum(4) = 3 — the crashed voter 1 is not needed.
   let promote_payload = ReconfigurePayload::from_membership(
@@ -8318,8 +8234,7 @@ fn a_banked_ack_demote_at_five_voters_recovers_by_immediate_re_promote() {
   for slot in [2u16, 3] {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(slot)),
       reconfigure_ack_at(promote.get(), &promote_payload, slot, epoch1, config1),
     );
@@ -8330,7 +8245,7 @@ fn a_banked_ack_demote_at_five_voters_recovers_by_immediate_re_promote() {
     "the re-promote commits on the surviving successor voters — immediate recovery, no restart needed"
   );
   for _ in 0..6 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.membership.replica_count(),

@@ -29,7 +29,11 @@ pub(crate) enum NewOpReject {
 }
 
 impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
-  pub(crate) fn primary_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn primary_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // Deferred forfeit: a primary that hit the force-sync strand
     // ([`Self::maybe_force_sync`]) flagged a step-down rather than reset its `op` (which would let it
     // reuse op numbers in this view). Act on it FIRST, on EVERY primary tick while the flag is set —
@@ -88,7 +92,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // step-down retries now) keeps `svc_message` the sole primary-side driver while forfeiting.
       self.timers.forfeit_armed = None;
       if self.timers.svc_message.is_none_or(|d| d <= now) {
-        self.propose_next_view(now, sb);
+        self.propose_next_view(now, storage);
       }
       return;
     }
@@ -250,7 +254,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // checkpoint — continuously for the grace window — forfeits primacy (steps down via a view
     // change). Checked each primary tick, AFTER the heartbeat/retransmit above (so an alive primary
     // still heartbeats while it is being given its grace window to catch up).
-    self.maybe_forfeit(now, sb);
+    self.maybe_forfeit(now, storage);
   }
 
   /// The shared NEW-op admission gate: EVERY op-content-independent precondition `on_request` enforces
@@ -264,7 +268,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// are NOT here (a reconfiguration uses the reserved sentinel client and no session row). Mapping these
   /// transient verdicts back: `on_request` drops the request silently (the client retransmits);
   /// `propose_membership` returns a retryable [`ProposeMembershipError`](crate::ProposeMembershipError).
-  pub(crate) fn check_new_op_admission<W: Wal>(&self, wal: &W) -> Result<(), NewOpReject> {
+  pub(crate) fn check_new_op_admission<W: Wal, B: Superblock>(
+    &self,
+    storage: &Storage<W, B>,
+  ) -> Result<(), NewOpReject> {
     if !self.status.is_normal() || !self.is_primary() {
       return Err(NewOpReject::NotNormalPrimary);
     }
@@ -322,7 +329,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // self-release as `quorum_checkpoint_op` rises and `run_gc` frees slots / shrinks the band.
     let next_op = self.op.get().saturating_add(1);
     let unpruned_window = next_op.saturating_sub(self.prune_floor().get());
-    let wal_would_overflow = unpruned_window > self.effective_wal_capacity(wal);
+    let wal_would_overflow = unpruned_window > self.effective_wal_capacity(storage);
     let band_would_overflow = self.band_at_capacity();
     if wal_would_overflow || band_would_overflow {
       return Err(NewOpReject::AtCapacity);
@@ -330,10 +337,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     Ok(())
   }
 
-  pub(crate) fn on_request<W: Wal>(
+  pub(crate) fn on_request<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     _from: Peer,
     r: crate::Request,
   ) {
@@ -363,7 +370,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // gets its cached-reply RESEND (the dedup mints no op, and a capacity stall gates only a would-be NEW
     // op, never a reply resend), exactly as the in-line order did before the extraction. `propose_membership`
     // applies the whole gate up front (it has no session/dedup to interleave).
-    let admission = self.check_new_op_admission(wal);
+    let admission = self.check_new_op_admission(storage);
     if matches!(
       admission,
       Err(
@@ -464,7 +471,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     );
     self.mint_op(
       now,
-      wal,
+      storage,
       client,
       request,
       body_bytes.clone(),
@@ -486,10 +493,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///
   /// Callers own the admission gating and any per-path bookkeeping (the client path's session row, the
   /// reconfiguration path's single-writer latch) BEFORE calling — this mints unconditionally.
-  pub(crate) fn mint_op<W: Wal>(
+  pub(crate) fn mint_op<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     client: ClientId,
     request: RequestNumber,
     body_bytes: Bytes,
@@ -501,7 +508,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // write is still in flight (op reuse after a truncation lowered the head; a ring wrap over a
     // GC-freed slot), and completion reordering must not let those stale bytes land over this op.
     self.submit_or_defer_append(
-      wal,
+      storage,
       self.op,
       header,
       body_bytes.clone(),
@@ -625,7 +632,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
-  pub(crate) fn try_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn try_commit<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // Do NOT apply ops while the SM is mid-replacement or does not yet hold its checkpoint — the SAME gate
     // `advance_commit` takes. A node owing a post-root SM-reconstruct (`self.checkpoint_op == M`, SM still
     // at the OLD content) can become a Normal PRIMARY through a view change that PRESERVES the obligation;
@@ -660,7 +671,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // `commit_op` HOLDS the commit (returns false without advancing) if `next`'s body read back
       // permanently faulty and must be peer-repaired — never skip a hole. Stop the loop; the repair
       // timer re-fetches it and a later try_commit resumes from exactly here.
-      if !self.commit_op(now, sb, next) {
+      if !self.commit_op(now, storage, next) {
         break;
       }
       advanced = true;
@@ -689,18 +700,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // this rarely fires here — but a forced sync ARMED while this replica was a backup, then satisfied by
     // ordinary commit after it regained primacy, must not linger to admit a stale SyncCheckpoint.
     self.cancel_forced_sync_if_satisfied();
+    // Adopt an owed INHERITED checkpoint frontier first (commit_min may have just reached it), so
+    // the cadence below computes its boundary off the adopted pointer in the same tail.
+    self.maybe_adopt_inherited_frontier();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint();
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint (the re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here). No-op when no debt is owed.
-    self.maybe_pay_checkpoint_debt(now, sb);
+    self.maybe_pay_checkpoint_debt(now, storage);
     // Re-submit a staged epoch swap that is waiting for a free superblock slot — chiefly a `pending_swap`
     // that SURVIVED a view change whose new generation issued no durable-view write (a `catch_up_to_view`):
     // there is no `on_sb_done` re-trigger on that path, so the commit tail is the re-submit point. No-op
     // unless a swap is staged AND the superblock is free (the same exclusion `maybe_checkpoint` enforces;
     // a checkpoint queued just above keeps the swap waiting its turn, re-submitted from `on_sb_done`).
-    self.maybe_swap_epoch(sb);
+    self.maybe_swap_epoch(storage);
   }
 
   /// Applies op `op` on the primary, caches + sends the reply, emits the event. Returns `true` if it
@@ -709,7 +723,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// and does NOT advance `commit_min`, so the caller HOLDS the commit at the hole until a peer
   /// supplies the op.
   #[must_use]
-  fn commit_op<B: Superblock>(&mut self, now: Instant, sb: &mut B, op: u64) -> bool {
+  fn commit_op<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+    op: u64,
+  ) -> bool {
     // Faults-as-data (peer fault-repair): a committed op whose body read back
     // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
     // dropped it rather than adopt a wrong/empty body), OR is present as a body-`Repairing` HOLE (the
@@ -739,7 +758,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // hole check below (a `Reconfigure` body is `as_present() == None`, which would otherwise route it
     // to peer-repair). Returns committed — the op IS committed; only its EFFECT is the epoch swap, not
     // an `sm.apply`.
-    if self.commit_reconfigure(op, &entry.body, sb) {
+    if self.commit_reconfigure(op, &entry.body, storage) {
       return true;
     }
     let Some(body) = entry.body.as_present() else {
@@ -805,7 +824,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// in memory here (the durable-epoch-before-participate fence — install runs only at the durable
   /// root). The op is NOT delivered to `S::apply` and no client `Reply`/`Committed` event is emitted
   /// (it carries no client request).
-  fn commit_reconfigure<B: Superblock>(&mut self, op: u64, body: &Body, sb: &mut B) -> bool {
+  fn commit_reconfigure<W: Wal, B: Superblock>(
+    &mut self,
+    op: u64,
+    body: &Body,
+    storage: &mut Storage<W, B>,
+  ) -> bool {
     let Some(payload) = body.as_reconfigure() else {
       return false;
     };
@@ -893,7 +917,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // Capture the reconfigure op NUMBER for the install-time `MembershipChanged` — `commit_min` is at
       // it NOW but may advance past it before the durable root lands (the primary keeps committing
       // through the SwapEpoch window), so the install must name THIS op, not `commit_min` then.
-      self.stage_epoch_swap(OpNumber::with(op), successor, sb);
+      self.stage_epoch_swap(OpNumber::with(op), successor, storage);
     }
     true
   }
@@ -901,8 +925,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_prepare<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     p: Prepare,
   ) {
     // Peer fault-repair: a `Prepare` answering our `RequestPrepare` for a committed-op hole is
@@ -911,7 +934,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // higher-view rule yank us into a view change, nor the `is_primary`/same-view guards drop it (a
     // recovered PRIMARY can also hold a hole). `fill_repair` verifies (checksum + placement) and
     // returns false for a non-hole / unverifiable body, so a normal Prepare falls through unchanged.
-    if self.fill_repair(now, wal, sb, &p) {
+    if self.fill_repair(now, storage, &p) {
       return;
     }
     // A registered repair hole is owned EXCLUSIVELY by the repair path:
@@ -974,7 +997,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     // Learn the primary's commit (apply anything we already have).
-    self.advance_commit(now, sb, p.commit().get());
+    self.advance_commit(now, storage, p.commit().get());
 
     let pop = p.op().get();
     if pop <= self.op.get() {
@@ -1027,7 +1050,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // committed-but-still-in-flight op. We keep the `appending` guard too, so the
         // in-flight-then-just-completed window defers its single ack to `on_wal_done` (whose
         // `Pending::Ack(pop)` owes exactly one PrepareOk) rather than emitting a redundant inline duplicate.
-        if !self.appending.contains(&pop) && self.op_durably_appended(wal, pop) {
+        if !self.appending.contains(&pop) && self.op_durably_appended(storage, pop) {
           self.send_prepare_ok(p.op());
         }
         return;
@@ -1041,7 +1064,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // to land. (If an append for `pop` is already in flight — `appending` set — do NOT start a second
       // one; its own `on_wal_done` will ack once the in-flight append completes.)
       if !self.appending.contains(&pop) {
-        self.reappend_canonical_prepare(wal, &p);
+        self.reappend_canonical_prepare(storage, &p);
       }
       return;
     }
@@ -1052,7 +1075,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // state-syncs to the cluster checkpoint instead of wrapping away a needed slot (and DROPS this
       // prepare). Inert for an unbounded WAL / an in-quorum backup (no overflow). Checked AFTER
       // `advance_commit` above, so a commit that just advanced the checkpoint can avert a needless sync.
-      if self.maybe_sync_below_ring_window(now, wal, pop, p.checkpoint_op()) {
+      if self.maybe_sync_below_ring_window(now, storage, pop, p.checkpoint_op()) {
         return;
       }
       // Header-only view-change-carrier backpressure on the BACKUP head-extend — the unbounded-WAL
@@ -1062,7 +1085,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       if self.band_at_capacity() {
         return;
       }
-      self.append_prepare(wal, p);
+      self.append_prepare(storage, p);
       // Drain any buffered, now-contiguous prepares — each also extends the head, so it too could fall
       // below the ring window OR push the carrier band past the frame-fit depth. Stop draining at the
       // first op that would overflow (it + every higher buffered op is unreachable until the sync just
@@ -1084,7 +1107,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           self.buffer.remove(&(self.op.get() + 1));
           break;
         }
-        if self.maybe_sync_below_ring_window(now, wal, next_op, next_ckpt)
+        if self.maybe_sync_below_ring_window(now, storage, next_op, next_ckpt)
           || self.band_at_capacity()
         {
           break;
@@ -1093,11 +1116,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           .buffer
           .remove(&(self.op.get() + 1))
           .expect("just peeked");
-        self.append_prepare(wal, next);
+        self.append_prepare(storage, next);
       }
       // After appending, apply any ops now available up to the learned commit.
       let target = self.commit_max.get();
-      self.advance_commit(now, sb, target);
+      self.advance_commit(now, storage, target);
     } else {
       // Future op: buffer it, and solicit the committed band between our head and it that the primary's
       // retransmit (only `commit_min+1..=op`) will never re-send (those ops are `<= commit_min`). This
@@ -1130,8 +1153,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_prepare_batch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     m: crate::PrepareBatch,
   ) {
     let (view, commit, checkpoint_op, epoch, config_id) = (
@@ -1153,8 +1175,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       };
       self.on_prepare(
         now,
-        wal,
-        sb,
+        storage,
         // Each reconstructed per-op `Prepare` carries the BATCH's epoch-policy pair (the envelope
         // every per-op `Prepare` would have carried), not this replica's — the un-batching preserves
         // the sender's `(epoch, config_id)` exactly as it preserves `view`/`commit`/`checkpoint_op`.
@@ -1275,7 +1296,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.seats_new_voter_against_current(&payload)
   }
 
-  fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
+  fn append_prepare<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B>, p: Prepare) {
     // Refuse a direct voter admission at the append seam: dropped exactly like the ring-window/band
     // stalls (no WAL write, no log entry, no head advance, and — by append-before-ack — no PrepareOk),
     // so the op cannot commit on compliant replicas. See `commit_reconfigure`'s fence for the safety
@@ -1294,18 +1315,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `pop == self.op + 1 > checkpoint_op` here, so the condition asserted is the exact negation of the
     // guard's overflow test (`pop - checkpoint_op > effective`).
     debug_assert!(
-      p.op().get().saturating_sub(self.checkpoint_op.get()) <= self.effective_wal_capacity(wal),
+      p.op().get().saturating_sub(self.checkpoint_op.get()) <= self.effective_wal_capacity(storage),
       "WAL-ring backup-overflow: appending op {} would overwrite an un-pruned ring slot \
        (checkpoint_op={}, effective capacity={}) — the maybe_sync_below_ring_window guard was bypassed",
       p.op().get(),
       self.checkpoint_op.get(),
-      self.effective_wal_capacity(wal),
+      self.effective_wal_capacity(storage),
     );
     self.op = p.op();
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     // Through the slot-quiescence choke: a backup's head extension can reuse an op number a
     // truncation released (or ring-wrap a GC-freed slot) whose old write is still in flight.
-    self.submit_or_defer_append(wal, p.op(), header, p.body_bytes(), Pending::Ack(p.op()));
+    self.submit_or_defer_append(
+      storage,
+      p.op(),
+      header,
+      p.body_bytes(),
+      Pending::Ack(p.op()),
+    );
     let entry = self.log_entry_from_prepare(&p);
     self.log.insert(p.op().get(), entry);
     // Append-before-ack: mark op in-flight so neither this op's deferred ack NOR a
@@ -1323,7 +1350,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (append-before-ack). Caller guarantees `pop` is not already `appending` (no double in-flight append) and
   /// that the Prepare is current-view (`p.view() == self.view`), so overwriting the slot is safe: the op is
   /// either committed-or-current-view-canonical, and only a stale superseded earlier-view body is replaced.
-  fn reappend_canonical_prepare<W: Wal>(&mut self, wal: &mut W, p: &Prepare) {
+  fn reappend_canonical_prepare<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    p: &Prepare,
+  ) {
     // The same direct-voter-admission screen as `append_prepare`: an interior overwrite also appends
     // and acks, so it must equally refuse to seat a brand-new voter (drop; no overwrite, no ack).
     if self.is_direct_voter_add_prepare(p) {
@@ -1336,13 +1367,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // need. Drop instead — the primary's retransmit re-delivers this Prepare, and the laggard's
     // committed-band catch-up keeps its ordinary checkpoints firing, so the window slides until
     // the re-delivery fits.
-    if self.ring_append_would_wrap(wal, p.op().get()) {
+    if self.ring_append_would_wrap(storage, p.op().get()) {
       return;
     }
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     // Through the slot-quiescence choke: an interior overwrite by definition re-targets a slot an
     // earlier write may still hold in flight (its own superseded stale append included).
-    self.submit_or_defer_append(wal, p.op(), header, p.body_bytes(), Pending::Ack(p.op()));
+    self.submit_or_defer_append(
+      storage,
+      p.op(),
+      header,
+      p.body_bytes(),
+      Pending::Ack(p.op()),
+    );
     let entry = self.log_entry_from_prepare(p);
     self.log.insert(p.op().get(), entry);
     // Mark in-flight so a further retransmit-driven re-ack defers to `on_wal_done` (which clears it +
@@ -1359,10 +1396,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// torn / bit-rotted — the append still completed; the corrupt bytes are a separate, peer-repaired
   /// concern). A `Dirty` (still in flight) or `Empty` (never written / truncated) slot above the
   /// checkpoint is NOT yet durable.
-  pub(crate) fn op_durably_appended<W: Wal>(&self, wal: &W, op: u64) -> bool {
+  pub(crate) fn op_durably_appended<W: Wal, B: Superblock>(
+    &self,
+    storage: &Storage<W, B>,
+    op: u64,
+  ) -> bool {
     op <= self.checkpoint_op.get()
       || matches!(
-        wal.status(OpNumber::with(op)),
+        storage.wal().status(OpNumber::with(op)),
         SlotStatus::Clean | SlotStatus::Faulty
       )
   }
@@ -1430,7 +1471,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Applies committed ops we hold, up to `min(target, op)`, strictly in order. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
-  pub(crate) fn advance_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, target: u64) {
+  pub(crate) fn advance_commit<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+    target: u64,
+  ) {
     // A PRE-ROOT staged install (`pending_install`) is about to wholesale-REPLACE the SM at the synced
     // point (`install_sync`), and keeps `commit_min`/`commit_max`/`self.op` FROZEN across the STAGE→install
     // window so the install is the single atomic mutation point (the captured held-tail decision + the
@@ -1473,7 +1519,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // `as_present() == None`, which would otherwise route it to peer-repair). The op IS committed, so
       // `commit_min` advances past it; the loop then continues to any further committed ops. Identical
       // recognition to the primary's `commit_op`, so primary and backup install the SAME successor.
-      if self.commit_reconfigure(op, &entry.body, sb) {
+      if self.commit_reconfigure(op, &entry.body, storage) {
         continue;
       }
       let Some(body) = entry.body.as_present() else {
@@ -1512,17 +1558,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // way — cancel the now-unneeded forced sync (clears `sync` + its solicit timer) so a delayed, stale
     // SyncCheckpoint for that target never reaches `apply_sync` below the advanced frontier.
     self.cancel_forced_sync_if_satisfied();
+    // Adopt an owed INHERITED checkpoint frontier first (commit_min may have just reached it), so
+    // the cadence below computes its boundary off the adopted pointer in the same tail.
+    self.maybe_adopt_inherited_frontier();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint();
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
     // advanced, so if it reached the reconfigure op force the owed checkpoint. The re-entrancy guard makes
     // this routine's own `advance_commit` a no-op here (the loop above already drove commit). No-op when
     // no debt is owed (the common path).
-    self.maybe_pay_checkpoint_debt(now, sb);
+    self.maybe_pay_checkpoint_debt(now, storage);
     // Re-submit a staged epoch swap waiting for a free superblock slot (mirrors `try_commit`'s tail) —
     // chiefly a `pending_swap` that survived a `catch_up_to_view` view change (no durable-view write, so
     // no `on_sb_done` re-trigger). No-op unless a swap is staged and the superblock is free.
-    self.maybe_swap_epoch(sb);
+    self.maybe_swap_epoch(storage);
   }
 
   /// The SINGLE apply-time client-session update, shared by the primary's [`Self::commit_op`] and the
@@ -1869,7 +1918,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.send_prepare_ok(self.checkpoint_op);
   }
 
-  pub(crate) fn on_prepare_ok<B: Superblock>(&mut self, now: Instant, sb: &mut B, ok: PrepareOk) {
+  pub(crate) fn on_prepare_ok<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+    ok: PrepareOk,
+  ) {
     if ok.view().get() > self.view.get() {
       self.catch_up_to_view(now, ok.view());
       return;
@@ -1899,7 +1953,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `maybe_request_sync` below, which covers the same evidence ABOVE our head (no bodies held → sync).
     let peer_checkpoint = self.max_peer_checkpoint_op();
     if peer_checkpoint.get() > self.commit_max.get() {
-      self.advance_commit(now, sb, peer_checkpoint.get());
+      self.advance_commit(now, storage, peer_checkpoint.get());
     }
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
@@ -1919,10 +1973,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     {
       inflight.oks |= 1u64 << ok.replica().get();
     }
-    self.try_commit(now, sb);
+    self.try_commit(now, storage);
   }
 
-  pub(crate) fn on_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, c: Commit) {
+  pub(crate) fn on_commit<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+    c: Commit,
+  ) {
     if c.view().get() > self.view.get() {
       self.catch_up_to_view(now, c.view());
       return;
@@ -1944,7 +2003,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Force-sync escalation: the primary's just-recorded checkpoint may have crossed a `repair`
     // hole we hold below it (pruned everywhere on the quorum) → escalate to a forced `RequestSync`.
     self.maybe_force_sync(now);
-    self.advance_commit(now, sb, c.commit().get());
+    self.advance_commit(now, storage, c.commit().get());
     // Tail-gap repair: if the primary's commit is ABOVE our head (committed ops we are missing, above
     // the cluster checkpoint), solicit them via `RequestPrepare` — the primary's retransmit (only
     // `commit_min+1..=op`) never re-sends a committed op below its own commit_min, so a backup that fell
