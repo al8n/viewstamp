@@ -136,7 +136,8 @@ pub struct Cluster {
   /// Per-replica superblocks (persist across crashes; see `crash`).
   sbs: Vec<InMemorySuperblock>,
   /// Per-replica content-addressed block stores holding the SM checkpoint DAGs (persist across
-  /// crashes — the SM blocks must survive a restart, exactly like the WAL + superblock).
+  /// crashes — the SM blocks must survive a restart, exactly like the WAL + superblock, and are
+  /// forfeited by a wipe for the same reason).
   block_stores: Vec<MemBlockStore>,
   /// Per-replica storage-lane execution-order witnesses. ONE cursor per replica because each drives
   /// its own inline serial lane; a job executed out of the order its endpoint issued it fail-stops
@@ -236,6 +237,19 @@ pub struct Cluster {
   /// reaches the `RemoveLearner` that would drop one — so this stays `false` for every node; the flag +
   /// its restart-loop guards are the foundation seam a member-dropping reconfiguration would set.
   retired: Vec<bool>,
+  /// Per-replica DURABLE-STATE-FORFEIT flag: `true` from the instant
+  /// [`wipe_and_restart`](Self::wipe_and_restart) replaces this node's three media until an endpoint
+  /// is next rebuilt over the replacement. The three media are honest the moment they are swapped —
+  /// the fresh WAL holds no slot, the fresh superblock reads epoch 0 with no membership, the emptied
+  /// block store holds no block — but the ENDPOINT handle is not: a wiped voter fail-stops on
+  /// `UnformattedVoter`, so recovery installs no successor and `replicas[i]` keeps describing the
+  /// disk the node no longer has. This flag is the one place that difference is recorded, so the
+  /// accessors reading the handle for DURABLE evidence
+  /// ([`replica_checkpoint_op`](Self::replica_checkpoint_op), and through it
+  /// [`replica_appended_op`](Self::replica_appended_op)) can report what the node's storage can
+  /// actually back rather than what its dead predecessor remembered. Cleared exactly where a
+  /// rebuilt endpoint is installed, so the flag can never outlive the staleness it stands for.
+  wiped_storage: Vec<bool>,
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
   groups: Vec<u8>,
@@ -559,6 +573,7 @@ impl Cluster {
       batch_mode: false,
       crashed: vec![false; n],
       retired: vec![false; n],
+      wiped_storage: vec![false; n],
       groups: vec![0; n],
       one_way: vec![vec![false; n]; n],
       slow: vec![None; n],
@@ -932,9 +947,31 @@ impl Cluster {
     self.replicas[i].view()
   }
 
-  /// Replica `i`'s current checkpoint op (for invariant checking / boundedness gates).
+  /// Replica `i`'s current checkpoint op (for invariant checking / boundedness gates) — the op its
+  /// DURABLE storage can back, not merely the one its endpoint handle remembers.
+  ///
+  /// Those coincide on every replica whose endpoint was built over the store it is reading: the
+  /// value only advances when a checkpoint root lands. They diverge in exactly one state, the one
+  /// [`replica_storage_wiped`](Self::replica_storage_wiped) reports: a node whose disk was replaced
+  /// and over which no endpoint has since been rebuilt. Its handle is the PRE-WIPE one — a wiped
+  /// voter fail-stops on `UnformattedVoter`, so recovery never reassigns it — and reporting its
+  /// remembered checkpoint would credit an empty disk with a snapshot that went with it. Such a node
+  /// reports 0, which is what a freshly formatted store holds.
   pub fn replica_checkpoint_op(&self, i: usize) -> viewstamp_proto::OpNumber {
+    if self.wiped_storage[i] {
+      return OpNumber::with(0);
+    }
     self.replicas[i].checkpoint_op()
+  }
+
+  /// True iff replica `i`'s durable storage was WIPED
+  /// ([`wipe_and_restart`](Self::wipe_and_restart)) and no endpoint has been rebuilt over the
+  /// replacement since — so every durable promise the node ever made went with the disk and it holds
+  /// nothing. A wiped VOTER stays in this state for the rest of the run: it fail-stops on
+  /// `UnformattedVoter` and no in-model path re-provisions it. A wiped LEARNER leaves it immediately,
+  /// on the rebuild that lets it rejoin empty.
+  pub fn replica_storage_wiped(&self, i: usize) -> bool {
+    self.wiped_storage[i]
   }
 
   /// Replica `i`'s current head op (for the M3 gate's laggard/strand-window construction).
@@ -964,8 +1001,15 @@ impl Cluster {
   /// after `Appended`, which a `Faulty` slot did fire) AND for the "a committed op stays in a quorum's
   /// durable WAL+snapshot" check (a committed slot stays occupied — `prune`/`truncate` never drop a
   /// committed slot above the checkpoint — even if its bytes later rot).
+  ///
+  /// Both clauses read a MEDIUM, never a memory of one: the slot status comes off the WAL fixture
+  /// itself, and the snapshot clause goes through
+  /// [`replica_checkpoint_op`](Self::replica_checkpoint_op), which reports 0 for a wiped disk no
+  /// endpoint has been rebuilt over. So a replica whose storage was replaced holds nothing here —
+  /// neither a slot nor a subsuming snapshot — which is the physical truth a stale handle would
+  /// otherwise contradict.
   pub fn replica_appended_op(&self, i: usize, op: OpNumber) -> bool {
-    op.get() <= self.replicas[i].checkpoint_op().get()
+    op.get() <= self.replica_checkpoint_op(i).get()
       || matches!(
         self.wals[i].status(op),
         viewstamp_proto::SlotStatus::Clean | viewstamp_proto::SlotStatus::Faulty
@@ -1425,9 +1469,9 @@ impl Cluster {
   /// [`crash`](Self::crash) + [`restart`](Self::restart): `crash` models power loss and so
   /// `discard_inflight`s both fixtures, destroying exactly the writes and completions that survive
   /// here. Nor is it [`wipe_and_restart`](Self::wipe_and_restart), which forfeits the durable state.
-  /// The endpoint is rebuilt through the same [`recover_in_place`](Self::recover_in_place) path a
-  /// plain `restart` uses, so the recovery itself is identical; the retained in-flight work is the
-  /// whole difference.
+  /// The endpoint is rebuilt through the same in-place recover path a plain
+  /// [`restart`](Self::restart) uses, so the recovery itself is identical; the retained in-flight
+  /// work is the whole difference.
   ///
   /// The replica is never marked crashed — it keeps being ticked across the swap, so the successor
   /// endpoint is live when the predecessor's completions arrive. Correlation ids restart at `1` in the
@@ -1488,6 +1532,9 @@ impl Cluster {
     )? {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
+        // The handle now describes the store underneath it again, so whatever it reports is backed by
+        // a medium — including after a wipe, where the successor recovers the EMPTY disk honestly.
+        self.wiped_storage[i] = false;
         // Drain the IMMEDIATE recover reads (synchronous in the sim). A faulted read leaves the op pending
         // and the replica Recovering; the recover-retry timer is then driven to a terminal status by the
         // CALLER — `restart` advances the shared clock for a single node, while `reconfigure_offline` ticks
@@ -1511,8 +1558,15 @@ impl Cluster {
   }
 
   /// Restart a previously-crashed replica with WIPED durable storage: its WAL + superblock are
-  /// REPLACED by fresh, empty ones (same fault plan / async modes / ring capacity — a swapped disk on
-  /// the same deployment), then boot `Endpoint::recover` over the empty disk.
+  /// REPLACED by fresh, empty ones and its block store is EMPTIED (same fault plans / async modes /
+  /// ring capacity — a swapped disk on the same deployment), then boot `Endpoint::recover` over the
+  /// empty disk.
+  ///
+  /// All THREE media go, because all three carry durable state: the WAL holds the log tail, the
+  /// superblock holds the root, and the block store holds the checkpoint DAGs the root names. Sparing
+  /// the blocks would leave the replica holding its whole checkpointed state on a disk it is supposed
+  /// to have lost — able to restore from it and to serve it to a peer's `RequestBlock` — so the axis
+  /// would never reach the work a genuinely empty replica owes: re-fetching its entire DAG from peers.
   ///
   /// This is the classic VSR AMNESIA hazard: every promise the replica's durable state ever made (its
   /// view participation, its durable quorum copies of committed ops) is forfeited. The recovery
@@ -1542,6 +1596,15 @@ impl Cluster {
       Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
       None => InMemorySuperblock::with_faults(self.storage_faults, s),
     };
+    // The third medium. Emptied in place rather than replaced so the store's seeded flush-fault plan,
+    // GC mode, and lifetime fault witnesses — all deployment properties, not medium contents — carry
+    // across the swap (see `MemBlockStore::wipe`).
+    self.block_stores[i].wipe();
+    // From here the node's durable state is forfeit. The three media above say so themselves; the
+    // endpoint handle does not, and stays behind if the recovery below installs no successor. Marked
+    // BEFORE the recover so the window is closed at both ends — a rebuild clears it, a fail-stop
+    // leaves it standing over the stale handle.
+    self.wiped_storage[i] = true;
     match self.recover_in_place(i) {
       // A wiped LEARNER resumes empty and rejoins (it never votes, so no amnesia risk).
       Ok(None) => {

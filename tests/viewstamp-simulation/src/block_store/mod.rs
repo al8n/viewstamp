@@ -148,6 +148,22 @@ impl MemBlockStore {
     self.flushed.insert(addr);
   }
 
+  /// Empties the MEDIUM: every held block and its durability bookkeeping are gone, as a replaced
+  /// disk's would be. Used by the cluster's wipe-and-restart to forfeit a replica's checkpoint DAGs
+  /// alongside its WAL + superblock — the blocks ARE the durable checkpoint's contents, so a wipe
+  /// that spared them would leave the replica able to restore and serve state it no longer has.
+  ///
+  /// The DEPLOYMENT survives the swap: the seeded flush-fault plan, the GC mode, and the lifetime
+  /// fault witnesses are properties of the machine the new medium is installed in, not of the medium.
+  /// Keeping the fault plan (rather than rebuilding a store without one) is what makes a wiped
+  /// replica keep faulting barriers at the same seeded rate the rest of the run does; keeping the
+  /// witnesses is what stops a wipe from silently retracting a fault an axis already observed.
+  pub fn wipe(&mut self) {
+    self.blocks.clear();
+    self.flushed.clear();
+    self.staged.clear();
+  }
+
   /// Whether the store holds `addr` AND a successful barrier has made it durable. The predicate the
   /// durable-checkpoint oracle is stated over: a held-but-STAGED block answers `false`.
   pub fn is_flushed(&self, addr: BlockAddress) -> bool {

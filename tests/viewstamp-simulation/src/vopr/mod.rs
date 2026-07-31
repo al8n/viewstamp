@@ -214,6 +214,21 @@ pub struct VoprReport {
   /// forfeited a replica's durable state; the committed wipe sweep asserts the cross-seed sum is
   /// `> 0`, so that lane can never silently become a no-op.
   wipes_fired: u64,
+  /// How many wipes landed on a non-voting LEARNER that then REJOINED the cluster on its empty disk.
+  /// A wiped VOTER fail-stops (`UnformattedVoter`) and stays down forever, so it is never ticked and
+  /// never re-syncs; only a learner walks the path a wiped node owes — rejoin, state-sync, and re-fetch
+  /// the whole checkpoint DAG it forfeited. `0` unless BOTH the wipe axis and the learner topology are
+  /// on; the wiped-learner sweep asserts the cross-seed sum is `> 0`, so a lane whose wipes all landed
+  /// on voters cannot pass as coverage of the re-fetch path.
+  learner_wipes_fired: u64,
+  /// Cumulative checkpoint blocks a wiped learner ACCEPTED from peers AFTER its wipe (hash-verified +
+  /// written over its state-sync block fetch), summed over the wiped learners against the fetch count
+  /// each held at the instant its disk was replaced. The cluster's per-replica fetch counter is a
+  /// lifetime observation that a disk swap does not reset, so the difference is exactly the DAG the
+  /// wiped node had to pull back across the network. `0` unless a wipe rejoined a learner; the
+  /// wiped-learner sweep asserts the cross-seed sum is `> 0` — the lane exists to prove the re-fetch
+  /// genuinely happened, not merely that nothing crashed.
+  wiped_learner_blocks_fetched: u64,
   /// The high-water of completed WAL appends that LOST their header (the torn-header
   /// contract-violation verdict), summed over replicas. `0` unless the torn-header axis is enabled
   /// (`VOPR_TORN_HEADER`, or [`run_vopr_with_torn_headers`] — the probe lane). `> 0` proves the
@@ -551,6 +566,20 @@ impl VoprReport {
   /// `0` with the axis disabled; the committed wipe sweep asserts the cross-seed sum is `> 0`.
   pub const fn wipes_fired(&self) -> u64 {
     self.wipes_fired
+  }
+
+  /// How many wipes landed on a LEARNER that rejoined on its empty disk (a wiped voter fail-stops and
+  /// stays down, so it never re-syncs). `0` unless the wipe axis and the learner topology are both on;
+  /// the wiped-learner sweep asserts the cross-seed sum is `> 0`.
+  pub const fn learner_wipes_fired(&self) -> u64 {
+    self.learner_wipes_fired
+  }
+
+  /// How many checkpoint blocks the wiped learners re-fetched from peers after their disks were
+  /// replaced. `> 0` ⇒ a node that genuinely lost its block store pulled the DAG back across the
+  /// network — the wiped-learner sweep's headline non-vacuity witness.
+  pub const fn wiped_learner_blocks_fetched(&self) -> u64 {
+    self.wiped_learner_blocks_fetched
   }
 
   /// The high-water of completed WAL appends that lost their header (the torn-header
@@ -995,6 +1024,13 @@ struct Vopr {
   /// Replicas wiped since the last invariant check, queued so [`Self::check_invariants`] can tell the
   /// stateful checkers their per-replica baselines are forfeit BEFORE they next observe the cluster.
   wiped_pending: Vec<usize>,
+  /// Per-replica checkpoint-block fetch count at the instant a LEARNER's disk was replaced, so
+  /// [`VoprReport::wiped_learner_blocks_fetched`] measures the DAG re-fetch that the wipe forced
+  /// rather than the ordinary catch-up the learner had already done. `None` for a replica no wipe
+  /// rejoined (every voter, and every learner on a run whose wipe landed elsewhere). Indexed by
+  /// replica. The cluster's fetch counter is a lifetime observation a disk swap does not reset, so the
+  /// baseline stays comparable across the wipe.
+  wiped_learner_fetch_base: Vec<Option<u64>>,
   /// Whether the BLOCK-JOB DELAY axis is enabled for this run: the `VOPR_BLOCK_DELAY` env var, or
   /// force-enabled via [`run_vopr_with_block_delay`]. Same discipline as [`Self::hold_axis`]: with the
   /// axis OFF no plan is installed on the cluster and no draw is consumed anywhere (the hold plan
@@ -1070,6 +1106,36 @@ pub fn run_vopr_with_hold(seed: u64, ticks: u64) -> VoprReport {
 /// sweep.
 pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.wipe_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr_with_wipe`] but with the LEARNER topology FORCE-ENABLED alongside the wipe axis
+/// (both programmatic, independent of `VOPR_WIPE` and `VOPR_LEARNER` — the [`run_vopr_with_hold`]
+/// pattern). The two axes only reach the emptied-disk RE-SYNC path in combination.
+///
+/// A wiped VOTER is refused readmission: an empty-log voter could join a view-change quorum having
+/// forgotten the durable vote that made the old commit quorum intersect the new one, so `recover`
+/// fail-stops it (`UnformattedVoter`) and it stays down for the rest of the run — never ticked, never
+/// answering a peer's block request, never fetching one. On a cluster of voters alone the wipe axis
+/// therefore proves only that the survivors carry on without the amnesiac. A non-voting LEARNER never
+/// votes, so nothing it forgot can break quorum intersection and it rejoins on the empty disk — and
+/// having lost its block store along with its WAL and superblock, it owes the full re-sync: state-sync
+/// to the cluster's checkpoint, then re-fetch every block of both content-addressed DAGs from peers,
+/// because it holds no leaf it could reuse.
+///
+/// That is the path this lane exists to keep under test, and
+/// [`VoprReport::wiped_learner_blocks_fetched`] is its witness: blocks the wiped learner accepted from
+/// peers after the swap. The EXISTING oracles judge every tick — agreement, no committed op
+/// rewritten/lost, quorum-durable retention relaxed by exactly the wiped count, the learner
+/// never-primary / no-emit gates, and learner convergence post-quiesce — so a violation here is a REAL
+/// finding, reported with its seed, never masked.
+///
+/// A run of this lane is a pure function of `(seed, ticks)` and its own deterministic baseline
+/// (byte-identical to a `VOPR_WIPE=1 VOPR_LEARNER=1` run of the same seed), distinct from both the
+/// wipe-only and learner-only lanes.
+pub fn run_vopr_with_wipe_learners(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, true);
   v.wipe_axis = true;
   run_seeded(v, ticks)
 }
@@ -1692,6 +1758,7 @@ impl Vopr {
       durable_quorum: DurableQuorumChecker::new(),
       sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
+      wiped_learner_fetch_base: vec![None; node_count],
       block_delay_axis: env_flag("VOPR_BLOCK_DELAY"),
       block_fault_axis: env_flag("VOPR_BLOCK_FAULT"),
       block_outstanding_committed: None,
@@ -2366,9 +2433,19 @@ impl Vopr {
         if trace {
           eprintln!("tick {tick}: WIPE replica {i} (fresh storage)");
         }
-        c.wipe_and_restart(i);
+        // A wiped VOTER fail-stops (`UnformattedVoter`) and stays down; only a non-voting LEARNER
+        // rejoins on the empty disk, and only it therefore walks the work an emptied node owes —
+        // state-sync plus a re-fetch of the whole checkpoint DAG that went with the block store.
+        // Baseline its lifetime fetch count here so the re-fetch is measured from the swap. The
+        // learner-range test is redundant with `rejoined` today and kept deliberately: it holds the
+        // counter's name true, and it keeps the armed baselines inside the range the fold reads.
+        let rejoined = c.wipe_and_restart(i);
         self.report.restarts += 1;
         self.report.wipes_fired += 1;
+        if rejoined && i >= self.voting_count {
+          self.report.learner_wipes_fired += 1;
+          self.wiped_learner_fetch_base[i] = Some(c.replica_blocks_fetched(i));
+        }
         // The stateful checkers' per-replica baselines (durable view, checkpoint high-water) are
         // forfeit with the disk; queue the notice so `check_invariants` resets them BEFORE the
         // next observation. Cluster-level invariants are NOT relaxed there.
@@ -3601,6 +3678,17 @@ impl Vopr {
       }
       self.learner_view_seen[i] = view;
     }
+    // WIPED-LEARNER re-fetch witness: how many checkpoint blocks each wiped learner has pulled from
+    // peers SINCE its disk was replaced. Recomputed from the baselines rather than folded, because the
+    // cluster's fetch counter is a lifetime observation no rebuild resets — the difference is already
+    // monotone, so assigning it each tick is idempotent. Stays 0 unless a wipe rejoined a learner
+    // (every baseline `None`), so no other lane's report is perturbed.
+    self.report.wiped_learner_blocks_fetched = (self.voting_count..self.node_count)
+      .filter_map(|i| {
+        self.wiped_learner_fetch_base[i]
+          .map(|base| c.replica_blocks_fetched(i).saturating_sub(base))
+      })
+      .sum();
     // Torn-header probe witness (summed over the persistent WALs, high-water like `misdirects_fired`
     // so a storage rebuild can never lower it). Stays 0 with the axis off.
     let th: u64 = (0..self.node_count)

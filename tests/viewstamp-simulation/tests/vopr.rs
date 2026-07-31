@@ -173,7 +173,7 @@ use viewstamp_simulation::{
   run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
   run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live, run_vopr_with_slow,
   run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
-  run_vopr_with_write_chaos,
+  run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -582,15 +582,18 @@ const WIPE_SEEDS: u64 = 16;
 /// The DEFAULT sweep leaves this axis OFF (it consumes extra PRNG draws, which would shift every
 /// pinned regression seed off its historical schedule); wipe-enabled runs are their own
 /// deterministic baselines, byte-identical to `VOPR_WIPE=1` runs of the same seeds.
+///
+/// `VOPR_SEEDS` widens the contiguous count at runtime, the same override the other axis lanes take.
 #[test]
 fn vopr_wipe_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(WIPE_SEEDS);
   let mut total_wipes = 0u64;
   let mut total_committed = 0usize;
   let mut seeds_with_view_change = 0u64;
   println!(
-    "VOPR wipe sweep: 0..{WIPE_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, wipe axis forced on"
+    "VOPR wipe sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, wipe axis forced on"
   );
-  for seed in 0..WIPE_SEEDS {
+  for seed in 0..seeds {
     let r = run_vopr_with_wipe(seed, DEFAULT_TICKS);
     total_wipes += r.wipes_fired();
     total_committed += r.max_committed();
@@ -623,6 +626,102 @@ fn vopr_wipe_sweep_no_violations() {
   println!(
     "VOPR wipe sweep OK: wipes_fired={total_wipes} committed={total_committed} \
      view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed WIPED-LEARNER sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const WIPE_LEARNER_SEEDS: u64 = 16;
+
+/// The committed WIPED-LEARNER sweep: [`run_vopr_with_wipe_learners`] over `0..WIPE_LEARNER_SEEDS` —
+/// the wipe axis AND the learner topology both FORCE-ENABLED programmatically (the
+/// [`run_vopr_with_hold`] pattern: no env var, so the lane cannot race another test's schedule and
+/// cannot be forgotten by a runner).
+///
+/// Neither axis alone reaches the path this lane guards. A wiped VOTER is refused readmission — an
+/// empty-log voter could join a view-change quorum having forgotten the durable vote that made the old
+/// commit quorum intersect the new one — so it fail-stops and stays down for the rest of the run,
+/// never ticked and never fetching anything. [`vopr_wipe_sweep_no_violations`] runs on voters alone, so
+/// every one of its wipes ends there. A non-voting LEARNER never votes, so nothing it forgot can break
+/// quorum intersection: it rejoins on the empty disk owing the FULL re-sync, because the wipe takes its
+/// block store along with its WAL and superblock. It must state-sync to the cluster's checkpoint and
+/// then re-fetch every block of both content-addressed DAGs from peers, holding no leaf it could reuse.
+///
+/// So the assertions below demand the combination actually happened: a wipe fired, one landed on a
+/// learner that REJOINED, and that learner pulled real blocks back across the network
+/// ([`VoprReport::wiped_learner_blocks_fetched`]). A lane that fetched nothing would be green while
+/// covering exactly nothing, which is the failure mode this sweep exists to prevent. Every standing
+/// oracle judges the run meanwhile — agreement, no committed op rewritten or lost, quorum-durable
+/// retention relaxed by exactly the wiped count, the learner never-primary / no-emit gates, and
+/// learner convergence post-quiesce — so a panic here is a REAL finding, reported with its seed, never
+/// masked.
+///
+/// The DEFAULT sweep leaves both axes OFF; a run of this lane is its own deterministic baseline,
+/// byte-identical to a `VOPR_WIPE=1 VOPR_LEARNER=1` run of the same seed. `VOPR_SEEDS` widens the
+/// contiguous count at runtime, the same override the other axis lanes take.
+#[test]
+fn vopr_wiped_learner_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(WIPE_LEARNER_SEEDS);
+  let mut total_wipes = 0u64;
+  let mut total_learner_wipes = 0u64;
+  let mut total_blocks_refetched = 0u64;
+  let mut total_learner_syncs = 0u64;
+  let mut total_committed = 0usize;
+  println!(
+    "VOPR wiped-learner sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, wipe + learner \
+     axes forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_wipe_learners(seed, DEFAULT_TICKS);
+    total_wipes += r.wipes_fired();
+    total_learner_wipes += r.learner_wipes_fired();
+    total_blocks_refetched += r.wiped_learner_blocks_fetched();
+    total_learner_syncs += r.learner_repairs_served();
+    total_committed += r.max_committed();
+  }
+  // Non-vacuity, in the order the coverage is built up. First the wipe axis fired at all — otherwise
+  // this is the learner sweep with extra steps.
+  assert!(
+    total_wipes > 0,
+    "the wipe axis never wiped a replica across the sweep (wipes_fired={total_wipes}) — the lane is \
+     vacuous (the axis is not plumbed through, or no seed ever had a crashed replica when the wipe \
+     roll fired)"
+  );
+  // Then a wipe landed on a LEARNER that rejoined. Without this the whole band could be wiped voters,
+  // every one of them fail-stopped and down — which is the wipe sweep's coverage, not this lane's.
+  assert!(
+    total_learner_wipes > 0,
+    "no wipe landed on a learner that rejoined across the sweep \
+     (learner_wipes_fired={total_learner_wipes}, wipes_fired={total_wipes}) — every wipe hit a voter \
+     and fail-stopped, so no emptied replica ever came back to re-sync"
+  );
+  // And the headline: the rejoined learner genuinely PULLED its checkpoint DAG back from peers. This
+  // is the claim the lane exists for — a wiped disk forfeits the block store, so the node owes the
+  // whole DAG. Passing with zero here would mean the re-fetch never ran.
+  assert!(
+    total_blocks_refetched > 0,
+    "no wiped learner re-fetched a single checkpoint block across the sweep \
+     (wiped_learner_blocks_fetched={total_blocks_refetched}, \
+     learner_wipes_fired={total_learner_wipes}) — the emptied replica rejoined without pulling its \
+     DAG back, so the block re-fetch path is untested"
+  );
+  // Supporting witnesses: the state-sync machinery that carries the re-fetch ran, and the cluster
+  // kept committing around the amnesiac.
+  assert!(
+    total_learner_syncs > 0,
+    "no learner completed a state-sync across the sweep \
+     (learner_repairs_served={total_learner_syncs}) — the catch-up path a wiped learner must walk \
+     never ran"
+  );
+  assert!(
+    total_committed > 0,
+    "the wiped-learner sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  println!(
+    "VOPR wiped-learner sweep OK: wipes_fired={total_wipes} \
+     learner_wipes_fired={total_learner_wipes} \
+     wiped_learner_blocks_fetched={total_blocks_refetched} \
+     learner_state_syncs={total_learner_syncs} committed={total_committed}"
   );
 }
 
