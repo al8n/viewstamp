@@ -1884,7 +1884,7 @@ fn no_old_generation_state_survives_a_view_transition() {
   // must end TRUE (the one field the shared reset sets false and this entry re-sets after).
   let mut e = backup();
   e.seed_old_generation_state_for_test();
-  e.catch_up_to_view(now, View::with(1));
+  e.catch_up_to_view(now, &mut storage, View::with(1));
   assert_eq!(e.status(), Status::ViewChange);
   assert_eq!(e.view(), View::with(1));
   assert!(
@@ -2690,10 +2690,14 @@ fn the_new_primary_re_drives_skipped_adoptions_when_its_view_root_lands() {
       "precondition: op {op} was skipped over the ring window at adoption (checkpoint_op still 0)"
     );
   }
-  // Release the queue: the checkpoint root completes FIRST (window advances; the sweep runs GATED
-  // — the StartViewAsPrimary root is still in flight), then the view root lands and its completion
-  // arm re-drives the skipped tail. The follow-on rounds complete the re-driven appends.
-  storage.sb_mut().flush();
+  // Release the queue write by write: the checkpoint root completes FIRST (window advances; the
+  // sweep runs GATED — the StartViewAsPrimary root is still in flight), then the pipeline hands the
+  // view root over and its landing's completion arm re-drives the skipped tail. The follow-on
+  // rounds complete the re-driven appends.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   for _ in 0..4 {
     e.storage_step(now, &mut storage, &mut blocks);
   }
@@ -3404,8 +3408,12 @@ fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
     "a primary must NOT hand out a StartView for a view that is not yet durable"
   );
   // Make the view durable: the deferred StartView broadcast fires now (start_view_participate).
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // Land the queue write by write: the one-deep root pipeline hands the next root to the
+  // backend only at the previous landing.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (pending_sb cleared)"
@@ -3477,8 +3485,12 @@ fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
     "a primary must NOT answer a Recovery in a view that is not yet durable"
   );
   // Make the view durable, then a fresh Recovery IS answered (with the canonical head).
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // Land the queue write by write: the one-deep root pipeline hands the next root to the
+  // backend only at the previous landing.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   while e.poll_message().is_some() {} // discard the deferred StartView broadcast
   e.handle_message(
     now,
@@ -3540,8 +3552,12 @@ fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending(
     "the ticks must not have force-completed the view write"
   );
   // Once the view is durable, the heartbeat resumes (start_view_participate arms the timers).
-  storage.sb_mut().flush();
-  e.storage_step(later_fire, &mut storage, &mut blocks);
+  // Land the queue write by write: the one-deep root pipeline hands the next root to the
+  // backend only at the previous landing.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(later_fire, &mut storage, &mut blocks);
+  }
   while e.poll_message().is_some() {} // discard the deferred StartView
   let later2 = later_fire + core::time::Duration::from_secs(5);
   e.handle_timeout(later2, &mut storage);
@@ -3604,8 +3620,12 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
   );
   // Make the view durable (this fires the deferred StartView broadcast — discard it), then the SAME
   // RequestPrepare IS answered with a Prepare carrying the now-durable view 1.
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // Land the queue write by write: the one-deep root pipeline hands the next root to the
+  // backend only at the previous landing.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (pending_sb cleared)"
@@ -3661,8 +3681,12 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   let now = Instant::ZERO;
   // Settle the primed view-1 window first: flush the view-1 root and discard the deferred
   // StartView. The window this test exercises is opened again below, over a CHECKPOINTED timeline.
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // Land the queue write by write: the one-deep root pipeline hands the next root to the
+  // backend only at the previous landing.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   while e.poll_message().is_some() {}
   assert!(!e.pending_sb_for_test(), "view 1 is durable");
   // Give this settled primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op
@@ -3777,11 +3801,13 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   );
   // Make the view durable — the StepSb publishes the roots the endpoint REALLY submitted, each
   // carrying the copy-forwarded op-1 checkpoint pair, so the durable root now names both view 4
-  // and the servable checkpoint with no fixture surgery. (This fires the deferred StartView
-  // broadcast — discard it.) Then the SAME RequestSync IS answered with a SyncCheckpoint carrying
-  // the now-durable view 4.
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // and the servable checkpoint with no fixture surgery. Land the queue write by write (the
+  // one-deep root pipeline). (This fires the deferred StartView broadcast — discard it.) Then the
+  // SAME RequestSync IS answered with a SyncCheckpoint carrying the now-durable view 4.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (pending_sb cleared)"
@@ -8050,4 +8076,72 @@ fn forked_normal_views_converge_and_resume_committing() {
     OpNumber::with(1),
     "the backup learns the committed frontier"
   );
+}
+
+#[test]
+fn a_slow_superblock_bounds_the_root_backlog_across_view_change_windows() {
+  // Replica 1 of 3, view-0 backup, over a superblock that never completes a write until the test
+  // releases it (`StepSb` without `flush`) — a CONFORMING backend that is merely arbitrarily slow.
+  // A quorum of peer SVCs enters view after view while the first durable-view root is still in
+  // flight; each entry supersedes the previous `pending_sb` correlation. The session must keep the
+  // root timeline and the backend's outstanding writes constant-bounded through every window, and
+  // once completions are released the LATEST view must become durable.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (wal, sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  const WINDOWS: u64 = 24;
+  for v in 1..=WINDOWS {
+    for peer in [ReplicaId::new(0), ReplicaId::new(2)] {
+      e.handle_message(
+        now,
+        &mut storage,
+        Peer::Replica(peer),
+        Message::StartViewChange(StartViewChange::new(
+          View::with(v),
+          peer,
+          crate::Epoch::new(0),
+          0,
+        )),
+      );
+    }
+    assert_eq!(e.view(), View::with(v), "the SVC quorum entered view {v}");
+    e.storage_step(now, &mut storage, &mut blocks);
+    while e.poll_message().is_some() {}
+    assert!(
+      storage.roots_in_flight() <= 3,
+      "window {v}: the root timeline grew past its bound ({} roots queued)",
+      storage.roots_in_flight()
+    );
+    assert!(
+      storage.sb_mut().inflight.len() <= 1,
+      "window {v}: the backend holds more than one outstanding root ({} staged)",
+      storage.sb_mut().inflight.len()
+    );
+  }
+  // Release the completions: each flush lands the write the backend holds, and that landing hands
+  // the next queued root over — so pump landing by landing until the timeline drains.
+  for _ in 0..8 {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+    while e.poll_message().is_some() {}
+    if !storage.has_inflight() {
+      break;
+    }
+  }
+  assert!(!storage.has_inflight(), "the released timeline drained");
+  assert_eq!(
+    storage.sb().state().view(),
+    View::with(WINDOWS),
+    "the LATEST submitted view became durable"
+  );
+  assert_eq!(e.durable_view, View::with(WINDOWS));
+  assert_eq!(e.view(), View::with(WINDOWS));
 }

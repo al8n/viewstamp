@@ -430,7 +430,8 @@ fn reset_for_view_transition_clears_the_probe_round() {
     "a round is outstanding before the transition"
   );
 
-  e.reset_for_view_transition(Instant::ZERO);
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+  e.reset_for_view_transition(Instant::ZERO, &mut storage);
   assert!(
     e.health_probe.is_none(),
     "the view transition wiped the outstanding probe round"

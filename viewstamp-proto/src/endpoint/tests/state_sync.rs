@@ -6125,7 +6125,8 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
   // (1) Drive the laggard into a Recovering, cross-epoch (`require_cross_epoch`) peer-fetch directly, then
   // deliver a VERIFIED crossing reply with a SCRIPTED FLUSH FAULT so the recovery `apply_sync` RETAINS the
   // crossing as an owed `pending_install` while STAYING Recovering.
-  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(m));
+  let mut storage = Storage::new(wal, sb);
+  e.enter_cross_epoch_peer_fetch(now, &mut storage, OpNumber::with(m));
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -6145,7 +6146,6 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
       .encode_body();
-  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
     &mut storage,
@@ -9860,7 +9860,8 @@ fn a_quarantine_armed_crossing_in_recovery_disarms_and_escalates() {
   // hint does for a non-Normal laggard (`maybe_request_cross_epoch_catchup` sets the donor, then
   // `enter_cross_epoch_peer_fetch` flips to Recovering and arms the forced crossing).
   e.seed_quarantined_donor_for_test(now, quarantined());
-  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(4));
+  let mut storage = Storage::new(wal, sb);
+  e.enter_cross_epoch_peer_fetch(now, &mut storage, OpNumber::with(4));
   assert!(
     e.status().is_recovering(),
     "precondition: the non-Normal laggard entered the Recovering crossing"
@@ -9871,7 +9872,6 @@ fn a_quarantine_armed_crossing_in_recovery_disarms_and_escalates() {
   );
 
   // No donor answers. Step the recovery retry cadence past the bounded window.
-  let mut storage = Storage::new(wal, sb);
   for ms in 1..=8 {
     e.handle_timeout(
       now + core::time::Duration::from_millis(ms * 200),
@@ -9912,11 +9912,11 @@ fn a_non_crossing_reply_in_recovery_does_not_shield_the_probe() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
+  let mut storage = Storage::new(wal, sb);
   e.seed_quarantined_donor_for_test(now, quarantined());
-  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(4));
+  e.enter_cross_epoch_peer_fetch(now, &mut storage, OpNumber::with(4));
   let nonce = e.sync_nonce_for_test();
   // A NON-crossing reply (same config, empty membership) admitted onto the recovery fetch path.
-  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
     &mut storage,

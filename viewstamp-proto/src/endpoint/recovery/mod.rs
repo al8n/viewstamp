@@ -1676,7 +1676,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// completion fires), enter `Recovering` with a FRESH `RecoverState` latched at `awaiting_peer_checkpoint`
   /// (no local reads — the WAL/SM are consistent at the stale point, just hopelessly behind the pruned
   /// cluster), and arm the FORCED peer-fetch exactly as the checkpoint-exhaustion escalation does.
-  pub(crate) fn enter_cross_epoch_peer_fetch(&mut self, now: Instant, checkpoint: OpNumber) {
+  pub(crate) fn enter_cross_epoch_peer_fetch<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    checkpoint: OpNumber,
+  ) {
     if self.awaiting_peer_checkpoint() {
       return; // already fetching — `recover_timeouts` re-solicits on its cadence.
     }
@@ -1697,7 +1702,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `ViewChange`-only collection (so the imminent `Recovering` status keeps the
     // `view_change.is_some() == is_view_change()` coupling), and any prior-view `pending_sb` (a stale
     // completion is then ignored in `on_sb_done`, the `catch_up_to_view` shape).
-    self.reset_for_view_transition(now);
+    self.reset_for_view_transition(now, storage);
     // A SAME-CONFIG pre-root staged install (if `reset_for_view_transition` preserved one) is SUPERSEDED
     // here: the crossing this path arms targets `>= N > M` (`N` is the reconfigure op, strictly above this
     // laggard's frontier, and M was at/below it), so the crossing is a strictly-NEWER checkpoint that
@@ -1715,7 +1720,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.inflight.clear();
     self.buffer.clear();
     self.view_change = None;
-    self.pending_sb = None;
+    // Only a Seal or SwapEpoch action can still be armed here (the `pending_durable_view` guard
+    // above deferred the three view-changing actions): abandon it — its completion must not fire
+    // mid-recovery — and forfeit its root with the correlation, so a parked one leaves the queue.
+    // A SUBMITTED one still lands, and an epoch-advancing landing still installs the successor
+    // through the landing absorb, exactly as any superseded swap's does.
+    if let Some((abandoned, _)) = self.pending_sb.take() {
+      storage.forfeit_root(abandoned);
+    }
     // Sweep in-flight serve-reads: a Recovering node abandons its donor role. A leaked `sync_serving`
     // entry (its completion is dropped as foreign by `on_recover_sb_done` without removing the entry) would
     // make `submit_or_refresh_serve` dedupe every future `RequestSync` from that requester — never
@@ -2059,7 +2071,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       if self.is_voter() {
         self.enter_view_change_from_recovery(now, storage, self.view);
       } else {
-        self.enter_catch_up_posture(now);
+        self.enter_catch_up_posture(now, storage);
       }
     } else if self.membership.replica_count() > 1
       && self
@@ -2826,7 +2838,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// bound (see the constant's rationale), so a legitimate catch-up is never rejected; the validated
   /// adoption vehicles (`on_start_view`/`on_recovery_response`, sender-bound to the claimed view's
   /// primary) remain unclamped.
-  pub(crate) fn catch_up_to_view(&mut self, now: Instant, view: View) {
+  pub(crate) fn catch_up_to_view<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    view: View,
+  ) {
     if self.sync_repersist_root_staged() {
       // Defer: a state-sync re-persist root is staged. Let it install to the synced point first (the
       // install is destructive and cannot run interleaved with the catch-up posture). The higher-view
@@ -2841,7 +2858,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       "catch-up target must be strictly newer than our view"
     );
     self.view = view;
-    self.enter_catch_up_posture(now);
+    self.enter_catch_up_posture(now, storage);
   }
 
   /// Enter the catching-up `ViewChange` posture AT the current `self.view`: reset old-generation
@@ -2853,14 +2870,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// a strictly-higher advertised view first; the learner recovery re-establishment
   /// ([`Self::complete_recovery`]) leaves it at the current view (re-fetching THIS view's installed log
   /// after a crash left `log_view < view`).
-  fn enter_catch_up_posture(&mut self, now: Instant) {
+  fn enter_catch_up_posture<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     self.set_status(Status::ViewChange);
     self.svc_target = self.view;
     // Tear down ALL old-generation in-flight state in one place: SVC bits, in-flight
     // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install
     // (cancelled together — durable-before-install leaves the old state intact), and the
     // forfeit sub-state. See [`Self::reset_for_view_transition`] for the per-field rationale.
-    self.reset_for_view_transition(now);
+    self.reset_for_view_transition(now, storage);
     // ViewChange ENTRY (the catch-up): install a fresh collection with `catching_up = true` — this entry
     // sends GetView, not SVC/DVC. (`is_some() == is_view_change()` coupling.)
     self.view_change = Some(ViewChangeCollection::entering(true));
@@ -2868,10 +2889,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // reset because `adopt_canonical_head` preserves a live primary pipeline).
     self.inflight.clear();
     self.buffer.clear();
-    // GetView is a catch-up probe, not a vote; no superblock write needed. Clear any prior-view
-    // pending_sb (supersession): a stale completion from the prior view must not fire. (This is the
-    // distinguishing `pending_sb` action — the two durable-view-writing entries overwrite it instead.)
-    self.pending_sb = None;
+    // GetView is a catch-up probe, not a vote; no superblock write needed. ABANDON any prior-view
+    // pending_sb: a stale completion from the prior view must not fire, and the abandoned root —
+    // if still parked — is forfeited with its correlation, or an alternating submit/catch-up
+    // schedule would strand one orphaned queue entry per cycle. (This is the distinguishing
+    // `pending_sb` action — the two durable-view-writing entries overwrite it instead.)
+    if let Some((abandoned, _)) = self.pending_sb.take() {
+      storage.forfeit_root(abandoned);
+    }
     self.arm_timers(now);
     self.send_get_view(now);
   }

@@ -161,18 +161,24 @@ pub struct Storage<W, B, S: StateMachine> {
   /// on the landed root instead of the back of this queue would come up BELOW a state the medium
   /// is already guaranteed to reach.
   ///
-  /// The queue's tail may be PARKED rather than submitted ([`Self::roots_submitted`] counts the
-  /// submitted prefix): a root submission is deferred behind a DIFFERENT incarnation's outstanding
-  /// root — the superblock analogue of the append fence — and the session itself submits it, in
-  /// queue order, once every foreign root ahead of it has landed. Parked or submitted, an entry is
-  /// a committed point on the timeline: the effective root includes it, and quiescence
-  /// ([`Self::has_inflight`], [`Self::into_parts`]) waits for it.
+  /// Only the FRONT is ever WITH the backend ([`Self::roots_submitted`] counts the submitted
+  /// prefix — at most one entry): every later submission is PARKED, deferred in queue order until
+  /// the landings ahead of it settle, so a conforming backend that is merely slow holds one root
+  /// write, never a backlog. Parked or submitted, an entry is a committed point on the timeline:
+  /// the effective root includes it, and quiescence ([`Self::has_inflight`],
+  /// [`Self::into_parts`]) waits for it — unless its submitter FORFEITS it
+  /// ([`Self::forfeit_root`]), which removes a parked entry the moment no correlation awaits it.
+  /// Forfeiture is what keeps the queue itself constant-bounded: a live endpoint awaits at most
+  /// two roots at a time (its durable-view write and its checkpoint root), so the queue holds the
+  /// front, the awaited roots, and at most the awaited pair of each dead incarnation that ended
+  /// with correlations in flight — each of those drains at a landing.
   roots: VecDeque<(WriteId, VsrState)>,
   /// How many entries at the FRONT of [`Self::roots`] have been handed to
-  /// [`Superblock::submit_write`]. Always a prefix: submission order is queue order, so a parked
-  /// entry can never overtake one ahead of it. Entries at/after this index are parked behind a
-  /// foreign outstanding root and are submitted by [`Self::poll_sb`] as the landings ahead of them
-  /// settle.
+  /// [`Superblock::submit_write`] — `0` or `1`, never more: the physical root pipeline is one
+  /// deep ([`Self::submit_root`]'s gate), so the backend can never accumulate a backlog of this
+  /// session's roots however slowly it completes them. Always a prefix: submission order is queue
+  /// order, so a parked entry can never overtake the front. Entries at/after this index are
+  /// parked and are submitted by [`Self::poll_sb`] as the landings ahead of them settle.
   roots_submitted: usize,
   /// EVERY in-flight checkpoint-envelope write: full id → the checkpoint op it stages. Tracked so
   /// quiescence ([`Self::has_inflight`], [`Self::into_parts`]) covers the envelope leg of a
@@ -297,6 +303,18 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
     &self.sb
   }
 
+  /// The number of durable-root writes on the in-flight timeline — the submitted front plus every
+  /// parked entry behind it.
+  ///
+  /// Exposed for the simulation boundedness checker: the submission gate keeps the backend at one
+  /// outstanding root, and forfeiture keeps this queue within the live endpoint's awaited roots
+  /// plus any dead incarnation's leftovers. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn roots_in_flight(&self) -> usize {
+    self.roots.len()
+  }
+
   /// Test-only escape hatch to the raw WAL handle, for fixture knobs (staging, landing order,
   /// fault injection). Never part of the public surface: a `&mut W` in embedder hands would let an
   /// append bypass the ledger.
@@ -415,9 +433,13 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// checkpoint pair and the configuration block) are instead COPIED FORWARD from here by every
   /// root writer, so a rebuilt endpoint holds them at the LANDED root — what a crash actually
   /// recovers — without its writes ever rewinding the timeline.
-  /// Invariant during any window in which no new root is submitted: landings drain the queue's
-  /// front without moving the back, and when the queue empties the durable root EQUALS the
+  /// Invariant during any window in which no root is submitted or forfeited: landings drain the
+  /// queue's front without moving the back, and when the queue empties the durable root EQUALS the
   /// last-submitted one — so this value is stable across the drain, never a snapshot of a moment.
+  /// A forfeiture ([`Self::forfeit_root`]) can retire the back itself: the value then steps back
+  /// to the previous timeline point, which is sound for the same reason the drain is — the
+  /// forfeited state was never handed to the medium, so the medium now converges to the new back,
+  /// and every later writer re-derives from it under the same no-rewind asserts.
   ///
   /// What it deliberately does NOT claim: that this state is durable YET. Across a process death
   /// the in-flight tail dies with the process, so an endpoint recovering here must keep its
@@ -449,14 +471,20 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// Submit a durable-root write, recording `(id, state)` on the root timeline. The ONLY route to
   /// [`Superblock::submit_write`] past genesis.
   ///
-  /// While a DIFFERENT incarnation's root is still outstanding, the submission is PARKED — recorded
-  /// on the timeline but not yet handed to the backend — and the session submits it, in queue
-  /// order, once every foreign root ahead of it has landed ([`Self::poll_sb`]). This is the
-  /// superblock analogue of the append fence: a successor endpoint defers its own root write
-  /// behind a dead predecessor's outstanding one, so the two incarnations' writes can never be
-  /// interleaved at the backend. Same-incarnation stacking is NOT parked — an endpoint may have a
-  /// checkpoint root and a view-change root in flight together, relying on ordered delivery and
-  /// last-submitted-wins exactly as before.
+  /// While ANY root is outstanding — this incarnation's or a dead predecessor's — the submission
+  /// is PARKED: recorded on the timeline but not yet handed to the backend, and submitted by the
+  /// session itself, in queue order, as the landings ahead of it settle ([`Self::poll_sb`]). One
+  /// physical root write in flight is the whole pipeline. The gate is what keeps a conforming but
+  /// arbitrarily slow backend from accumulating a write backlog: the backend owes completions in
+  /// order but owes them at no particular time, so a submitter that stacked a root per view-change
+  /// window would otherwise grow the backend's queue — and this ledger, each entry cloning a
+  /// header-bearing state — without bound. It also subsumes the cross-incarnation fence: with one
+  /// write ever out, a successor's root can never interleave with a dead predecessor's
+  /// outstanding one. An endpoint may still have a checkpoint root and a view-change root in
+  /// flight together — ordered delivery and last-submitted-wins hold exactly as before, with the
+  /// order now enforced by the queue rather than trusted to the backend's serialization — and a
+  /// stacked root a later submission supersedes is removed by [`Self::forfeit_root`] the moment
+  /// its correlation ends, which is what bounds the queue itself.
   pub(crate) fn submit_root(&mut self, id: WriteId, state: VsrState) {
     // The no-rewind invariants ENFORCED at the submission choke, in every build profile. The
     // asserts run BEFORE `Superblock::submit_write`, so a violating root is REFUSED — it never
@@ -520,37 +548,47 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
       state.config_install_op().get(),
       effective.config_install_op().get(),
     );
-    let parked = self.roots_submitted < self.roots.len()
-      || self
-        .roots
-        .iter()
-        .take(self.roots_submitted)
-        .any(|(qid, _)| qid.incarnation() != id.incarnation());
-    if !parked {
+    if self.roots.is_empty() {
       self.sb.submit_write(id, state.clone());
-      self.roots_submitted += 1;
+      self.roots_submitted = 1;
     }
     self.roots.push_back((id, state));
   }
 
-  /// Hand the longest releasable parked prefix to the backend: each parked root submits, in queue
-  /// order, once nothing of a DIFFERENT incarnation is outstanding ahead of it. Runs after every
-  /// root landing, so the fence releases exactly when its blocking write quiesces — the same
-  /// release discipline as a fence-deferred append.
-  fn release_parked_roots(&mut self) {
-    while self.roots_submitted < self.roots.len() {
-      let next_id = self.roots[self.roots_submitted].0;
-      let blocked = self
-        .roots
-        .iter()
-        .take(self.roots_submitted)
-        .any(|(qid, _)| qid.incarnation() != next_id.incarnation());
-      if blocked {
-        return;
-      }
-      let (id, state) = self.roots[self.roots_submitted].clone();
+  /// Hand the next queued root to the backend once nothing is outstanding. Runs after every root
+  /// settlement, so the one-deep pipeline refills the moment its slot frees — the same release
+  /// discipline as a fence-deferred append.
+  fn release_next_root(&mut self) {
+    if self.roots_submitted == 0
+      && let Some((id, state)) = self.roots.front().cloned()
+    {
       self.sb.submit_write(id, state);
-      self.roots_submitted += 1;
+      self.roots_submitted = 1;
+    }
+  }
+
+  /// Remove a PARKED root whose submitter has ended its correlation — superseded it with a newer
+  /// submission, or abandoned it without one. A no-op for the submitted front (an outstanding
+  /// write is owed to the medium and must land) and for an id the queue no longer holds (already
+  /// landed).
+  ///
+  /// Removal is sound exactly because the entry is parked and disowned. The backend never saw the
+  /// write, so nothing physical exists for quiescence to wait on; no completion can ever name it
+  /// (only submitted writes complete) and its owner awaits none (this call IS the correlation's
+  /// end), so nothing strands. And the landing sequence stays monotone: the queue is monotone in
+  /// every no-rewind dimension by the submission asserts, and removing one entry leaves a
+  /// subsequence, so no retained landing rewinds another. The back itself may be removed — the
+  /// effective root then steps back to the previous entry, which is again the state the medium
+  /// converges to, because the forfeited state was never handed to the medium and every later
+  /// writer re-derives from the post-removal effective root under the same asserts.
+  pub(crate) fn forfeit_root(&mut self, id: WriteId) {
+    if let Some(at) = self
+      .roots
+      .iter()
+      .skip(self.roots_submitted)
+      .position(|(qid, _)| *qid == id)
+    {
+      self.roots.remove(self.roots_submitted + at);
     }
   }
 
@@ -571,9 +609,9 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// incarnation's — pops the front of the root timeline and rides alongside the completion with
   /// the exact state it made durable, so a successor endpoint can adopt an inherited landing even
   /// though the completion itself is refused as foreign. An envelope landing leaves the envelope
-  /// ledger the same way. Each root landing also releases any parked roots whose fence it was: a
-  /// successor's deferred root write is handed to the backend the moment the last foreign root
-  /// ahead of it has landed.
+  /// ledger the same way. Each root settlement also refills the one-deep root pipeline: the next
+  /// parked root — a later write of this incarnation's, or a successor's deferred behind a dead
+  /// predecessor's — is handed to the backend the moment the landing frees the slot.
   pub(crate) fn poll_sb(&mut self) -> Option<SbPolled> {
     let done = self.sb.poll()?;
     let landed_root = match &done {
@@ -583,26 +621,26 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
         if self.roots_submitted > 0 && self.roots.front().is_some_and(|(fid, _)| fid == id) {
           self.roots_submitted -= 1;
           let landed = self.roots.pop_front();
-          self.release_parked_roots();
+          self.release_next_root();
           landed
         } else if self.checkpoints.remove(&key(*id)).is_some() {
           None
         } else if let Some(at) = self.roots.iter().position(|(fid, _)| fid == id) {
-          // Root completions must arrive in submission order (the single-serialized-writer
-          // contract), and a parked root has no completion to arrive at all; either shape here is
-          // a backend violation. Settle it anyway so the ledger drains — including releasing any
-          // parked tail whose fence this settlement retired, exactly as the in-order arm does,
-          // else the parked roots would strand with nothing left to release them (`has_inflight`
-          // true forever, `into_parts` refused forever) — then surface the violation, in every
-          // profile: out-of-order root landings break the last-submitted-wins convergence every
-          // effective-root read stands on, so continuing would be consensus over a medium whose
-          // durable root is no longer the one the timeline promised. The settle precedes the
-          // panic so the ledger is coherent at the panic point.
+          // With one root outstanding, a completion matching the queue anywhere but the submitted
+          // front can only name a PARKED root — a write the backend was never handed — or arrive
+          // against a desynced submitted count; either shape is a backend violation. Settle it
+          // anyway so the ledger drains — including refilling the pipeline exactly as the
+          // in-order arm does, else the parked roots would strand with nothing left to release
+          // them (`has_inflight` true forever, `into_parts` refused forever) — then surface the
+          // violation, in every profile: out-of-order root landings break the
+          // last-submitted-wins convergence every effective-root read stands on, so continuing
+          // would be consensus over a medium whose durable root is no longer the one the timeline
+          // promised. The settle precedes the panic so the ledger is coherent at the panic point.
           if at < self.roots_submitted {
             self.roots_submitted -= 1;
           }
           self.roots.remove(at);
-          self.release_parked_roots();
+          self.release_next_root();
           panic!("a root write completed out of submission order: {id:?} at queue position {at}");
         } else {
           // A completion for a write the session never submitted — the same untrusted-medium

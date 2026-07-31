@@ -778,10 +778,13 @@ fn a_view_change_entered_inside_the_swap_window_carries_the_successor_configurat
   assert_eq!(e.status(), Status::ViewChange);
   while e.poll_message().is_some() {}
 
-  // Both roots land in submission order. The LAST landing is the view-change root, so whatever
-  // configuration it carries is what a crash from here recovers.
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // Both roots land in submission order — the one-deep root pipeline hands the view root to the
+  // backend at the swap root's landing, so land the queue write by write. The LAST landing is the
+  // view-change root, so whatever configuration it carries is what a crash from here recovers.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   let durable = storage.sb().state();
   assert_eq!(
     durable.view(),
@@ -1268,7 +1271,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   // A higher-epoch heartbeat in a non-Normal state routes the laggard into the cross-epoch peer-fetch.
   // `enter_cross_epoch_peer_fetch` clears the in-flight SwapEpoch root (its stale completion is ignored)
   // but PRESERVES `pending_swap` via `reset_for_view_transition` — the exact precondition of the bug.
-  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(n1));
+  e.enter_cross_epoch_peer_fetch(now, &mut storage, OpNumber::with(n1));
   assert!(
     e.pending_swap_for_test(),
     "the cross-epoch peer-fetch PRESERVES the staged swap (reset_for_view_transition keeps it)",
@@ -1425,7 +1428,7 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut storage);
 
   // A higher-epoch heartbeat routes the non-Normal laggard into the recovery peer-fetch.
-  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(n1));
+  e.enter_cross_epoch_peer_fetch(now, &mut storage, OpNumber::with(n1));
   assert!(
     e.status() == Status::Recovering
       && e.awaiting_peer_checkpoint_for_test()
@@ -1962,9 +1965,12 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   );
 
   // Once the durable-view write LANDS (the window closes), a fresh proposal is admitted — proving the
-  // `Busy` verdict was a transient retry signal, not a permanent rejection. Flush the SB then drain.
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // `Busy` verdict was a transient retry signal, not a permanent rejection. Land the queue write by
+  // write (the one-deep root pipeline), then drain.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   while e.poll_message().is_some() {}
   assert!(
     !e.pending_durable_view_for_test(),
@@ -3888,7 +3894,7 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
   assert!(e.learner_proof.is_some(), "a challenge is outstanding");
 
   // A view transition clears the outstanding challenge.
-  e.reset_for_view_transition(Instant::ZERO);
+  e.reset_for_view_transition(Instant::ZERO, &mut storage);
   assert!(
     e.learner_proof.is_none(),
     "reset_for_view_transition clears the outstanding learner-promote challenge",

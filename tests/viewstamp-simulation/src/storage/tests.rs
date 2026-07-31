@@ -888,12 +888,15 @@ fn crash_discards_a_staged_but_unrooted_snapshot_keeping_the_rooted_one() {
 }
 
 #[test]
-fn supersession_keeps_the_older_rooted_snapshot_readable() {
-  // The serialized-root-ordering supersession (the proto's `submit_durable_view` comment): a
-  // checkpoint's step-2 root (naming the NEW op) is left in flight when a view change issues a
-  // durable-view root naming the OLD checkpoint; FIFO completes the new-op root FIRST but the later
-  // old-op root supersedes it. The live checkpoint must end up the OLD one, and its snapshot must
-  // still be readable (not GC'd by the transient new-op-rooted window). Async mode to stage both.
+fn a_staged_root_defers_the_live_checkpoint_handoff_until_it_lands() {
+  // The retention window the serialized root writer still opens: a checkpoint's step-2 root is
+  // STAGED (in flight, not yet durable), and until it lands the OLD checkpoint is the live one —
+  // its snapshot must stay readable, and the newer written-but-unrooted generation must be
+  // retained without being served. (The historical supersession arm — a LATER root naming an
+  // OLDER checkpoint completing behind a newer-op root — can no longer be submitted at all: the
+  // proto session refuses a checkpoint-pointer rewind at its submission choke and hands the
+  // backend one root write at a time, which the submit_write assert above enforces. The GC's
+  // drain-before-collect deferral stays as a general-backend belt.)
   let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
   // Establish a rooted checkpoint at op 4 first (drain fully).
   sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"snap4"));
@@ -901,16 +904,17 @@ fn supersession_keeps_the_older_rooted_snapshot_readable() {
   sb.submit_write(write_id(2), root_naming_checkpoint(4));
   drain(&mut sb);
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
-  // A new checkpoint at op 8: snapshot written + its step-2 root staged...
+  // A new checkpoint at op 8: snapshot written and durable, its step-2 root STAGED but unlanded.
   sb.submit_write_checkpoint(write_id(3), OpNumber::with(8), Bytes::from_static(b"snap8"));
   drain(&mut sb); // snapshot durable; op-8 root not yet submitted
   sb.submit_write(write_id(4), root_naming_checkpoint(8)); // step-2 root for op 8 (staged)
-  // ...then a view change supersedes it with a durable-view root naming the OLD op 4 (staged AFTER).
-  sb.submit_write(write_id(5), root_naming_checkpoint(4));
-  drain(&mut sb);
-  // The FINAL durable root names op 4 (supersession), and the op-4 snapshot is STILL readable.
+  // While the root is in flight the OLD checkpoint is still the live, servable one.
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
   assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
+  // The landing promotes op 8: the new generation is served, and only then is op 4 collectable.
+  drain(&mut sb);
+  assert_eq!(sb.state().checkpoint_op(), OpNumber::with(8));
+  assert_eq!(read_live_checkpoint(&mut sb), (8, b"snap8".to_vec()));
 }
 
 #[test]

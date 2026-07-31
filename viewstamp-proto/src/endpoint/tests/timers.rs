@@ -51,10 +51,13 @@ fn new_primary_in_pending_view_window_does_not_spin_a_poll_timeout_driver() {
       "the durable-view window stays open until the superblock completes (no timer resolves it)"
     );
   }
-  // PASS-AFTER: the durable-view completion (not a timer) is what begins participation. Deliver it and
-  // confirm the new primary now broadcasts its StartView and arms its real Normal-primary timers.
-  storage.sb_mut().flush();
-  e.storage_step(now, &mut storage, &mut blocks);
+  // PASS-AFTER: the durable-view completion (not a timer) is what begins participation. Deliver the
+  // queue write by write (the one-deep root pipeline) and confirm the new primary now broadcasts its
+  // StartView and arms its real Normal-primary timers.
+  while storage.sb_mut().has_inflight() {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (the superblock completion, not a timer, resolved the window)"

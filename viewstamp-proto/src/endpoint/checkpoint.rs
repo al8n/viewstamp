@@ -1410,7 +1410,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Persist the durable VSR root for the current `(view, log_view, commit_max)` and arm the
   /// participation deferred until the write completes.
-  /// Overwrites any prior `pending_sb` (supersession): an older-view completion is then ignored.
+  /// Overwrites any prior `pending_sb` (supersession): an older-view completion is then ignored,
+  /// and the superseded root — if still parked in the session — is forfeited rather than left to
+  /// accumulate one queue entry per view-change window.
   ///
   /// **Persists the KNOWN-committed frontier, not the applied one.** The `VsrState`
   /// commit is `self.commit_max` (the highest op KNOWN committed cluster-wide), NOT `self.commit_min`
@@ -1427,9 +1429,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///, lose committed ops on recovery. The view transitions drop the LOGICAL
   /// `pending_checkpoint`, so `self.checkpoint_op` equals the durable checkpoint op and
   /// `sb.state().checkpoint_id()` is its matching id. (A checkpoint's step-2 root write may still be
-  /// PHYSICALLY in flight when a view change issues this durable-view root write; the `Superblock`
-  /// serialized root-write ordering contract guarantees this later write is the final durable root,
-  /// so the stale checkpoint root cannot win.) `commit_max >= commit_min >= checkpoint_op` always holds,
+  /// on the session timeline — with the backend or parked — when a view change issues this
+  /// durable-view root write; the session's queue-ordered one-deep root pipeline plus the
+  /// `Superblock` root-write ordering contract guarantee this later write is the final durable
+  /// root, so the stale checkpoint root cannot win.) `commit_max >= commit_min >= checkpoint_op` always holds,
   /// so `try_new`'s `commit >= checkpoint_op` invariant cannot fail.
   /// Derive the CANONICAL headers of the un-checkpointed committed band `(checkpoint_floor ..
   /// commit_max]` from `self.log`, for persistence in the durable [`crate::VsrState`] root
@@ -1535,6 +1538,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.committed_band_headers(checkpoint_op),
     );
     let id = self.mint_write_id();
+    // Supersession: this write replaces any prior `pending_sb` correlation, so the root that
+    // correlation named is disowned here — forfeit it, AFTER the mint above so the new state
+    // copy-forwarded everything the superseded root carried (the checkpoint pair and the
+    // configuration ride the effective-root read). A parked superseded root then leaves the queue
+    // (nothing awaits it, nothing will ever complete it); a SUBMITTED one is owed to the medium
+    // and the forfeit leaves it to land, its completion ignored by the overwritten correlation.
+    if let Some((superseded, _)) = &self.pending_sb {
+      storage.forfeit_root(*superseded);
+    }
     storage.submit_root(id, state);
     self.pending_sb = Some((id, action));
   }

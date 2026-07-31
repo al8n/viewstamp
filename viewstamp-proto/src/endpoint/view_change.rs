@@ -392,7 +392,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// retires it); the forward `arm_timers(now)` re-arm; and `log_floor` (a MONOTONE vouched fact
   /// about durable cluster checkpoints, not per-generation in-flight state — clearing it would
   /// un-learn the floor the force-sync escalation needs after `peer_checkpoint` is dropped here).
-  pub(crate) fn reset_for_view_transition(&mut self, now: Instant) {
+  pub(crate) fn reset_for_view_transition<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
     // SVC-collection bits for the OLD view (these stay flat — live in Normal too, see the struct
     // fields). The ViewChange-only DVC collection + catch-up discriminant are NOT touched here: they
     // live behind `self.view_change`, which each transition site sets (the two ViewChange entries) or
@@ -460,6 +464,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       matches!(pc.kind, CheckpointKind::SyncRepersist)
         || matches!(pc.step, CheckpointStep::FlushingBlocks(_))
     }) {
+      // A dropped re-persist can already have its ROOT staged (`AwaitRoot`): the drop ends the
+      // only correlation that awaited it, so the root is forfeited with it — a parked one leaves
+      // the session queue (nothing will ever await or complete it), a submitted one lands and is
+      // ignored. The ordinary-checkpoint KEEP above never reaches here, so a root that is still
+      // awaited is never forfeited. (The view-change triggers defer while a re-persist root is
+      // staged — `sync_repersist_root_staged` — so this arm is the backstop for any teardown path
+      // that reaches the reset outside those triggers.)
+      if let Some(PendingCheckpoint {
+        step: CheckpointStep::AwaitRoot(abandoned, _),
+        ..
+      }) = self.pending_checkpoint
+      {
+        storage.forfeit_root(abandoned);
+      }
       self.pending_checkpoint = None;
     }
     // Release the PROPOSAL latch: an uncommitted `Reconfigure` op this primary proposed belongs to the
@@ -562,7 +580,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Tear down ALL old-generation in-flight state in one place: SVC bits, in-flight
     // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install, and
     // the forfeit sub-state.
-    self.reset_for_view_transition(now);
+    self.reset_for_view_transition(now, storage);
     // ViewChange ENTRY: install a fresh ViewChange-only collection — `catching_up = false` (a real,
     // self-driven change, not the higher-view catch-up). (`is_some() == is_view_change()` coupling.)
     self.view_change = Some(ViewChangeCollection::entering(false));
@@ -1573,7 +1591,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // a Normal primary can reach here via a higher-view `on_start_view` holding a live pipeline, so —
     // unlike the two ViewChange entries — adoption preserves it (this is the real per-site asymmetry
     // the shared reset keeps out).
-    self.reset_for_view_transition(now);
+    self.reset_for_view_transition(now, storage);
     // Record a NON-ZERO carried floor as the sending primary's checkpoint report, mirroring
     // `on_commit`'s recording of the primary's `Commit.checkpoint_op` (monotone; the caller verified
     // the sender IS `config.primary(view)`). AFTER the shared reset — which just cleared
