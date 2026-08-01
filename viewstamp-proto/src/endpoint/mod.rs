@@ -4732,7 +4732,12 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// Test-only: plant a `Some` ViewChange collection while keeping the current status, so an invariant
   /// test can violate the `view_change.is_some() == is_view_change()` coupling on a non-ViewChange
   /// replica (the old `catching_up = true` poke, now that the discriminant lives behind the Option).
-  #[cfg(test)]
+  ///
+  /// Gated on `debug_assertions` alongside its sole caller: the clause it provokes is a
+  /// [`debug_assert!`] inside [`Self::assert_invariants`], so the test that plants the violation
+  /// exists only where that clause is compiled in. Every other `*_for_test` helper here is read by a
+  /// profile-independent test and so stays on a bare `#[cfg(test)]`.
+  #[cfg(all(test, debug_assertions))]
   fn force_view_change_present_for_test(&mut self) {
     self.view_change = Some(ViewChangeCollection::entering(true));
   }
