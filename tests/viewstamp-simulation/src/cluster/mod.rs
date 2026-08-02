@@ -8,7 +8,7 @@ use viewstamp_proto::{
   AcceptReducedFaultTolerance, BlockAddress, BlockResponse, BlockStore, Committed, Config,
   DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership, MembershipChanged,
   Message, OpNumber, Outgoing, Peer, Prng, ProposeMembershipError, Recipient, Recovered, ReplicaId,
-  SingleChange, SingleVoterDelta, Storage, Wal, block_address, prepare_restart,
+  SingleChange, SingleVoterDelta, Status, Storage, Wal, block_address, prepare_restart,
 };
 
 use crate::{
@@ -424,20 +424,31 @@ pub struct Cluster {
   /// landing evicts a slot, the vote whose durable backing vanished with it. Survives restarts (a
   /// sent vote is not un-sent by rebuilding the endpoint that sent it).
   latest_votes: Vec<BTreeMap<u64, (u64, u128)>>,
-  /// Per-replica edge-detector for the re-formation escalation: `true` if replica `i` was in
-  /// `Status::RecoveringHead` at the end of the PREVIOUS [`tick`](Self::tick). Sampled each tick to
-  /// count [`reform_escalations_fired`](Self::reform_escalations_fired): a node that was
-  /// `RecoveringHead` and is now `ViewChange` escalated, the UNIQUE `RecoveringHead → ViewChange`
-  /// transition the proto's `retire_recover_and_escalate` produces (a `RecoveringHead` node otherwise
-  /// only ever leaves to `Normal` via `StartView`/`RecoveryResponse` adoption). Paired with
-  /// [`was_recovering_head_inc`](Self::was_recovering_head_inc) so only a SAME-INCARNATION edge counts.
-  was_recovering_head: Vec<bool>,
-  /// The incarnation [`was_recovering_head`](Self::was_recovering_head) was last sampled at, per replica.
-  /// A crash + restart between samples bumps the incarnation (`recover` rebuilds the endpoint), so a
-  /// `RecoveringHead` observed before the crash must NOT pair with a `ViewChange` the restarted node
-  /// reaches through ordinary recovery completion — that crossed a crash/restart boundary, not the
-  /// proto's re-formation transition. The edge counts only when this equals the current incarnation.
-  was_recovering_head_inc: Vec<u64>,
+  /// Per-replica LAST STATUS ENTERED: folded from the endpoint's [`Event::StatusChanged`] stream by
+  /// the drain in [`record_applied_events`](Self::record_applied_events). The proto's `set_status`
+  /// chokepoint emits one event per ACTUAL change, so the drained sequence is the replica's exact
+  /// status TRAJECTORY rather than a per-tick sample of it, and consecutive events are consecutive
+  /// DISTINCT statuses (a same-status re-entry emits nothing). `None` until the replica first changes
+  /// status — a constructor sets the initial status directly, and construction is not a transition.
+  ///
+  /// [`reform_escalations_fired`](Self::reform_escalations_fired) counts the re-formation escalation as
+  /// the ADJACENT pair `RecoveringHead` then `ViewChange`: the direct edge `retire_recover_and_escalate`
+  /// produces, and the only `ViewChange` reachable from `RecoveringHead` (there the central ingress
+  /// admits only `StartView`/`RecoveryResponse`/`Recovery`, and the other exit is `adopt_canonical_head`
+  /// to `Normal`). Any status entered between the two breaks the adjacency and is NOT counted: a
+  /// `RecoveringHead` voter that adopts the canonical head and is then recruited by an ordinary
+  /// `StartViewChange` quorum passes through `Normal`, however few ticks separate the two transitions.
+  /// The pair identifies the EDGE, not its cause — the fold does not attribute it to a particular proto
+  /// call site, so ANY direct `RecoveringHead → ViewChange` transition counts, which is precisely what
+  /// the off-axis guard forbids.
+  prev_status_entered: Vec<Option<Status>>,
+  /// The incarnation [`prev_status_entered`](Self::prev_status_entered) was recorded at, per replica. A
+  /// crash + restart between the two transitions bumps the incarnation (`recover` rebuilds the
+  /// endpoint), so a `RecoveringHead` entered before the crash must NOT pair with a `ViewChange` the
+  /// restarted node reaches through ordinary recovery completion — that crossed a crash/restart
+  /// boundary, not the proto's re-formation transition. The pair counts only when this equals the
+  /// current incarnation.
+  prev_status_entered_inc: Vec<u64>,
   /// High-water of the recover read-window's HELD TAIL above the durable checkpoint
   /// (`op - checkpoint_op`), sampled ONCE per recovery at recover construction in
   /// [`recover_in_place`](Self::recover_in_place). `op` is the held head the recover read loop scans and
@@ -452,7 +463,8 @@ pub struct Cluster {
   recovered_band_high_water: u64,
   /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change —
   /// the observable of the proto's re-formation escalation (`retire_recover_and_escalate`),
-  /// counted by the `RecoveringHead → ViewChange` edge in [`tick`](Self::tick). Monotone over the
+  /// counted by the DIRECT `RecoveringHead → ViewChange` edge in the endpoint's status-change stream,
+  /// which [`record_applied_events`](Self::record_applied_events) folds per replica. Monotone over the
   /// cluster's lifetime. `0` unless a coordinated all-`RecoveringHead` wedge formed and re-formed (the
   /// `reconfigure_offline` axis), so the off-axis sweeps assert it stays `0` (byte-identity to a
   /// no-escalation run) while the wedge repro asserts it goes `> 0` (the escalation genuinely fired).
@@ -647,8 +659,8 @@ impl Cluster {
       membership_swaps: vec![Vec::new(); n],
       incarnations: vec![0; n],
       latest_votes: vec![BTreeMap::new(); n],
-      was_recovering_head: vec![false; n],
-      was_recovering_head_inc: vec![0; n],
+      prev_status_entered: vec![None; n],
+      prev_status_entered_inc: vec![0; n],
       recovered_band_high_water: 0,
       reform_escalations_fired: 0,
       blocks_fetched: vec![0; n],
@@ -1576,7 +1588,8 @@ impl Cluster {
 
   /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change so
   /// far — the observable of the proto's re-formation escalation (`retire_recover_and_escalate`),
-  /// counted by the `RecoveringHead → ViewChange` edge in [`tick`](Self::tick). Monotone. `0` on every
+  /// counted by the DIRECT `RecoveringHead → ViewChange` edge in the endpoint's status-change
+  /// stream, which the drain in `record_applied_events` folds per replica. Monotone. `0` on every
   /// schedule that never drove a coordinated all-`RecoveringHead` wedge (so an off-axis sweep asserts
   /// it stays `0` — byte-identity to a no-escalation run), and `> 0` once the wedge formed and
   /// re-formed (the [`reconfigure_offline`](Self::reconfigure_offline) axis), the non-vacuity witness
@@ -3730,47 +3743,16 @@ impl Cluster {
       }
       self.record_applied_events(ri);
     }
-
-    // Per-tick re-formation observer — pure observation (no PRNG draw, message, or storage write), so
-    // off-axis schedules stay byte-identical. A crashed node is skipped (its state and incarnation are
-    // frozen until it restarts); this runs at the one point every tick passes through, so an escalation
-    // inside `reconfigure_offline`'s internal drive is observed too.
-    //
-    // Re-formation escalation: the `RecoveringHead → ViewChange` edge — the UNIQUE transition
-    // `retire_recover_and_escalate` produces (a `RecoveringHead` node otherwise only returns to `Normal`
-    // via `StartView`/`RecoveryResponse`, never to `ViewChange`). Keyed by incarnation so a crash +
-    // restart boundary is not mistaken for it, while still re-arming across a genuine re-wedge (each
-    // escalation pairs within its own incarnation).
-    //
-    // (The recovered read-window tail witness is NOT observed here: it is sampled once at recover
-    // construction in `recover_in_place`, since the held head is fixed there and the committed band above
-    // the checkpoint is peer-learned only after recovery — there is no completion-edge band to observe.)
-    //
-    // Only VOTERS run the re-formation escalation (a voting-quorum path); a learner is never an active
-    // view-change participant, so iterate the voter prefix `0..replica_count` — a non-voter must never
-    // pollute this voter-only non-vacuity witness.
-    for ri in 0..self.replica_count as usize {
-      if self.crashed[ri] {
-        continue;
-      }
-      let inc = self.incarnations[ri];
-      let is_recovering_head = self.replicas[ri].status().is_recovering_head();
-      if self.was_recovering_head[ri]
-        && self.was_recovering_head_inc[ri] == inc
-        && self.replicas[ri].status().is_view_change()
-      {
-        self.reform_escalations_fired += 1;
-      }
-      self.was_recovering_head[ri] = is_recovering_head;
-      self.was_recovering_head_inc[ri] = inc;
-    }
   }
 
   /// Drains replica `ri`'s pending application events into its recorded apply stream, tagged with
   /// its current incarnation: every [`Event::Committed`] (one per state-machine apply, in apply
   /// order) and every [`Event::StateSyncCompleted`] (the snapshot-rebase point that justifies the op
-  /// jump a bulk restore produces). Other event kinds are embedder observability with no bearing on
-  /// the apply stream. Recording is observation-only: no PRNG draw, no message, no storage write.
+  /// jump a bulk restore produces). The same drain FOLDS the replica's status trajectory — every
+  /// [`Event::StatusChanged`] into [`prev_status_entered`](Self::prev_status_entered), which is what
+  /// backs [`reform_escalations_fired`](Self::reform_escalations_fired). Other event kinds are
+  /// embedder observability with no bearing on either. Recording is observation-only: no PRNG draw,
+  /// no message, no storage write.
   fn record_applied_events(&mut self, ri: usize) {
     while let Some(ev) = self.replicas[ri].poll_event() {
       match ev {
@@ -3786,6 +3768,28 @@ impl Cluster {
         // distinctly from the first install.
         Event::MembershipChanged(mc) => {
           self.membership_swaps[ri].push((self.incarnations[ri], mc));
+        }
+        // The re-formation escalation, observed as the DIRECT `RecoveringHead → ViewChange` edge in
+        // the status trajectory rather than inferred from two end-of-tick samples: a multi-step
+        // path out of `RecoveringHead` puts an intervening `Normal` between the two events even
+        // when both transitions land inside one `tick`, so only the adjacent pair — the edge
+        // `retire_recover_and_escalate` produces — counts. Keyed by incarnation so a crash +
+        // restart boundary is not mistaken for it, while still re-arming across a genuine re-wedge
+        // (each escalation pairs within its own incarnation). Only VOTERS escalate (the gate in
+        // `may_escalate_reformation` is voter-only), so the pair is required to fall in the voter
+        // prefix `0..replica_count` — a non-voter must never pollute this voter-only non-vacuity
+        // witness.
+        Event::StatusChanged(s) => {
+          let inc = self.incarnations[ri];
+          if ri < self.replica_count as usize
+            && s.is_view_change()
+            && self.prev_status_entered_inc[ri] == inc
+            && self.prev_status_entered[ri] == Some(Status::RecoveringHead)
+          {
+            self.reform_escalations_fired += 1;
+          }
+          self.prev_status_entered[ri] = Some(s);
+          self.prev_status_entered_inc[ri] = inc;
         }
         _ => {}
       }

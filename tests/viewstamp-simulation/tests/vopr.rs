@@ -229,7 +229,7 @@ fn sweep_ticks() -> u64 {
 /// specific divergences/wedges ever returning. The `vsr_headers` recovery fix is also covered
 /// by the contiguous range, but stays pinned here as an explicit named guard against its return.
 const REGRESSION_SEEDS: &[u64] = &[
-  21, 52, 84, 85, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774, 796,
+  21, 52, 84, 85, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774, 796, 887,
 ];
 
 #[test]
