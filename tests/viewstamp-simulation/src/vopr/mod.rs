@@ -360,8 +360,9 @@ pub struct VoprReport {
   /// sweep asserts the cross-seed sum is `> 0` so the lane cannot silently decay.
   reconfigs_fired: u64,
   /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change
-  /// this run — the proto's re-formation escalation (`retire_recover_and_escalate`), observed
-  /// by the `RecoveringHead → ViewChange` edge in [`Cluster::tick`]. `0` on EVERY run without the
+  /// this run — the proto's re-formation escalation (`retire_recover_and_escalate`), observed as the
+  /// DIRECT `RecoveringHead → ViewChange` edge in the replica's status-change stream, which `Cluster`
+  /// folds per replica as it drains endpoint events. `0` on EVERY run without the
   /// reconfig axis (the escalation is off-axis-unsatisfiable — `epoch > prev_epoch` is false without a
   /// reconfiguration), so the off-axis sweep asserts this stays `0` (byte-identity to a no-escalation
   /// run); `> 0` once a reconfig-axis run drove and re-formed the wedge — the non-vacuity witness that
@@ -3610,11 +3611,13 @@ impl Vopr {
     // Off-axis re-formation guard: WITHOUT the reconfig axis, the re-formation escalation is
     // off-axis-unsatisfiable (`epoch > prev_epoch` is false absent a reconfiguration), so NO voter may
     // ever escalate out of `RecoveringHead` into a view change — the `RecoveringHead → ViewChange`
-    // edge stays untaken and the cluster's counter stays 0. (Ordinary crash/restart faults can drive a
-    // single replica `RecoveringHead`, but it only ever returns to `Normal` via adoption, never to
-    // `ViewChange`.) A non-zero count off-axis would be a REAL finding: the escalation fired without a
-    // reconfiguration, breaking its off-axis inertness (the byte-identity property the default sweep
-    // rests on). The reconfig axis exercises the firing path separately.
+    // edge stays untaken and the cluster's counter stays 0. The counter observes that DIRECT edge in
+    // the replica's status-change stream, so a `RecoveringHead` node that adopts the canonical head and
+    // is only later recruited into an ordinary view change passes through `Normal` and is not counted,
+    // even when both transitions land in one tick. A non-zero count off-axis would be a REAL finding:
+    // the escalation fired without a reconfiguration, breaking its off-axis inertness (the
+    // byte-identity property the default sweep rests on). The reconfig axis exercises the firing path
+    // separately.
     if !self.reconfig_axis && c.reform_escalations_fired() > 0 {
       panic!(
         "vopr seed {} tick {tick}: a RecoveringHead voter escalated into a view change \
