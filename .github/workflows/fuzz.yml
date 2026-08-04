@@ -48,7 +48,7 @@ jobs:
       - name: Install nightly
         run: rustup update nightly --no-self-update && rustup default nightly
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.6
         with:
           tool: cargo-fuzz
       # The prebuilt cargo-fuzz is a musl-static binary, and without an explicit --target it builds
