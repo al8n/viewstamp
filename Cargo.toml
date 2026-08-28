@@ -24,7 +24,7 @@ buffa-build = "0.8"
 derive_more = { version = "2", default-features = false }
 thiserror = { version = "2", default-features = false }
 smol_str = "0.3"
-agnostic = { version = "0.10", default-features = false }
+agnostic = { version = "0.11", default-features = false }
 agnostic-lite = { version = "0.6", default-features = false }
 compio = { version = "0.19", default-features = false }
 flume = { version = "0.12", default-features = false, features = ["async"] }
