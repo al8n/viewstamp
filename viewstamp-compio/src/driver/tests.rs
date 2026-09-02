@@ -870,6 +870,14 @@ fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
     viewstamp_proto::DEFAULT_STREAM_RECEIVE_WINDOW,
     viewstamp_proto::QuicTuning::new().stream_receive_window()
   );
+  // The per-stream ceiling an embedder computes a relative override against: a larger request is
+  // clamped to it, so the value has to be readable from out here.
+  assert_eq!(
+    viewstamp_proto::QuicTuning::new()
+      .with_stream_receive_window(u64::MAX)
+      .stream_receive_window(),
+    viewstamp_proto::MAX_STREAM_RECEIVE_WINDOW
+  );
   assert_eq!(
     viewstamp_driver::DriverConfig::new().max_conns(),
     viewstamp_driver::MAX_CONNS
