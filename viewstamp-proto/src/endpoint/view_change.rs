@@ -479,6 +479,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         ..
       }) = self.pending_checkpoint
       {
+        // COUNT the disown: this is the only site that drops a `Checkpoint`-role root's
+        // correlation, and without the counter it fires silently — the deferral guards above it
+        // all live at the CALLERS, so nothing at this layer would ever say the backstop was
+        // reached. The simulation sweeps assert the count stays 0.
+        self.repersist_roots_disowned += 1;
         storage.abandon_root(RootRole::Checkpoint, abandoned);
       }
       self.pending_checkpoint = None;
@@ -1289,6 +1294,25 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     {
       return;
     }
+    // `Continue` above means "did not enter recovery", NOT "no debt owed": the reconciliation's
+    // deferral arms return it with the debt still latched. Gate participation on the debt ITSELF,
+    // exactly as the `on_get_view` / `on_recovery` handouts do. The one deferral arc reachable at
+    // this emission is an owed SM-reconstruct (the arc whose retry install sits below the owed
+    // frontier) — the in-flight-checkpoint arc cannot coexist with a latchable debt (the
+    // `force_checkpoint` timeline fence demands `commit_min` at/above the effective frontier the
+    // latch demands it below), and the durable-view arc is this very completion — but the withhold
+    // reads the debt, not the arc, so any future deferral shape is covered identically. A landing
+    // that latched a debt also absorbed a commit frontier this canonical log may not carry
+    // (`commit_max` above `op`), so a StartView built now would fail-stop every adopting backup at
+    // the `commit <= op` adopt guard — in release, where the emission assert below is compiled
+    // out, straight off the wire. Keep the timers armed and stand down: the deferred-to arc
+    // completes, the heartbeat re-drive consumes the debt (entering the reconciling fetch, or
+    // retiring it through the applied frontier), and participation resumes through that
+    // resolution — the solicitors' retransmits re-drive the withheld handouts meanwhile.
+    if self.repersist_orphan_owed().is_some() {
+      self.arm_timers(now);
+      return;
+    }
     // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
     // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
     // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised
@@ -1304,13 +1328,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `commit_max <= self.op` is a FORMATION-layer bound (`commit_max == commit_star <= op_head ==
     // self.op` by `select_canonical_log`'s fail-stop) and this emission runs a root-landing window
     // later, so it is re-checked HERE, at the emission layer. The in-window raiser is an
-    // uncorrelated commit-proven landing: one that latched the debt is consumed by the
-    // reconciliation above (entered, or retired through the applied-frontier leg), and one that
-    // lifted a frontier the applied prefix covers keeps `commit <= op_head` because a genuinely
-    // committed op is carried by some canonical donor. The one shape that can reach this emission
-    // still owing is a debt the reconciliation deferred to an owed SM-reconstruct (the arc whose
-    // retry install sits below the owed frontier); the assert is that shape's tripwire, pinning
-    // the emission-layer half of the receiver's `commit <= op` adopt guard.
+    // uncorrelated commit-proven landing: one that latched a debt was consumed above (entered,
+    // retired through the applied-frontier leg, or withheld on), and one that lifted a frontier
+    // the applied prefix covers keeps `commit <= op_head` because a genuinely committed op is
+    // carried by some canonical donor. The assert pins the emission-layer half of the receiver's
+    // `commit <= op` adopt guard against any raiser class a future absorb adds.
     debug_assert!(
       self.commit_max.get() <= self.op.get(),
       "StartView would advertise commit {} above its op {}",

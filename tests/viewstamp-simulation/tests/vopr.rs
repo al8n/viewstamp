@@ -290,6 +290,9 @@ fn vopr_sweep_no_violations() {
   // delivered. See the assertion below.
   let mut total_sweeps_coalesced = 0u64;
   let mut total_sweeps_dropped = 0u64;
+  // The view-transition reset's backstop arm (disowning a staged re-persist root) must never be
+  // reached: every teardown into the reset is guarded one call layer above. See the assertion below.
+  let mut total_repersist_roots_disowned = 0u64;
   let start = sweep_seed_start();
   let contiguous = sweep_seed_count();
   let ticks = sweep_ticks();
@@ -400,6 +403,23 @@ fn vopr_sweep_no_violations() {
        downstream of a delivery of this lane's own",
       r.sweeps_coalesced(),
       r.sweeps_dropped()
+    );
+    total_repersist_roots_disowned += r.repersist_roots_disowned();
+    // The RESET BACKSTOP's reachability oracle. The one arm that disowns a staged re-persist root
+    // (`reset_for_view_transition`) is argued unreachable — every view-change trigger defers while
+    // such a root is staged, and every other teardown path into the reset carries its own stronger
+    // guard — but those guards all live at the CALLERS, so the arm itself fires silently. This
+    // fold is what turns that argument into a checked claim: a schedule that reaches the arm
+    // fails here with its seed. The landing is still absorbed and reconciled, so a failure is
+    // information about the guard chain (one was narrowed, or a new teardown path was added
+    // without one), never a reason to drop the assert.
+    assert_eq!(
+      r.repersist_roots_disowned(),
+      0,
+      "seed {seed}: a view-transition reset disowned {} staged re-persist root(s) — a teardown \
+       path now reaches the reset while a re-persist root is staged, so a caller's deferral \
+       guard no longer holds",
+      r.repersist_roots_disowned()
     );
     if r.wal_capacity().is_some() {
       bounded_seeds += 1;
@@ -597,7 +617,8 @@ fn vopr_sweep_no_violations() {
      unions_floored={total_unions_floored} \
      appends_slot_fenced={total_slot_fenced} appends_quota_refused={total_quota_refused} \
      envelopes_fenced={total_envelopes_fenced} \
-     sweeps_coalesced={total_sweeps_coalesced} sweeps_dropped={total_sweeps_dropped}"
+     sweeps_coalesced={total_sweeps_coalesced} sweeps_dropped={total_sweeps_dropped} \
+     repersist_roots_disowned={total_repersist_roots_disowned}"
   );
 }
 
@@ -952,6 +973,7 @@ fn vopr_sb_reorder_sweep_no_violations() {
   let mut total_committed = 0usize;
   let mut seeds_with_view_change = 0u64;
   let mut total_envelopes_fenced = 0u64;
+  let mut total_repersist_roots_disowned = 0u64;
   println!(
     "VOPR sb-reorder sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, envelope-lag axis \
      forced on"
@@ -974,6 +996,19 @@ fn vopr_sb_reorder_sweep_no_violations() {
       "seed {seed}: the session envelope fence refused {} submissions under the envelope-lag axis \
        — the endpoint's staging gates no longer keep the fence unreachable",
       r.envelopes_fenced()
+    );
+    total_repersist_roots_disowned += r.repersist_roots_disowned();
+    // The RESET BACKSTOP's reachability oracle on the lane that most contends the staging windows:
+    // this axis lags every envelope write so later roots complete AROUND it, the schedule class
+    // under which a view transition crosses a checkpoint's in-flight window. Even here the arm
+    // that disowns a staged re-persist root must never be reached — the view-change triggers
+    // defer while one is staged — so this lane would surface a narrowed caller guard first.
+    assert_eq!(
+      r.repersist_roots_disowned(),
+      0,
+      "seed {seed}: a view-transition reset disowned {} staged re-persist root(s) under the \
+       envelope-lag axis — a teardown path now reaches the reset while a re-persist root is staged",
+      r.repersist_roots_disowned()
     );
     if r.max_view() >= 1 {
       seeds_with_view_change += 1;
@@ -1007,7 +1042,8 @@ fn vopr_sb_reorder_sweep_no_violations() {
   println!(
     "VOPR sb-reorder sweep OK: sb_envelope_lags={total_lags} \
      sb_envelope_overtakes={total_overtakes} committed={total_committed} \
-     view_change_seeds={seeds_with_view_change} envelopes_fenced={total_envelopes_fenced}"
+     view_change_seeds={seeds_with_view_change} envelopes_fenced={total_envelopes_fenced} \
+     repersist_roots_disowned={total_repersist_roots_disowned}"
   );
 }
 

@@ -610,11 +610,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
                 self.install_sync(now, storage, install);
                 return;
               }
-              // NOTHING TO INSTALL: a view transition cancelled the pre-root staging while this root
-              // was in flight, so there is no SM content to reconstruct and no reconstruct to wait
-              // for. The tail still runs HERE — the handshake this root belonged to must be torn
-              // down and the crossing re-armed, or the node keeps an armed `sync` no reply can
-              // complete.
+              // NOTHING TO INSTALL — a structural backstop, not a described schedule. No path
+              // separates a staged re-persist root from its install (`assert_invariants` clause
+              // (1a) pins the coupling: every teardown that drops `pending_install` drops this
+              // correlation in the same pass, so a correlated completion cannot find the install
+              // gone). If a future edit ever breaks that pairing, this arm degrades safely: there
+              // is no SM content to reconstruct, and the handshake this root belonged to is still
+              // torn down and the crossing re-armed, rather than leaving an armed `sync` no reply
+              // can complete.
               self.complete_state_sync(now, storage);
               self.retry_unappended_adopted_tail(storage);
             }

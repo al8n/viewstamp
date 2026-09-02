@@ -1883,6 +1883,20 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// one-pin-at-a-time admission is genuinely engaging under contention. Same lifecycle as the other
   /// observability counters (reset to 0 on `new`/`recover`); exposed only via `walk_pins_refused()`.
   walk_pins_refused: u64,
+  /// Test/observability counter: how many times [`Self::reset_for_view_transition`]'s backstop arm
+  /// DISOWNED a staged state-sync re-persist ROOT — dropped a `SyncRepersist` correlation whose
+  /// `AwaitRoot` write was already with the backend, so a submitted root lands UNCORRELATED and
+  /// takes the orphaned-landing absorb. Expected `0` in production schedules: every view-change
+  /// trigger defers while such a root is staged (`sync_repersist_root_staged`), and every other
+  /// teardown path into the reset carries its own stronger guard (`pending_checkpoint.is_some()`
+  /// at the peer-fetch entries, the recovery early-returns) — claims that hold one CALL LAYER
+  /// ABOVE the arm, which is why the arm itself stays as a live backstop and why, without this
+  /// counter, it fires silently. A non-zero count is information, not corruption (the absorb holds
+  /// the landing's facts and enters the reconciling fetch); the simulation sweeps assert `0` so
+  /// any schedule that reaches the arm surfaces with its seed instead of passing unnoticed. Same
+  /// lifecycle as the other observability counters (reset to 0 on `new`/`recover`); exposed only
+  /// via `repersist_roots_disowned()`.
+  repersist_roots_disowned: u64,
   /// Test/observability counter: how many canonical-log selections actually FLOORED the union —
   /// [`Self::select_canonical_log`] dropped at least one canonical-donor entry at/below the vouched
   /// checkpoint floor `floor*` (the floored-union path doing real work). `0` while every selection's
@@ -2293,6 +2307,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       below_ring_window_syncs: 0,
       dag_walks_capped: 0,
       walk_pins_refused: 0,
+      repersist_roots_disowned: 0,
       unions_floored: 0,
       repair_batches_served: 0,
       prepare_batches_sent: 0,
@@ -3324,6 +3339,21 @@ impl<S: StateMachine, R> Endpoint<S, R> {
           .pending_checkpoint
           .is_none_or(|pc| matches!(pc.kind, CheckpointKind::SyncRepersist)),
       "pending_install coexists with a non-SyncRepersist checkpoint"
+    );
+    // (1a) The CONVERSE retention direction: a STAGED re-persist root (`SyncRepersist` at
+    // `AwaitRoot`) still holds the install it is carrying to durability. `flush_and_stage_install`
+    // stages only under a live `pending_install`, and every `pending_install` clear either consumes
+    // the root first (the `on_sb_done` arm drops `pending_checkpoint` before its `take()`) or drops
+    // the staged checkpoint in the same pass (`reset_for_view_transition`, the peer-fetch entries)
+    // — so the pair cannot separate. This clause is checked at this layer (the endpoint's handler
+    // exits) because two shields one layer AWAY read the pair as inseparable without re-checking:
+    // `advance_quarantine_probe` refuses to disarm — and so to escalate a Recovering node out of a
+    // staged re-persist — only because `pending_install.is_some()` stands in for "a root is
+    // staged", and `enter_orphan_repersist_fetch` is deferred on the same reading. Those sites
+    // enforce; this is the detection that the coupling they lean on holds at every exit.
+    debug_assert!(
+      !self.sync_repersist_root_staged() || self.pending_install.is_some(),
+      "a staged re-persist root without its owed install"
     );
     // (1b) A block-DAG fetch belongs to an OUTSTANDING sync: it is armed only under a live nonce-matched
     // `sync` (`handle_sync_checkpoint`) OR re-armed by an SM-reconstruct retry that KEEPS `sync`, and
@@ -4595,6 +4625,17 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn walk_pins_refused(&self) -> u64 {
     self.walk_pins_refused
+  }
+
+  /// Test/observability counter: how many times a view-transition reset disowned a staged
+  /// state-sync re-persist ROOT (the backstop arm of `reset_for_view_transition` — see the field).
+  /// Expected `0`: every production teardown into the reset is guarded one call layer above; the
+  /// simulation sweeps assert `0` so a schedule that does reach the arm surfaces with its seed.
+  /// Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn repersist_roots_disowned(&self) -> u64 {
+    self.repersist_roots_disowned
   }
 
   /// Test/observability counter: how many canonical-log selections actually FLOORED the union —
