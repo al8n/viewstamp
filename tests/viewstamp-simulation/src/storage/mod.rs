@@ -41,7 +41,7 @@
 //! read that has not completed is outstanding, not failed, and is waited on — is vacuous at every
 //! seed. Under the axis each read's verdict is decided exactly as before and then HELD until the
 //! device's clock reaches its due instant: a healthy slot answers within [`READ_DELAY_SPAN`], while
-//! a seeded minority of slots are DEGRADED and answer only past the whole per-op retry allowance
+//! a seeded minority of slots are DEGRADED and answer only past the whole give-up horizon
 //! ([`READ_GIVE_UP_HORIZON`]), so a recovery genuinely waits out many cadence ticks before the
 //! verdict that resolves the op arrives. A delay is a latency model, never a drop — every submitted
 //! read still resolves exactly once, per the [`Wal`] completion contract.
@@ -81,8 +81,8 @@ pub const READ_GIVE_UP_HORIZON: Duration = Duration::from_millis(900);
 pub const READ_DELAY_SPAN: Duration = Duration::from_millis(250);
 
 /// The floor of the latency band a DEGRADED slot answers within — strictly above
-/// [`READ_GIVE_UP_HORIZON`], so a read of such a slot outlives every cadence tick the whole
-/// failure-driven retry allowance spans: the recovery provably WAITS it out.
+/// [`READ_GIVE_UP_HORIZON`], so a read of such a slot outlives every cadence tick that horizon
+/// spans: the recovery provably WAITS it out.
 ///
 /// Only JUST above it, deliberately. What the axis has to deliver is a completion whose consumption
 /// only the wait can explain, and the read that delivers it is the FIRST one submitted — so the
@@ -98,7 +98,7 @@ pub const READ_STALL_FLOOR: Duration = Duration::from_millis(950);
 pub const READ_STALL_SPAN: Duration = Duration::from_millis(300);
 
 /// How many slots in a thousand are DEGRADED on a medium running the read-delay axis: every read of
-/// such a slot answers past the whole per-op retry allowance. Adversarially high for a real device,
+/// such a slot answers past the whole give-up horizon. Adversarially high for a real device,
 /// and deliberately so — the axis exists to make the waited-out completion a routine event rather
 /// than a coincidence — while leaving the large majority of slots answering promptly, so the
 /// ordinary recovery read path keeps being exercised alongside it.
@@ -500,8 +500,8 @@ pub struct InMemoryWal {
   reads_delayed: u64,
   /// Observability: how many reads this WAL answered only AFTER [`READ_GIVE_UP_HORIZON`] had elapsed
   /// on the device clock since their submission — measured across the wait actually served, at the
-  /// release. Such a read outlived every cadence tick the proto's whole failure-driven retry
-  /// allowance spans, so its consumption is explainable only by the recovery WAITING it out — this
+  /// release. Such a read outlived every cadence tick the whole give-up horizon spans, so its
+  /// consumption is explainable only by the recovery WAITING it out — this
   /// counts reads genuinely waited on rather than merely drawing a long latency. Always `0` off-axis.
   reads_past_budget: u64,
   /// Observability: the subset of [`reads_past_budget`](Self::reads_past_budget) that delivered
@@ -680,8 +680,8 @@ impl InMemoryWal {
   }
 
   /// Test-only: how many reads this WAL answered only after [`READ_GIVE_UP_HORIZON`] had elapsed
-  /// since their submission — reads that outlived the proto's whole failure-driven retry allowance,
-  /// so the recovery provably WAITED them out. `0` off-axis.
+  /// since their submission — reads that outlived the whole give-up horizon, so the recovery
+  /// provably WAITED them out. `0` off-axis.
   #[doc(hidden)]
   pub fn reads_past_budget(&self) -> u64 {
     self.reads_past_budget

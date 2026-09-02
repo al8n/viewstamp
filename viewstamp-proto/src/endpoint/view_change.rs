@@ -1720,15 +1720,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // RecoveringHead replica that reaches here via this path leaves `recover` = None (the field is
     // structurally None in every non-recovering status). A non-recovering adopter already has None.
     // (This is the distinguishing reset only the adoption path owns.) Nothing else needs retiring
-    // with it: `RecoveringHead` is entered only over a drained read fence, so no read completion
+    // with it: `RecoveringHead` is entered only over a drained read fence — BOTH halves, since
+    // `recover_progress` holds behind `rec.pending` and behind the checkpoint phase marker, which
+    // stays `Some` for as long as any submitted checkpoint read is tracked — so no read completion
     // remains owed, and any hole the adopted log re-carries `Repairing` is the ordinary peer-repair
-    // lane's to fill. Asserted, like every other site that drops the recovery bookkeeping, so no
-    // transition can silently abandon a read obligation the medium still owes.
+    // lane's to fill. (The one exit that DOES re-open the checkpoint phase, the owed
+    // orphaned-re-persist reconciliation, returned above rather than reaching here.) Asserted, like
+    // every other site that drops the recovery bookkeeping, so no transition can silently abandon a
+    // read obligation the medium still owes.
     assert!(
-      self
-        .recover
-        .as_ref()
-        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      self.recover.as_ref().is_none_or(|rec| {
+        rec.pending.is_empty() && rec.reads.is_empty() && rec.checkpoint_reads.is_empty()
+      }),
       "adopting a canonical head over an open read fence"
     );
     self.recover = None;

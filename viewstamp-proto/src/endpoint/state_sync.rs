@@ -634,9 +634,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// probe (else a donor answering only with non-crossing replies would hold it open forever). It also
   /// shields on `pending_install` (a staged install — REQUIRED: the disarm clears `sync`, so disarming
   /// under a live `pending_install` would breach the `pending_install ⟹ sync` invariant; a staged install
-  /// is transient and completes on its own root) and on `sm_reconstruct` (a post-install SM retry). Any of
-  /// these REFRESHES the deadline forward so a genuine DAG transfer or two-write superblock persist
-  /// spanning several windows survives; `install_sync` clears the probe on completion.
+  /// is transient and completes on its own root), on `sm_reconstruct` (a post-install SM retry), and on
+  /// an OPEN CHECKPOINT-READ FENCE (`RecoverState::checkpoint_reads` — a local read the superblock
+  /// still owes a completion, which the disarm's Recovering landing would abandon). Any of
+  /// these REFRESHES the deadline forward so a genuine DAG transfer, a two-write superblock persist, or
+  /// a slow local read spanning several windows survives; `install_sync` clears the probe on completion.
   ///
   /// Serviced ONCE per `handle_timeout`, at the TOP, BEFORE the status dispatch — so its expiry is on a
   /// wall-clock deadline INDEPENDENT of the `sync_solicit` cadence that a quarantined higher-epoch
@@ -665,6 +667,27 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.quarantined_donor = None;
       self.quarantine_probe_deadline = None;
       self.quarantine_probe_progress_mark = 0;
+      return false;
+    }
+    // A submitted CHECKPOINT READ still owes its completion: DEFER the whole disarm, pushing the
+    // deadline one window forward so the expiry is re-observed rather than lost. The disarm's
+    // `Recovering` landing drops the recovery bookkeeping wholesale
+    // ([`Self::retire_recover_and_escalate`]), so firing over an open fence would abandon a read
+    // the superblock owes exactly one completion — and the reformation it escalates into replaces
+    // nothing that read is for: the snapshot it serves is this endpoint's OWN durable checkpoint,
+    // which no view change supplies. It is the trade the checkpoint retry gate already refuses
+    // (`retry_verdict` folds an owed completion into [`RetryVerdict::Wait`]): elapsed time is never
+    // evidence of failure. The wait is bounded by the MEDIUM, not by a clock — every submitted read
+    // is answered exactly once, and a FAILED one re-submits against a finite budget whose
+    // exhaustion closes the phase into the peer fetch — so the fence always drains and a later
+    // window disarms exactly as this one would have. `recover` is structurally `None` outside the
+    // recovering statuses, so this is inert for a Normal / ViewChange crossing.
+    if self
+      .recover
+      .as_ref()
+      .is_some_and(|rec| !rec.checkpoint_reads.is_empty())
+    {
+      self.refresh_quarantine_probe(now);
       return false;
     }
     // A staged install or an owed SM-reconstruct is a VERIFIED, committed crossing near completion — it

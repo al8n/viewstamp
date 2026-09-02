@@ -4906,6 +4906,158 @@ fn recover_checkpoint_read_withheld_past_the_retry_cadence_restores_locally_when
 }
 
 #[test]
+fn the_quarantine_probe_waits_out_an_owed_checkpoint_read_and_recovery_completes_locally() {
+  // The bounded quarantine probe is a WALL-CLOCK deadline, and its `Recovering` landing
+  // (`retire_recover_and_escalate`) drops the recovery bookkeeping wholesale to escalate into a view
+  // change. Fired over a checkpoint read whose completion the superblock still owes, it would
+  // abandon that read — and the reformation it escalates into supplies no substitute: the snapshot
+  // the read serves is this replica's OWN durable checkpoint, which no view change carries. With no
+  // eligible donor (solo here) the replica would be left with neither its local snapshot nor a peer
+  // able to answer. So the probe waits the fence out, exactly as the checkpoint retry gate waits out
+  // an owed completion instead of spending its budget on elapsed time.
+  //
+  // Withhold the Phase-1 read's completion across several probe windows with a quarantine-armed
+  // crossing and NO donor, then release it: the recovery must still be intact and complete LOCALLY.
+  // The MIRROR at the tail then pins the other direction — once the fence drains the deadline fires
+  // on the next window, so waiting it out postpones the disarm rather than pinning the probe open.
+  //
+  // FAIL-BEFORE (the probe disarming over the open fence): the deadline fires at the first window,
+  // the recovery is torn down and escalated to a view change, and the released read's completion is
+  // then refused as foreign — the replica never reaches Normal.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::InMemoryBlockStore::new(),
+    ),
+  );
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    crate::checkpoint_id(&good_env),
+    std::vec::Vec::new(),
+  )
+  .unwrap()
+  .with_wal_geometry(2, u64::MAX);
+  // The Phase-1 read's completion surfaces only at the explicit `flush` below — the withheld window.
+  let sb = ScriptedCheckpointSb::new(
+    state,
+    VecDeque::from(std::vec![(OpNumber::with(2), good_env.clone())]),
+  );
+  let wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  blocks.put(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  let mut e = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(
+    e.recover
+      .as_ref()
+      .is_some_and(|rec| !rec.checkpoint_reads.is_empty()),
+    "precondition: the Phase-1 checkpoint read is outstanding — its completion is owed"
+  );
+  assert!(
+    e.recover.as_ref().is_some_and(|rec| rec.pending.is_empty()),
+    "precondition: no TAIL read is owed, so only the checkpoint half of the fence is open"
+  );
+
+  // Mark the crossing quarantine-armed and arm it — what a quarantined `Peer::Member`'s
+  // higher-epoch hint does to a non-Normal laggard (record the donor, arm the bounded probe, pin a
+  // crossing-required forced sync).
+  let now = Instant::ZERO;
+  e.seed_quarantined_donor_for_test(now, Peer::Member(MemberId::new(99)));
+  e.arm_cross_epoch_sync_for_test(4);
+  assert!(
+    e.quarantine_probe_deadline.is_some(),
+    "precondition: the bounded probe is armed on the quarantine-sourced crossing"
+  );
+
+  // Fire the timer well past several probe windows while the read's completion stays withheld and
+  // no donor answers.
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 2) {
+    t = t + RECOVER_READ_RETRANSMIT;
+    e.handle_timeout(t, &mut storage);
+    e.storage_step(t, &mut storage, &mut blocks);
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the probe DEFERRED over the owed checkpoint read — the recovery was not torn down"
+  );
+  assert!(
+    e.recover
+      .as_ref()
+      .is_some_and(|rec| !rec.checkpoint_reads.is_empty()),
+    "the read is still owed, so the fence is still what the probe is waiting on"
+  );
+  assert!(
+    e.quarantine_probe_deadline.is_some(),
+    "the deferral RE-ARMED the deadline, so the expiry is re-observed rather than lost"
+  );
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the crossing is deferred whole — disarming it while refusing to escalate would strand the \
+     replica with neither the crossing nor a live posture"
+  );
+
+  // Release the withheld completion: the valid read restores the SM LOCALLY and completes recovery.
+  storage.sb_mut().flush();
+  e.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the released valid read restores the SM locally and completes recovery"
+  );
+  assert!(
+    !e.awaiting_peer_checkpoint_for_test(),
+    "recovery completed off the local medium — no donor exists here to answer a peer fetch"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "checkpoint_op restored from the durable root"
+  );
+
+  // THE MIRROR: the deferral must not become a wedge. The fence is bounded by the MEDIUM, so once
+  // it drains the deadline fires on the very next window and tears the unanswered crossing down —
+  // the deferral POSTPONED the disarm, it did not pin the probe open. (The disarm's escalating
+  // landing, taken when a drained fence leaves the replica `Recovering`, is pinned by
+  // `a_quarantine_armed_crossing_in_recovery_disarms_and_escalates`; here the replica settled
+  // Normal, so the same disarm takes the drop-the-crossing landing.)
+  assert!(
+    e.sync_target_for_test().is_some() && e.quarantine_probe_deadline.is_some(),
+    "precondition for the mirror: the crossing and its deadline outlived the deferral"
+  );
+  for _ in 0..4 {
+    t = t + RECOVER_READ_RETRANSMIT;
+    e.handle_timeout(t, &mut storage);
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "with the fence drained the deadline fired: the unanswered quarantine crossing DISARMED"
+  );
+  assert!(
+    e.quarantine_probe_deadline.is_none(),
+    "the disarm cleared the probe bookkeeping with it"
+  );
+}
+
+#[test]
 fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // A single-replica primary commits past a checkpoint (checkpoint_ops=2), so the checkpoint is
   // durable; then it "crashes". recover() MUST restore the SM from the checkpoint snapshot and set

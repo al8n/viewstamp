@@ -949,10 +949,15 @@ const MAX_VIEW_JUMP: u64 = 1 << 32;
 struct RecoverState {
   /// Ops whose resolution is still owed → remaining retry budget, spent ONLY on delivered FAILURE
   /// verdicts (never on elapsed time — a slow read is outstanding, not failed, and is waited on).
-  /// Non-empty ⇒ the read phase is open, which every terminal and install transition waits out: the
-  /// HOLE in the log is the obligation and the log owns it; the reads, this budget, and any staged
-  /// state are disposable, re-derivable cache, so nothing here ever needs to survive a phase
-  /// transition. Seeded ONCE per op at the Phase-1 submit (`RECOVER_READ_RETRIES`); `recover_timeouts`
+  /// Non-empty ⇒ the read phase is open, which every terminal and install transition waits out.
+  /// What a transition may then DROP is decided by OWNERSHIP, not by convenience: the HOLE in the
+  /// log is the obligation and the log owns it, and a SETTLED verdict about that hole must survive
+  /// with it — `retire_recover_for_staged_sync` carries the whole `faulty` set across the install
+  /// through `sync_carried_faulty`, because the completion still has to route a permanently-faulty
+  /// HEAD to `RecoveringHead` and to keep the reformation gate refusing while a committed-band slot
+  /// is faulty. What does NOT survive is the disposable, re-derivable cache: the in-flight reads,
+  /// this budget, and any staged fill.
+  /// Seeded ONCE per op at the Phase-1 submit (`RECOVER_READ_RETRIES`); `recover_timeouts`
   /// re-reads an op only once its prior attempt has COMPLETED AND FAILED (no id left in `reads`),
   /// decrementing at each re-submission, and resolves the op from its durable witnesses once every
   /// attempt has returned and failed (`resolve_exhausted_tail_read`). A resolving completion removes

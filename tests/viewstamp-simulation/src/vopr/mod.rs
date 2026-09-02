@@ -152,9 +152,9 @@ pub struct VoprReport {
   /// the media end to end. Deliberately NOT folded into the digest report hash (like
   /// [`Self::wal_write_reorders`]).
   wal_reads_delayed: u64,
-  /// The high-water of WAL reads answered only AFTER the proto's whole failure-driven retry
-  /// allowance elapsed, summed over replicas. Such a read outlived every cadence tick that
-  /// allowance spans, so its consumption is explainable only by the recovery WAITING it out —
+  /// The high-water of WAL reads answered only AFTER the whole give-up horizon elapsed, summed
+  /// over replicas. Such a read outlived every cadence tick that horizon spans, so its
+  /// consumption is explainable only by the recovery WAITING it out —
   /// elapsed ticks spend nothing on an outstanding read. Always `0` off-axis: a synchronous
   /// backend resolves every read in the call that submitted it. Deliberately NOT folded into the
   /// digest report hash.
@@ -621,9 +621,9 @@ impl VoprReport {
     self.wal_reads_delayed
   }
 
-  /// The high-water of WAL reads answered only after the proto's whole failure-driven retry
-  /// allowance elapsed (summed over replicas). Always `0` off-axis and on every synchronous-read
-  /// run; `> 0` ⇒ a read outlived every cadence tick that allowance spans — the recovery provably
+  /// The high-water of WAL reads answered only after the whole give-up horizon elapsed (summed
+  /// over replicas). Always `0` off-axis and on every synchronous-read
+  /// run; `> 0` ⇒ a read outlived every cadence tick that horizon spans — the recovery provably
   /// WAITED it out.
   pub const fn wal_reads_past_budget(&self) -> u64 {
     self.wal_reads_past_budget
@@ -1495,14 +1495,14 @@ pub fn run_vopr_with_sb_reorder(seed: u64, ticks: u64) -> VoprReport {
 /// Every replica's WAL then gives its reads a LATENCY: the verdict is decided at submit exactly as
 /// before — same fault, misdirect and placement decisions — and the completion is held until the
 /// device clock reaches a drawn due instant. Most slots answer within a fraction of the recovery
-/// cadence; a seeded minority are DEGRADED and answer only past the proto's whole per-op retry
-/// allowance, and a degraded slot answers late for EVERY read of it.
+/// cadence; a seeded minority are DEGRADED and answer only past the whole give-up horizon, and a
+/// degraded slot answers late for EVERY read of it.
 ///
 /// The default sweep's WAL resolves each read in the call that submitted it, which makes a late read
 /// structurally impossible: a recovery read is never outstanding when a cadence tick fires, so the
 /// WAIT the proto's recovery runs on — an outstanding read spends no budget, resolves to nothing,
 /// and is waited out until its verdict delivers — is vacuous at every seed. This axis is what makes
-/// the wait real: a degraded slot answers only past the whole failure-driven retry allowance, so a
+/// the wait real: a degraded slot answers only past the whole give-up horizon, so a
 /// recovery over one holds its read phase open across many ticks and consumes the eventual verdict
 /// exactly where a prompt one would have been consumed.
 ///

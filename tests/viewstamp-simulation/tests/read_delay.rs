@@ -5,7 +5,7 @@
 //! proto's recovery runs on — a read that has not completed is outstanding, not failed; no cadence
 //! tick spends the failure budget on it; the recovery stays open until its verdict delivers — is
 //! vacuous at every seed. [`Cluster::set_wal_read_delay`] gives reads a latency, with a seeded
-//! minority of slots answering only past the whole per-op retry allowance, so the wait becomes the
+//! minority of slots answering only past the whole give-up horizon, so the wait becomes the
 //! load-bearing path.
 //!
 //! The subject here is a SOLO voter, because it makes the argument causal rather than
@@ -43,7 +43,7 @@ struct Cycle {
   before_commit: u64,
   /// The commit frontier it reached by the end of the run.
   after_commit: u64,
-  /// Beyond-allowance reads that delivered BYTES — completions only the wait can have consumed.
+  /// Beyond-horizon reads that delivered BYTES — completions only the wait can have consumed.
   late_bodies: u64,
   /// The distinct statuses the replica entered after the restart, in order.
   statuses: Vec<String>,
@@ -149,7 +149,7 @@ fn a_solo_voter_waits_out_slow_interior_reads_and_rejoins_whole() {
   );
   assert!(
     armed.late_bodies > 0,
-    "seed {SEED}: no read outlived the retry allowance with bytes to deliver — the axis is \
+    "seed {SEED}: no read outlived the give-up horizon with bytes to deliver — the axis is \
      vacuous here and this lane proves nothing"
   );
   assert_eq!(
@@ -225,8 +225,8 @@ fn a_solo_voters_slow_head_read_never_routes_through_recovering_head() {
   );
   assert!(
     armed.late_bodies > 0,
-    "seed {SEED}: no beyond-allowance read delivered bytes — the head's read never genuinely \
-     outlived the retry allowance, so this lane proves nothing"
+    "seed {SEED}: no beyond-horizon read delivered bytes — the head's read never genuinely \
+     outlived the give-up horizon, so this lane proves nothing"
   );
   let normal_at = armed.normal_at.expect("the armed run reaches Normal");
   assert!(
