@@ -71,6 +71,37 @@ fn small_table_round_trips() {
 }
 
 #[test]
+fn a_refused_reply_record_round_trips_alongside_body_records() {
+  // The refusal is a cached outcome like any other — the row must survive a checkpoint and restore
+  // so a duplicate request after recovery is answered with the SAME refusal the client already had,
+  // not with silence (no cached reply) and not with a body. Encoded in a table mixing all three
+  // record kinds, so the reader cannot confuse the refusal's fixed layout with a body's.
+  let max = crate::ReplyBody::max_len();
+  let mut table = std::collections::BTreeMap::new();
+  table.insert(
+    1u128,
+    session(3, 10, Some((3, Bytes::from_static(b"body")))),
+  );
+  table.insert(2u128, refused_session(7, 20, 7, max + 1));
+  table.insert(3u128, session(4, 30, None));
+  assert_round_trip(&table);
+
+  // The refusal decoded back carries the offending length and the bound verbatim.
+  let mut store = InMemoryBlockStore::new();
+  let root = encode_sessions(&table, &mut store);
+  let decoded = decode_sessions(root, &store).expect("the whole DAG is present");
+  let outcome = decoded[&2u128]
+    .reply
+    .as_ref()
+    .map(|(_, outcome)| outcome.clone())
+    .expect("the refusal row keeps its cached outcome");
+  assert_eq!(
+    outcome,
+    ReplyOutcome::TooLarge(ReplyTooLarge::new(max + 1, max))
+  );
+}
+
+#[test]
 fn a_single_large_cached_reply_is_externalized_and_round_trips() {
   // One cached reply far larger than a leaf budget — it must split into body-chunk blocks and still
   // round-trip exactly. Use a body several block-budgets long with POSITION-VARYING bytes so the chunks
