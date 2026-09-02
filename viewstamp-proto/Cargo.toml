@@ -38,7 +38,10 @@ rustls = { version = "0.23", default-features = false, features = ["std"], optio
 # ceiling. Drift is caught by tests rather than held off by a version pin:
 # `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` fails if a full window
 # no longer fits the bound, and the receiver-side span regression fails if the segmentation the
-# sizing assumes stops holding.
+# sizing assumes stops holding. This crate's CI resolves fresh and so runs them against each new
+# 0.11.x; an embedder who pins or upgrades quinn-proto themselves should run those two regressions as
+# the compatibility check (the sizing and the unsolicited-half classifier were verified against
+# 0.11.17 and rest on quinn-private behaviour).
 quinn-proto = { version = "0.11", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 

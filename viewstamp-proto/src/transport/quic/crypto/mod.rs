@@ -251,6 +251,17 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// Frame size is not bounded by any of this: a frame spans as many window grants as it needs, so the
 /// transport's frame ceiling ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is
 /// unchanged.
+///
+/// **Compatibility with `quinn-proto`.** The bridge's reassembly sizing and its unsolicited-half
+/// classifier were verified against `quinn-proto` 0.11.17, and both rest on behaviour that crate keeps
+/// private: the per-stream span ceiling the window is sized against, the compaction rule that merges
+/// only spans under 5/6 utilization, `Readable` being raised for a frame that arrived, and a reset
+/// clearing the assembler before the application drains the event. The dependency is a plain `0.11`
+/// range, so a newer patch release resolves without ceremony — this repository's own CI resolves fresh
+/// and runs `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` and the
+/// receiver-side span regression against whatever it picks. An embedder who pins or upgrades
+/// `quinn-proto` themselves does not get that for free: run those two regressions as the compatibility
+/// check.
 pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
   QUINN_REASSEMBLY_MAX_SPANS * MIN_FILLED_STREAM_FRAME_PAYLOAD;
 

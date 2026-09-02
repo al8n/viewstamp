@@ -875,11 +875,13 @@ impl Bridge {
         // span ceiling well before a window's worth of bytes, closing the connection anyway on a
         // path that costs a per-datagram check first.
         //
-        // So it is a protocol violation, handled once and deterministically: close the connection.
-        // No read, no allocation for it, no per-datagram cost — a `Readable` for one of our own send
-        // ids cannot occur on a conforming link, so this arm is off the hot path entirely.
+        // So it is treated as a protocol violation: when data is OBSERVABLE on that half, a one-byte
+        // peek is what sees it and the connection is closed. Nothing is read into a decoder and
+        // nothing is retained. It is not free of work — quinn has already parsed the datagram by the
+        // time the event is drained — and it is not unconditional: a `RESET_STREAM` processed in the
+        // same batch releases the data before the peek runs, and that connection stays open.
         //
-        // One classification is needed first: this transport's OWN retire protocol resets the unused
+        // A classification is needed because this transport's OWN retire protocol resets the unused
         // half ([`retire_local_send`]), and a peer's `RESET_STREAM` surfaces as a `Readable` too. So
         // peek at the half once, and read the outcome as:
         //

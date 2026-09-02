@@ -1449,15 +1449,15 @@ fn recover_and_complete(
   (now, done, redials)
 }
 
-/// A receiver whose loop stalls under the primary's own traffic has its connection refused by
-/// quinn's reassembler — and the cluster recovers: both ends reap it, the link is re-established,
-/// and the request that was in flight completes. Twice.
+/// COMPONENT-LEVEL exercise of the recovery path over real cluster-private mTLS and real consensus
+/// traffic, with the receiver's stall and the redial schedule MODELLED.
 ///
 /// The transport's stream receive window bounds an unread backlog's BYTES, not the number of spans
 /// the peer segments them into, so a sender producing sub-packet `Prepare`s to a receiver that is not
 /// draining walks the span count to quinn's per-stream ceiling and the connection is closed with a
-/// transport error. That is documented as recoverable rather than prevented, and this is the proof of
-/// the whole recovery chain over REAL cluster-private mTLS with real consensus traffic:
+/// transport error. That is documented as recoverable rather than prevented. What follows is what
+/// this test drives — every step real except the two named above, and NOT a whole-chain proof, which
+/// would take a real-driver test that reaches the refusal and does not exist:
 ///
 /// 1. two coordinators mutually dial, authenticate and commit a client request;
 /// 2. a second request is submitted and left in flight;

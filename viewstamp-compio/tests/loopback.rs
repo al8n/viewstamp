@@ -843,7 +843,7 @@ async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
   );
 
   // Loss stops: node 2 has to be caught up and serving again, which a submit relayed through it
-  // proves end to end.
+  // shows — for that path, not for anything the refusal's recovery claim rests on.
   drop_one_in.store(0, Relaxed);
   let reply = compio::time::timeout(
     std::time::Duration::from_secs(15),
