@@ -188,6 +188,34 @@ impl EpochSwap {
   }
 }
 
+/// The status outcome a commit helper hands back to its caller.
+///
+/// The shared commit tail (run by [`Endpoint::advance_commit`] / [`Endpoint::try_commit`], and
+/// directly by the quiescent-primary heartbeat) contains one arm —
+/// [`Endpoint::maybe_enter_orphan_repersist_fetch`] — that can tear the whole generation down
+/// into the recovery peer-fetch. A caller that keeps executing after that teardown acts on a
+/// generation that no longer exists: forming a new primary's view would overwrite `Recovering`
+/// with `Normal` and stage a `StartView` for a checkpoint frontier this endpoint never installed.
+/// So the transition is returned as a value every caller must consume and short-circuit on,
+/// instead of being left to a per-site status re-read.
+#[must_use = "the commit tail can tear the generation down into Recovering; the caller must stop on it"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitFlow {
+  /// The endpoint is still in the caller's generation — continue.
+  Continue,
+  /// The commit tail entered the recovery peer-fetch: the caller's generation is torn down, so
+  /// the caller returns without touching status or staging further participation.
+  EnteredRecovery,
+}
+
+impl CommitFlow {
+  /// `true` iff the commit tail tore the generation down into the recovery peer-fetch.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn entered_recovery(self) -> bool {
+    matches!(self, Self::EnteredRecovery)
+  }
+}
+
 /// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
 /// `PendingSbAction` (durable-view writes) and matched by its own minted `WriteId`, so a durable-view
 /// write completion and a checkpoint write completion never alias on the single id-match dispatch
@@ -6506,17 +6534,22 @@ where
         // replica has no commit-advance tail to re-drive the adoption, and the settled-lockstep
         // assertion holds its excluded window open until this clears it. Then re-drive an owed
         // orphaned-re-persist reconciliation for the same reason — a quiescent primary is the one
-        // Normal posture with no commit tail to re-drive a deferral.
+        // Normal posture with no commit tail to re-drive a deferral. Entering it ends the
+        // generation: the debt-pay and checkpoint cadences below must not run over the teardown.
         self.maybe_adopt_inherited_frontier();
-        self.maybe_enter_orphan_repersist_fetch(now, storage);
-        self.maybe_pay_checkpoint_debt(now, storage);
-        // Re-attempt a due ORDINARY checkpoint a prior commit-tail tried but whose block-store flush
-        // faulted: a backup re-fires the cadence off the primary's Commit heartbeats, but a QUIESCENT
-        // primary has no commit-advance tail to re-drive `maybe_checkpoint`, so without this a transient
-        // flush fault would defer the checkpoint (and its WAL prune) until fresh client traffic. The cadence
-        // self-gates on the boundary (`commit_min >= checkpoint_op + checkpoint_ops`) + a free superblock, so
-        // it is a no-op unless a checkpoint is genuinely due, leaving the steady-state heartbeat unchanged.
-        self.maybe_checkpoint(storage);
+        if !self
+          .maybe_enter_orphan_repersist_fetch(now, storage)
+          .entered_recovery()
+        {
+          self.maybe_pay_checkpoint_debt(now, storage);
+          // Re-attempt a due ORDINARY checkpoint a prior commit-tail tried but whose block-store flush
+          // faulted: a backup re-fires the cadence off the primary's Commit heartbeats, but a QUIESCENT
+          // primary has no commit-advance tail to re-drive `maybe_checkpoint`, so without this a transient
+          // flush fault would defer the checkpoint (and its WAL prune) until fresh client traffic. The cadence
+          // self-gates on the boundary (`commit_min >= checkpoint_op + checkpoint_ops`) + a free superblock, so
+          // it is a no-op unless a checkpoint is genuinely due, leaving the steady-state heartbeat unchanged.
+          self.maybe_checkpoint(storage);
+        }
       }
       Status::Normal => {
         // backup: bootstrap + fire primary_idle, then re-arm THIS timer only so we

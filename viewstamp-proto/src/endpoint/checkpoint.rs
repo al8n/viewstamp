@@ -109,9 +109,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     match resolved {
       Some(Pending::Ack(op)) => {
         if self.is_primary() {
-          // the primary's own append is durable → record its vote and try to commit
+          // the primary's own append is durable → record its vote and try to commit. A commit
+          // tail that entered the owed reconciliation ended the generation — the deferred-append
+          // release below must not re-drive an abandoned submission over the teardown.
           self.record_own_vote(op.get());
-          self.try_commit(now, storage);
+          if self.try_commit(now, storage).entered_recovery() {
+            return;
+          }
         } else {
           self.send_prepare_ok(op);
         }
@@ -122,7 +126,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // it has not durably appended (append-before-ack for the view-change adoption path).
       Some(Pending::AdoptVote(op)) => {
         self.record_own_vote(op.get());
-        self.try_commit(now, storage);
+        if self.try_commit(now, storage).entered_recovery() {
+          return;
+        }
       }
       // a backup's adopted uncommitted-tail op is now durable → send the deferred
       // PrepareOk. No PrepareOk was sent for this op before its append completed (append-before-ack).
@@ -173,12 +179,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           && self.inflight.contains_key(&op.get())
         {
           self.record_own_vote(op.get());
-          self.try_commit(now, storage);
+          if self.try_commit(now, storage).entered_recovery() {
+            return;
+          }
         } else {
           // The hole is filled + durable → resume applying the held committed prefix from where it
           // stalled (committed-repair case, or a backup that owes no vote).
           let target = self.commit_max.get();
-          self.advance_commit(now, storage, target);
+          if self.advance_commit(now, storage, target).entered_recovery() {
+            return;
+          }
         }
       }
       None => {}
@@ -330,7 +340,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             self.repersist_orphan = Some(owed);
           }
           self.maybe_adopt_inherited_frontier();
-          self.maybe_enter_orphan_repersist_fetch(now, storage);
+          // A teardown here flips the status the completion routing below reads: the landing's
+          // own completion then takes the Recovering peel (a defensive no-op for a `Wrote`),
+          // never a Normal arm — so the flow needs no separate short-circuit at this site.
+          let _ = self.maybe_enter_orphan_repersist_fetch(now, storage);
         }
       }
     }
@@ -818,29 +831,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// after all; [`Self::maybe_adopt_inherited_frontier`] — always run just before this — then
   /// completes the catch-up in place), so the fetch fires only while the reconciliation is
   /// genuinely unreachable by commits.
+  ///
+  /// Returns [`CommitFlow::EnteredRecovery`] exactly when the teardown ran: the caller's
+  /// generation ended here, and every caller must short-circuit on it (see [`CommitFlow`]).
   pub(crate) fn maybe_enter_orphan_repersist_fetch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
     storage: &mut Storage<W, B, S>,
-  ) {
-    let Some(target) = self.repersist_orphan else {
-      return;
+  ) -> CommitFlow {
+    let Some(target) = self.repersist_orphan_owed() else {
+      return CommitFlow::Continue;
     };
-    if self.checkpoint_op >= target || self.commit_min >= target {
-      self.repersist_orphan = None;
-      return;
-    }
     if self.status.is_recovering() || self.status.is_recovering_head() || self.status.is_retired() {
-      return;
+      return CommitFlow::Continue;
     }
     if self.pending_durable_view() {
-      return;
+      return CommitFlow::Continue;
     }
     if self.pending_checkpoint.is_some()
       || self.sm_reconstruct_owed()
       || self.pending_install.is_some()
     {
-      return;
+      return CommitFlow::Continue;
     }
     // The teardown mirrors the cross-epoch peer-fetch entry: end the old generation's in-flight
     // state at the shared chokepoint, drop the pipeline/buffer and the ViewChange-only
@@ -869,6 +881,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // the absorb), so the fetch runs at the configuration this endpoint already holds.
     let target = OpNumber::with(target.get().max(self.checkpoint_op.get()));
     self.escalate_checkpoint_to_peer_fetch(now, target, false);
+    CommitFlow::EnteredRecovery
+  }
+
+  /// The still-owed orphaned-re-persist frontier ([`Self::repersist_orphan`]), retiring the latch
+  /// in passing when either satisfaction has arrived: the pointer reached the frontier (an
+  /// install or restore delivered it) or `commit_min` caught up after all (repair recovered the
+  /// band, and the passive adoption completes the catch-up). Every consumer of the debt reads it
+  /// through this one check, so none can act on a latch that is already met.
+  fn repersist_orphan_owed(&mut self) -> Option<OpNumber> {
+    let target = self.repersist_orphan?;
+    if self.checkpoint_op >= target || self.commit_min >= target {
+      self.repersist_orphan = None;
+      return None;
+    }
+    Some(target)
   }
 
   /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
@@ -1290,8 +1317,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // commit-advance-tail re-entry: the outer advance already moved commit as far as the held log allows.
     if !self.paying_checkpoint_debt {
       self.paying_checkpoint_debt = true;
-      self.advance_commit(now, storage, self.commit_max.get());
+      let flow = self.advance_commit(now, storage, self.commit_max.get());
       self.paying_checkpoint_debt = false;
+      // The proactive advance's tail can enter the owed orphaned-re-persist reconciliation: the
+      // generation is torn down, so the owed checkpoint must not be forced over it (the debt is
+      // sticky and re-pays once the node next settles Normal).
+      if flow.entered_recovery() {
+        return;
+      }
     }
     // (b) Once the band reached the reconfigure op, force the owed checkpoint at `commit_min` (>= N), so
     // its durable root advances `checkpoint_op` to `>= config_install_op` and clears the debt. Re-check

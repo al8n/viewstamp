@@ -1042,7 +1042,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (checkpoints only start in Normal) — no NEW checkpoint starts. An ordinary checkpoint kept in flight
     // across the transition is carried forward verbatim by the StartViewAsPrimary durable-view write below
     // (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
-    self.advance_commit(now, storage, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
+    //
+    // The tail CAN, however, enter the owed orphaned-re-persist reconciliation (the debt latched
+    // while a durable-view write deferred it, and this is the first tail with every deferral
+    // clear): the forming generation is then torn down into the recovery peer-fetch, and the
+    // formation MUST stop — continuing would overwrite `Recovering` with `Normal` and stage a
+    // `StartView` for a checkpoint frontier this replica never installed. The fetched install
+    // completes recovery, which re-drives the view change (`log_view < view`) over installed
+    // state.
+    if self
+      .advance_commit(now, storage, commit_star) // apply newly-exposed committed ops (prior-view quorum decision)
+      .entered_recovery()
+    {
+      return;
+    }
 
     // truncate the uncommitted suffix at the FIRST interior gap above commit*. The
     // adopted canonical log is the offset-union `(min_floor .. op_head]` and may still have an interior
@@ -1294,7 +1307,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ));
 
     self.arm_timers(now);
-    self.try_commit(now, storage);
+    // Nothing follows: a teardown in the tail has nothing left to short-circuit; discard the flow.
+    let _ = self.try_commit(now, storage);
   }
 
   /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`, floored at
@@ -1459,15 +1473,23 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // `StartView`, re-driving the adopt from the cleanly-synced state.
       return;
     }
-    self.adopt_canonical_head(
-      now,
-      storage,
-      m.view(),
-      m.op(),
-      m.commit(),
-      m.checkpoint_op(),
-      m.log_slice(),
-    );
+    // An adoption that routed into the recovery peer-fetch adopted the head as data but ended the
+    // generation: leave the WAL tail to the reconciling install (it prunes and truncates at the
+    // synced point), exactly as if the StartView had arrived while already Recovering.
+    if self
+      .adopt_canonical_head(
+        now,
+        storage,
+        m.view(),
+        m.op(),
+        m.commit(),
+        m.checkpoint_op(),
+        m.log_slice(),
+      )
+      .entered_recovery()
+    {
+      return;
+    }
     self.truncate_wal_above_adopted_head(storage);
   }
 
@@ -1523,6 +1545,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   // The parameters are the carried head fields of ONE message (`view`/`op`/`commit`/`checkpoint_op`/
   // `log` — both callers unpack the same accessors of a `StartView`/`RecoveryResponse`), so the arity
   // mirrors the wire shape rather than an over-wide ad-hoc surface.
+  //
+  // Returns the adoption's status outcome: [`CommitFlow::EnteredRecovery`] when the commit tail
+  // (or the owed-debt check below it) routed the adopter into the recovery peer-fetch instead of
+  // settling Normal — the callers' post-adoption steps must short-circuit on it.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn adopt_canonical_head<W: Wal, B: Superblock>(
     &mut self,
@@ -1533,7 +1559,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     commit: OpNumber,
     checkpoint_op: OpNumber,
     log: &[crate::PreparedEntry],
-  ) {
+  ) -> CommitFlow {
     assert!(
       commit.get() <= op.get(),
       "canonical head commit must not exceed its op (malformed primary)"
@@ -1572,7 +1598,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // tail is a no-op (checkpoints only start in Normal) — no NEW checkpoint starts; an ordinary
     // checkpoint kept in flight is carried forward verbatim by the AdoptedStartView durable-view write
     // below (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
-    self.advance_commit(now, storage, commit.get());
+    //
+    // For a ViewChange (or Normal) adopter the tail can enter the owed orphaned-re-persist
+    // reconciliation directly: the adopting generation is torn down, so the adoption stops here —
+    // the head/log adoption above is pure data (memory-only), and the fetched install decides the
+    // tail when it completes recovery.
+    if self
+      .advance_commit(now, storage, commit.get())
+      .entered_recovery()
+    {
+      return CommitFlow::EnteredRecovery;
+    }
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;
     self.set_status(Status::Normal);
@@ -1625,6 +1661,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // entries are in-memory only until then; the deferred ack gates on both the view write (here) and
     // the per-op append (in `start_view_acks`) completing, so no PrepareOk precedes either.
     self.submit_durable_view(PendingSbAction::AdoptedStartView, storage);
+    CommitFlow::Continue
   }
 
   /// Runs once the adopted-StartView superblock write is durable: re-ack held uncommitted-tail ops —

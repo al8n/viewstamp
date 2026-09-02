@@ -2216,7 +2216,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       );
     }
     self.arm_timers(now);
-    self.try_commit(now, storage);
+    // Nothing follows: a teardown in the tail has nothing left to short-circuit; discard the flow.
+    let _ = self.try_commit(now, storage);
   }
 
   /// Recover-retry timer: the SOLE retry+budget owner for the tail reads (and the checkpoint read), so
@@ -3195,15 +3196,23 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // re-solicits, re-driving the adopt once the sync installs.
       return;
     }
-    self.adopt_canonical_head(
-      now,
-      storage,
-      m.view(),
-      m.op(),
-      m.commit(),
-      m.checkpoint_op(),
-      m.log_slice(),
-    );
+    // An adoption that routed into the recovery peer-fetch adopted the head as data but ended the
+    // generation: leave the WAL tail to the reconciling install (it prunes and truncates at the
+    // synced point), mirroring `on_start_view`.
+    if self
+      .adopt_canonical_head(
+        now,
+        storage,
+        m.view(),
+        m.op(),
+        m.commit(),
+        m.checkpoint_op(),
+        m.log_slice(),
+      )
+      .entered_recovery()
+    {
+      return;
+    }
     self.truncate_wal_above_adopted_head(storage);
   }
 }
