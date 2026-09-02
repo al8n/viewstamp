@@ -368,7 +368,7 @@ pub struct Cluster {
   /// genuinely outstanding at a cadence tick. `Some(base)` ⇒ READ-DELAY mode on every replica's WAL
   /// with a per-replica seed derived from `base`: each read's verdict is decided as usual and then
   /// held for a drawn latency, with a seeded minority of slots DEGRADED and answering only past the
-  /// proto's whole per-op retry allowance. Set via [`set_wal_read_delay`] before running; persists across
+  /// whole give-up horizon. Set via [`set_wal_read_delay`] before running; persists across
   /// `crash`/`restart` because the WAL struct does (a `crash` discards the reads in flight, which die
   /// with the process).
   ///
@@ -978,7 +978,7 @@ impl Cluster {
   /// `seed` with a per-replica derivation. In this mode a WAL still decides each read's verdict at
   /// submit — same faults, same misdirects, same placement — and then HOLDS the completion for a drawn
   /// latency: a short band for a healthy slot, and, for a seeded minority of DEGRADED slots, a band
-  /// strictly above the proto's whole per-op retry allowance.
+  /// strictly above the whole give-up horizon.
   ///
   /// The synchronous default makes a WAL read structurally incapable of being late: every read
   /// resolves in the call that submitted it, so a recovery read is never outstanding when a cadence
@@ -1039,8 +1039,8 @@ impl Cluster {
     self.wals[i].borrow().reads_delayed()
   }
 
-  /// How many reads replica `i`'s WAL answered only AFTER the proto's whole failure-driven retry
-  /// allowance had elapsed since their submission — reads the recovery provably WAITED out. `0`
+  /// How many reads replica `i`'s WAL answered only AFTER the whole give-up horizon had
+  /// elapsed since their submission — reads the recovery provably WAITED out. `0`
   /// with the axis off.
   pub fn wal_reads_past_budget(&self, i: usize) -> u64 {
     self.wals[i].borrow().reads_past_budget()

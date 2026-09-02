@@ -1775,7 +1775,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // empty, and every other caller arms over a fresh or already-escalated recovery — so a late
     // valid completion never races an armed fetch (it would arrive untracked and be refused, its
     // snapshot lost to a donor that need not exist).
-    debug_assert!(
+    assert!(
       self
         .recover
         .as_ref()
@@ -2340,16 +2340,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
       return;
     }
-    // No terminal transition may settle over an open read phase: every submitted recovery read is
-    // owed exactly one completion, and each caller reaches here only once the fence has drained
-    // (`recover_progress` gates on `pending`; the peer-checkpoint ingress defers behind the same
-    // fence) — asserted so a future completion path cannot silently abandon an outstanding read.
+    // No terminal transition may settle over an open read phase — the TAIL half (`pending`/`reads`)
+    // or the CHECKPOINT half (`checkpoint_reads`): every submitted recovery read is owed exactly one
+    // completion, and each caller reaches here only once BOTH have drained. `recover_progress` gates
+    // on `pending` and, for the checkpoint half, on `rec.checkpoint` — the phase marker, which stays
+    // `Some` for as long as any submitted checkpoint read is tracked (the single submit choke sets
+    // both, and the only site that clears the marker under a live phase, the restore, runs with the
+    // fence already empty). The peer-checkpoint ingress defers behind the same tail fence, and the
+    // orphaned-re-persist branch above RETURNS before this point on every path that re-opens the
+    // checkpoint phase. Asserted so a future completion path cannot silently abandon an outstanding
+    // read.
     assert!(
-      self
-        .recover
-        .as_ref()
-        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
-      "completing recovery with a tail read still outstanding"
+      self.recover.as_ref().is_none_or(|rec| {
+        rec.pending.is_empty() && rec.reads.is_empty() && rec.checkpoint_reads.is_empty()
+      }),
+      "completing recovery with a read still outstanding"
     );
     // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
     // exemption below. A re-latched recovery (`on_recover_sync_checkpoint` builds a default state)
@@ -2663,11 +2668,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (`recover_timeouts` → `retry_install_flush`, reached when the escape's first flush FAULTED so no
   /// `pending_checkpoint` existed there and `recover` survived into the retry cadence).
   ///
-  /// The read FENCE is never retired here, because it can never be non-empty here: the
-  /// peer-checkpoint ingress defers every reply while a tail read is outstanding or a failed op
-  /// still owes its budgeted re-read (`on_recover_sync_checkpoint`'s tail-fence guard), the fence
-  /// only drains after that admission (no path re-opens it mid-recovery), and this retirement is
-  /// reached only through a reply that passed the guard — asserted below, so a future escalation
+  /// The read FENCE is never retired here, because neither half can be non-empty here. The TAIL
+  /// half: the peer-checkpoint ingress defers every reply while a tail read is outstanding or a
+  /// failed op still owes its budgeted re-read (`on_recover_sync_checkpoint`'s tail-fence guard),
+  /// the fence only drains after that admission (no path re-opens it mid-recovery), and this
+  /// retirement is reached only through a reply that passed the guard. The CHECKPOINT half: a
+  /// staging is reached only under `awaiting_peer_checkpoint`, which `escalate_checkpoint_to_peer_fetch`
+  /// sets with the outstanding-completion fence already empty, closing the phase marker
+  /// (`checkpoint = None`) — and both checkpoint-read submit sites require that marker open, so
+  /// nothing re-opens it while the fetch runs. Both are asserted below, so a future escalation
   /// lane cannot silently abandon an outstanding read by staging over it. What IS discarded is
   /// settled bookkeeping (the checkpoint phase, the awaiting-peer latch, the verdict maps), which
   /// the install subsumes.
@@ -2686,10 +2695,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// consumed by `complete_state_sync`.
   pub(super) fn retire_recover_for_staged_sync(&mut self) {
     assert!(
-      self
-        .recover
-        .as_ref()
-        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      self.recover.as_ref().is_none_or(|rec| {
+        rec.pending.is_empty() && rec.reads.is_empty() && rec.checkpoint_reads.is_empty()
+      }),
       "staging a sync install over an open read fence — the ingress guard must defer the reply"
     );
     if let Some(rec) = self.recover.as_ref()
@@ -2834,36 +2842,43 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     storage: &mut Storage<W, B, S>,
   ) {
-    // Neither caller can reach here over an open fence, and each for its own reason.
+    // Neither caller can reach here over an open fence — the TAIL half (`pending`/`reads`) or the
+    // CHECKPOINT half (`checkpoint_reads`) — and each for its own reason.
     //
     // - `recover_head_timeouts` runs in `RecoveringHead`, and BOTH entries into that status hold a
-    //   read-free state: `recover_progress` returns early while `rec.pending` is non-empty, and
-    //   `complete_state_sync`'s carried-faulty re-arm builds a `RecoverState` carrying only the
-    //   verdicts. Nothing re-opens the fence afterwards — the sole site that submits a tail read
-    //   for a NEW op is the constructor's batch, and `recover_timeouts` re-submits only for an op
-    //   already pending.
+    //   read-free state: `recover_progress` returns early while `rec.pending` is non-empty and
+    //   again while `rec.checkpoint` is `Some` (which it is for as long as any submitted checkpoint
+    //   read is tracked), and `complete_state_sync`'s carried-faulty re-arm builds a `RecoverState`
+    //   carrying only the verdicts. Nothing re-opens either half afterwards — the sole site that
+    //   submits a tail read for a NEW op is the constructor's batch, `recover_timeouts` re-submits
+    //   only for an op already pending, and both checkpoint-read submit sites require the phase
+    //   marker still open.
     // - The bounded quarantine-probe disarm in `handle_timeout` fires in `Status::Recovering`, NOT
-    //   `RecoveringHead`, so its status alone does not drain the tail fence. It runs only when
+    //   `RecoveringHead`, so its status alone drains neither half. It runs only when
     //   `advance_quarantine_probe` returns true, which requires an armed `require_cross_epoch`
-    //   sync — and no such sync can coexist with an open fence, whether it was armed here or
+    //   sync — and no such sync can coexist with an open TAIL fence, whether it was armed here or
     //   carried in. Every site that pins the crossing outside recovery is gated on `Status::Normal`,
     //   where `recover` is structurally `None`. The one recovery site,
     //   `enter_cross_epoch_peer_fetch`, refuses to arm while `rec.pending` is non-empty and then
     //   installs a read-free `RecoverState`; the other mid-session entry into `Recovering`
     //   (`enter_orphan_repersist_recovery`, which may carry a Normal-armed sync across) installs a
-    //   read-free state too, opening only the checkpoint phase. A boot recovery is the one holder
-    //   of an open tail fence, and it starts with no sync at all.
+    //   tail-read-free state too — but it OPENS THE CHECKPOINT PHASE, so that half is not drained
+    //   by the crossing's own gating. The probe closes it directly instead: it DEFERS the whole
+    //   disarm while `rec.checkpoint_reads` is non-empty, re-arming its deadline so the expiry is
+    //   re-observed once the medium answers. A boot recovery is the one holder of an open tail
+    //   fence, and it starts with no sync at all.
     //
     // So this escalation can never abandon an outstanding read or a staged fill: a recovering
     // endpoint stages no append, and every obligation the reformation supersedes lives in the
-    // log/WAL (a `Repairing` hole, a durable header), which the reformed view re-derives. Asserted
-    // so a future entry path — or a relaxation of either gate above — cannot silently reopen the
-    // window.
+    // log/WAL (a `Repairing` hole, a durable header), which the reformed view re-derives. The one
+    // obligation it could NOT re-derive is a local checkpoint read — the reformed view supplies no
+    // substitute for this endpoint's own durable snapshot — which is why the probe waits it out
+    // rather than escalating past it. Asserted so a future entry path — or a relaxation of any gate
+    // above — cannot silently reopen the window.
     assert!(
-      self
-        .recover
-        .as_ref()
-        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      self.recover.as_ref().is_none_or(|rec| {
+        rec.pending.is_empty() && rec.reads.is_empty() && rec.checkpoint_reads.is_empty()
+      }),
       "reformation escalating over an open read fence"
     );
     self.recover = None;
@@ -3019,13 +3034,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // re-read, and nothing re-opens the fence mid-recovery) — so the read phase is settled here:
     // every retained held-tail entry is a faithfully-resolved slot (`Present(body)` or a
     // `Repairing` hole), never an unresolved Phase-1 placeholder, `self.op` is the verified head,
-    // and abandoning the local recovery below discards no completion the medium still owes.
+    // and abandoning the local recovery below discards no completion the medium still owes. The
+    // CHECKPOINT half is settled by the same ingress: the reply is admitted only while
+    // `awaiting_peer_checkpoint`, which the escalation latched with the outstanding-completion
+    // fence empty and the phase marker closed, and no submit site re-opens a closed marker.
     assert!(
-      self
-        .recover
-        .as_ref()
-        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty() && rec.absent.is_empty()),
-      "peer-fetch completing over an unsettled tail-read pass — the ingress fence must defer"
+      self.recover.as_ref().is_none_or(|rec| {
+        rec.pending.is_empty()
+          && rec.reads.is_empty()
+          && rec.absent.is_empty()
+          && rec.checkpoint_reads.is_empty()
+      }),
+      "peer-fetch completing over an unsettled read pass — the ingress fence must defer"
     );
     // CENTRALIZED committed-band drop via the `finalize_recovery` choke: before we abandon local recovery
     // (`recover = None` discards `rec.faulty`) and `apply_sync` (whose held-tail retain KEEPS `self.log`

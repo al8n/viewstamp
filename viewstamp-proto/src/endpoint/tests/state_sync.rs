@@ -12910,6 +12910,13 @@ fn a_quarantine_armed_crossing_in_recovery_disarms_and_escalates() {
     e.sync_target_for_test().is_some(),
     "precondition: the crossing sync is armed"
   );
+  assert!(
+    e.recover
+      .as_ref()
+      .is_some_and(|rec| rec.checkpoint_reads.is_empty()),
+    "precondition: this entry installs a READ-FREE recovery, so the checkpoint fence the probe \
+     defers over is empty and the disarm is free to fire"
+  );
 
   // No donor answers. Step the recovery retry cadence past the bounded window.
   for ms in 1..=8 {

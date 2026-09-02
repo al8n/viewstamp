@@ -1165,7 +1165,7 @@ const READ_DELAY_SEEDS: u64 = 16;
 /// WAIT the proto's recovery runs on — an outstanding read spends no budget and is waited out
 /// until its verdict delivers — sits vacuous at every seed of every sweep. This lane gives reads a
 /// latency: most slots answer within a fraction of the recover cadence, and a seeded minority are
-/// DEGRADED and answer only past the whole failure-driven retry allowance — for EVERY read of
+/// DEGRADED and answer only past the whole give-up horizon — for EVERY read of
 /// them, so a recovery over one provably holds its read phase open across many ticks and consumes
 /// the eventual verdict where a prompt one would have been consumed.
 ///
@@ -1177,7 +1177,7 @@ const READ_DELAY_SEEDS: u64 = 16;
 /// deterministic baselines, byte-identical to `VOPR_READ_DELAY=1` runs of the same seeds.
 ///
 /// What this lane can assert cross-seed is that the medium genuinely REACHED the state — reads
-/// outliving the whole retry allowance, with bytes to deliver. That an endpoint then CONSUMED one
+/// outliving the whole give-up horizon, with bytes to deliver. That an endpoint then CONSUMED one
 /// through the wait is proved causally instead, by the deterministic `read_delay.rs` lanes: a SOLO
 /// voter, which has no peer to solicit, no donor to sync from, and no escalation available to a
 /// single-voter cluster, waits out its own slow reads — interior and head alike — and rejoins
@@ -1230,28 +1230,28 @@ fn vopr_read_delay_sweep_no_violations() {
     "the read-delay axis never delayed a read across the sweep (wal_reads_delayed={total_delayed}) \
      — the plan is not plumbed through to the media"
   );
-  // Non-vacuity, second half — the one that matters. A read that OUTLIVES the whole retry
-  // allowance is the point: no failure-driven re-read can explain its consumption, so a recovery
-  // that consumed it provably WAITED across every cadence tick the allowance spans. A sweep where
-  // every delay stayed inside the allowance would exercise nothing the synchronous default does not.
+  // Non-vacuity, second half — the one that matters. A read that OUTLIVES the whole give-up
+  // horizon is the point: no failure-driven re-read can explain its consumption, so a recovery
+  // that consumed it provably WAITED across every cadence tick the horizon spans. A sweep where
+  // every delay stayed inside the horizon would exercise nothing the synchronous default does not.
   assert!(
     total_drawn > 0,
-    "the axis never drew a beyond-allowance stall across the sweep \
+    "the axis never drew a beyond-horizon stall across the sweep \
      (wal_read_stalls_drawn={total_drawn}) — no recovery ever read a degraded slot, so no wait \
-     ever genuinely outlasted the retry allowance"
+     ever genuinely outlasted the give-up horizon"
   );
   assert!(
     total_past_budget > 0,
-    "no read outlived the retry allowance across the sweep \
+    "no read outlived the give-up horizon across the sweep \
      (wal_read_stalls_drawn={total_drawn}, wal_reads_past_budget={total_past_budget}, \
-     wal_reads_discarded={total_discarded}) — every read beat the allowance on its own, so the \
+     wal_reads_discarded={total_discarded}) — every read beat the horizon on its own, so the \
      wait path was never load-bearing"
   );
-  // And they must carry BYTES: a beyond-allowance fault or absent verdict spends a failure or
+  // And they must carry BYTES: a beyond-horizon fault or absent verdict spends a failure or
   // settles a phantom, while only a `ReadOk` resolves a waited-out op with its body.
   assert!(
     total_late_bodies > 0,
-    "every beyond-allowance read delivered a fault or absent verdict \
+    "every beyond-horizon read delivered a fault or absent verdict \
      (wal_late_bodies_delivered={total_late_bodies}) — no canonical body was ever consumed through \
      the wait, so the path this sweep exists to exercise was never genuinely reached"
   );
