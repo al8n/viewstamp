@@ -1303,11 +1303,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //
     // `commit_max <= self.op` is a FORMATION-layer bound (`commit_max == commit_star <= op_head ==
     // self.op` by `select_canonical_log`'s fail-stop) and this emission runs a root-landing window
-    // later, so it is re-established HERE, at the emission layer: the only in-window raiser is an
-    // uncorrelated commit-proven landing, which either latched the debt the reconciliation above
-    // consumed, or lifted a frontier the applied prefix covers — whose commit the canonical union
-    // then bounds by `op_head` (a genuinely committed op is carried by some canonical donor). The
-    // assert pins the emission-layer half of the receiver's `commit <= op` adopt guard.
+    // later, so it is re-checked HERE, at the emission layer. The in-window raiser is an
+    // uncorrelated commit-proven landing: one that latched the debt is consumed by the
+    // reconciliation above (entered, or retired through the applied-frontier leg), and one that
+    // lifted a frontier the applied prefix covers keeps `commit <= op_head` because a genuinely
+    // committed op is carried by some canonical donor. The one shape that can reach this emission
+    // still owing is a debt the reconciliation deferred to an owed SM-reconstruct (the arc whose
+    // retry install sits below the owed frontier); the assert is that shape's tripwire, pinning
+    // the emission-layer half of the receiver's `commit <= op` adopt guard.
     debug_assert!(
       self.commit_max.get() <= self.op.get(),
       "StartView would advertise commit {} above its op {}",
