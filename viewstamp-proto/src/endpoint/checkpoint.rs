@@ -816,10 +816,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// [`Self::advance_checkpoint_op`].
   ///
   /// Called from the settle site and re-driven from the commit tails and the quiescent-primary
-  /// heartbeat, because every deferral below waits on an event those sites observe:
-  /// - already `Recovering`/`RecoveringHead`: a recovery is in flight, and every recovery
-  ///   completion restores or fetches to the durable checkpoint — at/above the owed frontier —
-  ///   so the latch retires with it; `Retired` participates in nothing, so nothing is owed.
+  /// heartbeat, because every deferral below waits on an event those sites observe — and each
+  /// deferral is BACKED by the deferred-to party knowing about the debt:
+  /// - already `Recovering`/`RecoveringHead`: a recovery is in flight, and the debt is satisfied
+  ///   by the work that recovery does, never by the deferral itself — an in-flight peer fetch is
+  ///   RETARGETED at the owed frontier right here ([`Self::retarget_recovery_fetch`]), the
+  ///   completion decision refuses every terminal transition while the debt is owed and turns
+  ///   the recovery into the reconciling fetch ([`Self::complete_recovery`]), and the
+  ///   `RecoveringHead` exit (a canonical-head adoption) enters the fetch at its completion
+  ///   ([`Self::adopt_canonical_head`]); `Retired` participates in nothing, so nothing is owed.
   /// - an in-flight durable-view write: never torn down mid-write (the view it vouches could
   ///   regress); its completion arm runs and the next tail re-drives this.
   /// - an own-advance window (`pending_checkpoint` / an owed SM reconstruct / a retained
@@ -843,6 +848,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return CommitFlow::Continue;
     };
     if self.status.is_recovering() || self.status.is_recovering_head() || self.status.is_retired() {
+      // The recovery in flight satisfies the debt itself (see above) — but a peer fetch armed
+      // BELOW the owed frontier would solicit donors that cannot satisfy it (the timeline
+      // admission floors every install at the effective root, which the landing just advanced),
+      // so lift its wire target to the frontier now.
+      self.retarget_recovery_fetch(now, target);
       return CommitFlow::Continue;
     }
     if self.pending_durable_view() {
@@ -854,13 +864,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     {
       return CommitFlow::Continue;
     }
-    // The teardown mirrors the cross-epoch peer-fetch entry: end the old generation's in-flight
-    // state at the shared chokepoint, drop the pipeline/buffer and the ViewChange-only
-    // collection (the Recovering flip keeps the `view_change.is_some() == is_view_change()`
-    // coupling), and abandon any remaining `pending_sb` — only a Seal or SwapEpoch action can
-    // still be armed (the durable-view guard above deferred the view-changing three), and an
-    // epoch-advancing landing still installs through the landing absorb whether or not its
-    // correlation survives.
+    self.enter_orphan_repersist_fetch(now, storage, target);
+    CommitFlow::EnteredRecovery
+  }
+
+  /// The orphaned-re-persist teardown: end the current generation and become the reconciling
+  /// recovery peer-fetch at/above `target`. The unconditional half of
+  /// [`Self::maybe_enter_orphan_repersist_fetch`], shared with the `RecoveringHead` adoption exit
+  /// ([`Self::adopt_canonical_head`]) — the one recovery completion that does not route through
+  /// [`Self::complete_recovery`]'s refusal.
+  ///
+  /// The teardown mirrors the cross-epoch peer-fetch entry: end the old generation's in-flight
+  /// state at the shared chokepoint, drop the pipeline/buffer and the ViewChange-only
+  /// collection (the Recovering flip keeps the `view_change.is_some() == is_view_change()`
+  /// coupling), and abandon any remaining `pending_sb` — only a Seal or SwapEpoch action can
+  /// still be armed (the callers' durable-view guard deferred the view-changing three), and an
+  /// epoch-advancing landing still installs through the landing absorb whether or not its
+  /// correlation survives.
+  pub(crate) fn enter_orphan_repersist_fetch<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+    target: OpNumber,
+  ) {
     self.reset_for_view_transition(now, storage);
     self.pending_install = None;
     self.block_fetch = None;
@@ -881,7 +907,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // the absorb), so the fetch runs at the configuration this endpoint already holds.
     let target = OpNumber::with(target.get().max(self.checkpoint_op.get()));
     self.escalate_checkpoint_to_peer_fetch(now, target, false);
-    CommitFlow::EnteredRecovery
   }
 
   /// The still-owed orphaned-re-persist frontier ([`Self::repersist_orphan`]), retiring the latch
@@ -889,7 +914,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// install or restore delivered it) or `commit_min` caught up after all (repair recovered the
   /// band, and the passive adoption completes the catch-up). Every consumer of the debt reads it
   /// through this one check, so none can act on a latch that is already met.
-  fn repersist_orphan_owed(&mut self) -> Option<OpNumber> {
+  pub(crate) fn repersist_orphan_owed(&mut self) -> Option<OpNumber> {
     let target = self.repersist_orphan?;
     if self.checkpoint_op >= target || self.commit_min >= target {
       self.repersist_orphan = None;
