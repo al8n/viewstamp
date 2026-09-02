@@ -1583,11 +1583,15 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// While owed, [`Self::maybe_enter_orphan_repersist_fetch`] flips this endpoint into the
   /// recovery peer-fetch — reconciliation before further participation — deferring only across
   /// an in-flight durable-view write or an own-advance window, each of which re-drives it from
-  /// the commit tails or the primary heartbeat. Cleared when [`Self::advance_checkpoint_op`]
-  /// reaches the frontier (any reconciling install or restore satisfies it) or when `commit_min`
-  /// catches up after all (repair recovered the band; the passive adoption then completes the
-  /// catch-up). Set only alongside `inherited_frontier`, so the settled-lockstep exclusion
-  /// already covers its window.
+  /// the commit tails or the primary heartbeat. A recovery ALREADY in flight when the debt
+  /// latches satisfies it by doing the work instead: an in-flight peer fetch is retargeted at
+  /// the owed frontier, [`Self::complete_recovery`] refuses every terminal transition while it
+  /// is owed and re-latches the fetch, and the `RecoveringHead` adoption exit enters the fetch
+  /// at its completion — so no recovery can end with the debt behind it. Cleared when
+  /// [`Self::advance_checkpoint_op`] reaches the frontier (any reconciling install or restore
+  /// satisfies it) or when `commit_min` catches up after all (repair recovered the band; the
+  /// passive adoption then completes the catch-up). Set only alongside `inherited_frontier`, so
+  /// the settled-lockstep exclusion already covers its window.
   repersist_orphan: Option<OpNumber>,
   /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
   /// (their ids never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.

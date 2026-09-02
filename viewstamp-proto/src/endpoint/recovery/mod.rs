@@ -1683,6 +1683,34 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.arm_timers(now);
   }
 
+  /// Raise an in-flight recovery peer-fetch's target to `target` — the retarget an orphaned
+  /// checkpoint-role root landing performs on a recovery already fetching below its frontier.
+  /// The landing advanced the effective root, and `apply_sync`'s timeline admission floors every
+  /// install at it — so a fetch still soliciting the OLD target would only draw replies the
+  /// admission then refuses, soliciting forever. Lifting the wire target makes donors below the
+  /// frontier stay silent and a donor at/above it answer with a reply that can actually install.
+  ///
+  /// Everything else about the handshake is preserved: the nonce (a late reply to the old
+  /// solicitation at/above the new target still admits), the forced assert-relaxation, and a
+  /// crossing requirement (a raise must never weaken it — the stale-crossing downgrade has its
+  /// own trigger machinery). A raise past a pinned chunked transfer invalidates it, exactly as
+  /// the Normal-path target raise does. No-op unless a peer fetch is in flight and the owed
+  /// frontier exceeds its target.
+  pub(crate) fn retarget_recovery_fetch(&mut self, now: Instant, target: OpNumber) {
+    if !self.awaiting_peer_checkpoint() {
+      return;
+    }
+    let Some(s) = self.sync else {
+      return;
+    };
+    if s.target >= target {
+      return;
+    }
+    self.sync = Some(SyncState { target, ..s });
+    self.drop_transfer_below_forced_target();
+    self.send_request_sync(now);
+  }
+
   /// Route a NON-NORMAL laggard stranded at the OLD epoch into the RECOVERY peer-fetch — the cross-epoch
   /// catch-up for a replica whose status is not `Normal` (a `ViewChange` driving a now-futile old-epoch
   /// election, or a `Recovering`/`RecoveringHead` whose own durable state is at the superseded epoch).
@@ -2105,6 +2133,26 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     storage: &mut Storage<W, B, S>,
   ) {
+    // An orphaned state-sync re-persist root landed while this recovery ran, and its frontier is
+    // still uninstalled: the durable root names state this endpoint does not hold, so NO terminal
+    // transition may settle over it — not a Normal resume, not a view-change re-drive, not an
+    // abdication (each is participation over a superseded pointer). Refuse the completion and
+    // turn the recovery INTO the reconciliation: keep `Recovering` and re-latch the peer fetch
+    // at/above the owed frontier. The install that satisfies it advances the pointer through the
+    // single pointer-advance choke — which retires the latch — and its completion re-runs this
+    // decision with nothing owed. This is what backs the fetch guard's deferral while already
+    // Recovering: the debt is met by the recovery doing the work, never by the status alone.
+    if let Some(owed) = self.repersist_orphan_owed() {
+      // Defensive: the refusal normally finds the read-phase `RecoverState` still latched (the
+      // staged-install path retires it, but its install also retires the debt before reaching
+      // here). Re-latch a fresh one so the awaiting-peer gate and its ingress hold.
+      if self.recover.is_none() {
+        self.recover = Some(RecoverState::default());
+      }
+      let target = OpNumber::with(owed.get().max(self.checkpoint_op.get()));
+      self.escalate_checkpoint_to_peer_fetch(now, target, false);
+      return;
+    }
     // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
     // exemption below. A re-latched recovery (`on_recover_sync_checkpoint` builds a default state)
     // carries `formatted = false`, which is correct: a re-syncing node is never at genesis.

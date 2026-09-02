@@ -1830,6 +1830,833 @@ fn an_orphaned_sync_repersist_root_enters_the_recovery_fetch_at_its_landing() {
   assert_eq!(e.state_syncs_applied(), 1, "the reconciling sync applied");
 }
 
+/// Build the restart-in-place store the mid-recovery orphan-landing tests recover over: a backup
+/// that installed a synced checkpoint L=4, then staged a second re-persist to M=8 whose ROOT is
+/// still with the medium when the process dies. Returns the live storage (holding the in-flight
+/// M root), the shared block store (L's DAG seeded last), the M donor's envelope + id, and the
+/// config the successor recovers under.
+fn store_with_orphan_root_in_flight() -> (
+  Storage<TestWal, KindSb, CountSm>,
+  InMemoryBlockStore,
+  Bytes,
+  u128,
+  Config,
+) {
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let wal = TestWal::default();
+  let mut sb0 = TestSb::default();
+  crate::format(&cfg, &genesis(3), &wal, &mut sb0).expect("format the genesis store");
+  // Re-home the formatted root under the kind-split superblock so ROOT writes stay in flight until
+  // an explicit `flush_roots` — the window the restart lands inside.
+  let sb = KindSb {
+    state: sb0.state(),
+    ..KindSb::default()
+  };
+  let mut blocks = InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  let now = Instant::ZERO;
+  let mut e = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut storage)
+    .expect("recover the formatted store")
+    .expect_active();
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "a formatted backup resumes Normal"
+  );
+  while e.poll_message().is_some() {}
+
+  // Sync #1 installs L=4 end to end (envelope, root, install), so the durable root names L.
+  let (_d4, d4s) = donor_primary_at_checkpoint(4);
+  let (env4, id4) = donor_envelope(&d4s);
+  seed_donor_blocks(&mut blocks, 4);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id4,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env4,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_envelopes();
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_roots();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the first sync installed: the durable root names L=4"
+  );
+  assert_eq!(e.status(), Status::Normal);
+  while e.poll_message().is_some() {}
+
+  // Sync #2 stages the re-persist to M=8: envelope durable, ROOT submitted and withheld.
+  let (_d8, d8s) = donor_primary_at_checkpoint(8);
+  let (env8, id8) = donor_envelope(&d8s);
+  seed_donor_blocks(&mut blocks, 8);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env8.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_envelopes();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sync_repersist_root_staged(),
+    "the M=8 re-persist root is staged and in flight"
+  );
+  drop(e); // the process dies; the session (and the in-flight M root) live on
+  // Re-seed L=4's DAG: driving the M=8 donor swept it from the shared store (the donor's own GC
+  // marks only from its live roots), and the successor's local restore of L walks it. The M
+  // donor's DAG is swept in turn here; a test that installs M re-seeds it first.
+  seed_donor_blocks(&mut blocks, 4);
+  (storage, blocks, env8, id8, cfg)
+}
+
+#[test]
+fn a_root_landing_mid_recovery_holds_the_exit_until_its_frontier_is_installed() {
+  // A dead incarnation's re-persist root M=8 lands while the successor's recovery is already
+  // rebuilding from the older durable checkpoint L=4 (checkpoint read verified, tail reads
+  // resolved, reconstruction running). The landing latches the owed reconciliation, and the
+  // recovery must not settle ANY terminal status over it: the completion re-latches the peer
+  // fetch at M, and only the install of M's snapshot lets the replica resume Normal. Without the
+  // completion-side check the recovery finishes at L and resumes Normal with the debt still owed
+  // — participating over state the durable root supersedes.
+  let (mut storage, mut blocks, env8, id8, cfg) = store_with_orphan_root_in_flight();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 1, CountSm::default(), &mut storage)
+    .expect("recover over the live store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  assert_eq!(
+    r.checkpoint_op(),
+    OpNumber::with(4),
+    "the recovery baselines on the landed root L"
+  );
+
+  // The recovery begins against L: the checkpoint read verifies against the still-L durable
+  // root, and the reconstruct walk is now in flight (queued on the block lane).
+  r.handle_storage(now, &mut storage);
+  assert_eq!(r.status(), Status::Recovering);
+
+  // M lands mid-recovery: the owed reconciliation latches, and the recovery keeps going.
+  storage.sb_mut().flush_roots();
+  r.handle_storage(now, &mut storage);
+  assert_eq!(
+    r.repersist_orphan,
+    Some(OpNumber::with(8)),
+    "the landing latched the orphaned re-persist debt while recovering"
+  );
+  assert_eq!(r.status(), Status::Recovering);
+
+  // The reconstruction of L completes and the recovery reaches its completion decision. The debt
+  // is still owed, so no terminal transition may happen: the recovery re-latches as the peer
+  // fetch at M instead of resuming Normal at L.
+  for _ in 0..4 {
+    r.block_step(now, &mut storage, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "recovery must not settle a terminal status while the landed frontier is uninstalled"
+  );
+  assert!(
+    r.awaiting_peer_checkpoint_for_test(),
+    "the completion re-latched the recovery as the reconciling peer fetch"
+  );
+  assert_eq!(
+    r.sync_target_for_test(),
+    Some(8),
+    "the re-latched fetch targets the landed frontier"
+  );
+  let mut nonce = None;
+  let (mut saw_dvc, mut saw_sv) = (false, false);
+  while let Some(out) = r.poll_message() {
+    match out.msg_ref() {
+      Message::RequestSync(rs) => nonce = Some(rs.nonce()),
+      Message::DoViewChange(_) => saw_dvc = true,
+      Message::StartView(_) => saw_sv = true,
+      _ => {}
+    }
+  }
+  assert!(
+    !saw_dvc && !saw_sv,
+    "no view participation is emitted while the reconciliation is owed"
+  );
+
+  // A donor answers at M: the install advances the pointer to the landed frontier, retires the
+  // debt, and ONLY THEN does recovery complete to Normal. (Re-seed M's DAG first: the L re-seed
+  // above swept it, and the restore of L that needed L's DAG has completed.)
+  seed_donor_blocks(&mut blocks, 8);
+  r.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce.expect("the re-latched fetch solicited"),
+      env8,
+      Bytes::new(),
+    )),
+  );
+  r.block_step(now, &mut storage, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_envelopes();
+  r.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_roots();
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    r.checkpoint_op(),
+    OpNumber::with(8),
+    "the reconciling install advanced the pointer to the landed frontier"
+  );
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completed after the install"
+  );
+  assert!(r.repersist_orphan.is_none(), "the install retired the debt");
+  assert!(r.inherited_frontier.is_none(), "nothing left owed");
+  assert_eq!(
+    r.state_machine_ref().applied().len(),
+    8,
+    "the SM holds the synced state the durable root names"
+  );
+  // The ordering pin over the whole schedule: the replica never became Normal before M's
+  // snapshot was installed.
+  let events: std::vec::Vec<Event> = core::iter::from_fn(|| r.poll_event()).collect();
+  let installed = events
+    .iter()
+    .position(|ev| matches!(ev, Event::StateSyncCompleted(op) if op.get() == 8))
+    .expect("the reconciling sync completed");
+  let first_normal = events
+    .iter()
+    .position(|ev| matches!(ev, Event::StatusChanged(Status::Normal)))
+    .expect("the replica resumed Normal at the end");
+  assert!(
+    first_normal > installed,
+    "Normal was reached only after the landed frontier's snapshot installed"
+  );
+}
+
+#[test]
+fn a_root_landing_mid_fetch_raises_the_fetch_target_to_its_frontier() {
+  // A dead incarnation's re-persist root M=8 lands while the successor's recovery is already in
+  // the PEER-FETCH phase (its own checkpoint reads exhausted; the fetch armed at its own L=4).
+  // The landing must retarget the in-flight fetch at the landed frontier: the solicitation then
+  // asks donors for a checkpoint that subsumes the durable root, instead of soliciting L forever
+  // while the timeline admission refuses every below-M reply.
+  let (mut storage, mut blocks, env8, id8, cfg) = store_with_orphan_root_in_flight();
+  // The local L envelope is gone: every checkpoint read faults, so the recovery escalates.
+  storage.sb_mut().checkpoints.remove(&4);
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 1, CountSm::default(), &mut storage)
+    .expect("recover over the live store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Burn the checkpoint-read budget on the retry cadence until the peer fetch arms.
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    r.storage_step(t, &mut storage, &mut blocks);
+    if r.awaiting_peer_checkpoint_for_test() {
+      break;
+    }
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, &mut storage);
+    }
+  }
+  assert!(
+    r.awaiting_peer_checkpoint_for_test(),
+    "the exhausted checkpoint read escalated to the peer fetch"
+  );
+  assert_eq!(
+    r.sync_target_for_test(),
+    Some(4),
+    "the fetch first targets the replica's own durable checkpoint"
+  );
+
+  // M lands mid-fetch: the debt latches AND the in-flight fetch is retargeted at its frontier.
+  storage.sb_mut().flush_roots();
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.repersist_orphan,
+    Some(OpNumber::with(8)),
+    "the landing latched the orphaned re-persist debt while fetching"
+  );
+  assert_eq!(
+    r.sync_target_for_test(),
+    Some(8),
+    "the landing raised the in-flight fetch's target to the landed frontier"
+  );
+  assert_eq!(r.status(), Status::Recovering);
+
+  // A donor answers at the raised target; the install retires the debt and recovery completes.
+  // (Re-seed M's DAG: the helper's L re-seed swept it, and this recovery never walks L's.)
+  seed_donor_blocks(&mut blocks, 8);
+  let mut nonce = None;
+  while let Some(out) = r.poll_message() {
+    if let Message::RequestSync(rs) = out.msg_ref() {
+      nonce = Some(rs.nonce());
+    }
+  }
+  r.handle_message(
+    t,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce.expect("the fetch solicited"),
+      env8,
+      Bytes::new(),
+    )),
+  );
+  r.block_step(t, &mut storage, &mut blocks);
+  r.storage_step(t, &mut storage, &mut blocks);
+  storage.sb_mut().flush_envelopes();
+  r.storage_step(t, &mut storage, &mut blocks);
+  storage.sb_mut().flush_roots();
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(r.checkpoint_op(), OpNumber::with(8));
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completed at the landed frontier"
+  );
+  assert!(r.repersist_orphan.is_none(), "the install retired the debt");
+}
+
+#[test]
+fn a_recovering_head_adoption_over_an_owed_orphan_debt_enters_the_fetch_instead_of_normal() {
+  // The RecoveringHead exit is the one recovery completion that does not route through
+  // `complete_recovery`: the canonical-head adoption settles the terminal status itself. With an
+  // orphaned re-persist debt latched (its root landed while the head was unresolved — the window
+  // where the fetch guard defers to the recovery in flight), the adoption must keep the head it
+  // came for but enter the reconciling fetch instead of Normal: a quiescent backup settled
+  // Normal here would have no commit tail to re-drive the fetch, and its next view change would
+  // cast votes over the superseded pointer.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.status = Status::RecoveringHead;
+  e.recover = Some(RecoverState::default());
+  e.inherited_frontier = Some(OpNumber::with(4));
+  e.repersist_orphan = Some(OpNumber::with(4));
+  let flow = e.adopt_canonical_head(
+    now,
+    &mut storage,
+    View::with(1),
+    OpNumber::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    &[],
+  );
+  assert!(
+    flow.entered_recovery(),
+    "the adoption yielded to the owed reconciliation"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the exit is the reconciling fetch, never Normal over an uninstalled frontier"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "the reconciling peer fetch is latched"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the fetch targets the landed frontier"
+  );
+  assert_eq!(e.view(), View::with(1), "the adopted view stands");
+  assert!(
+    e.log_view.get() < e.view().get(),
+    "the fetch's completion re-drives the view over installed state"
+  );
+}
+
+#[test]
+fn forming_a_view_over_an_owed_orphan_reconciliation_yields_to_the_recovery_fetch() {
+  // The commit tail run inside `start_view_as_new_primary` can enter the orphaned-re-persist
+  // reconciliation (the owed debt latched while the durable-view write was in flight, and the
+  // view formation is the first tail that finds every deferral clear). Entering the fetch tears
+  // the forming generation down, so the formation must STOP: continuing would overwrite
+  // `Recovering` with `Normal` and stage a `StartView` for a checkpoint frontier this replica
+  // never installed. The transition is returned by the commit helpers as a value, so the caller
+  // short-circuits instead of carrying on over the dead generation.
+  let (_donor, dstorage) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dstorage);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let wal = TestWal::default();
+  let sb = StepSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  // A live WAL band {1,2} below the synced point; the applied frontier stays at 0.
+  for op in 1..=2u64 {
+    e.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
+    e.storage_step(now, &mut storage, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sync_repersist_root_staged(),
+    "the re-persist root is staged and in flight"
+  );
+  // The teardown that orphans the staged re-persist (the backstop arm of the shared reset).
+  e.reset_for_view_transition(now, &mut storage);
+  assert!(e.pending_checkpoint.is_none(), "the correlation is gone");
+
+  // The node proposes and joins the view change to view 1 — the view it leads. Its
+  // SendDoViewChange root queues BEHIND the orphaned root on the timeline.
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+
+  // The orphaned root lands first (queue order): the debt latches, deferred behind the in-flight
+  // durable-view write; the landing's settle releases the parked view root to the backend.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.repersist_orphan,
+    Some(OpNumber::with(4)),
+    "the landing latched the debt while the durable-view write deferred the fetch"
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  // The view root lands: the deferred DoViewChange fires (the accepted deferral window).
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  let mut voted = false;
+  while let Some(m) = e.poll_message() {
+    voted |= matches!(m.msg_ref(), Message::DoViewChange(_));
+  }
+  assert!(voted, "the deferred vote fired once the view root landed");
+
+  // A canonical donor's DoViewChange completes the quorum: the node would now form view 1 as its
+  // primary — but the commit tail inside the formation enters the owed reconciliation first, and
+  // the formation must yield to it.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(0),
+      OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![],
+    )),
+  );
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "forming the view yielded to the owed orphaned-re-persist reconciliation"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "the reconciling peer fetch is armed"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the fetch targets the orphaned root's landed frontier"
+  );
+  let mut refetch_nonce = None;
+  let mut saw_sv = false;
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::RequestSync(rs) => refetch_nonce = Some(rs.nonce()),
+      Message::StartView(_) => saw_sv = true,
+      _ => {}
+    }
+  }
+  assert!(
+    !saw_sv,
+    "no StartView is staged for the abandoned formation"
+  );
+
+  // The reconciliation completes: the install advances the pointer to the landed frontier, and
+  // recovery re-drives the interrupted view change (log_view < view) — participation resumes
+  // only now, over installed state.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      refetch_nonce.expect("the reconciling fetch solicited"),
+      env,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the reconciling install advanced the pointer to the landed frontier"
+  );
+  assert!(e.repersist_orphan.is_none(), "the install retired the debt");
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "recovery completed into the re-driven view change (log_view < view)"
+  );
+  // The whole schedule never reached Normal and never staged a StartView: the formation that
+  // began over the owed debt was abandoned, not completed.
+  let mut saw_sv = false;
+  while let Some(out) = e.poll_message() {
+    saw_sv |= matches!(out.msg_ref(), Message::StartView(_));
+  }
+  assert!(!saw_sv, "no StartView was ever broadcast");
+  let went_normal = core::iter::from_fn(|| e.poll_event())
+    .any(|ev| matches!(ev, Event::StatusChanged(Status::Normal)));
+  assert!(
+    !went_normal,
+    "the replica never resumed Normal while the reconciliation was owed"
+  );
+}
+
+#[test]
+fn a_debt_landing_behind_the_new_primary_root_is_reconciled_before_the_start_view() {
+  // The orphaned root can land AFTER the canonical selection instead of before it: the formation
+  // runs clean (no debt latched), defers participation to its StartViewAsPrimary root, and THAT
+  // root queues behind the orphaned one. The orphaned landing then absorbs `commit_max` to its
+  // frontier — above the formed head — and latches the debt, deferred behind the in-flight
+  // durable-view write. The write's completion arm must reconcile the debt BEFORE broadcasting:
+  // the formation-time bound `commit_max == commit* <= op` no longer holds at the emission, so a
+  // StartView built first would carry `commit > op` and fail-stop every honest adopter at
+  // `adopt_canonical_head`'s `commit <= op` guard, with this primary entering recovery only
+  // afterwards.
+  let (_donor, dstorage) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dstorage);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let wal = TestWal::default();
+  let sb = StepSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  // A live WAL band {1,2} below the synced point; the applied frontier stays at 0.
+  for op in 1..=2u64 {
+    e.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
+    e.storage_step(now, &mut storage, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sync_repersist_root_staged(),
+    "the re-persist root is staged and in flight"
+  );
+  // The teardown that orphans the staged re-persist (the backstop arm of the shared reset).
+  e.reset_for_view_transition(now, &mut storage);
+  assert!(e.pending_checkpoint.is_none(), "the correlation is gone");
+
+  // The node proposes and joins the view change to view 1 — the view it leads. Its durable-view
+  // write parks behind the orphaned root on the timeline.
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+
+  // The donor DVC completes the quorum while the orphaned root is STILL WITH THE MEDIUM: the
+  // canonical selection runs with no debt latched, and the StartViewAsPrimary root supersedes the
+  // parked vote root — queued behind the orphaned root.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(0),
+      OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![],
+    )),
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the view formed; participation defers to the durable-view root"
+  );
+  assert!(
+    e.repersist_orphan.is_none(),
+    "no debt is latched at canonical-selection time"
+  );
+  while e.poll_message().is_some() {}
+
+  // The orphaned root lands first (submission order): `commit_max` absorbs the landed frontier 4
+  // — above the formed head 2 — and the debt latches, deferred behind the in-flight
+  // StartViewAsPrimary write.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.repersist_orphan,
+    Some(OpNumber::with(4)),
+    "the landing latched the debt while the durable-view write deferred the fetch"
+  );
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(4),
+    "the absorbed commit frontier now exceeds the formed head"
+  );
+  assert_eq!(e.op(), OpNumber::with(2), "the formed head is the pre-sync 2");
+  assert_eq!(e.status(), Status::Normal);
+
+  // The StartViewAsPrimary root lands: the completion arm must observe the owed debt BEFORE
+  // participating — enter the reconciling fetch, emit no StartView and no Commit.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the completion reconciled the owed debt instead of leading over it"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "the reconciling peer fetch is armed"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the fetch targets the orphaned root's landed frontier"
+  );
+  // Nothing malformed reached the wire: no StartView, no Commit — and an honest backup receiving
+  // everything that WAS emitted survives it (the malformed StartView would fail-stop it at the
+  // `commit <= op` adopt guard).
+  let mut backup = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::with_checkpoint_ops(1, MemberId::new(2), 1_000).unwrap(),
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let mut bstorage = Storage::new(TestWal::default(), TestSb::default());
+  let (mut saw_sv, mut saw_commit) = (false, false);
+  let mut refetch_nonce = None;
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::StartView(_) => saw_sv = true,
+      Message::Commit(_) => saw_commit = true,
+      Message::RequestSync(rs) => refetch_nonce = Some(rs.nonce()),
+      _ => {}
+    }
+    backup.handle_message(
+      now,
+      &mut bstorage,
+      Peer::Replica(ReplicaId::new(1)),
+      out.into_msg(),
+    );
+  }
+  assert!(
+    !saw_sv && !saw_commit,
+    "no StartView or Commit is emitted before the owed debt is reconciled"
+  );
+
+  // The reconciliation completes: the install advances the pointer to the landed frontier and
+  // retires the debt; the recovered ex-candidate then abdicates into the next view change rather
+  // than resuming as the established primary.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      refetch_nonce.expect("the reconciling fetch solicited"),
+      env,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the reconciling install advanced the pointer to the landed frontier"
+  );
+  assert!(e.repersist_orphan.is_none(), "the install retired the debt");
+}
+
 #[test]
 fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_clearing_it() {
   // REGRESSION. The `on_sb_done` root-completion arm must route by whether THIS
