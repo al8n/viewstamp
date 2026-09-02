@@ -848,6 +848,94 @@ async fn inbound_datagram_rekeys_so_the_dial_pass_drops_a_removed_slot() {
   );
 }
 
+/// The link reconcile is what re-establishes a mesh edge that died — including one quinn closed
+/// because a stalled reader let its reassembler fill. It must ARM before it dials (a dial and its
+/// handshake are in flight while `has_bound_conn` is still false, so dialing on every observation
+/// would stack dials), then dial when the backoff is due, doubling it toward the cap so a peer that
+/// stays down is probed at a bounded rate.
+///
+/// A dial is observable as the handshake datagram the coordinator queues for the peer's address: the
+/// pass that only ARMS must queue nothing, and the pass that is DUE must queue one. Removing the
+/// reconcile's dial leaves the second half with no datagram — the state a lost connection would sit
+/// in forever.
+#[compio::test]
+async fn the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff() {
+  let (mut driver, _handle) = test_quic_driver_with_handle().await;
+  let peer_addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+  let slot = viewstamp_proto::ReplicaId::new(1);
+  driver.peers.clear();
+  driver.peers.push(super::PeerLink {
+    id: slot,
+    member_id: MemberId::new(1),
+    addr: peer_addr,
+    backoff: viewstamp_driver::REDIAL_BACKOFF_BASE,
+    next_dial: None,
+  });
+  while driver.coord.poll_transmit().is_some() {}
+
+  // First observation of an unbound peer: arm a deadline, dial nothing yet.
+  let t0 = viewstamp_proto::Instant::ZERO;
+  driver.reconcile_peer_links(t0);
+  let armed = driver.peers[0]
+    .next_dial
+    .expect("the first pass arms a deadline");
+  assert!(
+    armed > t0,
+    "the deadline is ahead of now, so no dial is due yet"
+  );
+  assert!(
+    driver.coord.poll_transmit().is_none(),
+    "the arming pass must not dial: a dial already in flight would be stacked on"
+  );
+  assert_eq!(
+    driver.peers[0].backoff,
+    viewstamp_driver::REDIAL_BACKOFF_BASE,
+    "arming alone does not consume backoff"
+  );
+
+  // A pass before the deadline still dials nothing.
+  driver.reconcile_peer_links(t0);
+  assert!(
+    driver.coord.poll_transmit().is_none(),
+    "a pass before the deadline must not dial either"
+  );
+
+  // Due: dial, and double the backoff for the next probe.
+  driver.reconcile_peer_links(armed);
+  let dialed = driver
+    .coord
+    .poll_transmit()
+    .expect("the due pass dials the unbound peer");
+  assert_eq!(dialed.0, peer_addr, "the dial goes to the peer's address");
+  assert!(
+    driver.peers[0].backoff > viewstamp_driver::REDIAL_BACKOFF_BASE,
+    "a probe doubles the backoff so a peer that stays down is retried at a bounded rate"
+  );
+  let after_first = driver.peers[0].backoff;
+  let next = driver.peers[0]
+    .next_dial
+    .expect("the probe re-arms for the next one");
+  assert!(next > armed, "and the next probe is scheduled later");
+
+  // Repeated probes keep doubling, and never past the configured cap.
+  let mut at = next;
+  for _ in 0..8 {
+    driver.reconcile_peer_links(at);
+    while driver.coord.poll_transmit().is_some() {}
+    at = driver.peers[0].next_dial.expect("still armed");
+  }
+  assert!(
+    driver.peers[0].backoff >= after_first,
+    "the backoff only grows while the peer stays unbound"
+  );
+  assert!(
+    driver.peers[0].backoff <= driver.cfg.redial_backoff_cap(),
+    "and is capped: {:?} exceeds the configured cap {:?}",
+    driver.peers[0].backoff,
+    driver.cfg.redial_backoff_cap()
+  );
+}
+
 #[test]
 fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
   // The referenceable defaults exist so an embedder can compute RELATIVE overrides (e.g. a

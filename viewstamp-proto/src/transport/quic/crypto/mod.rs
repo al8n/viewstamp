@@ -187,18 +187,26 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// sender, NOT a guarantee over all legal STREAM segmentation.
 ///
 /// **Supported sender.** This transport's own bridge stages a class's frames in one buffer and
-/// writes the whole buffer to quinn in a single call per pump, so quinn fills packets whenever a
-/// backlog exists and a pump contributes at most one sub-packet span. Nothing bounds how many such
-/// spans accumulate — that is the ratio between the sender's pump rate and the receiver's, and the
-/// receiver drains a 64 KiB budget per pump and re-arms itself while bytes remain, so a backlog
-/// builds only while a receiver's loop is stalled outright.
+/// writes that whole buffer to quinn in a single call, and the coordinator defers PACKETIZING to one
+/// service pass rather than running one per message. So per packetizing pass a class emits
+/// packet-filling frames plus at most one short tail — one sub-packet span, however many messages
+/// went into it. It is NOT one per coordinator entry: an entry can packetize more than once (the
+/// read pass services to release flow-control credit, the pump services at the end), which makes the
+/// per-entry count a small constant rather than one.
+///
+/// Nothing bounds how many such spans ACCUMULATE at a peer. That is the ratio between the sender's
+/// pump rate and the receiver's: the receiver drains a 64 KiB budget per pump and re-arms itself
+/// while bytes remain, far outpacing a sub-packet sender, so a backlog builds only while a
+/// receiver's loop is stalled outright — and then the ceiling is reachable, which is what the
+/// recovery below is for.
 ///
 /// **When a peer exceeds it.** quinn closes the connection; the bridge classifies that loss, unbinds
 /// the peer's routing and queues the connection for reaping, the driver's redial reconciler
 /// re-establishes it on a backoff, and consensus retransmission re-drives whatever was in flight.
-/// The failure mode is a bounded reconnect, not a wedge —
-/// `a_sub_packet_flood_that_outruns_the_reader_reaps_and_re_establishes` is the regression that
-/// holds that path in place.
+/// The failure mode is a bounded reconnect, not a wedge. The whole chain — a stalled receiver
+/// refused, both ends reaping, the link redialed, and the request that was in flight completing — is
+/// driven over real mTLS by
+/// `quic::loopback::a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_operation`.
 ///
 /// Frame size is not bounded by any of this: a frame spans as many window grants as it needs, so the
 /// transport's frame ceiling ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is

@@ -1275,3 +1275,483 @@ fn a_prepare_larger_than_the_stream_window_commits_over_bulk() {
     "backup converged on the full over-window op across the per-budget flow-control window updates"
   );
 }
+
+/// Drive `sender` at full speed while `stalled` receives datagrams but never DRAINS them, until
+/// `stalled`'s reassembler refuses the stream (its `RecordRejected` count rises above `base_rr`).
+///
+/// The stall models a node whose event loop is not running while its network stack still accepts
+/// packets: `feed_datagram_for_test` runs the bridge service pass — so the stalled side still ACKs
+/// and the sender's window keeps opening, exactly as a real receiver's kernel and quinn would — but
+/// never runs `drain_bridge`, so no frame is read out and every arriving STREAM frame stays a span.
+/// The traffic itself is the protocol's own: client requests submitted at the primary, and the
+/// `Prepare` retransmissions its timers drive because the stalled backup never acknowledges.
+///
+/// Returns the clock it stopped at and how many requests were submitted.
+fn flood_a_stalled_receiver(
+  sender: &mut Replica,
+  sender_addr: std::net::SocketAddr,
+  stalled: &mut Replica,
+  stalled_addr: std::net::SocketAddr,
+  start: Instant,
+  base_rr: u64,
+  client_base: u128,
+) -> (Instant, u64) {
+  let mut now = start;
+  let mut submits = 0u64;
+  for k in 0..60_000u64 {
+    now = now + Duration::from_micros(200);
+    {
+      let (c, w, b) = sender;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+      // One small request per few ticks: each mints a `Prepare` too small to fill a packet, which is
+      // the sub-packet span shape. The rest of the spans come from the retransmissions the stalled
+      // backup's silence provokes.
+      if k % 4 == 0 {
+        submits += 1;
+        c.submit_client_request(
+          now,
+          w,
+          Request::new(
+            ClientId::new(client_base + submits as u128),
+            RequestNumber::with(1),
+            Bytes::from_static(b"z"),
+          ),
+        );
+      }
+    }
+    let mut to_stalled: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, bytes)) = sender.0.poll_transmit() {
+      if dst == stalled_addr {
+        to_stalled.push(bytes);
+      }
+    }
+    for bytes in &to_stalled {
+      stalled.0.feed_datagram_for_test(now, sender_addr, bytes);
+    }
+    let mut to_sender: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, bytes)) = stalled.0.poll_transmit() {
+      if dst == sender_addr {
+        to_sender.push(bytes);
+      }
+    }
+    for bytes in &to_sender {
+      let (c, w, _) = &mut *sender;
+      c.handle_udp(now, stalled_addr, None, bytes, w);
+    }
+    if stalled
+      .0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected)
+      > base_rr
+    {
+      break;
+    }
+  }
+  (now, submits)
+}
+
+/// Both loops run normally again: pump each side, redial any peer left with no bound connection on
+/// the backoff a driver's link reconcile uses, and re-submit the SAME client request the way the
+/// driver's stale-request scan does, until BOTH replicas have applied `want`.
+///
+/// Returns the clock it stopped at, whether the request completed, and how many redials were issued.
+fn recover_and_complete(
+  r0: &mut Replica,
+  r1: &mut Replica,
+  addrs: (std::net::SocketAddr, std::net::SocketAddr),
+  start: Instant,
+  client: u128,
+  want: &[u8],
+  redial: bool,
+) -> (Instant, bool, u64) {
+  let (addr0, addr1) = addrs;
+  let p0 = Peer::Replica(ReplicaId::new(0));
+  let p1 = Peer::Replica(ReplicaId::new(1));
+  let mut now = start;
+  let mut redials = 0u64;
+  let mut due: Option<Instant> = None;
+  let mut done = false;
+  for k in 0..80_000u64 {
+    now = now + Duration::from_millis(5);
+    {
+      let (c, w, b) = &mut *r0;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+    }
+    {
+      let (c, w, b) = &mut *r1;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+    }
+    // The link reconcile a driver runs each iteration: a peer with no bound connection is redialed
+    // once its backoff is due, and binding stops the redials.
+    if redial
+      && (!r0.0.has_bound_conn(p1) || !r1.0.has_bound_conn(p0))
+      && due.is_none_or(|d| now >= d)
+    {
+      if !r0.0.has_bound_conn(p1) {
+        let _ = r0.0.connect(now, addr1, p1);
+        redials += 1;
+      }
+      if !r1.0.has_bound_conn(p0) {
+        let _ = r1.0.connect(now, addr0, p0);
+        redials += 1;
+      }
+      due = Some(now + Duration::from_millis(50));
+    }
+    // The client retransmission the driver's stale-request scan performs: the SAME request, resent
+    // until it commits. Nothing new is injected — this is the operation that was in flight.
+    if k % 200 == 0 {
+      let (c, w, _) = &mut *r0;
+      c.submit_client_request(
+        now,
+        w,
+        Request::new(
+          ClientId::new(client),
+          RequestNumber::with(1),
+          Bytes::copy_from_slice(want),
+        ),
+      );
+    }
+    let mut to_r1: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, bytes)) = r0.0.poll_transmit() {
+      if dst == addr1 {
+        to_r1.push(bytes);
+      }
+    }
+    for bytes in &to_r1 {
+      let (c, w, _) = &mut *r1;
+      c.handle_udp(now, addr0, None, bytes, w);
+    }
+    let mut to_r0: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, bytes)) = r1.0.poll_transmit() {
+      if dst == addr0 {
+        to_r0.push(bytes);
+      }
+    }
+    for bytes in &to_r0 {
+      let (c, w, _) = &mut *r0;
+      c.handle_udp(now, addr1, None, bytes, w);
+    }
+    let applied_at = |r: &Replica| {
+      r.0
+        .endpoint()
+        .state_machine_ref()
+        .applied()
+        .iter()
+        .any(|(_, body)| body == want)
+    };
+    if applied_at(r0) && applied_at(r1) {
+      done = true;
+      break;
+    }
+  }
+  (now, done, redials)
+}
+
+/// A receiver whose loop stalls under the primary's own traffic has its connection refused by
+/// quinn's reassembler — and the cluster recovers: both ends reap it, the link is re-established,
+/// and the request that was in flight completes. Twice.
+///
+/// The transport's stream receive window bounds an unread backlog's BYTES, not the number of spans
+/// the peer segments them into, so a sender producing sub-packet `Prepare`s to a receiver that is not
+/// draining walks the span count to quinn's per-stream ceiling and the connection is closed with a
+/// transport error. That is documented as recoverable rather than prevented, and this is the proof of
+/// the whole recovery chain over REAL cluster-private mTLS with real consensus traffic:
+///
+/// 1. two coordinators mutually dial, authenticate and commit a client request;
+/// 2. a second request is submitted and left in flight;
+/// 3. the backup's loop stalls — its stack still receives and ACKs, it just never drains — while the
+///    primary submits and retransmits, until the reassembler refuses the stream;
+/// 4. BOTH ends observe the loss: the stalled side classifies it `RecordRejected`, the sender sees the
+///    peer's close, and each reaps the dead connection out of its table;
+/// 5. the loops resume, an unbound peer is redialed on the reconcile's backoff, and the SAME client
+///    request — resent the way the driver's stale-request scan resends it, not injected as fresh
+///    bytes — commits on both replicas;
+/// 6. the overload is repeated from whichever replica the intervening view change left as primary,
+///    and a further request commits after that too.
+///
+/// Nothing here is constructed: every connection comes from a real dial and mTLS handshake, every
+/// frame from the consensus endpoint, and the close from quinn's own refusal. Removing the redial
+/// leaves step 6 with no route to rebuild and the final request never commits.
+#[test]
+fn a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_operation() {
+  let ca = test_ca();
+  let addr0 = addr(41);
+  let addr1 = addr(42);
+  let p0 = Peer::Replica(ReplicaId::new(0));
+  let p1 = Peer::Replica(ReplicaId::new(1));
+  let mut r0 = replica(&ca, 0, [7u8; 32], Scheme::Hello, StreamLayout::ControlBulk);
+  let mut r1 = replica(&ca, 1, [9u8; 32], Scheme::Hello, StreamLayout::ControlBulk);
+  r0.0
+    .connect(Instant::ZERO, addr1, p1)
+    .expect("a fresh coordinator dials under the connection cap");
+  r1.0
+    .connect(Instant::ZERO, addr0, p0)
+    .expect("a fresh coordinator dials under the connection cap");
+  r0.0.submit_client_request(
+    Instant::ZERO,
+    &mut r0.1,
+    Request::new(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::from_static(b"warm"),
+    ),
+  );
+  let mut now = converged_at(&mut r0, addr0, &mut r1, addr1)
+    .expect("the cluster commits one request over real mTLS before anything is broken");
+
+  // The operation that must survive the fault: in flight when the backup stalls.
+  r0.0.submit_client_request(
+    now,
+    &mut r0.1,
+    Request::new(
+      ClientId::new(2),
+      RequestNumber::with(1),
+      Bytes::from_static(b"survivor"),
+    ),
+  );
+
+  let table_before = (r0.0.bridge_table_len(), r1.0.bridge_table_len());
+  let (n, submits) = flood_a_stalled_receiver(&mut r0, addr0, &mut r1, addr1, now, 0, 1_000);
+  now = n;
+  assert_eq!(
+    r1.0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected),
+    1,
+    "the stalled receiver's reassembler must refuse the stream and the QUIC layer close the \
+     connection — {submits} submitted requests and their retransmissions did not get there"
+  );
+  assert!(
+    r0.0
+      .conn_close_count(crate::transport::CloseCause::PeerClosed)
+      >= 1,
+    "and the SENDER must observe that close too, not keep writing into a dead connection"
+  );
+
+  // The loops resume. Both ends must reap the dead connection, and the in-flight request completes.
+  let (n, done, _) =
+    recover_and_complete(&mut r0, &mut r1, (addr0, addr1), now, 2, b"survivor", true);
+  now = n;
+  assert!(
+    done,
+    "the request that was in flight when the connection died must complete once the loops resume — \
+     resent by the client, carried by whatever route the mesh recovered"
+  );
+  assert!(
+    r0.0.bridge_table_len() < table_before.0 && r1.0.bridge_table_len() < table_before.1,
+    "both ends must have REAPED the refused connection, not left it in the table: {:?} -> {:?}",
+    table_before,
+    (r0.0.bridge_table_len(), r1.0.bridge_table_len())
+  );
+
+  // Overload it again, from whichever replica the stall's view change left as primary.
+  let prim0 = r0.0.endpoint().is_primary();
+  let refusals_before = r0
+    .0
+    .conn_close_count(crate::transport::CloseCause::RecordRejected)
+    + r1
+      .0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected);
+  let (n, _) = if prim0 {
+    let base = r1
+      .0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected);
+    flood_a_stalled_receiver(&mut r0, addr0, &mut r1, addr1, now, base, 500_000)
+  } else {
+    let base = r0
+      .0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected);
+    flood_a_stalled_receiver(&mut r1, addr1, &mut r0, addr0, now, base, 500_000)
+  };
+  now = n;
+  let refusals_after = r0
+    .0
+    .conn_close_count(crate::transport::CloseCause::RecordRejected)
+    + r1
+      .0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected);
+  assert_eq!(
+    refusals_after,
+    refusals_before + 1,
+    "the second overload must reach the ceiling exactly once more — a recovery that left the link \
+     churning would show extra refusals"
+  );
+
+  let (_, done, redials) = recover_and_complete(
+    &mut r0,
+    &mut r1,
+    (addr0, addr1),
+    now,
+    3,
+    b"after-second",
+    true,
+  );
+  assert!(
+    done,
+    "a further request must commit after the SECOND overload — the fault is repeatable and the \
+     cluster keeps making progress across it"
+  );
+  assert!(
+    redials > 0,
+    "the second overload left the peer with no bound connection, so the recovery must have gone \
+     through a redial"
+  );
+  assert!(
+    r0.0.has_bound_conn(p1) && r1.0.has_bound_conn(p0),
+    "and the mesh must be bound again at the end, not limping on a half-open route"
+  );
+}
+
+/// What the sender actually guarantees about sub-packet spans, measured on the production call path.
+///
+/// A receiver's reassembler refuses a stream once it holds too many spans, and a span is one STREAM
+/// frame, so how the sender segments matters. The guarantee is per PACKETIZING PASS: every message
+/// staged for a class since the last pass is written to quinn as one contiguous run, so the pass
+/// emits packet-filling frames plus at most one short tail — one sub-packet span, however many
+/// messages went into it. It is NOT one per coordinator entry: an entry can packetize more than once
+/// (the read pass services to release flow-control credit, the pump services at the end), so the
+/// per-entry count is a small constant.
+///
+/// Both halves are measured here on the real path — `route` per message exactly as `pump` does, then
+/// the real pump-end service:
+///
+/// - a batch of 64 small Control messages leaves as a couple of datagrams with ONE short one, not 64
+///   short ones. Servicing per message instead (or staging per message without coalescing) turns
+///   that into 64 sub-packet spans and fails this by a wide margin;
+/// - across a converged run that includes a multi-megabyte Bulk frame — so partial writes and the
+///   `Writable`-driven retries of a blocked stream are in the sample — no coordinator entry emits
+///   more than a couple of short datagrams.
+///
+/// A datagram shorter than the 1200-byte path minimum is the observable for "quinn had less than a
+/// packet's worth for this stream", which is exactly the span shape that walks a stalled receiver
+/// toward the ceiling.
+#[test]
+fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
+  /// Below the 1200-byte QUIC path minimum: a datagram this small could not have been packet-filling.
+  const SHORT: usize = 1100;
+
+  let ca = test_ca();
+  let addr0 = addr(51);
+  let addr1 = addr(52);
+  let p0 = Peer::Replica(ReplicaId::new(0));
+  let p1 = Peer::Replica(ReplicaId::new(1));
+  let mut r0 = replica(&ca, 0, [7u8; 32], Scheme::Hello, StreamLayout::ControlBulk);
+  let mut r1 = replica(&ca, 1, [9u8; 32], Scheme::Hello, StreamLayout::ControlBulk);
+  r0.0
+    .connect(Instant::ZERO, addr1, p1)
+    .expect("a fresh coordinator dials under the connection cap");
+  r1.0
+    .connect(Instant::ZERO, addr0, p0)
+    .expect("a fresh coordinator dials under the connection cap");
+  r0.0.submit_client_request(
+    Instant::ZERO,
+    &mut r0.1,
+    Request::new(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::from_static(b"warm"),
+    ),
+  );
+  let mut now = converged_at(&mut r0, addr0, &mut r1, addr1).expect("the link comes up");
+  while r0.0.poll_transmit().is_some() {}
+
+  // A pump's worth of small same-class messages, routed one at a time exactly as `pump` routes them.
+  const BATCH: usize = 64;
+  let heartbeat = Message::Commit(Commit::new(
+    View::with(0),
+    OpNumber::with(1),
+    OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
+  ));
+  for _ in 0..BATCH {
+    r0.0
+      .route_message_for_test(now, crate::Recipient::To(p1), &heartbeat);
+  }
+  now = now + Duration::from_millis(1);
+  {
+    let (c, w, _) = &mut r0;
+    c.handle_timeout(now, w);
+  }
+  let (mut datagrams, mut short) = (0usize, 0usize);
+  while let Some((_, d)) = r0.0.poll_transmit() {
+    datagrams += 1;
+    if d.len() < SHORT {
+      short += 1;
+    }
+  }
+  assert!(
+    short <= 1,
+    "{BATCH} messages staged for one class must coalesce into packet-filling frames plus at most \
+     ONE short tail; got {short} short of {datagrams} datagrams"
+  );
+  assert!(
+    datagrams < BATCH / 8,
+    "and they must not leave as a datagram apiece: {datagrams} datagrams for {BATCH} messages"
+  );
+
+  // A converged run whose traffic includes a frame far larger than the stream window, so the sample
+  // contains partial writes and the `Writable` retries that drain a blocked stream's tail.
+  r0.0.submit_client_request(
+    now,
+    &mut r0.1,
+    Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from(std::vec![0x5Au8; 3 * 1024 * 1024]),
+    ),
+  );
+  let mut worst = 0usize;
+  let mut delivered = false;
+  for _ in 0..40_000u64 {
+    now = now + Duration::from_millis(1);
+    {
+      let (c, w, b) = &mut r0;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+    }
+    {
+      let (c, w, b) = &mut r1;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+    }
+    let mut entry_short = 0usize;
+    let mut to_r1: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, d)) = r0.0.poll_transmit() {
+      if dst == addr1 {
+        if d.len() < SHORT {
+          entry_short += 1;
+        }
+        to_r1.push(d);
+      }
+    }
+    worst = worst.max(entry_short);
+    for d in &to_r1 {
+      let (c, w, _) = &mut r1;
+      c.handle_udp(now, addr0, None, d, w);
+    }
+    let mut to_r0: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, d)) = r1.0.poll_transmit() {
+      if dst == addr0 {
+        to_r0.push(d);
+      }
+    }
+    for d in &to_r0 {
+      let (c, w, _) = &mut r0;
+      c.handle_udp(now, addr1, None, d, w);
+    }
+    if r1.0.endpoint().state_machine_ref().applied().len() >= 2 {
+      delivered = true;
+      break;
+    }
+  }
+  assert!(
+    delivered,
+    "the large op must commit, so the measured sample really did include its blocked-stream retries"
+  );
+  assert!(
+    worst <= 2,
+    "no coordinator entry may emit more than a couple of sub-packet spans for a class, got {worst}"
+  );
+}
