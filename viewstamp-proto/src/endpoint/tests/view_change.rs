@@ -8146,3 +8146,105 @@ fn a_slow_superblock_bounds_the_root_backlog_across_view_change_windows() {
   assert_eq!(e.durable_view, View::with(WINDOWS));
   assert_eq!(e.view(), View::with(WINDOWS));
 }
+
+#[test]
+fn a_read_completion_delivered_outside_recovery_is_ignored() {
+  // No read correlation outlives the recovery wait: recovery completes only once every read it
+  // submitted has delivered its verdict, so a read completing at a Normal endpoint can only be
+  // stale — a dropped subsumed tracking entry, or a dead phase's read. The router must ignore it
+  // outright: no install, no vote, no hole cleared — a body is admitted into a running replica
+  // exclusively through the peer-repair fill's append barrier, never off a read completion.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (wal, sb) = (ReorderWal::new(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now + core::time::Duration::from_millis(300), &mut storage);
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // Replica 2's DVC: head op 2, commit 1 — op 2 an UNCOMMITTED tail carried HEADER-ONLY, so the
+  // new primary holds it as a repair hole soliciting its body.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          op2_checksum,
+        ),
+      ],
+    )),
+  );
+  e.storage_step(now, &mut storage, &mut blocks); // durable-view write → repair solicit
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "setup: op 2 is a header-only adopted-tail repair hole"
+  );
+  while e.poll_message().is_some() {}
+  // A stale read completion arrives carrying op 2's canonical bytes — same client, same request,
+  // same checksum, so it would match the kept hole's identity in full if any lane consumed it.
+  let body2 = Bytes::copy_from_slice(&[2u8]);
+  let h2 = Header::new(
+    OpNumber::with(2),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &body2,
+  );
+  storage.wal_mut().entries.insert(2, (h2, body2));
+  let held = e.mint_read_id();
+  storage.submit_wal_read(held, OpNumber::with(2));
+  e.storage_step(now, &mut storage, &mut blocks);
+  // IGNORED: the hole stays open (peer repair remains the only fill lane), no vote was recorded,
+  // and nothing was staged for durability.
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_repairing()),
+    "a read completion outside recovery installs nothing — the hole stays a peer-repair hole"
+  );
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(0),
+    "no vote is recorded off a read completion"
+  );
+  assert!(
+    !e.appending.contains(&2),
+    "no append was staged off a read completion"
+  );
+}

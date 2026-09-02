@@ -57,6 +57,11 @@ enum Pending {
   /// repair hole, and only THEN `advance_commit`s. The body rides in the variant (not `self.log`) so a
   /// non-durable repaired op is never exposed in a `DoViewChange`/`StartView`/checkpoint nor applied by
   /// a concurrently-triggered `advance_commit` before its WAL append lands.
+  ///
+  /// This is the ONLY body-bearing pending kind, and none is ever staged by a recovering endpoint:
+  /// a `Recovering`/`RecoveringHead` replica submits reads and WAITS on their delivered verdicts,
+  /// staging no append of its own — so every append completion arriving in a recovering status is a
+  /// pre-transition leftover, absorbed without dispatch.
   RepairFill(RepairFill),
 }
 
@@ -743,13 +748,19 @@ const FORFEIT_GRACE: core::time::Duration = core::time::Duration::from_millis(30
 /// messages (`RequestSync`/`SyncCheckpoint`/repair serves) it would gate are bounded, not unlimited.
 /// Two is the realistic single-change window; a larger window is a Tier-A/joint concern.
 const LINEAGE_RING: usize = 2;
-/// Recovery (`Status::Recovering`): how often the recover-read timer re-submits any still
-/// pending/faulty WAL-tail reads. Covers a real async driver that drops a completion, and the
-/// transient-clears-on-retry case where a `Fault` only resolves on a later read.
+/// Recovery (`Status::Recovering`): the cadence on which `recover_timeouts` re-observes the read
+/// phase. A submitted read whose completion has not arrived is WAITED ON — the [`Wal`] contract owes
+/// it exactly one delivered verdict, on no deadline, and elapsed time is never evidence of failure —
+/// so a tick re-submits a read ONLY for an op (or the checkpoint phase) whose prior attempt has
+/// COMPLETED AND FAILED, covering the transient-clears-on-retry case where a `Fault` resolves on a
+/// later read. The same cadence re-solicits the peer fetch while one is armed.
 const RECOVER_READ_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
-/// Recovery: per-slot read-retry budget. A `Fault`/`Absent`/checksum-mismatch on a WAL-tail read is
-/// re-submitted up to this many times (transient faults clear within the budget); once exhausted the
-/// slot is classed *permanently* faulty, which drives the `Normal`-vs-`RecoveringHead` decision.
+/// Recovery: per-slot read-retry budget, spent ONLY on delivered FAILURE verdicts (a `Fault`, a
+/// misdirected read, a checksum-failing `ReadOk`/`BodyFaulty`) — never on elapsed time. Once every
+/// attempt has returned and failed the slot is resolved from its durable witnesses
+/// (`resolve_exhausted_tail_read`): kept header-only for peer repair, or classed *permanently*
+/// faulty, which drives the `Normal`-vs-`RecoveringHead` decision. A definitive verdict (`Absent`,
+/// an identity mismatch) resolves its op on delivery without spending the budget at all.
 const RECOVER_READ_RETRIES: u8 = 8;
 /// RecoveringHead (`Status::RecoveringHead`): how often the replica re-broadcasts its `Recovery`
 /// solicitation while waiting for the canonical head. A permanently-faulty head cannot be repaired
@@ -936,15 +947,23 @@ const MAX_VIEW_JUMP: u64 = 1 << 32;
 /// bounded by the WAL-tail length (bounded by the checkpoint-interval headroom).
 #[derive(Debug, Default)]
 struct RecoverState {
-  /// Ops whose body read is still outstanding → remaining ABSOLUTE retransmission budget. Non-empty ⇒
-  /// reads in flight. Seeded ONCE per op at the Phase-1 submit (`RECOVER_READ_RETRIES`) and decremented
-  /// ONLY by `recover_timeouts` (never reset, never touched by a completion); at zero the op is resolved
-  /// from its durable header (`resolve_exhausted_tail_read`). A clean completion removes the op's entry.
+  /// Ops whose resolution is still owed → remaining retry budget, spent ONLY on delivered FAILURE
+  /// verdicts (never on elapsed time — a slow read is outstanding, not failed, and is waited on).
+  /// Non-empty ⇒ the read phase is open, which every terminal and install transition waits out: the
+  /// HOLE in the log is the obligation and the log owns it; the reads, this budget, and any staged
+  /// state are disposable, re-derivable cache, so nothing here ever needs to survive a phase
+  /// transition. Seeded ONCE per op at the Phase-1 submit (`RECOVER_READ_RETRIES`); `recover_timeouts`
+  /// re-reads an op only once its prior attempt has COMPLETED AND FAILED (no id left in `reads`),
+  /// decrementing at each re-submission, and resolves the op from its durable witnesses once every
+  /// attempt has returned and failed (`resolve_exhausted_tail_read`). A resolving completion removes
+  /// the op's entry.
   pending: BTreeMap<u64, u8>,
-  /// Maps an in-flight read's `OpId` → the op it reads, so a `Fault`/`Absent` completion (which
-  /// carries only the `OpId`) is attributed to the right slot. An op can have SEVERAL live ids at once:
-  /// `recover_timeouts` re-submits ADDITIVELY (a fresh id without retiring the prior ones), so a late
-  /// completion under any still-live id resolves the op; resolving an op retires ALL of its ids.
+  /// Maps an in-flight read's `OpId` → the op it reads — the per-op outstanding-completion fence,
+  /// the tail twin of `checkpoint_reads`: while any id for an op remains, the [`Wal`] owes that read
+  /// exactly one completion and `recover_timeouts` neither re-submits for the op nor spends its
+  /// budget nor resolves it. A `Fault` completion retires only its own id (the op stays pending for
+  /// the budgeted re-read); a resolving verdict retires ALL of the op's ids, so a duplicate under a
+  /// stale id is refused.
   reads: BTreeMap<u64, u64>,
   /// Ops that read back permanently FAULTY — a written slot that is torn/bit-rotted/misdirected (a
   /// definitive read fault or a retry-exhausted one). Drives the `Normal`-vs-`RecoveringHead` decision in
@@ -1066,6 +1085,38 @@ struct RecoverState {
   /// window. Dropped with `RecoverState` at `recover = None`; reset by a fresh `recover()`. NEVER
   /// hashed/serialized/emitted.
   peers_recovering_prev: u64,
+}
+
+/// The one retry discipline every recovery read obligation runs — a tail op and the checkpoint
+/// phase judged by the same rule, so the two cannot drift: an OUTSTANDING completion is WAITED ON
+/// (the backend owes it exactly once, on no deadline, and elapsed time is never evidence of
+/// failure); a completed-and-FAILED attempt re-submits, spending one unit of budget; and once every
+/// attempt has returned and failed, the obligation escalates past the local read — a tail op
+/// resolves from its durable witnesses (`resolve_exhausted_tail_read`), the checkpoint phase falls
+/// to the peer fetch. Applied by `recover_timeouts`, the sole retry+budget owner for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryVerdict {
+  /// A submitted read's completion is still owed: wait for it — never re-submit, spend, or
+  /// escalate over a read the medium has not answered.
+  Wait,
+  /// The prior attempt completed and failed with budget remaining: re-submit one read, recording
+  /// the decremented budget carried here.
+  Retry(u8),
+  /// Every attempt completed and failed: the local read cannot answer — escalate.
+  Exhausted,
+}
+
+/// Judge one recovery read obligation against the shared retry discipline: `outstanding` is
+/// whether any submitted read still owes its completion (the op's ids in `RecoverState::reads`;
+/// the checkpoint phase's `checkpoint_reads`), `budget` the retries remaining.
+const fn retry_verdict(outstanding: bool, budget: u8) -> RetryVerdict {
+  if outstanding {
+    return RetryVerdict::Wait;
+  }
+  match budget.checked_sub(1) {
+    Some(rest) => RetryVerdict::Retry(rest),
+    None => RetryVerdict::Exhausted,
+  }
 }
 
 /// The body-state of a log entry — `Present` (bytes held) or `Repairing` (header-only, body
@@ -1230,7 +1281,7 @@ struct Timers {
   /// ViewChange (catch-up): retransmit GetView.
   get_view_message: Option<Instant>,
   /// Recovering: re-submit any still-pending/faulty WAL-tail (and checkpoint) reads. Drives the
-  /// recover loop to termination under a transient fault whose completion was dropped or whose retry
+  /// recover loop to termination under a read slower than the cadence, or a transient fault that
   /// only clears on a later read.
   recover_retry: Option<Instant>,
   /// RecoveringHead: re-broadcast the `Recovery` solicitation. A replica whose durable head slot is
@@ -6664,7 +6715,7 @@ where
     // Peer fault-repair retransmit runs only in Normal (the only status that can solicit/serve a hole
     // and adopt the reply). It re-solicits every unrepaired committed-op hole until each is filled.
     if self.status.is_normal() {
-      self.repair_timeouts(now);
+      self.repair_timeouts(now, storage);
       // State-sync re-solicitation likewise runs only in Normal: re-broadcast RequestSync while a
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one), re-drive the one
       // outstanding block pull of an in-progress block-fetch transfer, AND self-heal an owed local
@@ -6930,8 +6981,8 @@ where
         self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
       }
       // Recovering: re-submit any still-outstanding/faulty WAL-tail (+ checkpoint) reads on a cadence,
-      // so the loop terminates even if a real async driver drops a completion or a transient fault
-      // only clears on a later read.
+      // so the loop terminates however late a real async driver's completions arrive, and a
+      // transient fault gets the later read that clears it.
       Status::Recovering => {
         let recover_retry = now + RECOVER_READ_RETRANSMIT;
         self.timers.recover_retry =

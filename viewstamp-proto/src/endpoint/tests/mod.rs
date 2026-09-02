@@ -834,6 +834,20 @@ struct ScriptedWal {
   /// Per deferred op: the submitted read ids still HELD, oldest-first. Each `submit_read` of a deferred
   /// op pushes its id; `release_deferred` pops the front (the original slow read finally completing).
   deferred_reads: BTreeMap<u64, VecDeque<ReadId>>,
+  /// Deferred ops whose read verdict is additionally CAPTURED AT SUBMIT: the device reads the slot
+  /// when the read is issued and only the COMPLETION is late, so a write landing over the slot in
+  /// between does not change what the read delivers — the capture-before-landing schedule the `Wal`
+  /// contract permits and the late-body durability witness must survive.
+  capture_on_submit: std::collections::BTreeSet<u64>,
+  /// Per capture-at-submit op: the full verdicts captured at each submission, oldest-first.
+  /// `release_deferred` delivers these ahead of recomputing from the (possibly rewritten) entries.
+  captured_reads: BTreeMap<u64, VecDeque<WalDone>>,
+  /// Ops whose APPEND is HELD: `submit_append` stages the write (the bytes are at the device but
+  /// nothing lands and no completion is enqueued) until `release_append_for` lands it — the
+  /// in-flight proactor write a restart in place inherits from a dead endpoint.
+  deferred_append_ops: std::collections::BTreeSet<u64>,
+  /// Held appends in submission order (oldest first), each landed by `release_append_for`.
+  staged_appends: std::vec::Vec<StagedAppend>,
   done: VecDeque<WalDone>,
 }
 impl ScriptedWal {
@@ -860,6 +874,10 @@ impl ScriptedWal {
       body_faulty: std::collections::BTreeSet::new(),
       deferred: std::collections::BTreeSet::new(),
       deferred_reads: BTreeMap::new(),
+      capture_on_submit: std::collections::BTreeSet::new(),
+      captured_reads: BTreeMap::new(),
+      deferred_append_ops: std::collections::BTreeSet::new(),
+      staged_appends: std::vec::Vec::new(),
       done: VecDeque::new(),
     }
   }
@@ -889,11 +907,54 @@ impl ScriptedWal {
   fn script_defer_read(&mut self, op: OpNumber) {
     self.deferred.insert(op.get());
   }
+  /// HOLD every read of `op` with its verdict CAPTURED AT SUBMIT: the device reads the slot the
+  /// moment the read is issued and only the completion is late, so a write that lands over the slot
+  /// while the completion is in flight does not change what the read delivers. This is the
+  /// capture-before-landing schedule the `Wal` contract permits — the one that makes a completed
+  /// read's bytes prove durability only AT CAPTURE, never NOW.
+  fn script_defer_read_captured(&mut self, op: OpNumber) {
+    self.deferred.insert(op.get());
+    self.capture_on_submit.insert(op.get());
+  }
+  /// HOLD every append of `op`: `submit_append` stages the write without landing it and enqueues no
+  /// completion until `release_append_for` drives it — the un-cancellable device write a restart in
+  /// place inherits from a dead endpoint, still owed to the medium across the rebuild.
+  fn script_defer_append(&mut self, op: OpNumber) {
+    self.deferred_append_ops.insert(op.get());
+  }
+  /// Land the OLDEST staged append for `op`: its bytes overwrite the slot, the head rises, and its
+  /// `Appended` completion queues — the deferred write finally completing, possibly long after the
+  /// endpoint that submitted it died. Returns `false` if none is staged for `op`.
+  fn release_append_for(&mut self, op: u64) -> bool {
+    let Some(i) = self.staged_appends.iter().position(|s| s.op == op) else {
+      return false;
+    };
+    let s = self.staged_appends.remove(i);
+    self.entries.insert(s.op, (s.header, s.body));
+    self.head = self.head.max(s.op);
+    self.done.push_back(WalDone::Appended(s.id));
+    true
+  }
+  /// The LANDED body at `op` (the durable slot content), or `None` — the final-state witness that
+  /// the durable slot holds exactly the value this replica installed, applied, or voted for.
+  fn durable_body(&self, op: u64) -> Option<Bytes> {
+    self.entries.get(&op).map(|(_, b)| b.clone())
+  }
   /// Complete the OLDEST still-held read of a deferred `op` under its ORIGINAL id — the slow first
   /// submission finally landing, AFTER a retry has minted a newer id. (Under retire-on-retry that
   /// original id was retired, so the completion would be IGNORED and recovery would never resolve `op`;
-  /// additive ids keep it live, so this resolves.) Returns `false` if no read of `op` is outstanding.
+  /// additive ids keep it live, so this resolves.) A capture-at-submit read delivers the verdict
+  /// captured when it was ISSUED; an ordinary deferred read reads the slot at release. Returns
+  /// `false` if no read of `op` is outstanding.
   fn release_deferred(&mut self, op: OpNumber) -> bool {
+    if let Some(done) = self
+      .captured_reads
+      .get_mut(&op.get())
+      .and_then(|q| q.pop_front())
+    {
+      self.done.push_back(done);
+      return true;
+    }
     let Some(id) = self
       .deferred_reads
       .get_mut(&op.get())
@@ -922,11 +983,25 @@ impl Wal for ScriptedWal {
   fn status(&self, op: OpNumber) -> SlotStatus {
     if self.entries.contains_key(&op.get()) {
       SlotStatus::Clean
+    } else if self.staged_appends.iter().any(|s| s.op == op.get()) {
+      // Submitted but not yet landed — the in-flight window the fence tracks; never `Clean`.
+      SlotStatus::Dirty
     } else {
       SlotStatus::Empty
     }
   }
   fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
+    // A DEFERRED append is STAGED: the bytes are at the device but nothing lands and no
+    // completion queues until `release_append_for` drives it.
+    if self.deferred_append_ops.contains(&op.get()) {
+      self.staged_appends.push(StagedAppend {
+        id,
+        op: op.get(),
+        header,
+        body,
+      });
+      return;
+    }
     self.entries.insert(op.get(), (header, body));
     self.head = self.head.max(op.get());
     self.done.push_back(WalDone::Appended(id));
@@ -944,7 +1019,21 @@ impl Wal for ScriptedWal {
     }
     // A DEFERRED read is HELD: record the submitted id (oldest-first) and enqueue NOTHING.
     // `release_deferred(op)` later completes the OLDEST held submission under its original id.
+    // A capture-at-submit read snapshots its full verdict NOW — the device reads the slot at
+    // issue time — so a later write over the slot cannot change what it will deliver.
     if self.deferred.contains(&op.get()) {
+      if self.capture_on_submit.contains(&op.get()) {
+        let done = match self.entries.get(&op.get()) {
+          Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
+          None => WalDone::Absent(id),
+        };
+        self
+          .captured_reads
+          .entry(op.get())
+          .or_default()
+          .push_back(done);
+        return;
+      }
       self
         .deferred_reads
         .entry(op.get())

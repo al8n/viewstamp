@@ -4215,20 +4215,14 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
 }
 
 #[test]
-fn recover_resolves_a_read_that_completes_after_a_retransmit() {
-  // A real async WAL whose tail-read latency exceeds `RECOVER_READ_RETRANSMIT` must still recover: the
-  // read submitted now completes LATER (after a retry tick), under the id it was submitted with.
-  // Retransmission is ADDITIVE — `recover_timeouts` mints a fresh read id WITHOUT retiring the prior
-  // ones — and the absolute per-op budget is decremented only by the timer, so when the original (slow)
-  // completion finally arrives under its still-live id it RESOLVES the op and recovery reaches Normal.
-  //
-  // FAIL-BEFORE (the churn this fixes): the old `recover_timeouts` RE-MINTED each pending op's id every
-  // tick and RETIRED the prior id (`rec.reads.retain(|_, o| o != op)`), then RESET the budget. A read
-  // slower than `RECOVER_READ_RETRANSMIT` therefore always completed under an already-RETIRED id, so
-  // `on_recover_wal_done`'s `rec.reads.get(&id)` missed it and dropped the completion; the budget kept
-  // resetting and `rec.pending` never emptied, wedging normal recovery in `Status::Recovering` forever.
-  // (The in-tree fixtures complete reads synchronously at `submit_read`, so only this DEFERRED-completion
-  // model can exhibit the churn — hence the dedicated WAL capability.)
+fn recover_resolves_a_read_that_completes_after_a_retransmit_tick() {
+  // A real async WAL whose tail-read latency exceeds `RECOVER_READ_RETRANSMIT` must still recover:
+  // the read submitted now completes LATER (after a retry tick), under the id it was submitted
+  // with. An outstanding read is WAITED ON — the cadence tick neither retires its id, re-submits
+  // over it, nor spends the failure budget — so when the slow completion finally arrives it
+  // RESOLVES the op and recovery reaches Normal. (The in-tree fixtures complete reads
+  // synchronously at `submit_read`, so only this DEFERRED-completion model exercises a tick firing
+  // with a read genuinely in flight — hence the dedicated WAL capability.)
   let mk_header = |op: u64| {
     Header::new(
       OpNumber::with(op),
@@ -4275,18 +4269,18 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
     "op 2's read has not completed yet — still recovering",
   );
 
-  // One recover-retry tick: `recover_timeouts` re-submits op 2 ADDITIVELY (a fresh id, prior id kept)
-  // and decrements its absolute budget. op 2's read is STILL held, so this enqueues no completion.
+  // One recover-retry tick: op 2's read is STILL outstanding, so `recover_timeouts` WAITS on it —
+  // no re-submission, no budget spend — and the recovery stays open.
   now = now + RECOVER_READ_RETRANSMIT;
   r.handle_timeout(now, &mut storage);
   assert_eq!(
     r.status(),
     Status::Recovering,
-    "still recovering after the retransmit (op 2's read remains in flight)",
+    "still recovering after the tick (op 2's read remains in flight, waited on)",
   );
 
-  // The original (slow) op-2 read now completes under its ORIGINAL id — the id a retire-on-retry
-  // retransmit would already have discarded. With additive ids it is still live, so it resolves op 2.
+  // The slow op-2 read now completes under its ORIGINAL id — still live, because nothing ever
+  // retires an outstanding read's correlation.
   assert!(
     storage.wal_mut().release_deferred(OpNumber::with(2)),
     "op 2 had an outstanding (held) read to release",
@@ -4297,8 +4291,7 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   assert_eq!(
     r.status(),
     Status::Normal,
-    "the slow read's late completion (under a still-live additive id) resolves op 2 → Normal \
-     (FAIL-BEFORE: a retired id dropped it and rec.pending never emptied — a permanent wedge)",
+    "the slow read's late completion resolves op 2 → Normal",
   );
   let entry = r.log.get(&2).expect("op 2 is present in the recovered log");
   assert_eq!(
@@ -4312,6 +4305,109 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
     "op 2's identity is its real client"
   );
   assert_eq!(r.op(), OpNumber::with(2), "the recovered head is op 2");
+}
+
+#[test]
+fn recover_solo_waits_out_withheld_wal_reads_and_applies_on_their_delivery() {
+  // A SOLO replica (no donor exists anywhere) restarts over a healthy WAL whose tail-read
+  // completions are ALL withheld far past the retry cadence — a real async WAL under long read
+  // latency. A read that has not completed is OUTSTANDING, not failed: no cadence tick spends the
+  // failure budget on it, recovery stays open waiting on the delivered verdicts, and each verdict
+  // — however late — is consumed exactly where a prompt one would have been. With no peer to
+  // answer any solicitation, the local WAL is the ONLY body source, so the wait is also the only
+  // resolution that can ever complete this recovery: a time-metered give-up would either strand
+  // the committed tail behind peer repair no donor answers, or trust reads that never returned.
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  // Solo voter. Durable root: view 0, commit 2 (ops 1 + 2 KNOWN committed), checkpoint 0, canonical
+  // band [h1, h2] matching the WAL bodies, geometry recorded (a formatted store). WAL head 2; BOTH
+  // tail reads are HELD (each completes only when the test releases it).
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![mk_header(1), mk_header(2)],
+  )
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_defer_read(OpNumber::with(1));
+  wal.script_defer_read(OpNumber::with(2));
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Tick the recover cadence far past the failure budget: no completion has been DELIVERED, so
+  // nothing spends, nothing resolves header-only, and the recovery keeps waiting on both reads.
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "an outstanding read is waited on — elapsed cadence ticks are never failure verdicts",
+  );
+  assert!(
+    matches!(r.log.get(&1).map(|e| &e.body), Some(Body::Present(b)) if b.is_empty()),
+    "op 1 still holds its Phase-1 placeholder; its resolution is owed by the outstanding read",
+  );
+  // The slow device completes op 1's held read under its original id: the verdict resolves op 1,
+  // and the recovery keeps waiting on op 2's.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(1)));
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    r.log.get(&1).is_some_and(|e| e.body.is_present()),
+    "op 1's late completion delivered its canonical body into the recovering log",
+  );
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "op 2's read is still outstanding — the read phase stays open until every verdict lands",
+  );
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the last delivered verdict settles the tail and recovery completes",
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "the solo pipeline re-committed the whole tail — every body arrived from the local WAL",
+  );
+  // Client progress RESUMES end-to-end: the next request commits + applies as op 3. (Requests 1 + 2
+  // were re-applied above, so the session watermark dedups them; request 3 is genuinely new.)
+  r.handle_message(
+    now,
+    &mut storage,
+    Peer::Client(ClientId::new(7)),
+    client_request(3),
+  );
+  for _ in 0..4 {
+    r.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(3),
+    "a solo primary serves a NEW request once the waited-out reads delivered the committed tail",
+  );
 }
 
 #[test]
@@ -5673,6 +5769,10 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
     body_faulty: std::collections::BTreeSet::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
@@ -5854,24 +5954,15 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
 }
 
 #[test]
-fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_applies_it_empty() {
-  // A peer `SyncCheckpoint` can complete recovery while a committed tail read is still in flight. The
-  // peer-fetch escalation (`escalate_checkpoint_to_peer_fetch`) is NOT gated on `rec.pending`, so a
-  // `SyncCheckpoint` (a `handle_message`) can race in AHEAD of a tail read's completion (a
-  // `handle_storage`). `apply_sync` RETAINS the held tail above the synced checkpoint, so a committed tail
-  // op's Phase-1 `Present(empty)` placeholder would survive into Normal (its later read completion is
-  // ignored once `recover` is cleared) and `advance_commit` would apply it with `&[]`: committed-state
-  // divergence. The fix RESOLVES every still-in-flight tail op above the synced checkpoint from its durable
-  // header — a Verified committed op is KEPT header-only as `Body::Repairing` (body peer-repaired on
-  // demand) — completing WITHOUT waiting on `rec.pending` (a wait would wedge: the retry timer re-mints
-  // each read's id every `RECOVER_READ_RETRANSMIT`, so a read slower than that never resolves and the
-  // pending set never empties).
-  //
-  // The deterministic `handle_storage` drains ALL WAL completions before the SB checkpoint completion, so
-  // a tail read can never be in flight when the checkpoint escalates here — the race needs a real async
-  // driver's interleaved completions. Reproduce that one missing condition directly: drive to a genuine
-  // `awaiting_peer_checkpoint` (all tail reads settled), then re-mark a committed tail op as an in-flight
-  // read with a `Present(empty)` placeholder the way an async driver would have.
+fn a_peer_sync_checkpoint_defers_while_a_committed_tail_read_is_outstanding() {
+  // A peer `SyncCheckpoint` can answer the checkpoint escalation while a committed tail read is
+  // still in flight: the checkpoint phase fails fast (delivered faults spend its budget) while a
+  // slow tail read is simply outstanding. The reply must DEFER at the ingress read fence — never
+  // stage an install over an unresolved Phase-1 `Present(empty)` placeholder (which the install's
+  // held-tail retain would carry toward an `advance_commit` that applies it with `&[]`). The
+  // outstanding read then delivers the committed op's REAL body into the recovering log, and the
+  // re-solicited reply installs over a settled tail — no empty apply is representable, and the
+  // local WAL (not the checkpoint donor) supplies the committed body.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
@@ -5906,7 +5997,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   let mut entries = BTreeMap::new();
   entries.insert(2u64, (h2, body2.clone()));
   entries.insert(3u64, (h3, body3.clone()));
-  let wal = ScriptedWal {
+  let mut wal = ScriptedWal {
     entries,
     head: 3,
     capacity: u64::MAX,
@@ -5915,23 +6006,32 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     body_faulty: std::collections::BTreeSet::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
     done: VecDeque::new(),
   };
+  // Op 2's read is HELD by the device — the genuine async interleaving: the checkpoint phase fails
+  // fast while a tail read is still owed its completion.
+  wal.script_defer_read(OpNumber::with(2));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut storage)
     .expect("recover accepts this store")
     .expect_active();
-  // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation
-  // (pumping the recover-retry timer each round).
+  // Drive: op 3 settles (Present), op 2's read stays outstanding (waited on — it spends nothing),
+  // and the own checkpoint read exhausts through delivered faults → peer-fetch escalation.
   drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
   );
   assert!(
-    e.recover.as_ref().is_some_and(|rec| rec.pending.is_empty()),
-    "the deterministic drain settled every tail read before escalating",
+    e.recover
+      .as_ref()
+      .is_some_and(|rec| rec.pending.contains_key(&2)),
+    "op 2's read is still outstanding at the escalation — the tail fence is open",
   );
 
   // Build the verified peer SyncCheckpoint (checkpoint op 1). Captured once so the deferred and the
@@ -5961,23 +6061,38 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     Bytes::new(),
   );
 
-  // Re-mark committed op 2 as an IN-FLIGHT tail read holding only a `Present(empty)` placeholder — the
-  // state a real async driver leaves when the checkpoint completion + the peer SyncCheckpoint arrive
-  // before op 2's WAL read does.
-  e.log.insert(
-    2,
-    LogEntry::present(ClientId::new(7), RequestNumber::with(2), Bytes::new()),
+  // Deliver the verified SyncCheckpoint WHILE op 2's read is outstanding: THE FENCE — the reply is
+  // deferred whole, staging nothing over the unresolved placeholder. The solicit cadence re-fetches
+  // once the tail settles, so the deferral costs one round trip, never a wedge (the read's
+  // completion is owed by contract).
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync.clone()),
   );
-  e.recover
-    .as_mut()
-    .unwrap()
-    .pending
-    .insert(2, RECOVER_READ_RETRIES);
-
-  // Deliver the verified SyncCheckpoint WHILE op 2's read is in flight. Recovery COMPLETES (it does not
-  // wait on `rec.pending` — that could wedge), RESOLVING the in-flight committed op 2 from its durable
-  // header to a header-only `Body::Repairing` hole (body peer-repaired on demand) — never a held
-  // `Present(empty)` entry.
+  assert!(
+    e.status().is_recovering() && e.awaiting_peer_checkpoint_for_test(),
+    "the reply deferred: recovery stays open, still awaiting the peer checkpoint",
+  );
+  assert!(
+    e.block_fetch.is_none() && e.pending_checkpoint.is_none(),
+    "nothing was staged over the open read fence",
+  );
+  assert!(
+    matches!(e.log.get(&2).map(|entry| &entry.body), Some(Body::Present(b)) if b.is_empty()),
+    "op 2 still holds its Phase-1 placeholder; its resolution is owed by the outstanding read",
+  );
+  // The slow device delivers op 2's read: the committed op's REAL body lands in the recovering log
+  // and the tail settles — the local WAL, not the checkpoint donor, supplied the body.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.log.get(&2).map(|entry| &entry.body),
+    Some(&Body::Present(body2.clone())),
+    "the delivered verdict resolved op 2 with its canonical body",
+  );
+  // The re-solicited reply now lands over a settled tail and installs.
   e.handle_message(
     now,
     &mut storage,
@@ -5991,37 +6106,48 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   assert_eq!(
     e.status(),
     Status::Normal,
-    "the verified SyncCheckpoint completes recovery WITHOUT waiting on the in-flight read (no wedge)",
-  );
-  // THE FIX: op 2's `Present(empty)` placeholder was RESOLVED to a `Body::Repairing` hole carrying the
-  // durable canonical body_checksum — NOT retained as a held empty entry. (FAIL-BEFORE: op 2 survived
-  // `apply_sync` as `Some({body: EMPTY})` and a later `advance_commit` applied committed op 2 with `&[]`.)
-  assert_eq!(
-    e.log.get(&2).map(|entry| &entry.body),
-    Some(&Body::Repairing(h2.body_checksum())),
-    "the in-flight committed op 2 is a Body::Repairing hole, not a held Present(empty) entry to apply with &[]",
+    "the re-delivered SyncCheckpoint completes recovery over the settled tail",
   );
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
-    "commit_min is the synced checkpoint op 1 (op 2 is a held hole below the known frontier)",
+    "commit_min is the synced checkpoint op 1; the held tail applies on the next commit signal",
+  );
+  // A commit signal drives the held tail: both retained ops apply with their REAL bodies — the
+  // empty placeholder never survived to any apply site.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     e.state_machine_ref().applied(),
-    &[(1u64, b"OP1-REAL-BODY".to_vec())],
-    "only the restored op 1 is applied — committed op 2 was NEVER applied empty",
+    &[
+      (1u64, b"OP1-REAL-BODY".to_vec()),
+      (2u64, b"OP2-REAL-BODY".to_vec()),
+      (3u64, b"OP3-REAL-BODY".to_vec()),
+    ],
+    "every committed op applied with its CANONICAL body, none with &[]",
   );
 }
 
 #[test]
-fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_it_empty() {
-  // The same peer-checkpoint race for an UNCOMMITTED in-flight tail op (op == commit_max + 1). An op above
-  // this replica's STALE durable `commit_max` can still be COMMITTED later — by the primary, or already
-  // committed elsewhere but unlearned here before the crash — so leaving its Phase-1 `Present(empty)`
-  // placeholder retained by `apply_sync` is NOT harmless: a later `Commit` makes `advance_commit` apply it
-  // with `&[]`, and a view change advertises its empty-body header. The fix RESOLVES it from its durable
-  // header to a header-only `Body::Repairing` hole (truncatable / peer-repaired if committed), so a
-  // `Commit` HOLDS + peer-repairs instead of applying empty.
+fn a_committed_read_that_fails_every_delivered_attempt_escalates_to_peer_repair() {
+  // The failure-driven escalation, end to end: a committed tail op whose EVERY read attempt
+  // returns and fails — a delivered `Fault` per attempt, never a mere silence — spends the retry
+  // budget down and resolves from its durable witnesses as a band-vouched `Body::Repairing` hole,
+  // so the peer-checkpoint escape finds a settled tail (the fence is closed by verdicts, not by
+  // time) and installs at once. The hole then rides the ordinary peer-repair lane: the commit
+  // HOLDS below it, a donor `Prepare` fills it, and the op applies with its canonical body —
+  // escalation to peer repair happened exactly because every local attempt had returned and
+  // failed, never because a read was slow.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
@@ -6040,8 +6166,186 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     RequestNumber::with(3),
     &body3,
   );
-  // Durable root: commit 2 (op 2 committed, band [h2]), checkpoint op 1 (its snapshot unreadable). op 3 is
-  // the UNCOMMITTED tail (op 3 == commit_max + 1).
+  // Durable root: known-committed frontier 3, checkpoint at op 1 (its own snapshot is unreadable),
+  // band [h2, h3]. Op 2's WAL reads fault on EVERY attempt (each fault DELIVERED); op 3 reads clean.
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(3),
+    OpNumber::with(1),
+    0xDEAD_BEEF,
+    std::vec![h2, h3],
+  )
+  .unwrap()
+  .with_wal_geometry(2, u64::MAX);
+  let sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut entries = BTreeMap::new();
+  entries.insert(2u64, (h2, body2.clone()));
+  entries.insert(3u64, (h3, body3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    capacity: u64::MAX,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
+    done: VecDeque::new(),
+  };
+  wal.script_read_fault(OpNumber::with(2), u8::MAX);
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  // Drive: op 3 settles Present; op 2 fails every delivered attempt and resolves band-vouched
+  // `Repairing` on exhaustion; the checkpoint read exhausts the same way → peer-fetch escalation.
+  drive_recovery_scripted_sb(&mut e, &mut storage, &mut blocks, now);
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "escalated to a peer fetch (own checkpoint unreadable)"
+  );
+  assert!(
+    e.recover.as_ref().is_some_and(|rec| rec.pending.is_empty()),
+    "every tail attempt returned and failed — the fence is closed by verdicts",
+  );
+  assert_eq!(
+    e.log.get(&2).map(|entry| &entry.body),
+    Some(&Body::Repairing(h2.body_checksum())),
+    "the exhausted committed op 2 is kept header-only as a band-vouched Repairing hole",
+  );
+
+  // The verified peer SyncCheckpoint (checkpoint op 1), with its SM leaf seeded locally so the
+  // block-fetch frontier drains without a RequestBlock round trip.
+  let mut peer_sm = CountSm::default();
+  peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
+  let peer_snap = peer_sm.snapshot();
+  let peer_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(1),
+    crate::block_address(&peer_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  let peer_id = crate::checkpoint_id(&peer_env);
+  blocks.put(peer_snap.clone());
+  let sync = crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(1),
+    peer_id,
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(0),
+    e.sync_nonce_for_test(),
+    peer_env,
+    Bytes::new(),
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync),
+  );
+  for _ in 0..3 {
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the settled tail admits the reply at once — no deferral, nothing left to wait on",
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "commit_min is the synced checkpoint op 1 — the committed prefix stops at op 2's hole",
+  );
+  // A commit signal drives the held tail: the commit HOLDS at the op-2 hole (never applies it
+  // empty) and solicits the body from a peer.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the commit is HELD below the op-2 hole",
+  );
+  // A donor answers with the canonical op-2 Prepare: the fill stages a durable append, and the
+  // completion applies op 2 with its REAL body, resuming the held prefix through op 3.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(3),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ClientId::new(7),
+      RequestNumber::with(2),
+      body2.clone(),
+    )),
+  );
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(3),
+    "the held committed prefix resumes once the peer fill lands",
+  );
+  assert_eq!(
+    e.state_machine_ref().applied(),
+    &[
+      (1u64, b"OP1-REAL-BODY".to_vec()),
+      (2u64, b"OP2-REAL-BODY".to_vec()),
+      (3u64, b"OP3-REAL-BODY".to_vec()),
+    ],
+    "each committed op applied with its CANONICAL body, none with &[]",
+  );
+}
+
+#[test]
+fn a_peer_sync_checkpoint_defers_while_an_uncommitted_tail_read_is_outstanding() {
+  // The same ingress fence for an UNCOMMITTED in-flight tail op (op == commit_max + 1). An op above
+  // this replica's STALE durable `commit_max` can still be COMMITTED later — by the primary, or
+  // already committed elsewhere but unlearned here before the crash — so an install must never
+  // retain its unresolved `Present(empty)` placeholder (a later `Commit` would apply it with `&[]`,
+  // and a view change would advertise its empty-body header). The reply DEFERS at the read fence;
+  // the outstanding read then delivers the op's real body, and the re-solicited reply installs a
+  // tail whose every retained entry is faithfully resolved.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
+  let body3 = Bytes::copy_from_slice(b"OP3-REAL-BODY");
+  let h2 = Header::new(
+    OpNumber::with(2),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &body2,
+  );
+  let h3 = Header::new(
+    OpNumber::with(3),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(3),
+    &body3,
+  );
+  // Durable root: commit 2 (op 2 committed, band [h2]), checkpoint op 1 (its snapshot unreadable).
+  // Op 3 is the UNCOMMITTED tail (op 3 == commit_max + 1); its read is HELD by the device.
   let state = VsrState::try_new(
     View::new(),
     View::new(),
@@ -6056,7 +6360,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   let mut entries = BTreeMap::new();
   entries.insert(2u64, (h2, body2.clone()));
   entries.insert(3u64, (h3, body3.clone()));
-  let wal = ScriptedWal {
+  let mut wal = ScriptedWal {
     entries,
     head: 3,
     capacity: u64::MAX,
@@ -6065,8 +6369,13 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     body_faulty: std::collections::BTreeSet::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
     done: VecDeque::new(),
   };
+  wal.script_defer_read(OpNumber::with(3));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut storage)
@@ -6076,6 +6385,12 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
+  );
+  assert!(
+    e.recover
+      .as_ref()
+      .is_some_and(|rec| rec.pending.contains_key(&3)),
+    "op 3's read is still outstanding at the escalation — the tail fence is open",
   );
   let mut peer_sm = CountSm::default();
   peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
@@ -6101,19 +6416,31 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     peer_env,
     Bytes::new(),
   );
-  // Re-mark UNCOMMITTED op 3 (== commit_max + 1) as an in-flight tail read with a `Present(empty)` placeholder.
-  e.log.insert(
-    3,
-    LogEntry::present(ClientId::new(7), RequestNumber::with(3), Bytes::new()),
+  // Deliver the verified SyncCheckpoint while op 3's read is outstanding: deferred whole.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync.clone()),
   );
-  e.recover
-    .as_mut()
-    .unwrap()
-    .pending
-    .insert(3, RECOVER_READ_RETRIES);
-  // Deliver the verified SyncCheckpoint while op 3's read is in flight → completes, resolving op 3 to a
-  // header-only `Body::Repairing` hole (it is uncommitted, so kept on its durable header without a
-  // canonical cross-check).
+  assert!(
+    e.status().is_recovering() && e.awaiting_peer_checkpoint_for_test(),
+    "the reply deferred: recovery stays open, still awaiting the peer checkpoint",
+  );
+  assert!(
+    e.block_fetch.is_none() && e.pending_checkpoint.is_none(),
+    "nothing was staged over the open read fence",
+  );
+  // The device delivers op 3's read: the current-generation uncommitted tail op is kept with its
+  // real body, and the tail settles.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(3)));
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.log.get(&3).map(|entry| &entry.body),
+    Some(&Body::Present(body3.clone())),
+    "the delivered verdict kept the uncommitted tail op with its real body",
+  );
+  // The re-solicited reply installs over the settled tail.
   e.handle_message(
     now,
     &mut storage,
@@ -6127,15 +6454,10 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   assert_eq!(
     e.status(),
     Status::Normal,
-    "the SyncCheckpoint completes recovery WITHOUT waiting on the in-flight read (no wedge)",
+    "the re-delivered SyncCheckpoint completes recovery over the settled tail",
   );
-  assert_eq!(
-    e.log.get(&3).map(|entry| &entry.body),
-    Some(&Body::Repairing(h3.body_checksum())),
-    "the in-flight UNCOMMITTED op 3 is resolved to a Body::Repairing hole — not a held Present(empty) entry",
-  );
-  // A Commit for op 3 (committing op 3) must HOLD at its Repairing hole + peer-repair, NEVER apply op 3
-  // with `&[]`. (FAIL-BEFORE: op 3's Present(empty) survived and advance_commit applied op 3 empty.)
+  // A Commit that commits op 3 applies the retained tail with the REAL bodies — nothing was ever
+  // held as an empty placeholder to apply or advertise.
   e.handle_message(
     now,
     &mut storage,
@@ -6148,29 +6470,35 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
       0,
     )),
   );
-  assert!(
-    e.state_machine_ref()
-      .applied()
-      .iter()
-      .all(|(op, _)| *op != 3),
-    "committed op 3 is HELD at its Repairing hole (peer-repaired), NEVER applied with &[]",
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(3),
+    "the retained tail applies through op 3",
   );
-  assert!(
-    e.commit().get() < 3,
-    "commit is held below the op-3 Repairing hole — op 3 is not applied",
+  assert_eq!(
+    e.state_machine_ref().applied(),
+    &[
+      (1u64, b"OP1-REAL-BODY".to_vec()),
+      (2u64, b"OP2-REAL-BODY".to_vec()),
+      (3u64, b"OP3-REAL-BODY".to_vec()),
+    ],
+    "every committed op applied with its CANONICAL body, none with &[]",
   );
 }
 
 #[test]
-fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
-  // An in-flight UNCOMMITTED tail op whose durable header is a SUPERSEDED earlier-view proposal (its
-  // `view` is BELOW this replica's durable `log_view`) must NOT be kept as a canonical `Body::Repairing`
+fn a_superseded_above_commit_tail_read_resolves_stale_and_is_never_kept_or_advertised() {
+  // An UNCOMMITTED tail op whose durable header is a SUPERSEDED earlier-view proposal (its `view`
+  // is BELOW this replica's durable `log_view`) must NOT be kept as a canonical `Body::Repairing`
   // hole: the replica already advanced `log_view` past that generation, so the slot is an abandoned
   // proposal. If kept, a `Commit` for the op registers the STALE Repairing as a repair hole and
-  // `fill_repair` then rejects the REAL committed body (its identity differs) — `commit_min` wedges — and
-  // a view change advertises the stale header as the canonical tail identity. The resolution runs the SAME
-  // `classify_committed_slot` verdict the Fault arm does, whose above-commit arm classes a `slot_view <
-  // log_view` slot StaleCommitted, so it is DROPPED to a peer-repaired hole the canonical op then fills.
+  // `fill_repair` then rejects the REAL committed body (its identity differs) — `commit_min` wedges
+  // — and a view change advertises the stale header as the canonical tail identity. Here the op's
+  // read is still outstanding when the peer checkpoint answers: the reply DEFERS at the read fence,
+  // the delivered verdict classifies the slot StaleCommitted (`classify_committed_slot`'s
+  // above-commit arm), and the re-delivered reply installs — leaving the un-vouchable settled head
+  // to the deferred head decision, which solicits the canonical head instead of advertising the
+  // stale one.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
@@ -6205,7 +6533,7 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   let mut entries = BTreeMap::new();
   entries.insert(2u64, (h2, body2.clone()));
   entries.insert(3u64, (h3_stale, stale3.clone()));
-  let wal = ScriptedWal {
+  let mut wal = ScriptedWal {
     entries,
     head: 3,
     capacity: u64::MAX,
@@ -6214,8 +6542,13 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     body_faulty: std::collections::BTreeSet::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
     done: VecDeque::new(),
   };
+  wal.script_defer_read(OpNumber::with(3));
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut storage = Storage::new(wal, sb);
   let mut e = Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut storage)
@@ -6225,6 +6558,12 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch"
+  );
+  assert!(
+    e.recover
+      .as_ref()
+      .is_some_and(|rec| rec.pending.contains_key(&3)),
+    "op 3's read is still outstanding at the escalation — the tail fence is open",
   );
   let mut peer_sm = CountSm::default();
   peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
@@ -6250,24 +6589,30 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     peer_env,
     Bytes::new(),
   );
-  // Re-mark the SUPERSEDED op 3 as an in-flight tail read with a `Present(empty)` placeholder.
-  e.log.insert(
-    3,
-    LogEntry::present(ClientId::new(7), RequestNumber::with(3), Bytes::new()),
+  // Deliver the reply while op 3's read is outstanding: deferred whole at the read fence.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync.clone()),
   );
-  e.recover
-    .as_mut()
-    .unwrap()
-    .pending
-    .insert(3, RECOVER_READ_RETRIES);
+  assert!(
+    e.status().is_recovering() && e.block_fetch.is_none(),
+    "the reply deferred: nothing was staged over the open read fence",
+  );
+  // The device delivers op 3's read: the slot self-verifies but its view is BELOW the durable
+  // log_view, so the verdict is StaleCommitted — the abandoned proposal is refused, never kept.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(3)));
+  e.storage_step(now, &mut storage, &mut blocks);
+  // The re-delivered reply installs over the settled tail; the un-vouchable settled head (op 3,
+  // refused stale) then resumes the deferred head decision: solicit the canonical head, never
+  // advertise the stale one.
   e.handle_message(
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
-  // Stage the re-persist (the node stays Recovering), then drive the scripted superblock to land the
-  // SyncRepersist root, which installs + completes recovery.
   for _ in 0..6 {
     storage.sb_mut().flush();
     e.storage_step(now, &mut storage, &mut blocks);
@@ -6275,22 +6620,60 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
       break;
     }
   }
-  // Recovery COMPLETES (no wedge) — it leaves Recovering. (Member 1 is the primary of the recovered view 1
-  // here, so `complete_recovery` abdicates into a view change; a non-primary backup would resume Normal.
-  // The terminal status is incidental to this test — the subject is the dropped superseded slot below.)
-  assert!(
-    !e.status().is_recovering(),
-    "recovery completes (no wedge) — it leaves Recovering"
+  assert_eq!(
+    e.status(),
+    Status::RecoveringHead,
+    "the stale-refused head is un-vouchable: the replica solicits the canonical head instead of \
+     advertising the stale identity or trusting it",
   );
-  // THE FIX: the superseded above-commit slot is DROPPED to a peer-repaired hole — NOT kept as a stale
-  // Body::Repairing entry whose identity a later `fill_repair` would require the REAL committed body to
-  // match (rejecting it, wedging commit_min) and whose header a view change would advertise as canonical.
-  // (FAIL-BEFORE the classify gate: op 3 was kept as Repairing(h3_stale checksum).) With no stale entry,
-  // the canonical view-1 op 3 fills the hole through the ordinary committed-hole repair path (a hole
-  // `advance_commit` registers + `fill_repair` fills — see the peer-fetch recovery test).
+  // The superseded slot was dropped outright — never kept as a stale Body::Repairing entry whose
+  // identity a later `fill_repair` would hold against the REAL committed body, and never
+  // advertised: a soliciting replica exposes no head.
   assert!(
     !e.log.contains_key(&3),
-    "the superseded view-0 op 3 is dropped to a hole, not kept as a stale Body::Repairing entry",
+    "the superseded view-0 op 3 is dropped, not kept as a stale Body::Repairing entry",
+  );
+  while e.poll_message().is_some() {}
+  // A later view's primary answers the solicitation with the canonical head (this replica is
+  // itself the view-1 primary, so the answer arrives from the view-3 primary, replica 0):
+  // adoption restores the real op 3 and returns the replica to Normal.
+  let canon3 = Bytes::copy_from_slice(b"OP3-REAL-V1");
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartView(StartView::new(
+      View::with(3),
+      OpNumber::with(3),
+      OpNumber::with(2),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          body2.clone(),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(3),
+          ClientId::new(7),
+          RequestNumber::with(3),
+          canon3.clone(),
+        ),
+      ],
+    )),
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the canonical head adoption completes the recovery",
+  );
+  assert_eq!(
+    e.log.get(&3).map(|entry| &entry.body),
+    Some(&Body::Present(canon3)),
+    "the canonical view-1 op 3 replaced the refused stale proposal",
   );
 }
 
@@ -6352,6 +6735,10 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
     body_faulty: std::collections::BTreeSet::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's read always faults → fault-exhaustion path
@@ -6460,6 +6847,10 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
     body_faulty: std::collections::BTreeSet::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
+    capture_on_submit: std::collections::BTreeSet::new(),
+    captured_reads: BTreeMap::new(),
+    deferred_append_ops: std::collections::BTreeSet::new(),
+    staged_appends: std::vec::Vec::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
@@ -7823,6 +8214,239 @@ fn a_predecessors_late_landing_never_evicts_a_slot_the_successor_voted() {
   );
 }
 
+/// The canonical band header for op `op` as `ScriptedWal::with_entries` stores it (client 7 /
+/// request `op` / body `[op]`), so a durable root's vsr_headers match the WAL's slots.
+fn solo_header(op: u64) -> Header {
+  let body = Bytes::copy_from_slice(&[op as u8]);
+  Header::new(
+    OpNumber::with(op),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(op),
+    &body,
+  )
+}
+
+/// Build the restart-in-place shape both inherited-append regressions share: a formatted solo
+/// store holding committed ops 1..=2 (commit 2 in the durable root), an op-2 append (B) a dead
+/// predecessor still has with the device — recorded in the session ledger that outlives it, staged
+/// un-landed at the WAL — and a successor recovered over that live session whose op-2 tail read
+/// outlives the retry cadence, its verdict captured at issue time (the canonical bytes A). The
+/// successor WAITS: the cadence spends nothing on the outstanding read, recovery stays open, and
+/// the successor has written nothing itself.
+fn recover_solo_waiting_on_an_inherited_op2_append(
+  storage: &mut Storage<ScriptedWal, TestSb, CountSm>,
+  blocks: &mut dyn BlockStore,
+) -> Endpoint<CountSm> {
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), storage)
+    .expect("recover over the live storage")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Tick the recover cadence far past the failure budget: op 2's read is outstanding, so nothing
+  // spends and nothing resolves — the recovery waits. Op 1's clean read resolved on the first drain.
+  drive_recovery(&mut r, storage, blocks, Instant::ZERO);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "setup: the outstanding op-2 read is waited on across every cadence tick"
+  );
+  assert!(
+    r.recover
+      .as_ref()
+      .is_some_and(|rec| rec.pending.contains_key(&2)),
+    "setup: op 2's resolution is still owed by its outstanding read"
+  );
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    1,
+    "setup: the predecessor's append is still with the device across the rebuild"
+  );
+  while r.poll_message().is_some() {}
+  r
+}
+
+/// The shared end-state of both landing orderings: the delivered captured read resolved op 2 with
+/// the canonical body A into this replica's log and SM, the predecessor's landing was refused as
+/// foreign (admitting nothing), and the durable slot — clobbered by B, with no repair lane left to
+/// rewrite it — is DETECTED by the next recovery's canonical-band cross-check rather than trusted.
+fn assert_op2_clobber_refused_and_detected(
+  r: Endpoint<CountSm>,
+  storage: &mut Storage<ScriptedWal, TestSb, CountSm>,
+  blocks: &mut dyn BlockStore,
+) {
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    0,
+    "every write over the medium quiesced"
+  );
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the predecessor's completion was delivered across the rebuild and refused at the choke"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "the waited-out read delivered the committed tail and the solo pipeline re-committed it"
+  );
+  assert!(
+    r.log
+      .get(&2)
+      .is_some_and(|e| e.body.as_present() == Some(&[2u8][..])),
+    "op 2 is held with the canonical body the delivered read carried — the foreign landing \
+     admitted nothing into memory"
+  );
+  assert_eq!(
+    r.state_machine_ref().applied(),
+    &[(1u64, std::vec![1u8]), (2u64, std::vec![2u8])],
+    "both committed ops applied with their canonical bodies"
+  );
+  assert_eq!(
+    storage.wal_mut().durable_body(2),
+    Some(Bytes::from_static(b"predecessor")),
+    "anti-vacuity: the inherited landing really clobbered the durable slot"
+  );
+  // The clobbered slot is caught, never trusted: a fresh recovery over this store reads B, the
+  // canonical band (still naming A's identity) refuses it as StaleCommitted, and the unvouchable
+  // head routes to RecoveringHead — detection in place of the repair the dropped machinery
+  // performed, and the correct terminal for a solo store whose only copy was overwritten.
+  drop(r);
+  // The fresh recovery's reads must complete inline: the deferral script belonged to the first
+  // incarnation's schedule.
+  storage.wal_mut().deferred.remove(&2);
+  storage.wal_mut().capture_on_submit.remove(&2);
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut fresh = Endpoint::recover(cfg, genesis(1), 1, CountSm::default(), storage)
+    .expect("recover over the clobbered store")
+    .expect_active();
+  drive_recovery(&mut fresh, storage, blocks, Instant::ZERO);
+  assert_eq!(
+    fresh.status(),
+    Status::RecoveringHead,
+    "the next recovery detects the clobbered committed head instead of trusting it"
+  );
+  while fresh.poll_message().is_some() {}
+}
+
+#[test]
+fn an_inherited_append_landing_after_the_waited_read_is_refused_and_its_clobber_detected() {
+  // Restart in place with a predecessor append (B) still in flight for the waited read's slot,
+  // landing AFTER the read delivers. The read's verdict was captured at issue (the canonical bytes
+  // A — the capture-before-landing schedule the `Wal` contract permits), so the wait consumes A,
+  // recovery completes, and B's later landing is refused as foreign: it admits nothing into
+  // memory, and the durable clobber it leaves is the next recovery's canonical-band cross-check to
+  // detect.
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_defer_read_captured(OpNumber::with(2));
+  wal.script_defer_append(OpNumber::with(2));
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![solo_header(1), solo_header(2)],
+  )
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  // The predecessor's op-2 append, submitted through the session that outlives it: incarnation 0
+  // is never minted (`next_incarnation` starts above it), so the id is foreign to every live
+  // endpoint. The write stays with the device — staged, its completion withheld.
+  let (header, body) = ReorderWal::predecessor_append(2);
+  assert_eq!(
+    storage.submit_append(crate::WriteId::new(0, 1), OpNumber::with(2), header, body),
+    crate::storage::AppendSubmission::Submitted,
+    "the predecessor's append went to the device through the session that outlives it"
+  );
+  let mut r = recover_solo_waiting_on_an_inherited_op2_append(&mut storage, &mut blocks);
+
+  // The waited read completes with the bytes A it captured at issue time — B has not landed, so
+  // capture and slot content agree. The delivered verdict settles the tail and recovery completes.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the delivered captured verdict settles the tail and recovery completes"
+  );
+
+  // The predecessor's write lands over the slot AFTER recovery completed: refused as foreign.
+  let mut landings = 0;
+  while storage.wal_mut().release_append_for(2) {
+    landings += 1;
+    assert!(landings <= 4, "the release loop settles");
+    r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  }
+  assert_op2_clobber_refused_and_detected(r, &mut storage, &mut blocks);
+}
+
+#[test]
+fn an_inherited_append_landing_during_the_wait_never_disturbs_it_and_its_clobber_detected() {
+  // The other ordering: the predecessor's append (B) lands WHILE the recovery is still waiting on
+  // the read — its foreign completion is consumed and refused mid-wait, disturbing nothing. The
+  // read then delivers the bytes A it captured before B landed; the wait consumes them exactly as
+  // a prompt read's, recovery completes, and the durable clobber is left to the next recovery's
+  // canonical-band cross-check.
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_defer_read_captured(OpNumber::with(2));
+  wal.script_defer_append(OpNumber::with(2));
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![solo_header(1), solo_header(2)],
+  )
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  let (header, body) = ReorderWal::predecessor_append(2);
+  assert_eq!(
+    storage.submit_append(crate::WriteId::new(0, 1), OpNumber::with(2), header, body),
+    crate::storage::AppendSubmission::Submitted,
+    "the predecessor's append went to the device through the session that outlives it"
+  );
+  let mut r = recover_solo_waiting_on_an_inherited_op2_append(&mut storage, &mut blocks);
+
+  // B lands FIRST, mid-wait: the slot durably holds the predecessor's bytes, the foreign
+  // completion is refused at the incarnation choke, and the wait is undisturbed.
+  assert!(
+    storage.wal_mut().release_append_for(2),
+    "the inherited append lands"
+  );
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "the foreign landing neither resolves the op nor ends the wait"
+  );
+  // The waited read then completes with the bytes it CAPTURED before B landed — the delivered
+  // verdict is what the recovery consumes, whatever landed over the slot since the capture.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
+  r.storage_step(Instant::ZERO, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the delivered captured verdict settles the tail and recovery completes"
+  );
+  assert_op2_clobber_refused_and_detected(r, &mut storage, &mut blocks);
+}
+
 #[test]
 fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
   // CONSENSUS-SAFETY regression. A solo cluster (replica_count 1) that committed
@@ -8068,4 +8692,495 @@ fn a_solo_replicas_inherited_walk_outlasting_the_read_budget_still_recovers_loca
     "the lane owes no walk once recovery completed"
   );
   while r2.poll_message().is_some() {}
+}
+
+#[test]
+fn a_solo_replicas_slow_head_read_is_waited_on_and_its_delivery_completes_recovery() {
+  // A solo voter's head read is merely SLOW: the WAL owes the completion on no deadline, and a
+  // read that has not completed is outstanding, never failed — so the recovery WAITS. The head is
+  // never promoted faulty, `RecoveringHead` is never entered (there is nothing a peer could tell
+  // this replica that its own outstanding read will not), and the eventual delivery resolves the
+  // head and completes recovery from the only body source a solo deployment has.
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let now = Instant::ZERO;
+  // Durable root: op 1 committed (its header in the band), op 2 the real head ABOVE the durable
+  // commit — the shape whose read the recovery must wait out.
+  let body1 = Bytes::copy_from_slice(&[1u8]);
+  let h1 = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(1),
+    &body1,
+  );
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(1),
+    OpNumber::new(),
+    0,
+    std::vec![h1],
+  )
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(2);
+  // Op 2's read is HELD by the device — it completes only when the test releases it.
+  wal.script_defer_read(OpNumber::with(2));
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Tick the recover cadence far past the failure budget: the outstanding head read spends
+  // nothing, resolves nothing, and the recovery keeps waiting — never RecoveringHead.
+  drive_recovery(&mut r, &mut storage, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "a slow head read is waited on — the head is never promoted faulty off elapsed time"
+  );
+  while r.poll_message().is_some() {}
+  // The device finally completes the held read with the healthy body.
+  assert!(
+    storage.wal_mut().release_deferred(OpNumber::with(2)),
+    "op 2's read was still held by the device"
+  );
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the delivered head body completes recovery locally"
+  );
+  assert!(
+    r.log
+      .get(&2)
+      .is_some_and(|e| e.body.as_present() == Some(&[2u8][..])),
+    "the head is held with its canonical body"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "the solo pipeline re-committed the delivered head"
+  );
+  assert_eq!(
+    r.state_machine_ref().applied(),
+    &[(1u64, std::vec![1u8]), (2u64, std::vec![2u8])],
+    "both committed ops applied with their canonical bodies"
+  );
+  while r.poll_message().is_some() {}
+}
+
+/// Build the restart-in-place shape the inherited-append head regressions share: a formatted solo
+/// store holding committed op 1 (its band header in the durable root) and head op 2 ABOVE the
+/// durable commit; an op-2 append (B) a dead predecessor still has with the device — recorded in
+/// the session ledger that outlives it, staged un-landed at the WAL — and a successor recovered
+/// over that live session whose op-2 head read outlives the retry cadence, its verdict (the
+/// healthy bytes A) captured at issue time. The successor WAITS: driving the cadence far past the
+/// failure budget spends nothing, promotes nothing, and leaves the recovery open on the
+/// outstanding read — the delivered verdict and the inherited write's landing are the only future
+/// events.
+fn recover_solo_waiting_on_an_inherited_head_append() -> (
+  Endpoint<CountSm>,
+  Storage<ScriptedWal, TestSb, CountSm>,
+  crate::block_store::InMemoryBlockStore,
+  Instant,
+) {
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let body1 = Bytes::copy_from_slice(&[1u8]);
+  let h1 = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(1),
+    &body1,
+  );
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(1),
+    OpNumber::new(),
+    0,
+    std::vec![h1],
+  )
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_defer_read_captured(OpNumber::with(2));
+  wal.script_defer_append(OpNumber::with(2));
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let mut storage = Storage::new(wal, sb);
+  // The predecessor's op-2 append, submitted through the session that outlives it: incarnation 0
+  // is never minted (`next_incarnation` starts above it), so the id is foreign to every live
+  // endpoint. The write stays with the device — staged, its completion withheld.
+  let (header, body) = ReorderWal::predecessor_append(2);
+  assert_eq!(
+    storage.submit_append(crate::WriteId::new(0, 1), OpNumber::with(2), header, body),
+    crate::storage::AppendSubmission::Submitted,
+    "the predecessor's append went to the device through the session that outlives it"
+  );
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  drive_recovery(&mut r, &mut storage, &mut blocks, Instant::ZERO);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "setup: the outstanding head read is waited on across every cadence tick — never promoted"
+  );
+  assert!(
+    r.recover
+      .as_ref()
+      .is_some_and(|rec| rec.pending.contains_key(&2)),
+    "setup: the head's resolution is still owed by its outstanding read"
+  );
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    1,
+    "setup: the predecessor's append is still with the device across the rebuild"
+  );
+  while r.poll_message().is_some() {}
+  (r, storage, blocks, Instant::ZERO)
+}
+
+/// The shared end-state of both inherited-head landing orderings: the delivered captured read
+/// resolved the head with the healthy bytes A, the solo pipeline re-committed through it, and the
+/// predecessor's landing was refused as foreign, admitting nothing into memory.
+fn assert_head_resolved_from_the_delivered_read(
+  r: &Endpoint<CountSm>,
+  storage: &mut Storage<ScriptedWal, TestSb, CountSm>,
+) {
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the delivered head body completed recovery locally"
+  );
+  assert!(
+    r.log
+      .get(&2)
+      .is_some_and(|e| e.body.as_present() == Some(&[2u8][..])),
+    "the head is held with the canonical body the delivered read carried"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "the solo pipeline re-committed through the delivered head"
+  );
+  assert_eq!(
+    r.state_machine_ref().applied(),
+    &[(1u64, std::vec![1u8]), (2u64, std::vec![2u8])],
+    "both ops applied with their canonical bodies"
+  );
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    0,
+    "every write over the medium quiesced"
+  );
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the predecessor's completion was delivered across the rebuild and refused at the choke"
+  );
+  assert_eq!(
+    storage.wal_mut().durable_body(2),
+    Some(Bytes::from_static(b"predecessor")),
+    "anti-vacuity: the inherited landing really wrote the durable slot — refusing its completion \
+     is a correlation fact, not a cancellation"
+  );
+}
+
+#[test]
+fn an_inherited_head_append_landing_during_the_wait_never_disturbs_it() {
+  // The inherited append lands WHILE the recovery is still waiting on the head read: its foreign
+  // completion is consumed and refused mid-wait, disturbing nothing. The read then delivers the
+  // bytes A it captured before B landed — the wait consumes the delivered verdict exactly as a
+  // prompt read's, and recovery completes over it.
+  let (mut r, mut storage, mut blocks, t) = recover_solo_waiting_on_an_inherited_head_append();
+  assert!(storage.wal_mut().release_append_for(2));
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the predecessor's landing was refused at the correlation choke"
+  );
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "a foreign landing neither resolves the head nor ends the wait"
+  );
+  // The waited read completes with the bytes A it captured before B landed.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_head_resolved_from_the_delivered_read(&r, &mut storage);
+  while r.poll_message().is_some() {}
+}
+
+#[test]
+fn an_inherited_head_append_landing_after_the_waited_delivery_is_refused() {
+  // The other ordering: the head read delivers first — recovery completes over the captured bytes
+  // A — and the inherited append B lands only afterwards, over a slot whose op the replica has
+  // re-committed. The landing's completion is refused as foreign and admits nothing: the log, the
+  // commit, and the SM keep exactly what the delivered read established.
+  let (mut r, mut storage, mut blocks, t) = recover_solo_waiting_on_an_inherited_head_append();
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the delivered head body completed recovery before the inherited landing"
+  );
+  let mut landings = 0;
+  while storage.wal_mut().release_append_for(2) {
+    landings += 1;
+    assert!(landings <= 4, "the release loop settles");
+    r.storage_step(t, &mut storage, &mut blocks);
+  }
+  assert_head_resolved_from_the_delivered_read(&r, &mut storage);
+  while r.poll_message().is_some() {}
+}
+
+#[test]
+fn a_slow_head_read_and_an_owed_checkpoint_read_are_waited_on_together() {
+  // Both read obligations outstanding at once: the head read is held by the device AND the
+  // checkpoint read's completion is withheld. Neither spends any budget — one discipline judges
+  // both — so cadence ticks leave the recovery open with no escalation. The head read then
+  // delivers while the checkpoint completion is STILL owed: the head resolves in place and the
+  // recovery keeps waiting on the checkpoint; when that completes, recovery finishes — the replica
+  // never enters `RecoveringHead` and never arms a peer fetch.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::InMemoryBlockStore::new(),
+    ),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    good_id,
+    std::vec::Vec::new(),
+  )
+  .unwrap()
+  .with_wal_geometry(2, u64::MAX);
+  // The scripted superblock holds the Phase-1 checkpoint read's completion INFLIGHT: it surfaces
+  // only at the explicit `flush` below.
+  let sb = ScriptedCheckpointSb::new(
+    state,
+    VecDeque::from(std::vec![(OpNumber::with(2), good_env.clone())]),
+  );
+  let mut wal = ScriptedWal::with_entries(3);
+  wal.script_defer_read_captured(OpNumber::with(3));
+  wal.script_defer_append(OpNumber::with(3));
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  blocks.put(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  let (header, body) = ReorderWal::predecessor_append(3);
+  assert_eq!(
+    storage.submit_append(crate::WriteId::new(0, 1), OpNumber::with(3), header, body),
+    crate::storage::AppendSubmission::Submitted,
+    "the predecessor's append went to the device through the session that outlives it"
+  );
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Tick far past both budgets: two outstanding reads, zero spend, zero escalation.
+  let mut t = Instant::ZERO;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 2) {
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, &mut storage);
+    }
+    r.storage_step(t, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "both outstanding reads are waited on — nothing resolves off elapsed time"
+  );
+  assert!(
+    !r.awaiting_peer_checkpoint_for_test(),
+    "the owed checkpoint read spent no budget, so no peer fetch was armed"
+  );
+  // The head read delivers its captured healthy bytes while the checkpoint completion is still
+  // owed: the head resolves in place, and the recovery keeps waiting on the checkpoint.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(3)));
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert!(
+    r.log.get(&3).is_some_and(|e| e.body.is_present()),
+    "the delivered verdict resolved the head while the checkpoint read was still owed"
+  );
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "the checkpoint read is still owed"
+  );
+  // The checkpoint read finally completes: recovery finds a consistent tail and finishes.
+  storage.sb_mut().flush();
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completed off the local medium once both owed completions delivered"
+  );
+  let mut entered_recovering_head = false;
+  while let Some(ev) = r.poll_event() {
+    if matches!(ev, Event::StatusChanged(Status::RecoveringHead)) {
+      entered_recovering_head = true;
+    }
+  }
+  assert!(
+    !entered_recovering_head,
+    "a merely-slow head read never routes through RecoveringHead"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(3),
+    "the delivered head re-committed"
+  );
+  assert_eq!(
+    r.state_machine_ref().applied(),
+    &[(3u64, std::vec![3u8])],
+    "the delivered head applied over the checkpoint-restored prefix"
+  );
+  // The inherited write lands after completion: refused as foreign, admitting nothing.
+  let mut landings = 0;
+  while storage.wal_mut().release_append_for(3) {
+    landings += 1;
+    assert!(landings <= 4, "the release loop settles");
+    r.storage_step(t, &mut storage, &mut blocks);
+  }
+  assert_eq!(r.foreign_completions_rejected(), 1);
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    0,
+    "every write over the medium quiesced"
+  );
+  while r.poll_message().is_some() {}
+}
+
+#[test]
+fn a_ring_aliased_inherited_write_never_disturbs_a_bounded_rings_waited_head_read() {
+  // On a bounded ring an inherited append can target the waited head's PHYSICAL slot under a
+  // DIFFERENT op number (here op 1 aliases head op 5 at capacity 4). The wait is indifferent to
+  // it: the head read's delivered verdict — captured at issue — is what resolves the head, and the
+  // aliased landing's foreign completion is refused, admitting nothing.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(4),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::InMemoryBlockStore::new(),
+    ),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(4),
+    OpNumber::with(4),
+    good_id,
+    std::vec::Vec::new(),
+  )
+  .unwrap()
+  .with_wal_geometry(2, 4);
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: Some((OpNumber::with(4), good_env.clone())),
+  };
+  let mut wal = ScriptedWal::with_entries(5);
+  wal.capacity = 4;
+  wal.script_defer_read_captured(OpNumber::with(5));
+  wal.script_defer_append(OpNumber::with(1));
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  blocks.put(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  // The predecessor's append targets op 1 — a checkpoint-subsumed op whose RING SLOT the head
+  // op 5 reuses (1 mod 4 == 5 mod 4) — still with the device across the rebuild.
+  let (header, body) = ReorderWal::predecessor_append(1);
+  assert_eq!(
+    storage.submit_append(crate::WriteId::new(0, 1), OpNumber::with(1), header, body),
+    crate::storage::AppendSubmission::Submitted,
+    "the predecessor's aliasing append went to the device through the session that outlives it"
+  );
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  let mut t = Instant::ZERO;
+  drive_recovery(&mut r, &mut storage, &mut blocks, t);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "the outstanding head read is waited on across every cadence tick"
+  );
+  while r.poll_message().is_some() {}
+  // The aliased op-1 write lands mid-wait: refused as foreign, disturbing nothing.
+  assert!(storage.wal_mut().release_append_for(1));
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    1,
+    "the aliased landing was refused at the correlation choke"
+  );
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "the aliased landing neither resolves the head nor ends the wait"
+  );
+  // The head read delivers its captured verdict and recovery completes.
+  assert!(storage.wal_mut().release_deferred(OpNumber::with(5)));
+  if let Some(deadline) = r.poll_timeout() {
+    t = deadline;
+  }
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the delivered head body completed recovery locally"
+  );
+  assert!(
+    r.log
+      .get(&5)
+      .is_some_and(|e| e.body.as_present() == Some(&[5u8][..])),
+    "the head is held with its canonical body"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(5),
+    "the solo pipeline re-committed through the delivered head"
+  );
+  assert_eq!(
+    r.state_machine_ref().applied(),
+    &[(5u64, std::vec![5u8])],
+    "the delivered head applied over the checkpoint-restored prefix"
+  );
+  assert_eq!(
+    storage.wal_appends_in_flight(),
+    0,
+    "every write over the medium quiesced"
+  );
+  while r.poll_message().is_some() {}
 }

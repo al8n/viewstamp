@@ -1719,7 +1719,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Adoption re-established a trustworthy head, so the recovery bookkeeping is retired: a
     // RecoveringHead replica that reaches here via this path leaves `recover` = None (the field is
     // structurally None in every non-recovering status). A non-recovering adopter already has None.
-    // (This is the distinguishing reset only the adoption path owns.)
+    // (This is the distinguishing reset only the adoption path owns.) Nothing else needs retiring
+    // with it: `RecoveringHead` is entered only over a drained read fence, so no read completion
+    // remains owed, and any hole the adopted log re-carries `Repairing` is the ordinary peer-repair
+    // lane's to fill.
     self.recover = None;
     // (The pending-repair set was reconciled above — holes the adopted log / applied-prefix held copies
     // now cover were retired; any committed op neither side carries — including the unapplied band

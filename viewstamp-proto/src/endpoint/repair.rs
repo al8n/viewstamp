@@ -330,7 +330,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// a holder answers with byte-bounded [`RepairBatch`]es, instead of one round trip per op. `self.repair`
   /// is a `BTreeSet` (ascending), so a maximal consecutive sub-sequence is one run; a non-consecutive gap
   /// (two separate holes with a filled op between) starts a new range request.
-  pub(crate) fn repair_timeouts(&mut self, now: Instant) {
+  pub(crate) fn repair_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    // `storage` is part of the uniform timer-handler signature (`handle_timeout` passes it to every
+    // servicer); the re-solicits below are wire-only.
+    let _ = &mut *storage;
     if self.timers.repair_retry.is_none_or(|d| d > now) {
       return;
     }
@@ -696,15 +703,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //      stale/reordered old-view Prepare carrying `commit < op` is rejected (keep the hole open +
     //      re-solicit) so a committed slot is never overwritten with an uncommitted old-view body.
     match self.log.get(&op) {
-      Some(LogEntry {
-        client,
-        request,
-        body: Body::Repairing(canonical_checksum),
-      }) => {
-        if p.client() != *client
-          || p.request() != *request
-          || crate::storage::fnv1a_128(p.body()) != *canonical_checksum
-        {
+      Some(entry) if entry.body.is_repairing() => {
+        if !Self::repairing_identity_matches(entry, p.client(), p.request(), p.body()) {
           return false; // does not match the kept canonical identity — never adopt; keep the hole
         }
       }
@@ -755,5 +755,31 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (but not-yet-durable) entry. Dropping the whole per-op set is safe — the op is answered.
     self.nack_from.remove(&op);
     true
+  }
+
+  /// Whether a supplied body may fill `entry` as its kept header-only [`Body::Repairing`] hole: the
+  /// entry's FULL kept canonical identity must vouch it — the SAME `client`, the SAME `request`, and
+  /// the body bytes hashing to the kept canonical `body_checksum`. `false` for any entry that is not
+  /// a `Repairing` hole (already `Present`, or a typed `Reconfigure` body).
+  ///
+  /// The one admission predicate of the peer-repair fill ([`Self::fill_repair`]): whatever source
+  /// offers bytes for a kept hole, admission means exactly "this is the body the durable identity
+  /// names". The comparison is against the CURRENT entry, so an op whose slot was re-identified
+  /// since the hole was minted (a view-change adoption installing a different `(client, request,
+  /// body)` at the same number) refuses a body that matched only the SUPERSEDED identity.
+  fn repairing_identity_matches(
+    entry: &LogEntry,
+    client: ClientId,
+    request: RequestNumber,
+    body: &[u8],
+  ) -> bool {
+    match &entry.body {
+      Body::Repairing(canonical_checksum) => {
+        entry.client == client
+          && entry.request == request
+          && crate::storage::fnv1a_128(body) == *canonical_checksum
+      }
+      _ => false,
+    }
   }
 }
