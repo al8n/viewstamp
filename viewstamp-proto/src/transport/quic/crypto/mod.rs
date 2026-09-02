@@ -152,14 +152,14 @@ pub const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
 /// arrived in — so spans from a peer that fills its packets survive compaction and a deep backlog
 /// cannot be compacted back under the ceiling.  The derivation below therefore has to hold at this
 /// count, not at the higher count that merely triggers a compaction.
-const QUINN_REASSEMBLY_MAX_SPANS: u64 = 1024;
+pub(crate) const QUINN_REASSEMBLY_MAX_SPANS: u64 = 1024;
 
 /// Smallest STREAM-frame payload assumed for a peer that fills its packets, in bytes.  QUIC
 /// guarantees a 1200-byte path, which leaves ~1160 bytes for frames once the short header, the
 /// packet number and the AEAD tag are paid for; 1024 rounds that down for margin.  A peer with a
 /// backlog to send fills every packet, so this is the span size that matters while an unread backlog
 /// builds: a trickling peer makes smaller spans but has too little in flight to build one.
-const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
+pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 
 /// Ceiling on the per-stream receive window, and what the tuning setters clamp to.
 ///

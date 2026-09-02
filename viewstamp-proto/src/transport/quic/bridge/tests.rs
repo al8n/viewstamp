@@ -7,7 +7,10 @@ use crate::{
     CloseCause,
     frame::LEN_PREFIX,
     quic::{
-      crypto::MAX_BIDI_STREAMS,
+      crypto::{
+        MAX_BIDI_STREAMS, MAX_STREAM_RECEIVE_WINDOW, MIN_FILLED_STREAM_FRAME_PAYLOAD,
+        QUINN_REASSEMBLY_MAX_SPANS,
+      },
       testutil::{PacketPipe, addr},
     },
   },
@@ -1068,6 +1071,155 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
     Some(FRAME_BODY),
     "the full over-window frame must be delivered once flow-control credit flows after each budget \
      read"
+  );
+}
+
+/// The unread backlog a full stream receive window admits must stay inside the span count quinn's
+/// stream reassembler will hold — the derivation
+/// [`MAX_STREAM_RECEIVE_WINDOW`](crate::transport::quic::crypto::MAX_STREAM_RECEIVE_WINDOW) states,
+/// measured against real packetization rather than assumed.
+///
+/// quinn buffers each received STREAM frame as its own span and rejects an insert once the count
+/// passes `QUINN_REASSEMBLY_MAX_SPANS` — closing the whole CONNECTION, not throttling the peer. The
+/// compaction it tries first merges only poorly utilized spans, so full packets from a sender with a
+/// backlog stay separate and a deep backlog cannot be compacted back under the ceiling. The window
+/// is what bounds that backlog, so it has to be small enough that a window's worth of full packets
+/// is fewer spans than the ceiling.
+///
+/// This test drives the worst case directly: a frame several windows long, ferried to B with B
+/// reading NOTHING, so B's reassembler holds a whole window unread. Each datagram carries at most
+/// one STREAM frame per stream, so the datagrams B absorbs unread bound the spans it holds. Then B
+/// drains and the frame must arrive in FULL — a stream quinn had errored would deliver nothing.
+///
+/// It fails in both directions the end-to-end tests only fail indirectly: raising the window (or
+/// shrinking the packets a window holds) drives the span count over the ceiling, and a quinn release
+/// that lowers its own bound errors this stream while the count assertion still passes.
+#[test]
+fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+
+  // Several windows' worth on the Bulk class, so A fills B's whole window and stays blocked behind
+  // it with a staged tail — the deepest unread backlog flow control permits.
+  const BODY: usize = 4 * MAX_STREAM_RECEIVE_WINDOW as usize;
+  let mut framed = Vec::new();
+  encode_frame(&vec![0x2Bu8; BODY], &mut framed);
+  let total = framed.len();
+  a.test_stage_outbound(ha, StreamClass::Bulk, &framed);
+
+  // Ferry with NO `ingest_recv` on B, counting every datagram B absorbs, until A can push nothing
+  // more onto the wire (B's window is full and A still holds a staged tail).
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut unread_datagrams = 0usize;
+  let mut unread_bytes = 0usize;
+  let mut idle = 0u64;
+  let mut tick = now;
+  for k in 1..4000u64 {
+    tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    while let Some((dst, bytes)) = a.poll_transmit() {
+      assert_eq!(dst, b_addr);
+      pipe_to_b.push(a_addr, bytes);
+    }
+    while let Some((dst, bytes)) = b.poll_transmit() {
+      assert_eq!(dst, a_addr);
+      pipe_to_a.push(b_addr, bytes);
+    }
+    let before = unread_datagrams;
+    while let Some((from, bytes)) = pipe_to_b.pop() {
+      unread_datagrams += 1;
+      unread_bytes += bytes.len();
+      b.handle_datagram(tick, from, None, &bytes);
+    }
+    while let Some((from, bytes)) = pipe_to_a.pop() {
+      a.handle_datagram(tick, from, None, &bytes);
+    }
+    a.handle_timeout(tick);
+    b.handle_timeout(tick);
+    // A is done filling once nothing more reaches B for a stretch of ticks while a staged tail
+    // remains: only B's window can be holding it back, since B never reads.
+    let a_left = {
+      let e = a.table.entry(ha).expect("A entry");
+      e.class_mut(StreamClass::Bulk).outbound.len()
+    };
+    if unread_datagrams == before && a_left > 0 {
+      idle += 1;
+      if idle >= 64 {
+        break;
+      }
+    } else {
+      idle = 0;
+    }
+  }
+  let a_left = {
+    let e = a.table.entry(ha).expect("A entry");
+    e.class_mut(StreamClass::Bulk).outbound.len()
+  };
+  assert!(
+    a_left > 0,
+    "A must still hold a staged tail: the frame ({total} B) is several windows long, so B's window \
+     is the only thing that can have stopped it"
+  );
+  // The pin: a full window of real packets is fewer spans than quinn's reassembler will hold. The
+  // count includes B's control-stream and pure-ACK datagrams, so it over-counts the Bulk spans.
+  assert!(
+    unread_datagrams as u64 <= QUINN_REASSEMBLY_MAX_SPANS,
+    "a window's worth of unread datagrams ({unread_datagrams}) must stay within the \
+     {QUINN_REASSEMBLY_MAX_SPANS}-span reassembly bound — the window is derived as \
+     {MAX_STREAM_RECEIVE_WINDOW} B / {MIN_FILLED_STREAM_FRAME_PAYLOAD} B per full packet"
+  );
+
+  // ...and the count is a full window's worth rather than an early-ended fill: a stream quinn has
+  // already errored stops ACKing, which ends the fill too, so this is checked after the pin.
+  assert!(
+    unread_bytes >= MAX_STREAM_RECEIVE_WINDOW as usize,
+    "a full window ({MAX_STREAM_RECEIVE_WINDOW} B) must have reached B unread before flow control \
+     stopped A, got {unread_bytes} B"
+  );
+
+  // B now drains. The frame arrives in full only if quinn kept every span it buffered: a stream it
+  // had errored delivers nothing, however much credit B goes on to grant.
+  let mut got: Option<Vec<u8>> = None;
+  for k in 0..8000u64 {
+    let t = tick + Duration::from_millis(k + 1);
+    a.flush_stream(t, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      t,
+    );
+    assert!(
+      !b.ingest_recv(t, hb),
+      "a legitimate over-window transfer must never reap the connection"
+    );
+    if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
+      got = Some(f);
+      break;
+    }
+  }
+  assert_eq!(
+    got.map(|f| f.len()),
+    Some(BODY),
+    "the whole {BODY}-byte frame must arrive after a full window sat unread in the reassembler"
   );
 }
 
