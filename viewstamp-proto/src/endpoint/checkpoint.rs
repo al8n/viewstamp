@@ -36,6 +36,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (nothing is owed; `pending` was cleared at the transition). A completion that freed no slot
     // (a read) falls through to the recovery router exactly as before.
     if self.status.is_recovering() || self.status.is_recovering_head() {
+      // A recovering endpoint stages no append of its own — it submits reads and waits on their
+      // delivered verdicts — so every append completion arriving here is a pre-transition
+      // leftover whose action was already abandoned: absorb it, releasing only the freed slot.
       if let WalDone::Appended(_) | WalDone::Cancelled(_) = &done
         && let Some(op) = freed_slot
       {
@@ -86,8 +89,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         }
         return;
       }
-      // Normal op: only appends matter, and a read completion cannot name one — a read carries a
-      // `ReadId`, an append a `WriteId`. (Reads + their verdicts occur during recovery.)
+      // A read completion (a read carries a `ReadId`, an append a `WriteId`; reads free no slot).
+      // No read correlation outlives the recovery loop — recovery waits out every read it submits,
+      // completing only once each has delivered its verdict — so a read completing outside the
+      // recovering statuses is stale (a dropped subsumed tracking entry, or a dead phase's read)
+      // and is ignored: faults-as-data, exactly as the recover router refuses an untracked id.
       _ => return,
     };
     // The write quiesced WITH its bytes durably landed: the session already retired its

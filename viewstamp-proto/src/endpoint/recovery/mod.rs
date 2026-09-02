@@ -498,12 +498,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Phase 2. Hence the `&mut W, &mut B`.
   ///
   /// **Phase 2 (`handle_storage`, async + fallible).** `on_wal_done`/`on_sb_done` drive the reads to
-  /// a consistent tail: each `ReadOk`'s body is adopted only after `Header::verify` (a torn write /
-  /// bit-rot surfaces as a checksum mismatch and is treated as a fault); `Fault`/`Absent`/mismatch is
-  /// retried within the budget, then classed permanently faulty; the checkpoint `CheckpointRead`
-  /// restores the SM + sessions. Once every read is satisfied, `recover_progress` transitions to
-  /// `Normal` (tail consistent) or `RecoveringHead` (the head slot is permanently faulty — it cannot
-  /// trust its head and awaits a `StartView`). A recovered backup re-emits
+  /// a consistent tail, WAITING on every delivered verdict: a submitted read that has not completed
+  /// is outstanding, never failed — the [`Wal`] contract owes it exactly one completion, on no
+  /// deadline — so the phase advances only on what the medium answers. Each `ReadOk`'s body is
+  /// adopted only after `Header::verify` (a torn write / bit-rot surfaces as a checksum mismatch and
+  /// is treated as a fault); a delivered `Fault`/mismatch spends the retry budget and is re-read,
+  /// then — once every attempt has returned and failed — resolved from the durable witnesses
+  /// (kept header-only for peer repair, or classed permanently faulty); `Absent` and an identity
+  /// mismatch are definitive on delivery. The checkpoint `CheckpointRead` restores the SM +
+  /// sessions under the same discipline. Once every read is satisfied, `recover_progress`
+  /// transitions to `Normal` (tail consistent) or `RecoveringHead` (the head slot is permanently
+  /// faulty — it cannot trust its head and awaits a `StartView`). A recovered backup re-emits
   /// nothing; it waits for the primary's `Prepare`/`Commit` to re-announce commit, exactly as before.
   ///
   /// **Durable-view.** The view is persisted before any view-change participation, so `state.view()`
@@ -1023,7 +1028,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // slot) has nothing to read, so it settles the terminal status HERE (a formatted genesis store
     // resumes Normal at view 0; an unformatted store abdicates / backs up — never a view-0 primary).
     // Otherwise this arms the recover_retry timer so an owner driving `poll_timeout`/`handle_timeout`
-    // re-submits any read whose completion is dropped or whose transient fault clears on a later read.
+    // re-reads any op whose prior attempt completed and failed (a transient fault clears on the
+    // later attempt); an outstanding read is waited on, never re-submitted over.
     endpoint.recover_progress(Instant::ZERO, storage);
     Ok(Recovered::Active(endpoint))
   }
@@ -1101,11 +1107,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Handles a WAL completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). Adopts a
   /// body ONLY after `Header::verify` (the faults-as-data chokepoint: a torn write / bit-rot fails
-  /// verify and is treated as a `Fault`). A clean read resolves its op (Verified body, KeepRepairing
-  /// hole, or StaleCommitted drop) and retires ALL of the op's in-flight ids; a `Fault`/`Absent`/
-  /// mismatch only drops THIS id and leaves the op PENDING — `recover_timeouts` is the sole owner of
-  /// retransmission, the absolute per-op budget, and the budget-exhaustion resolution
-  /// (`resolve_exhausted_tail_read`). Calls `recover_progress` after each.
+  /// verify and is treated as a `Fault`). A resolving verdict (Verified body, KeepRepairing hole,
+  /// StaleCommitted drop, definitive Absent) settles its op and retires ALL of the op's read ids; a
+  /// delivered `Fault`/mismatch drops only THIS id and leaves the op PENDING with no completion
+  /// owed — `recover_timeouts` is the sole owner of the re-read, the per-op failure budget, and the
+  /// exhaustion resolution (`resolve_exhausted_tail_read`). Calls `recover_progress` after each.
   pub(crate) fn on_recover_wal_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -1268,13 +1274,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     match outcome {
       Outcome::Verified(client, request, body) => {
-        // Adopt the verified body, retiring EVERY in-flight read for this op. Normally the Phase-1
+        // Adopt the verified body, retiring EVERY read id for this op. Normally the Phase-1
         // header-only placeholder is still present and we just fill its body; but if this slot had earlier
         // been classed faulty and DROPPED from `self.log` (`drop_faulty_committed_slots`), a later
-        // timer-driven re-read that clears the transient must RE-INSERT the full entry rather than
-        // silently lose the recovered op. `recover_timeouts` mints reads ADDITIVELY (one op can have
-        // several outstanding ids), so drop ALL of op's ids — a late duplicate under another id must be
-        // ignored, never re-processed.
+        // budgeted re-read that clears the transient must RE-INSERT the full entry rather than
+        // silently lose the recovered op. Retiring the op's ids by op (not just this completion's)
+        // keeps a stale id from ever resolving the op twice.
         rec.reads.retain(|_, &mut o| o != op);
         rec.pending.remove(&op);
         rec.faulty.remove(&op);
@@ -1301,7 +1306,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // re-read — unlike a no-durable-header `Fault`, which IS faulty. A `Repairing` entry already
         // present (a re-read after a prior body fault) is left as-is; a Phase-1 `Present(empty)`
         // placeholder is REPLACED with the `Repairing` hole (the empty body must never apply). Retire
-        // EVERY in-flight read for this op (additive ids — a late duplicate must be ignored).
+        // EVERY read id for this op, so a stale id can never resolve it twice.
         rec.reads.retain(|_, &mut o| o != op);
         rec.pending.remove(&op);
         rec.faulty.remove(&op);
@@ -1323,17 +1328,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // class it permanently faulty IMMEDIATELY (no retry — the mismatch is authoritative). The
         // existing peer fault-repair path then drops it from the `log` cache (`recover_progress`) and `advance_commit`
         // peer-repairs it on demand; the canonical body is fetched, never re-derived from the stale WAL.
-        // Retire EVERY in-flight read for this op (additive ids — a late duplicate must be ignored).
+        // Retire EVERY read id for this op, so a stale id can never resolve it twice.
         rec.reads.retain(|_, &mut o| o != op);
         rec.pending.remove(&op);
         rec.faulty.insert(op);
       }
       Outcome::Fault => {
-        // A faulted read: drop this id and leave the op PENDING. `recover_timeouts` re-submits it
-        // (additive) and decrements the ABSOLUTE budget; when the budget exhausts it resolves the op via
-        // `resolve_exhausted_tail_read`. We do NOT retry/resolve here — keeping a single retry+budget
-        // owner avoids the id-churn that dropped a slow completion (a re-mint that retired the id the
-        // late completion arrives under).
+        // A delivered failure: drop this id and leave the op PENDING. The attempt has now COMPLETED
+        // AND FAILED, so `recover_timeouts` — the sole retry+budget owner — sees the op with no
+        // completion owed and re-submits with a budget decrement, resolving it from its durable
+        // witnesses once every attempt has returned and failed (`resolve_exhausted_tail_read`). We
+        // do NOT retry here: the single owner is what pins each budget unit to exactly one
+        // delivered failure.
         rec.reads.remove(&id.seq());
       }
       Outcome::Absent => {
@@ -1369,7 +1375,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// identity). `None` otherwise. The SINGLE source of the verdict the Fault retry-exhaustion path
   /// (`resolve_exhausted_tail_read`) and the peer-checkpoint completion (`on_recover_sync_checkpoint`)
   /// both apply, so they cannot drift.
-  fn inflight_tail_repairing_identity<W: Wal, B: Superblock>(
+  pub(super) fn inflight_tail_repairing_identity<W: Wal, B: Superblock>(
     &self,
     storage: &Storage<W, B, S>,
     op: u64,
@@ -1413,13 +1419,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .map(|h| (h.client(), h.request(), h.body_checksum()))
   }
 
-  /// Resolve a tail op whose ABSOLUTE read budget is exhausted, from its durable header. Any op whose
-  /// durable header classifies `Verified` is KEPT header-only as `Body::Repairing` (existence + identity
-  /// preserved so a later view change cannot re-mint its op number); a StaleCommitted/superseded slot or a
-  /// slot with no durable header is routed to `rec.faulty` (a peer-repaired hole). This is the STORAGE-path
-  /// resolution `recover_timeouts` invokes on budget exhaustion; it shares the VERDICT
-  /// (`inflight_tail_repairing_identity`) with the always-Normal-bound message path
-  /// (`on_recover_sync_checkpoint`), so the two do not drift.
+  /// Resolve a tail op whose EVERY read attempt has returned and failed, from its durable witnesses.
+  /// Any op whose durable header classifies `Verified` is KEPT header-only as `Body::Repairing`
+  /// (existence + identity preserved so a later view change cannot re-mint its op number); a
+  /// StaleCommitted/superseded slot or a slot with no durable header is routed to `rec.faulty` (a
+  /// peer-repaired hole). This is the resolution `recover_timeouts` invokes on budget exhaustion; it
+  /// shares the VERDICT (`inflight_tail_repairing_identity`) with the peer-checkpoint completion
+  /// path, so the two cannot drift.
+  ///
+  /// Escalating to peer repair is sound here — and only here — because nothing local remains to
+  /// wait on: the budget spends exclusively on DELIVERED failure verdicts and the timer exhausts an
+  /// op only with no read outstanding, so by this point the medium has answered every attempt and
+  /// each answer failed. A merely-slow read never reaches this resolution; it is waited on.
   ///
   /// This does NOT itself decide the non-committed-faulty-HEAD case (route the head to `RecoveringHead`):
   /// under batched reads `self.op` here is only the PROVISIONAL batch frontier, so a boundary op with
@@ -1440,8 +1451,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ) {
     let keep = self.inflight_tail_repairing_identity(storage, op);
     if let Some(rec) = self.recover.as_mut() {
+      // Exhaustion is judged only with the op's outstanding-completion fence empty (the shared
+      // retry discipline), so every id was already retired by the delivered failure it named.
+      debug_assert!(
+        !rec.reads.values().any(|&o| o == op),
+        "resolving op {op} with a read still outstanding — the retry discipline waits on it"
+      );
       rec.pending.remove(&op);
-      rec.reads.retain(|_, &mut o| o != op); // drop ALL of op's in-flight ids
     }
     match keep {
       Some((client, request, body_checksum)) => {
@@ -2131,7 +2147,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the apply path), so the replica safely returns to `Normal` and re-fetches the op on demand via
   /// `RequestPrepare` when its commit reaches it — HOLDING the commit below the hole until then. This
   /// is what lets a recovering replica with a rotted committed slot rejoin without losing the op.
-  fn recover_progress<W: Wal, B: Superblock>(
+  pub(super) fn recover_progress<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
     storage: &mut Storage<W, B, S>,
@@ -2173,6 +2189,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         Some(Body::Repairing(_))
       );
     if promote_faulty_head {
+      // The removal is safe to make unconditionally: the read phase settles only on delivered
+      // verdicts, so a head that reaches this promotion has had EVERY read attempt returned and
+      // failed — no completion remains owed that could yet identify it, and the durable header in
+      // the WAL (the log's own record) stays the obligation a peer's `RecoveryResponse`/`StartView`
+      // answers.
       self.log.remove(&real_head);
       if let Some(rec) = self.recover.as_mut() {
         rec.faulty.insert(real_head);
@@ -2319,6 +2340,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
       return;
     }
+    // No terminal transition may settle over an open read phase: every submitted recovery read is
+    // owed exactly one completion, and each caller reaches here only once the fence has drained
+    // (`recover_progress` gates on `pending`; the peer-checkpoint ingress defers behind the same
+    // fence) — asserted so a future completion path cannot silently abandon an outstanding read.
+    debug_assert!(
+      self
+        .recover
+        .as_ref()
+        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      "completing recovery with a tail read still outstanding"
+    );
     // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
     // exemption below. A re-latched recovery (`on_recover_sync_checkpoint` builds a default state)
     // carries `formatted = false`, which is correct: a re-syncing node is never at genesis.
@@ -2434,30 +2466,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let _ = self.try_commit(now, storage);
   }
 
-  /// Recover-retry timer: the SOLE retry+budget owner for the tail reads and the checkpoint read.
-  /// For each still-PENDING tail op it re-submits an ADDITIVE read (a fresh id WITHOUT retiring the
-  /// op's existing in-flight ids) and decrements the op's ABSOLUTE retransmission budget; once that
-  /// budget reaches zero the op is resolved via [`Self::resolve_exhausted_tail_read`], so the tail
-  /// loop terminates even when a real async driver delivers a completion later than this cadence or
-  /// drops one. The CHECKPOINT read is retried on the opposite discipline: its completion is
-  /// contract-guaranteed (exactly one per submitted read), so an owed completion is WAITED ON —
-  /// re-submission (with a budget decrement) runs only after the prior attempt completed and
-  /// FAILED, and exhaustion escalates to the peer fetch only once no read remains outstanding (see
-  /// the checkpoint block below).
+  /// Recover-retry timer: the SOLE retry+budget owner for the tail reads and the checkpoint read,
+  /// both judged by the ONE retry discipline ([`retry_verdict`]): an obligation whose submitted
+  /// read still owes its completion is WAITED ON — the [`Wal`]/[`Superblock`] contracts owe every
+  /// read exactly one delivered verdict, on no deadline, so elapsed time is never evidence of
+  /// failure and a merely-slow read spends nothing; a completed-and-FAILED attempt re-submits with
+  /// a budget decrement; and only once EVERY attempt has returned and failed does the obligation
+  /// escalate past the local read — a tail op resolves from its durable witnesses
+  /// ([`Self::resolve_exhausted_tail_read`], keeping a verified identity header-only for peer
+  /// repair), the checkpoint phase falls to the peer fetch. Escalation therefore always means "the
+  /// medium answered, and every answer failed", never "the medium was slow": a backend that wants a
+  /// wall-clock bound on its reads delivers a `Fault` verdict itself (the [`Wal::submit_read`]
+  /// latency-policy clause), and that fault spends budget here like any other.
   ///
-  /// Each budget is ABSOLUTE (seeded once at its phase's submit to `RECOVER_READ_RETRIES`,
-  /// decremented ONLY here, never reset and never decremented by a completion arm). Tail additivity
-  /// is what fixes the tail slow-read wedge: every retransmission of an op shares the SAME op, so a
-  /// (late) completion arriving under ANY still-live id resolves the op — whereas retiring the
-  /// prior ids on each retry (the old behaviour) dropped a completion slower than
-  /// `RECOVER_READ_RETRANSMIT` (its id was always already retired) and the budget — being reset —
-  /// never reached zero, wedging recovery forever. A genuinely-dead slot still terminates: its
-  /// budget counts down to zero across a bounded number of retransmissions and
+  /// Each budget is seeded once at its phase's submit to `RECOVER_READ_RETRIES` and decremented
+  /// ONLY here, at a re-submission — never by a tick that merely observed an outstanding read, and
+  /// never by a completion arm. A genuinely-dead slot still terminates: each of its reads faults
+  /// (delivered), the budget counts down across the bounded re-reads, and
   /// `resolve_exhausted_tail_read` routes it to peer-repair.
   ///
   /// Faulty ops are NOT re-read here: a `rec.faulty` op is already resolved (a peer-repaired hole), and
   /// the read fault that produced it is replayed by neither the completion arm nor this timer — only a
-  /// still-PENDING op (one whose read has not yet resolved it) is retransmitted.
+  /// still-PENDING op (one whose read has not yet resolved it) is judged.
   pub(crate) fn recover_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -2512,48 +2542,44 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.send_request_sync(now);
     }
     for op in ops {
-      // Read the op's ABSOLUTE budget under a brief immutable borrow, released before the method calls
-      // below (`resolve_exhausted_tail_read`/`mint_read_id` re-borrow `self`/`self.recover`).
-      let budget = self
-        .recover
-        .as_ref()
-        .and_then(|rec| rec.pending.get(&op).copied());
-      match budget {
-        // Exhausted: resolve from the durable header (keep header-only as Repairing, or route to
-        // peer-repair). This both removes `op` from `rec.pending` and drops all its in-flight ids.
-        Some(0) => self.resolve_exhausted_tail_read(storage, op),
-        Some(budget) => {
-          // Re-submit an ADDITIVE read — a fresh id that does NOT retire the op's existing in-flight
-          // ids, so a slow completion under an earlier id still resolves the op — and decrement the
-          // absolute budget by one.
+      // Judge the op under a brief immutable borrow, released before the method calls below
+      // (`resolve_exhausted_tail_read`/`mint_read_id` re-borrow `self`/`self.recover`).
+      let verdict = self.recover.as_ref().and_then(|rec| {
+        let budget = rec.pending.get(&op).copied()?;
+        Some(retry_verdict(rec.reads.values().any(|&o| o == op), budget))
+      });
+      match verdict {
+        // A submitted read still owes its completion: wait on it. The delivered verdict resolves
+        // the op or retires the failed id, and only then does a tick re-judge it here. (`None` ⇒
+        // the op resolved between the snapshot and here — skip.)
+        Some(RetryVerdict::Wait) | None => {}
+        // The prior attempt completed and failed: re-submit one read, spending one unit of budget.
+        Some(RetryVerdict::Retry(rest)) => {
           let new_id = self.mint_read_id();
           if let Some(rec) = self.recover.as_mut() {
-            rec.pending.insert(op, budget - 1);
+            rec.pending.insert(op, rest);
             rec.reads.insert(new_id.seq(), op);
           }
           storage.submit_wal_read(new_id, OpNumber::with(op));
         }
-        // No budget entry ⇒ `op` is no longer pending (resolved between the snapshot and here) — skip.
-        None => {}
+        // Every attempt returned and failed: resolve from the durable witnesses (keep header-only
+        // as Repairing, or route to peer-repair). This removes `op` from `rec.pending`.
+        Some(RetryVerdict::Exhausted) => self.resolve_exhausted_tail_read(storage, op),
       }
     }
-    // Re-issue the checkpoint read only once the PRIOR attempt has COMPLETED AND FAILED — never
-    // while a submitted read's completion is still owed (`checkpoint_read_owed`): the superblock
-    // owes every submitted read exactly one completion (`CheckpointRead` or `Fault`) with no
-    // latency ceiling, so an owed completion is WAITED ON — the `pending_checkpoint` early-return
-    // shape — with the cadence re-armed below purely to re-observe its aftermath. The ABSOLUTE
-    // budget is decremented at each re-submission, and a re-submission runs only after a failure
-    // verdict (a read `Fault`, a verify-mismatch, a probe/reconstruct abort) retired the
-    // outstanding read or job — so the budget counts completed-and-failed attempts, never elapsed
-    // time: a merely-SLOW read spends nothing, and the escalation below cannot fire while its
-    // completion is owed. That exclusion is what keeps a valid-but-late read from being traded
-    // for a peer fetch no donor may exist to answer (solo, partitioned, or every reachable peer
-    // itself a debtor — a permanent Recovering wedge over a healthy local checkpoint), and it
-    // makes local-read/peer-fetch coexistence structurally impossible rather than resolved by
-    // discarding the late completion. On exhaustion — every attempt completed and FAILED —
-    // escalate to a PEER FETCH: the durable root names a permanently-unreadable or
-    // root-inconsistent snapshot (bit-rot/torn write in this replica's single durable copy),
-    // unrecoverable from local disk.
+    // The checkpoint phase under the SAME discipline. An owed completion is WAITED ON
+    // (`checkpoint_read_owed` folds into [`RetryVerdict::Wait`]): the superblock owes every
+    // submitted read exactly one completion (`CheckpointRead` or `Fault`) with no latency ceiling,
+    // so the budget counts completed-and-failed attempts, never elapsed time — a merely-SLOW read
+    // spends nothing, and the escalation cannot fire while its completion is owed. That exclusion
+    // is what keeps a valid-but-late read from being traded for a peer fetch no donor may exist to
+    // answer (solo, partitioned, or every reachable peer itself a debtor — a permanent Recovering
+    // wedge over a healthy local checkpoint), and it makes local-read/peer-fetch coexistence
+    // structurally impossible rather than resolved by discarding the late completion. On
+    // exhaustion — every attempt completed and FAILED (a read `Fault`, a verify-mismatch, a
+    // probe/reconstruct abort) — escalate to a PEER FETCH: the durable root names a
+    // permanently-unreadable or root-inconsistent snapshot (bit-rot/torn write in this replica's
+    // single durable copy), unrecoverable from local disk.
     //
     // NOT while the verified read's continuation is with the BLOCK LANE — retained as a deferred
     // probe obligation (`probe_deferred`), or live as the queued-or-executing probe/reconstruct
@@ -2566,23 +2592,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // solo replica (or any replica with no reachable donor) a permanent wedge over a perfectly
     // valid local checkpoint, strictly worse than the wait, and reached by nothing more than a job
     // outliving the retry deadlines.
-    if want_checkpoint.is_some() && !probe_deferred && !reconstructing && !checkpoint_read_owed {
-      if checkpoint_retries == 0 {
-        // Permanently-unreadable OWN checkpoint: any peer at/above it subsumes ours — NOT a cross-epoch
-        // crossing (no epoch target to pin), so target our own `checkpoint_op` with the requirement off.
-        // An owed orphaned-re-persist frontier lifts the target: the read that just exhausted was
-        // serving the LANDED root's generation (at/above the owed frontier), so the pointer alone
-        // under-states what a donor must supply — a donor below the frontier would answer with a
-        // reply the timeline admission then refuses, soliciting forever.
-        let target = match self.repersist_orphan_owed() {
-          Some(owed) => OpNumber::with(owed.get().max(self.checkpoint_op.get())),
-          None => self.checkpoint_op,
-        };
-        self.escalate_checkpoint_to_peer_fetch(now, target, false);
-      } else {
-        self.submit_tracked_checkpoint_read(storage);
-        if let Some(rec) = self.recover.as_mut() {
-          rec.checkpoint_retries = checkpoint_retries - 1;
+    if want_checkpoint.is_some() && !probe_deferred && !reconstructing {
+      match retry_verdict(checkpoint_read_owed, checkpoint_retries) {
+        RetryVerdict::Wait => {}
+        RetryVerdict::Retry(rest) => {
+          self.submit_tracked_checkpoint_read(storage);
+          if let Some(rec) = self.recover.as_mut() {
+            rec.checkpoint_retries = rest;
+          }
+        }
+        RetryVerdict::Exhausted => {
+          // Permanently-unreadable OWN checkpoint: any peer at/above it subsumes ours — NOT a
+          // cross-epoch crossing (no epoch target to pin), so target our own `checkpoint_op` with
+          // the requirement off. An owed orphaned-re-persist frontier lifts the target: the read
+          // that just exhausted was serving the LANDED root's generation (at/above the owed
+          // frontier), so the pointer alone under-states what a donor must supply — a donor below
+          // the frontier would answer with a reply the timeline admission then refuses, soliciting
+          // forever.
+          let target = match self.repersist_orphan_owed() {
+            Some(owed) => OpNumber::with(owed.get().max(self.checkpoint_op.get())),
+            None => self.checkpoint_op,
+          };
+          self.escalate_checkpoint_to_peer_fetch(now, target, false);
         }
       }
     }
@@ -2601,9 +2632,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// FIRST carrying the faulty verdicts across the install — the shared chokepoint of BOTH staging
   /// lanes: the fresh `SyncCheckpoint` escape (`on_recover_sync_checkpoint`) and the local flush-retry
   /// (`recover_timeouts` → `retry_install_flush`, reached when the escape's first flush FAULTED so no
-  /// `pending_checkpoint` existed there and `recover` survived into the retry cadence). The read phase
-  /// settled its verdicts before either staging, but the `awaiting_peer_checkpoint` gate in
-  /// `recover_progress` sits BEFORE its faulty-head → `RecoveringHead` decision — so a
+  /// `pending_checkpoint` existed there and `recover` survived into the retry cadence).
+  ///
+  /// The read FENCE is never retired here, because it can never be non-empty here: the
+  /// peer-checkpoint ingress defers every reply while a tail read is outstanding or a failed op
+  /// still owes its budgeted re-read (`on_recover_sync_checkpoint`'s tail-fence guard), the fence
+  /// only drains after that admission (no path re-opens it mid-recovery), and this retirement is
+  /// reached only through a reply that passed the guard — asserted below, so a future escalation
+  /// lane cannot silently abandon an outstanding read by staging over it. What IS discarded is
+  /// settled bookkeeping (the checkpoint phase, the awaiting-peer latch, the verdict maps), which
+  /// the install subsumes.
+  ///
+  /// The read phase settled its verdicts before either staging, but the `awaiting_peer_checkpoint`
+  /// gate in `recover_progress` sits BEFORE its faulty-head → `RecoveringHead` decision — so a
   /// permanently-faulty (occupied-but-unidentifiable) HEAD reaches staging still marked only in
   /// `rec.faulty`, which this teardown discards. Carrying the WHOLE set (`sync_carried_faulty`) lets
   /// the install completion route to `RecoveringHead` instead of `Normal` when the installed
@@ -2615,6 +2656,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `faulty`) and must not erase the original verdicts — nothing was re-read, so they stand until
   /// consumed by `complete_state_sync`.
   pub(super) fn retire_recover_for_staged_sync(&mut self) {
+    debug_assert!(
+      self
+        .recover
+        .as_ref()
+        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      "staging a sync install over an open read fence — the ingress guard must defer the reply"
+    );
     if let Some(rec) = self.recover.as_ref()
       && !rec.faulty.is_empty()
     {
@@ -2757,6 +2805,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     storage: &mut Storage<W, B, S>,
   ) {
+    // `RecoveringHead` is entered only through `recover_progress`, whose gate requires the read
+    // fence drained — so this escalation can never abandon an outstanding read or a staged fill:
+    // a recovering endpoint stages no append, and every obligation the reformation supersedes
+    // lives in the log/WAL (a `Repairing` hole, a durable header), which the reformed view
+    // re-derives. Asserted so a future entry path cannot silently reopen the window.
+    debug_assert!(
+      self
+        .recover
+        .as_ref()
+        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      "reformation escalating over an open read fence"
+    );
     self.recover = None;
     self.enter_view_change_from_recovery(now, storage, self.view.next());
   }
@@ -2806,6 +2866,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // once the root lands. (`pending_checkpoint` cannot be set on this path — it stages none until
     // `apply_sync` — but the guard is symmetric with the Normal ingress.)
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return;
+    }
+    // THE TAIL-READ FENCE: defer the reply while the local read phase is unsettled — a tail read
+    // still owed its completion, a failed op still owed its budgeted re-read (`rec.pending`), or an
+    // absent verdict not yet consumed by a settle. The WAL journal read runs to completion before
+    // any install consumes the recovery: each outstanding read is owed exactly one delivered
+    // verdict, so the fence always drains, and the solicit cadence re-fetches once it has — the
+    // reply this defers costs one round trip, never a wedge. Admitting it instead would stage an
+    // install whose retained held tail still carries unresolved Phase-1 placeholders (an empty body
+    // no trim or apply may ever see) and would put the recovery's terminal transition in a race
+    // with its own outstanding reads. The read-free escalation lanes (the cross-epoch fetch, the
+    // install-error re-pull, an orphan reconciliation past its read phase) hold an empty fence and
+    // pass untouched. The checkpoint phase needs no half here: escalation to the peer fetch already
+    // required its outstanding-completion fence empty, and `awaiting_peer_checkpoint` (this reply's
+    // ingress gate) keeps the phase closed.
+    if let Some(rec) = self.recover.as_ref()
+      && (!rec.pending.is_empty() || !rec.absent.is_empty())
+    {
       return;
     }
     if m.checkpoint_op().get() < self.checkpoint_op.get() {
@@ -2871,9 +2949,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// The recovery peer-fetch's POST-FETCH tail: both DAGs of the verified `SyncCheckpoint` `m` are now
-  /// present locally, so resolve the still-in-flight tail reads, settle the verified head, drop the
-  /// faulty committed-band placeholders, and STAGE the durable re-persist through the shared
-  /// state-sync core.
+  /// present locally, so drop the faulty committed-band placeholders and STAGE the durable
+  /// re-persist through the shared state-sync core.
   ///
   /// Reached from the frontier walk's completion (the drain), which is why it is separate from the
   /// verification head above: re-entering that head would re-walk an already-drained transfer forever.
@@ -2888,105 +2965,26 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     donor: Peer,
     m: crate::SyncCheckpoint,
   ) {
-    // Every still-IN-FLIGHT tail op that `apply_sync` would RETAIN above the synced checkpoint holds only
-    // a Phase-1 `Present(empty)` placeholder, and its WAL read completion is ignored once `recover` is
-    // cleared below — so it must NOT survive into Normal: `advance_commit` would apply a committed op with
-    // `&[]`, and a view change would advertise the empty-body header (an op above this replica's stale
-    // durable `commit_max` can still be committed later, or already be committed elsewhere). Resolve each
-    // from its durable header instead of WAITING for the read: this path ABANDONS local recovery
-    // (`recover = None` below) and flips to Normal, so a later read completion is ignored — there is no
-    // one left to drive `rec.pending` to empty. Apply the SAME verdict the storage-path exhaustion uses,
-    // via the shared `inflight_tail_repairing_identity`: KEEP it header-only as `Body::Repairing` only
-    // when Verified — a committed op that matches the canonical band, or an uncommitted op whose header
-    // is CURRENT-GENERATION (its `view` is not below the durable `log_view`, so it is not a superseded
-    // earlier-view proposal this replica has abandoned). Else DROP it to a peer-repaired hole (a committed
-    // StaleCommitted slot routes through `rec.faulty` so the `finalize_recovery` survival assert holds; an
-    // uncommitted hole is just removed, never advertised).
-    let durable_commit = self.commit_max.get();
-    let synced_checkpoint = m.checkpoint_op().get();
-    // Whether the local tail-read pass is UNSETTLED at this reply — reads still in flight (the head is the
-    // PROVISIONAL read-window top) or absent verdicts not yet consumed by a settle. Captured BEFORE the
-    // resolution loop below empties `pending`; gates the settle choke after it. The read-FREE lanes that
-    // also route through here (the cross-epoch crossing fetch and the install-error re-pull arm a fresh
-    // `RecoverState` with no reads) must NOT be settled against: there `self.op` is the node's LIVE head,
-    // whose committed on-demand repair holes legitimately have no `self.log` entry, so a settle would
-    // wrongly cap `op` below the applied frontier.
-    let tail_unsettled = self
-      .recover
-      .as_ref()
-      .is_some_and(|rec| !rec.pending.is_empty() || !rec.absent.is_empty());
-    let pending_tail: std::vec::Vec<u64> = self
-      .recover
-      .as_ref()
-      .map(|rec| {
-        rec
-          .pending
-          .keys()
-          .copied()
-          .filter(|&op| op > synced_checkpoint)
-          .collect()
-      })
-      .unwrap_or_default();
-    for op in pending_tail {
-      // The SAME placement + `classify_committed_slot` verdict the storage-path exhaustion uses
-      // (`resolve_exhausted_tail_read`), via the one shared source so the two paths cannot drift.
-      let keep = self.inflight_tail_repairing_identity(storage, op);
-      if let Some(rec) = self.recover.as_mut() {
-        rec.pending.remove(&op);
-        rec.reads.retain(|_, &mut o| o != op);
-      }
-      match keep {
-        Some((client, request, body_checksum)) => {
-          if let Some(rec) = self.recover.as_mut() {
-            rec.faulty.remove(&op);
-          }
-          self.log.insert(
-            op,
-            LogEntry {
-              client,
-              request,
-              body: Body::Repairing(body_checksum),
-            },
-          );
-        }
-        None if op <= durable_commit => {
-          if let Some(rec) = self.recover.as_mut() {
-            rec.faulty.insert(op);
-          }
-        }
-        None => {
-          self.log.remove(&op);
-        }
-      }
-    }
-    // Settle the VERIFIED head through the shared choke BEFORE abandoning local recovery, so this exit
-    // upholds the recovery exit invariant LOCALLY: no path leaves the read phase with `self.op` still the
-    // PROVISIONAL read-window top (which, under an over-counted / bit-rotted `op_head`, includes a phantom
-    // suffix this replica never wrote — an unheld head a later `Prepare` would blind-re-ack and a DVC
-    // would falsely advertise). On today's schedules this is a defensive no-op — every path that arms
-    // `awaiting_peer_checkpoint` (the ingress gate for this reply) is already settled-or-read-free: the
-    // own-checkpoint exhaustion shares its retry budget cadence with the tail reads, so `recover_timeouts`
-    // resolves the last pending op and runs `recover_progress`'s settle in the SAME call that escalates;
-    // the cross-epoch fetch and the install-error re-pull arm a fresh READ-FREE `RecoverState`. But that
-    // is a global argument spanning the budget cadence, `recover_timeouts`'s internal order, and the
-    // ingress gate — this call makes the invariant hold by construction instead, so a future escalation
-    // lane or budget change cannot silently reopen it. Gated on `tail_unsettled`: only a reply landing
-    // mid-read-pass needs settling (the just-resolved in-flight ops are then already in `self.log` as
-    // `Repairing` or in `rec.faulty`, so the settle sees the full written tail); the read-free lanes are
-    // excluded (see `tail_unsettled`). Unlike `recover_progress`, a `Repairing` real head is NOT
-    // re-classified here (no `RecoveringHead` on this path): the durable header is vouched header-only
-    // and the online repair/nack machinery resolves it.
-    if tail_unsettled {
-      self.settle_recover_verified_head();
-    }
+    // The tail-read fence drained BEFORE this reply was admitted (`on_recover_sync_checkpoint`
+    // defers every reply while a tail read is outstanding or a failed op still owes its budgeted
+    // re-read, and nothing re-opens the fence mid-recovery) — so the read phase is settled here:
+    // every retained held-tail entry is a faithfully-resolved slot (`Present(body)` or a
+    // `Repairing` hole), never an unresolved Phase-1 placeholder, `self.op` is the verified head,
+    // and abandoning the local recovery below discards no completion the medium still owes.
+    debug_assert!(
+      self
+        .recover
+        .as_ref()
+        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty() && rec.absent.is_empty()),
+      "peer-fetch completing over an unsettled tail-read pass — the ingress fence must defer"
+    );
     // CENTRALIZED committed-band drop via the `finalize_recovery` choke: before we abandon local recovery
     // (`recover = None` discards `rec.faulty`) and `apply_sync` (whose held-tail retain KEEPS `self.log`
     // entries above the synced checkpoint), drop every faulty committed-band slot's EMPTY placeholder
-    // (including the now-faulty in-flight reads routed above) so none survives as `Some({body: EMPTY})`
-    // for a later `advance_commit` to apply with `&[]`. The peer-checkpoint-fetch path completes HERE (not
-    // through `recover_progress`'s finalize tail), so it routes the drop through the SAME choke (which
-    // also debug-asserts no faulty slot survives). Each dropped slot is a genuine repair hole
-    // `advance_commit` peer-repairs on demand.
+    // so none survives as `Some({body: EMPTY})` for a later `advance_commit` to apply with `&[]`. The
+    // peer-checkpoint-fetch path completes HERE (not through `recover_progress`'s finalize tail), so it
+    // routes the drop through the SAME choke (which also debug-asserts no faulty slot survives). Each
+    // dropped slot is a genuine repair hole `advance_commit` peer-repairs on demand.
     self.finalize_recovery();
     // STAGE the durable re-persist via the shared state-sync core, but STAY Recovering: both the
     // destructive install (`install_sync`: restore the SM/sessions, advance `commit_min`/`commit_max`/`op`,
