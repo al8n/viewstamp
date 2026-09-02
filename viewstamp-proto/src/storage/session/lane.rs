@@ -6,7 +6,7 @@
 //! [`Storage`](super::Storage) session: an un-polled job and the slot it occupies are ONE object,
 //! so they cannot come apart across an endpoint rebuild — the successor polls what its predecessor
 //! queued and the (refused) completion releases the slot that admitted it. Keeping the queue on
-//! the endpoint while relaying the slot is what let a rebuild inherit a claim no lane could ever
+//! the endpoint while relaying the slot would let a rebuild inherit a claim no lane could ever
 //! release.
 //!
 //! # The depth bound is the slot table's cardinality

@@ -751,9 +751,9 @@ impl InMemoryWal {
   /// drawn due instant. The one delivery point every arm of `submit_read` returns through, so no
   /// verdict can bypass the latency model.
   ///
-  /// Off-axis this is exactly the inline `completions.push_back` the arms used to do, and it takes no
-  /// draw: the latency band is entered only when a plan exists, which is what keeps every existing
-  /// seed's schedule byte-identical.
+  /// Off-axis this is exactly the inline `completions.push_back` each arm would otherwise do, and
+  /// it takes no draw: the latency band is entered only when a plan exists, which is what keeps
+  /// every existing seed's schedule byte-identical.
   fn resolve_read(&mut self, op: u64, done: WalDone) {
     let Some(plan) = self.read_delay.as_mut() else {
       self.completions.push_back(done);

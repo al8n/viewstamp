@@ -377,9 +377,9 @@ fn vopr_sweep_no_violations() {
     // claim in prose: `force_checkpoint` and `flush_and_stage_install` each defer while the
     // envelope lane is occupied, and no other envelope can enter it between that gate and the
     // submission, so the session's fence is a structural backstop for a future caller rather than a
-    // live path. That claim had no witness. It has one now: if a new caller ever reaches the
-    // backstop, this fails with the seed instead of the refusal passing unnoticed. A failure here
-    // is a re-evaluation of the gates, never a reason to drop the assert.
+    // live path. This is that claim's witness: if a new caller ever reaches the backstop, this
+    // fails with the seed instead of the refusal passing unnoticed. A failure here is a
+    // re-evaluation of the gates, never a reason to drop the assert.
     assert_eq!(
       r.envelopes_fenced(),
       0,
@@ -557,9 +557,9 @@ fn vopr_sweep_no_violations() {
     // The session's SLOT-QUIESCENCE fence must genuinely REFUSE somewhere. It is the fence the whole
     // storage session exists around — no new append may take a ring slot an older physical write has
     // not quiesced, or completion reordering could land the abandoned old bytes over a value this
-    // replica's ack already named — and until now nothing said it ever fires. A depth oracle cannot:
-    // a fence deleted from the admission path refuses nothing, so the ledger never grows and every
-    // bound stays green.
+    // replica's ack already named — and nothing but this sum says it ever fires. A depth oracle
+    // cannot: a fence deleted from the admission path refuses nothing, so the ledger never grows
+    // and every bound stays green.
     //
     // The count is SMALL by construction, and that is worth stating rather than tuning away. The
     // endpoint's own `appending` set already refuses a duplicate append for an op it has one in

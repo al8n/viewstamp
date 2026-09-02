@@ -389,9 +389,9 @@ pub struct Storage<W, B, S: StateMachine> {
   /// [`Self::release_next_root`] promotes it and it lands — safe either way, because the entry
   /// passed the no-rewind asserts at its submission and everything submitted after it was
   /// asserted against it (a wasted write, still monotone). That is the failure mode the cells
-  /// buy: the depth growth a leaked correlation once fed — and the every-profile fail-stop that
-  /// refused it on an otherwise healthy replica — are both unrepresentable, because there is no
-  /// fourth cell to grow into.
+  /// buy: the depth growth a leaked correlation would feed — and the every-profile fail-stop that
+  /// would refuse it on an otherwise healthy replica — are both unrepresentable, because there is
+  /// no fourth cell to grow into.
   parked_roots: [Option<RootEntry>; PARKED_ROOT_ROLES],
   /// The submission-stamp mint for [`RootEntry::stamp`]: the next stamp to hand out, advanced at
   /// every root submission. Session-owned so the order it defines spans endpoint rebuilds. A
@@ -438,8 +438,8 @@ pub struct Storage<W, B, S: StateMachine> {
   /// [`Self::envelopes_fenced`].
   envelopes_fenced: u64,
   /// Observability counter: how many parked roots a same-role resubmission OVERWROTE — the
-  /// supersessions the cells perform structurally, where a removal call once had to be paired
-  /// with the replacing submission. A growing count is healthy view-change churn outrunning a
+  /// supersessions the cells perform structurally, with no removal call for the replacing
+  /// submission to be paired with. A growing count is healthy view-change churn outrunning a
   /// slow backend (each overwrite is one root write the medium never had to take); the counter
   /// exists so that traffic is observable at all, because no depth arm can see an overwrite — it
   /// leaves the timeline exactly as deep as it found it. Session-lifetime, like every count
