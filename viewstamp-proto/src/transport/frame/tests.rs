@@ -370,3 +370,39 @@ fn small_frames_reuse_the_retained_partial_buffer() {
     );
   }
 }
+
+/// A budget's worth of minimal frames does not leave its queue slots retained.
+///
+/// One read pass can complete `STAGE_CHUNK / LEN_PREFIX` zero-body frames, and a `VecDeque` keeps
+/// whatever capacity that burst grew it to. Retaining it would pin hundreds of kilobytes of slot
+/// headers per receive class for the connection's life, on top of any payload — memory the stated
+/// bound would have to carry forever rather than for one pass.
+#[test]
+fn a_burst_of_frames_releases_its_queue_slots_once_drained() {
+  let mut dec = FrameDecoder::new(MAX_FRAME_LEN);
+  let burst = STAGE_CHUNK / LEN_PREFIX;
+  let mut wire = Vec::new();
+  for _ in 0..burst {
+    encode_frame(&[], &mut wire);
+  }
+  dec.extend(&wire).unwrap();
+  assert_eq!(
+    dec.ready_len(),
+    burst,
+    "the whole budget's frames are queued"
+  );
+  assert!(
+    dec.ready.capacity() >= burst,
+    "the queue really did grow to hold them"
+  );
+  let mut drained = 0usize;
+  while dec.next_frame().is_some() {
+    drained += 1;
+  }
+  assert_eq!(drained, burst, "every frame is delivered");
+  assert!(
+    dec.ready.capacity() <= RETAINED_READY_CAP,
+    "and the slots are released once the queue empties, not carried forward: {} slots",
+    dec.ready.capacity()
+  );
+}

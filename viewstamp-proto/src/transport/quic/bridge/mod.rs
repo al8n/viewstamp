@@ -43,28 +43,38 @@
 //! no post-free replay). Dropping `Drained` entirely (the original behaviour) leaked
 //! that endpoint-owned state under reconnect / failed-handshake churn.
 //!
-//! **Inbound memory, per recv stream.** Received bytes are live in three places on the way to a
-//! delivered frame:
+//! **Inbound memory, per recv stream.** INBOUND ONLY — the send side is separate, below. Two
+//! numbers matter: the PEAK a peer can drive it to, and what stays RETAINED once the traffic passes.
 //!
-//! - quinn's reassembler holds what has ARRIVED but not yet been read. Stream flow control caps the
-//!   PAYLOAD at `stream_receive_window` (1 MiB). Its allocation runs ahead of that payload — spans
-//!   reference the packet buffers they arrived in, and quinn compacts only once over-allocation
-//!   passes `1.5x` the buffered bytes — so allow ~2.5 MiB of allocation, plus ~48 bytes of
-//!   bookkeeping per span (bounded by
-//!   [`QUINN_REASSEMBLY_MAX_SPANS`](super::crypto::QUINN_REASSEMBLY_MAX_SPANS), so under 100 KiB).
-//! - the read scratch a single pass moves between the two: [`STAGE_CHUNK`], 64 KiB.
-//! - the class [`FrameDecoder`]: the frame being assembled, capped at [`MAX_FRAME_LEN`] (16 MiB) and
-//!   reserved to exactly that rather than doubling past it, plus the frames a pass completed.
+//! Peak, with the arithmetic:
 //!
-//! The decoder holds ONE frame-sized buffer, not two: a completed frame IS the buffer that assembled
-//! it, handed over rather than copied out of a retained one, and what stays behind is bounded working
-//! capacity. Across a pass the ready queue takes at most the one frame the pass completed plus a
-//! budget's worth of smaller ones, and `drain_bridge` pops the queue after every `ingest_recv`, so a
-//! second frame-sized buffer never accumulates behind the first.
+//! | | |
+//! |---|---|
+//! | quinn reassembler, payload | `stream_receive_window` = 1 MiB |
+//! | quinn reassembler, allocation ahead of payload — it compacts only once over-allocation passes `max(32 KiB, 1.5 x buffered)` | `1 MiB + max(32 KiB, 1.5 MiB)` = 2.5 MiB |
+//! | quinn span bookkeeping — it holds up to `2 x MAX_CHUNKS` = 2048 spans before compacting, and its heap capacity rounds up | ~4096 x ~48 B = 192 KiB |
+//! | read scratch, one pass | [`STAGE_CHUNK`] = 64 KiB |
+//! | decoder, frame being assembled — reserved to its own size, not doubled past it | `LEN_PREFIX + MAX_FRAME_LEN` = 16 MiB |
+//! | decoder, frames one pass completed — the one that was already assembling, plus what a budget can complete | 16 MiB + 64 KiB |
+//! | decoder, ready-queue slots — one budget of minimal frames is `STAGE_CHUNK / LEN_PREFIX` = 16384 of them | 16384 x 24 B = 384 KiB |
 //!
-//! Per recv stream that totals roughly `2.5 MiB + 64 KiB + 16 MiB`, and a connection carries at most
-//! two such streams (Control + Bulk). Reaching it requires a peer actually sending a maximum-sized
-//! frame; [`decoder_max`] holds the frame cap down to the hello size until the connection validates.
+//! That totals under 36 MiB per recv stream, and a connection carries at most two (Control + Bulk).
+//! The last two rows are what one pass can leave queued: `drain_bridge` pops the queue after every
+//! `ingest_recv`, so a second frame-sized buffer does not accumulate behind the first, and the
+//! decoder itself never holds two — a completed frame IS the buffer that assembled it, handed over
+//! rather than copied out of a retained one. Reaching any of this needs a peer actually sending a
+//! maximum-sized frame; [`decoder_max`] holds the frame cap down to the hello size until the
+//! connection validates.
+//!
+//! Retained between frames, which is what a long-lived idle connection costs: the decoder carries
+//! bounded working capacity and nothing frame-sized — the partial buffer is released above the
+//! retained bound as each frame completes, and the ready queue releases its slots as it empties —
+//! while quinn's reassembler keeps its heap allocation for the stream's life.
+//!
+//! **Outbound memory is separate** and separately capped: per class, the staged `outbound` buffer up
+//! to `PER_CLASS_OUTBOUND_CAP` (64 MiB, past which the class resets or the connection is reaped),
+//! one framed message as the encode temporary (at most `MAX_FRAME_LEN`), and quinn's own send buffer
+//! for the connection, bounded by its `send_window`.
 //!
 //! Reading a budget is also what frees flow-control credit, so the peer's next window opens as the
 //! decoder fills: a frame LARGER than the window still arrives, across as many window grants as it

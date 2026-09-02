@@ -62,6 +62,15 @@ pub const LEN_PREFIX: usize = 4;
 /// ([`STAGE_CHUNK`]), which is already what one read may hand the decoder at a time.
 const RETAINED_PARTIAL_CAP: usize = STAGE_CHUNK;
 
+/// Ready-queue slots [`FrameDecoder`] carries forward once the queue drains.
+///
+/// One read pass can complete a whole budget's worth of minimal frames — `STAGE_CHUNK / LEN_PREFIX`
+/// = 16384 of them — and a `VecDeque` keeps the capacity that burst grew, so without this the queue's
+/// backing would stay at 16384 slots (about 384 KiB of `Vec` headers on a 64-bit target) for the
+/// connection's life after one burst. Draining back to empty releases everything above this, which
+/// comfortably holds the handful of frames a steady pass delivers.
+const RETAINED_READY_CAP: usize = 64;
+
 /// Appends `[u32 len][payload]` to `out`.
 #[cfg_attr(not(tarpaulin), inline)]
 pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
@@ -328,7 +337,14 @@ impl FrameDecoder {
   /// Pops the next complete frame, if any.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn next_frame(&mut self) -> Option<Vec<u8>> {
-    self.ready.pop_front()
+    let frame = self.ready.pop_front();
+    // Emptying the queue releases the slots a burst grew it to: the capacity is what would otherwise
+    // be retained for the connection's life (see `RETAINED_READY_CAP`). Only on the empty transition,
+    // so draining a burst frame-by-frame does not reallocate per pop.
+    if self.ready.is_empty() && self.ready.capacity() > RETAINED_READY_CAP {
+      self.ready.shrink_to(RETAINED_READY_CAP);
+    }
+    frame
   }
 
   /// Adjusts the per-frame length cap in place, leaving any buffered partial frame and the ready queue
