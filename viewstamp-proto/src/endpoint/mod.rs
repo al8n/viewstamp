@@ -958,14 +958,30 @@ struct RecoverState {
   /// head); an absent BELOW the real head is a genuine interior hole and is reclassified faulty (repaired
   /// on demand). Kept separate from `faulty` so a phantom tail never drives the head-fault decision.
   absent: std::collections::BTreeSet<u64>,
-  /// The in-flight checkpoint-read `OpId` (`Some` until the snapshot is restored), or `None` if no
-  /// checkpoint exists / it is already restored.
+  /// The open checkpoint phase's latest read id (`Some` until the snapshot is restored or the
+  /// phase escalates to a peer fetch), or `None` if no checkpoint exists / it is already restored.
+  /// The phase marker only — acceptance and the escalation fence are keyed to `checkpoint_reads`.
   checkpoint: Option<u64>,
+  /// Every checkpoint-read id submitted by THIS recovery whose completion has not yet arrived. The
+  /// superblock owes each submitted read EXACTLY ONE completion (`CheckpointRead` or `Fault`) but
+  /// no latency ceiling, so this set is the fence between a SLOW read and a FAILED one:
+  /// `recover_timeouts` neither re-submits, nor spends the retry budget, nor escalates to the peer
+  /// fetch while any entry remains — the budget pays for completed-and-failed attempts only, and a
+  /// merely-slow read on a deployment with no eligible donor (solo, partitioned, every peer itself
+  /// a debtor) must never be traded for an unbounded peer-fetch wait. Because escalation requires
+  /// this set empty, a local read and an armed peer fetch never coexist — a late valid completion
+  /// has nothing to race. Entries are removed unconditionally at completion arrival
+  /// (`on_recover_sb_done`), whatever becomes of the bytes; a completion under an id NOT in this
+  /// set (a dead phase's read, a donor serve-read) is refused before verification, so it can
+  /// neither restore nor count as this phase's attempt. Every submission routes through the one
+  /// choke that inserts here (`submit_tracked_checkpoint_read`), so no read can exist that the
+  /// fence does not track. Non-empty ⇒ `checkpoint` is `Some`.
+  checkpoint_reads: std::collections::BTreeSet<u64>,
   /// The in-flight block job of the two-step cold-start reconstruct — first the LOCAL presence probe
   /// over the checkpoint read back above, then the reconstruct itself — or `None` when neither is
-  /// executing. While `Some`, a further (additively re-submitted) checkpoint read is ignored rather
-  /// than starting a second reconstruct, and each completion is applied only when its id matches — so
-  /// a superseded step can never install content.
+  /// executing. While `Some`, a duplicate tracked checkpoint read completing mid-job is dropped
+  /// rather than starting a second reconstruct, and each completion is applied only when its id
+  /// matches — so a superseded step can never install content.
   reconstruct: Option<crate::JobId>,
   /// A VALID checkpoint read whose local presence probe was DEFERRED because the block lane still
   /// owed an inherited walk (a dead incarnation's, queued-or-executing) at completion time: the
@@ -988,12 +1004,15 @@ struct RecoverState {
   /// view 0 as its primary; an unformatted store (fresh/wiped/legacy) abdicates instead, so the view
   /// change recovers any committed op a wiped member forgot from a surviving peer.
   formatted: bool,
-  /// Remaining retry budget for the checkpoint read (the per-op `pending` analog). A transient
-  /// checkpoint-read `Fault` is re-submitted within this budget; once exhausted — the durable root
-  /// names a snapshot that is PERMANENTLY unreadable or permanently inconsistent with the root (wrong
-  /// op/hash/unparsable on EVERY read) — the replica cannot restore its SM from its OWN disk and
-  /// escalates to a peer fetch (see `awaiting_peer_checkpoint`), never panics on storage-controlled
-  /// bytes.
+  /// Remaining retry budget for the checkpoint read (the per-op `pending` analog), spent ONLY on
+  /// completed-and-FAILED attempts: `recover_timeouts` decrements it exactly when it re-submits
+  /// after the prior attempt's failure verdict (a read `Fault`, a verify-mismatch, a probe or
+  /// reconstruct abort) — never while a submitted read's completion is still owed
+  /// (`checkpoint_reads`), so a slow-but-conforming medium spends nothing. Once exhausted — every
+  /// attempt completed and FAILED, so the durable root names a snapshot that is PERMANENTLY
+  /// unreadable or permanently inconsistent with the root (wrong op/hash/unparsable on every
+  /// read) — the replica cannot restore its SM from its OWN disk and escalates to a peer fetch
+  /// (see `awaiting_peer_checkpoint`), never panics on storage-controlled bytes.
   checkpoint_retries: u8,
   /// `true` once the local checkpoint read EXHAUSTED its budget: the replica's own durable
   /// checkpoint snapshot is permanently unreadable/inconsistent, so it has escalated to FETCHING the
@@ -1001,7 +1020,10 @@ struct RecoverState {
   /// While set, `recover_progress` will NOT complete recovery (the SM is not yet restored), and
   /// `handle_message` accepts a `SyncCheckpoint` (mirroring how `RecoveringHead` accepts `StartView`);
   /// a verified one restores the SM via `apply_sync` and completes recovery to `Normal`. Cleared on
-  /// that success (alongside `recover = None`).
+  /// that success (alongside `recover = None`) — and by a verified LOCAL restore that lands while a
+  /// same-epoch fetch is armed (`on_recovered_checkpoint_restored` cancels the fetch the restored
+  /// checkpoint subsumes: a reconstruct job outliving the read retries must not leave the escalation
+  /// latched over a restored SM, or completion waits forever on a donor that need not exist).
   awaiting_peer_checkpoint: bool,
   /// The CANONICAL operation identity of the persisted committed band `(checkpoint_op ..
   /// persisted_commit]` (op → `(client, request, body_checksum)`), seeded in `recover` from the durable

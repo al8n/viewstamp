@@ -4489,13 +4489,15 @@ fn recover_restores_a_nonzero_durable_view() {
 
 #[test]
 fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
-  // The recover-retry timer re-submits the checkpoint read ADDITIVELY (a fresh id without retiring the
-  // prior). On a real async superblock a slow read completes AFTER a retransmit minted a newer id, so its
-  // `CheckpointRead` arrives under a SUPERSEDED id. `on_recover_sb_done` must accept ANY read while one is
-  // outstanding (the bytes are checksum-verified regardless) — matching only the latest id would drop the
-  // late completion and, with the budget no longer reset on the timer, wedge recovery in `Recovering`.
-  // (The deterministic `TestSb` completes the checkpoint read on submit, so reproduce the superseded id
-  // directly: re-mark `rec.checkpoint` to a fresh id before draining the original read's completion.)
+  // Acceptance of a checkpoint read is keyed to the outstanding-completion fence
+  // (`rec.checkpoint_reads` — every id this recovery submitted and still awaits), NOT to the latest
+  // phase marker (`rec.checkpoint`): a slow read completing after the marker moved to a newer id
+  // must still be accepted (the bytes are checksum-verified regardless of which submission
+  // delivered them) — matching only the marker would drop the late completion and wedge recovery
+  // in `Recovering`. (The deterministic `TestSb` completes the checkpoint read on submit, so
+  // reproduce the moved marker directly: re-mark `rec.checkpoint` to a fresh id before draining
+  // the original read's completion; the original id stays tracked in the fence, so its completion
+  // is still awaited.)
   let cfg = || Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
@@ -4542,9 +4544,10 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
     .checkpoint
     .expect("a checkpoint read is outstanding after recover()");
   r.recover.as_mut().unwrap().checkpoint = Some(original.wrapping_add(1000));
-  // Drain: the original checkpoint read completes under `original` (now superseded). It MUST be accepted,
-  // restoring the SM and completing recovery. (FAIL-BEFORE the additive accept: the superseded id is
-  // ignored, the SM is never restored, and recovery stays `Recovering`.)
+  // Drain: the original checkpoint read completes under `original` (an id the phase marker has
+  // moved past, but still tracked in the fence). It MUST be accepted, restoring the SM and
+  // completing recovery. (FAIL-BEFORE fence-membership acceptance: a marker-only match ignores
+  // the id, the SM is never restored, and recovery stays `Recovering`.)
   for _ in 0..4 {
     r.storage_step(now, &mut storage, &mut blocks);
     if r.status() != Status::Recovering {
@@ -4565,17 +4568,19 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
 
 #[test]
 fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_read_restores() {
-  // TIMER-OWNERSHIP REGRESSION: the recover-retry TIMER (`recover_timeouts`) is the SOLE owner of the
-  // checkpoint-read retry budget; it re-submits ADDITIVELY, so a real async superblock can have several
-  // checkpoint reads in flight at once and older ones may FAULT out of order while a later one still
-  // carries the valid snapshot. A `Fault` (or verify-mismatch) delivered through `on_recover_sb_done` is
-  // therefore a NO-OP — it must NOT decrement the budget or escalate. Otherwise a STORM of such faults
-  // would exhaust the budget and escalate to a peer fetch BEFORE the in-flight valid read lands (and the
-  // valid read would then be treated as foreign and dropped — a solo/partitioned wedge). Here a storm of
-  // in-band faults (far exceeding the budget) arrives WITHOUT firing the timer; recovery stays Recovering
-  // with the checkpoint outstanding (NOT escalated), and the still-in-flight valid read then restores the
-  // SM LOCALLY — no peer. (FAIL-BEFORE, were a fault to escalate in-band: the storm sets
-  // `awaiting_peer_checkpoint`, failing the asserts below.)
+  // BUDGET-OWNERSHIP REGRESSION: the checkpoint retry budget belongs to THIS recovery's own
+  // attempts — a `Fault` (or verify-mismatch) under an id the recovery never submitted (a dead
+  // phase's read, a donor serve-read) must neither spend it nor escalate. Otherwise a STORM of
+  // such foreign faults would exhaust the budget and escalate to a peer fetch while the genuine
+  // read is still in flight (and its valid completion would then be refused — a solo/partitioned
+  // wedge). The decrement itself lives on the recover-retry TIMER (`recover_timeouts` re-submits
+  // only after one of this recovery's attempts completed and failed), so an in-band fault's whole
+  // effect is retiring ITS OWN outstanding entry — a foreign fault retires nothing. Here a storm
+  // of in-band faults under foreign ids (far exceeding the budget) arrives WITHOUT firing the
+  // timer; recovery stays Recovering with the genuine read still owed (NOT escalated), and that
+  // read's valid completion then restores the SM LOCALLY — no peer. (FAIL-BEFORE, were a foreign
+  // fault to spend/escalate in-band: the storm sets `awaiting_peer_checkpoint`, failing the
+  // asserts below.)
   let good_snap = CountSm::default().snapshot();
   let good_env = Endpoint::<CountSm>::encode_checkpoint(
     OpNumber::with(2),
@@ -4656,6 +4661,102 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   assert!(
     !e.awaiting_peer_checkpoint_for_test(),
     "restored from the local read — never fell back to a peer"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "checkpoint_op restored from the durable root"
+  );
+}
+
+#[test]
+fn recover_checkpoint_read_withheld_past_the_retry_cadence_restores_locally_when_released() {
+  // A conforming superblock owes every submitted checkpoint read EXACTLY ONE completion, but no
+  // latency ceiling: a fault-free read may complete only after many recover-retry ticks. The retry
+  // budget pays for completed-and-FAILED attempts, never for that latency — a tick that fires while
+  // the read's completion is still owed must neither spend the budget nor escalate to a peer fetch.
+  // Escalating instead converts a merely-slow local medium into a peer-fetch dependency, and on a
+  // deployment with no eligible donor (solo, partitioned, every peer itself a debtor) that is a
+  // permanent Recovering wedge: the escalation clears the local phase, so the read's late VALID
+  // completion is discarded as foreign. Withhold the Phase-1 read's completion across the whole
+  // cadence (well past the budget), with NO donor, then release it: recovery must wait it out and
+  // still complete LOCALLY.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::InMemoryBlockStore::new(),
+    ),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    good_id,
+    std::vec::Vec::new(),
+  )
+  .unwrap()
+  // Geometry-recorded solo store (checkpoint_ops 2, ring-less capacity), so recovery accepts it
+  // rather than fail-stopping on the geometry fence.
+  .with_wal_geometry(2, u64::MAX);
+  // The scripted superblock queues the Phase-1 read's completion as INFLIGHT: submitted at
+  // recover(), it surfaces only at the explicit `flush` below — the withheld window.
+  let sb = ScriptedCheckpointSb::new(
+    state,
+    VecDeque::from(std::vec![(OpNumber::with(2), good_env.clone())]),
+  );
+  let wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  // The envelope names the SM + session roots by content address; both live locally, so a local
+  // restore is genuinely possible once the read is released.
+  blocks.put(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  let mut e = Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut storage)
+    .expect("recover accepts this store")
+    .expect_active();
+  assert_eq!(e.status(), Status::Recovering);
+
+  // Fire the recover-retry cadence well past the whole budget while the read's completion is
+  // withheld — the production timer path, with nothing to drain (no completion has surfaced).
+  let mut t = Instant::ZERO;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 2) {
+    t = t + RECOVER_READ_RETRANSMIT;
+    e.handle_timeout(t, &mut storage);
+    e.storage_step(t, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the withheld read's completion is still owed — recovery keeps waiting on it"
+  );
+  assert!(
+    !e.awaiting_peer_checkpoint_for_test(),
+    "a read whose completion is still owed must not escalate to a peer fetch: the budget pays \
+     for failed attempts, not for elapsed time"
+  );
+
+  // Release the withheld completion: the valid read surfaces and must restore LOCALLY — no donor
+  // exists in this solo cluster to answer a peer fetch.
+  storage.sb_mut().flush();
+  e.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the released valid read restores the SM locally and completes recovery"
+  );
+  assert!(
+    !e.awaiting_peer_checkpoint_for_test(),
+    "recovery completed off the local medium — no peer fetch was ever armed"
   );
   assert_eq!(
     e.checkpoint_op(),
