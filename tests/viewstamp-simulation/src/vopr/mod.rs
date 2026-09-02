@@ -400,6 +400,15 @@ pub struct VoprReport {
   /// quiescence re-drives them — so this witnesses the fence ENGAGING, not a fault; its job is to keep
   /// the fence from decaying into dead code that every depth oracle would still pass.
   appends_slot_fenced: u64,
+  /// Cumulative staged state-sync re-persist ROOTS a view-transition reset DISOWNED (the backstop
+  /// arm of the proto's `reset_for_view_transition`), accumulated reset-robustly like
+  /// [`Self::walk_pins_refused`] (the counter lives on the endpoint and zeroes on `recover`).
+  /// Expected `0` on every lane: each view-change trigger defers while such a root is staged and
+  /// every other teardown path carries its own stronger guard — claims that live at the reset's
+  /// CALLERS, which is exactly why the arm itself fires silently without this fold. A non-zero
+  /// value is a schedule that reached the backstop: the landing is still absorbed and reconciled,
+  /// so it is information about the guard chain, surfaced with its seed.
+  repersist_roots_disowned: u64,
   /// Cumulative append submissions the session's APPEND QUOTA refused, accumulated exactly like
   /// [`Self::appends_slot_fenced`] but read the opposite way. The quota ceiling sits above every
   /// legitimate in-flight window (twice the implied ring, so one full sync handover fits under it),
@@ -838,6 +847,13 @@ impl VoprReport {
     self.appends_slot_fenced
   }
 
+  /// The run-cumulative count of staged re-persist roots a view-transition reset disowned.
+  /// Expected `0`: the reset's backstop arm is unreachable while every caller's deferral guard
+  /// holds, and the sweeps assert that rather than assuming it.
+  pub const fn repersist_roots_disowned(&self) -> u64 {
+    self.repersist_roots_disowned
+  }
+
   /// The run-cumulative count of append submissions the session's append quota refused. Expected
   /// `0` on an ordinary schedule — the ceiling sits above every legitimate in-flight window — so a
   /// non-zero value means the quota started stalling appends the medium could have taken.
@@ -1246,6 +1262,9 @@ struct Vopr {
   /// Per-replica last-observed `walk_pins_refused`, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (the `Endpoint` counter zeroes on `recover`).
   walk_pins_refused_seen: Vec<u64>,
+  /// Per-replica last-observed `repersist_roots_disowned`, accumulated reset-robustly like
+  /// [`Self::walk_pins_refused_seen`] (the `Endpoint` counter zeroes on `recover`).
+  repersist_roots_disowned_seen: Vec<u64>,
   /// Per-replica last-observed session refusal counts — `(slot fence, append quota, envelope
   /// fence)` — accumulated reset-robustly for the same reason as [`Self::walk_pins_refused_seen`],
   /// one level down: these live on the SESSION, which an in-place endpoint rebuild inherits but a
@@ -2090,6 +2109,7 @@ impl Vopr {
       block_fault_axis: env_flag("VOPR_BLOCK_FAULT"),
       block_outstanding_committed: None,
       walk_pins_refused_seen: vec![0; node_count],
+      repersist_roots_disowned_seen: vec![0; node_count],
       session_refusals_seen: vec![(0, 0, 0); node_count],
       sweeps_absorbed_seen: vec![(0, 0); node_count],
       checkpoint_roots_seen: vec![None; node_count],
@@ -4056,6 +4076,14 @@ impl Vopr {
         self.report.walk_pins_refused += refused - self.walk_pins_refused_seen[i];
       }
       self.walk_pins_refused_seen[i] = refused;
+      // Staged re-persist roots a view-transition reset disowned — the backstop arm made
+      // observable. Same reset-robust positive-delta accumulation (the counter zeroes on
+      // `recover`); the sweeps assert the fold stays 0.
+      let disowned = c.replica_repersist_roots_disowned(i);
+      if disowned > self.repersist_roots_disowned_seen[i] {
+        self.report.repersist_roots_disowned += disowned - self.repersist_roots_disowned_seen[i];
+      }
+      self.repersist_roots_disowned_seen[i] = disowned;
       // The SESSION's three admission chokes — the slot fence, the append quota, the envelope
       // fence. Same reset-robust positive-delta accumulation, one layer down: these counters ride
       // the session, so an in-place endpoint rebuild inherits them and only a crash restart (which

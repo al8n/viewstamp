@@ -2903,6 +2903,16 @@ impl Cluster {
     self.replicas[i].walk_pins_refused()
   }
 
+  /// Test-only: how many staged state-sync re-persist ROOTS replica `i`'s view-transition reset
+  /// DISOWNED (the backstop arm of `reset_for_view_transition`). Expected `0`: every production
+  /// teardown into the reset is guarded one call layer above, so the arm firing at all is the
+  /// signal the sweeps exist to surface. Folded reset-robustly (the counter zeroes on `recover`).
+  /// Mirrors the proto's `Endpoint::repersist_roots_disowned`.
+  #[doc(hidden)]
+  pub fn replica_repersist_roots_disowned(&self, i: usize) -> u64 {
+    self.replicas[i].repersist_roots_disowned()
+  }
+
   /// Mis-store ONE locally-present block in replica `i`'s block store: overwrite the bytes at a
   /// non-root address reachable from its current durable checkpoint root with bytes that hash
   /// ELSEWHERE, so `block_address(bytes) != addr` (the content-address violation a disk fault — bit-rot

@@ -950,6 +950,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       below_ring_window_syncs: 0,
       dag_walks_capped: 0,
       walk_pins_refused: 0,
+      repersist_roots_disowned: 0,
       unions_floored: 0,
       repair_batches_served: 0,
       prepare_batches_sent: 0,

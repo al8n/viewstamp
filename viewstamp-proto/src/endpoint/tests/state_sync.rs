@@ -1739,7 +1739,18 @@ fn an_orphaned_sync_repersist_root_enters_the_recovery_fetch_at_its_landing() {
   // The teardown that orphans it: the shared reset drops the SyncRepersist correlation at every
   // step, abandoning a root the medium still owes (the abandon inside the backstop arm no-ops on
   // the submitted front) and clearing the staged install and the sync handshake with it.
+  assert_eq!(
+    e.repersist_roots_disowned(),
+    0,
+    "no disown before the teardown"
+  );
   e.reset_for_view_transition(now, &mut storage);
+  assert_eq!(
+    e.repersist_roots_disowned(),
+    1,
+    "the backstop arm counted the disown — the one site that drops a Checkpoint-role root's \
+     correlation is detectable, not silent"
+  );
   assert!(e.pending_checkpoint.is_none(), "the correlation is gone");
   assert!(
     e.sync_target_for_test().is_none() && e.pending_install.is_none(),
@@ -1842,7 +1853,22 @@ fn store_with_orphan_root_in_flight() -> (
   u128,
   Config,
 ) {
-  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  store_with_orphan_root_in_flight_at(1_000)
+}
+
+/// [`store_with_orphan_root_in_flight`] with an explicit checkpoint interval, for a successor that
+/// must reach an ORDINARY checkpoint of its own while the predecessor's M root is still in flight
+/// (the predecessor never commits ops, so its build is interval-independent).
+fn store_with_orphan_root_in_flight_at(
+  checkpoint_ops: u64,
+) -> (
+  Storage<TestWal, KindSb, CountSm>,
+  InMemoryBlockStore,
+  Bytes,
+  u128,
+  Config,
+) {
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), checkpoint_ops).unwrap();
   let wal = TestWal::default();
   let mut sb0 = TestSb::default();
   crate::format(&cfg, &genesis(3), &wal, &mut sb0).expect("format the genesis store");
@@ -2458,6 +2484,393 @@ fn an_owed_debt_withholds_the_canonical_head_handouts() {
     saw_sv && saw_rr,
     "both handouts resume once the debt is retired"
   );
+}
+
+#[test]
+fn a_new_primary_withholds_start_view_while_the_debt_defers_to_an_owed_reconstruct() {
+  // THE EMISSION-LAYER WITHHOLD, the SM-reconstruct deferral arm. `maybe_enter_orphan_repersist_fetch`
+  // returns `Continue` from four paths, and only one of them means "no debt owed" — the deferral
+  // arms return it with the debt STILL LATCHED. The StartView emission must therefore gate on the
+  // debt itself, not on the flow value: a checkpoint-role root landing in the StartViewAsPrimary
+  // flight window — AFTER formation re-established `commit_max = commit*` — absorbs a commit
+  // frontier above the canonical head, so an emission that proceeds would advertise `commit > op`
+  // and fail-stop every honest backup at `adopt_canonical_head`'s release assert. Withheld, the
+  // primary stays Normal with its timers armed; the deferred-to arc completes, the next heartbeat
+  // re-drive enters the reconciling fetch, and participation resumes through recovery.
+  //
+  // The orphaned root is produced by the direct teardown (the shape
+  // `an_orphaned_sync_repersist_root_enters_the_recovery_fetch_at_its_landing` pins): the landing
+  // absorb classifies by CORRELATION, so this stands in for the production-reachable
+  // foreign-incarnation landing without a second storage generation — the envelope-overtake
+  // regression below drives that two-generation variant end to end.
+  let (d4, d4s) = donor_primary_at_checkpoint(4);
+  let (env4, id4) = donor_envelope(&d4s);
+  let (_d8, d8s) = donor_primary_at_checkpoint(8);
+  let (env8, id8) = donor_envelope(&d8s);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let wal = TestWal::default();
+  let sb = StepSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+
+  // Sync #1 installs M=4, but its post-root SM restore FAULTS: poison the donor's SM leaf so the
+  // verify-on-read walk sees it absent. The obligation latches (`sm_reconstruct_owed`), the durable
+  // pointer already names 4, and the kept sync's ARQ owns the retry.
+  seed_donor_blocks(&mut blocks, 4);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id4,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env4.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  let sm4_leaf = d4.state_machine_ref().snapshot();
+  let sm4_addr = crate::block_address(&sm4_leaf);
+  blocks.insert_raw(sm4_addr, Bytes::from_static(b"rotted"));
+  e.storage_step(now, &mut storage, &mut blocks); // root lands → install@4 → Restore issued
+  e.block_step(now, &mut storage, &mut blocks); // Restore reads the poisoned leaf → faults
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.block_step(now, &mut storage, &mut blocks); // the re-armed walk settles (front absent → ARQ)
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the faulted restore left the SM-reconstruct obligation owed at M=4"
+  );
+  assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+  while e.poll_message().is_some() {}
+
+  // Sync #2 stages the re-persist to 8 over the kept handshake (the obligation deliberately
+  // survives the staging), up to `AwaitRoot` — the root write stays with the backend.
+  seed_donor_blocks(&mut blocks, 8);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env8,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sync_repersist_root_staged() && e.sm_reconstruct_owed(),
+    "the newer staging coexists with the kept older obligation"
+  );
+  // The teardown that orphans the staged root (the submitted write is owed to the medium).
+  e.reset_for_view_transition(now, &mut storage);
+  assert!(e.pending_checkpoint.is_none() && e.sm_reconstruct_owed());
+  while e.poll_message().is_some() {}
+
+  // The view change, through the production entries: an SVC quorum flips to ViewChange (the
+  // DVC-root write queues BEHIND the orphaned 8-root), and the peer DVC forms the quorum while
+  // that write is still in flight — formation runs, re-establishes `commit_max = commit* = 4`,
+  // and submits the StartViewAsPrimary root.
+  for peer in [0u16, 2] {
+    e.handle_message(
+      now,
+      &mut storage,
+      Peer::Replica(ReplicaId::new(peer)),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(1),
+        ReplicaId::new(peer),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(e.status(), Status::ViewChange);
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::DoViewChange(
+      DoViewChange::new(
+        View::with(1),
+        View::with(0),
+        OpNumber::with(4),
+        OpNumber::with(4),
+        crate::Epoch::new(0),
+        0,
+        ReplicaId::new(0),
+        std::vec::Vec::new(),
+      )
+      .with_checkpoint_op(OpNumber::with(4)),
+    ),
+  );
+  assert!(
+    e.status().is_normal() && e.is_primary(),
+    "the DVC quorum formed the view while the durable-view write is still in flight"
+  );
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(4),
+    "formation re-established commit* = 4"
+  );
+  while e.poll_message().is_some() {}
+
+  // The flight window closes: the orphaned 8-root lands FIRST (absorbing commit 8 > op 4 and
+  // latching the debt, deferred behind the pending durable-view write) — the session then releases
+  // the queued view root (the DVC's cell was superseded by the StartViewAsPrimary write), whose
+  // completion reaches the emission with the debt still owed, deferred to the SM-reconstruct arc.
+  // The emission must WITHHOLD: no StartView reaches the wire in any profile (in release the
+  // advertised `commit 8 > op 4` would fail-stop every adopting backup).
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.repersist_orphan,
+    Some(OpNumber::with(8)),
+    "the flight-window landing latched the debt"
+  );
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(8),
+    "the landing absorbed commit 8 above op 4"
+  );
+  assert_eq!(e.op(), OpNumber::with(4));
+  assert!(e.sm_reconstruct_owed(), "the deferred-to arc is still owed");
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.pending_sb.is_none(),
+    "the StartViewAsPrimary write completed — the emission point was reached"
+  );
+  assert!(
+    e.status().is_normal() && e.is_primary(),
+    "the withheld primary keeps its posture (no participation, no teardown)"
+  );
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::StartView(_)),
+      "no StartView is emitted while the reconciliation is owed"
+    );
+  }
+  assert!(
+    e.poll_timeout().is_some(),
+    "the withheld primary keeps timers armed so the deferral is re-driven"
+  );
+
+  // The deferred-to arc completes: the donor's leaf is repaired, a fresh same-M reply fails the
+  // fetch over to a live donor, and the retry restores the SM at 4 — retiring the obligation. The
+  // next heartbeat re-drive then finds no deferral and enters the reconciling fetch at the landed
+  // frontier: the generation ends into recovery instead of broadcasting a head it cannot vouch.
+  seed_donor_blocks(&mut blocks, 4);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::with(1),
+      OpNumber::with(4),
+      id4,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env4,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks); // the failover walk finds the DAG complete
+  e.block_step(now, &mut storage, &mut blocks); // the re-issued restore succeeds
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(!e.sm_reconstruct_owed(), "the retry restored the SM at 4");
+  let later = now + core::time::Duration::from_millis(400);
+  e.handle_timeout(later, &mut storage);
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "with the deferral retired, the re-drive enters the reconciling fetch"
+  );
+  assert!(e.awaiting_peer_checkpoint_for_test());
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(8),
+    "the fetch targets the landed frontier the debt named"
+  );
+}
+
+#[test]
+fn an_in_flight_inherited_frontier_fences_the_ordinary_checkpoint_and_the_landing_enters_the_fetch()
+{
+  // THE SCHEDULE THE `pending_checkpoint` DEFERRAL ARM CANNOT CARRY. An ordinary checkpoint parked
+  // at `AwaitSnapshot` across a view transition — its envelope held while later view roots
+  // complete around it — would reach the StartView emission through the reconciliation's
+  // `pending_checkpoint.is_some()` deferral if an orphaned-re-persist debt could be owed at the
+  // same time. It cannot, and the exclusion lives one layer DOWN from the deferral arm, in the
+  // session-timeline fence `force_checkpoint` reads: an ordinary checkpoint may begin only at
+  // `commit_min >=` the session's EFFECTIVE checkpoint frontier (which an in-flight inherited
+  // root has already raised to its own frontier), while the debt latches only at
+  // `commit_min <` that same landed frontier — so "an ordinary checkpoint in flight" and "the
+  // debt owed" demand contradictory `commit_min` and cannot coexist. This test pins the fence
+  // ENGAGING (the checkpoint cadence defers, `pending_checkpoint` stays `None`) and what happens
+  // instead: with no own-advance arc to defer to, the landing consumes the debt IMMEDIATELY —
+  // the reconciling fetch is entered at the landing, before any emission point exists. If the
+  // fence is ever narrowed, the checkpoint starts below the in-flight frontier here, the debt
+  // gains a deferral arc, and the emission-layer withhold becomes that schedule's last guard.
+  let (mut storage, mut blocks, env8, id8, cfg) = store_with_orphan_root_in_flight_at(2);
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 1, CountSm::default(), &mut storage)
+    .expect("recover over the live store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // The local recovery completes at L=4 without touching the root lane (reads only), so the
+  // predecessor's M=8 root stays with the medium.
+  for _ in 0..6 {
+    r.block_step(now, &mut storage, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
+    if r.status() == Status::Normal {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "local recovery settled at L=4");
+  assert_eq!(r.checkpoint_op(), OpNumber::with(4));
+  while r.poll_message().is_some() {}
+
+  // Commits 5..=7 cross the interval boundary (4 + 2), so the ordinary cadence is DUE — but the
+  // in-flight inherited root holds the session's effective checkpoint frontier at 8, above
+  // `commit_min = 7`, and the timeline fence defers the checkpoint: nothing starts.
+  for op in 5..=7u64 {
+    r.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
+    r.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(r.op(), OpNumber::with(7), "the prepares extended the head");
+  r.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(7),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(r.commit(), OpNumber::with(7), "the commits applied to 7");
+  r.block_step(now, &mut storage, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    r.pending_checkpoint.is_none(),
+    "the due ordinary checkpoint DEFERRED below the in-flight inherited frontier — the timeline \
+     fence is what keeps the reconciliation's own-advance deferral from ever holding an ordinary \
+     checkpoint together with a latchable debt"
+  );
+
+  // The inherited root lands: the debt latches (commit_min 7 < 8) with NO own-advance arc in
+  // flight to defer to, so the reconciliation consumes it at the landing — the endpoint enters
+  // the reconciling fetch before any participation or emission point is reached.
+  storage.sb_mut().flush_roots();
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "the landing entered the reconciling fetch immediately (no deferral arc existed)"
+  );
+  assert!(r.awaiting_peer_checkpoint_for_test());
+  assert_eq!(
+    r.sync_target_for_test(),
+    Some(8),
+    "the fetch targets the landed frontier"
+  );
+  assert!(
+    r.repersist_orphan.is_some(),
+    "the debt is latched until the fetch installs it"
+  );
+  let mut nonce = None;
+  while let Some(out) = r.poll_message() {
+    if let Message::RequestSync(rs) = out.msg_ref() {
+      nonce = Some(rs.nonce());
+    }
+  }
+
+  // A donor answers at the landed frontier: the install retires the debt and recovery completes,
+  // and the deferred ordinary cadence then has nothing left to checkpoint below the frontier.
+  seed_donor_blocks(&mut blocks, 8);
+  r.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce.expect("the reconciling fetch solicited"),
+      env8,
+      Bytes::new(),
+    )),
+  );
+  r.block_step(now, &mut storage, &mut blocks);
+  r.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_envelopes();
+  r.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush_roots();
+  r.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    r.checkpoint_op(),
+    OpNumber::with(8),
+    "the reconciling install landed the frontier"
+  );
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completed at the reconciled frontier"
+  );
+  assert!(r.repersist_orphan.is_none(), "the install retired the debt");
 }
 
 #[test]
