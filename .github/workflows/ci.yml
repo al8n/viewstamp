@@ -34,6 +34,10 @@ env:
 # from the sweeps because it mandates a crypto provider (a `compile_error!` rejects `quic` with no
 # provider, by design), so it cannot build standalone; each sweep job builds, lints, and tests it
 # explicitly via `quic,tls-rustls-ring`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Check formatting
   rustfmt:
