@@ -236,9 +236,10 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// That path is proved at COMPONENT level, and the claim is no wider than that evidence:
 ///
 /// - `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
-///   drives the refusal and the recovery over real mTLS with real consensus traffic. The stall that
-///   reaches the refusal, and the redial schedule, are MODELLED there; the reaping, the
-///   re-establishment and the in-flight request's completion are real.
+///   drives the refusal and the recovery over real mTLS with real consensus traffic. THREE seams are
+///   MODELLED there — the stall that reaches the refusal, the redial schedule, and the client's
+///   stale-request rebroadcast (the driver's pending map and `retransmit_stale` do not run in it);
+///   the reaping, the re-establishment and the request's completion are real.
 /// - `viewstamp-compio`'s `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff`
 ///   proves the redial schedule itself on the real reconcile.
 ///
@@ -258,10 +259,21 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// only spans under 5/6 utilization, `Readable` being raised for a frame that arrived, and a reset
 /// clearing the assembler before the application drains the event. The dependency is a plain `0.11`
 /// range, so a newer patch release resolves without ceremony — this repository's own CI resolves fresh
-/// and runs `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` and the
-/// receiver-side span regression against whatever it picks. An embedder who pins or upgrades
-/// `quinn-proto` themselves does not get that for free: run those two regressions as the compatibility
-/// check.
+/// and runs the whole QUIC suite against whatever it picks.
+///
+/// An embedder who pins or upgrades `quinn-proto` themselves does not get that for free. The
+/// compatibility check is this crate's QUIC suite (`cargo test -p viewstamp-proto --features
+/// quic,tcp,tls,tls-rustls-ring`). Running only part of it, these are the five that fail when the
+/// private behaviour moves — two for the SIZING, three for the CLASSIFIER:
+///
+/// - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
+/// - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
+///   assumes, counted from the receiver's own STREAM-frame counter;
+/// - `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
+/// - `gapped_writes_into_our_opened_streams_recv_half_close_the_connection` — `Readable` being raised
+///   for a frame that arrived, at the read offset and ahead of a gap;
+/// - `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open` — a reset clearing the
+///   assembler before the event is drained.
 pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
   QUINN_REASSEMBLY_MAX_SPANS * MIN_FILLED_STREAM_FRAME_PAYLOAD;
 

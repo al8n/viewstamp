@@ -7,10 +7,21 @@
 //! only spans under 5/6 utilization, `Readable` being raised for a frame that arrived, and a reset
 //! clearing the assembler before the application drains the event. The dependency is a plain `0.11`
 //! range, so a newer patch release resolves without ceremony — this repository's own CI resolves fresh
-//! and runs `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` and the
-//! receiver-side span regression against whatever it picks. An embedder who pins or upgrades
-//! `quinn-proto` themselves does not get that for free: run those two regressions as the compatibility
-//! check.
+//! and runs the whole QUIC suite against whatever it picks.
+//!
+//! An embedder who pins or upgrades `quinn-proto` themselves does not get that for free. The
+//! compatibility check is this crate's QUIC suite (`cargo test -p viewstamp-proto --features
+//! quic,tcp,tls,tls-rustls-ring`). Running only part of it, these are the five that fail when the
+//! private behaviour moves — two for the SIZING, three for the CLASSIFIER:
+//!
+//! - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
+//! - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
+//!   assumes, counted from the receiver's own STREAM-frame counter;
+//! - `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
+//! - `gapped_writes_into_our_opened_streams_recv_half_close_the_connection` — `Readable` being raised
+//!   for a frame that arrived, at the read offset and ahead of a gap;
+//! - `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open` — a reset clearing the
+//!   assembler before the event is drained.
 
 mod bridge;
 mod conn;

@@ -36,12 +36,13 @@ rustls = { version = "0.23", default-features = false, features = ["std"], optio
 # The QUIC bridge sizes its stream receive window against `MAX_CHUNKS`, a private constant in
 # quinn-proto's `connection/assembler.rs` that no API exposes, so a release is free to move that
 # ceiling. Drift is caught by tests rather than held off by a version pin:
-# `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` fails if a full window
-# no longer fits the bound, and the receiver-side span regression fails if the segmentation the
-# sizing assumes stops holding. This crate's CI resolves fresh and so runs them against each new
-# 0.11.x; an embedder who pins or upgrades quinn-proto themselves should run those two regressions as
-# the compatibility check (the sizing and the unsolicited-half classifier were verified against
-# 0.11.17 and rest on quinn-private behaviour).
+# `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` and
+# `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` cover the sizing, and the three
+# unsolicited-half tests (`sub_packet_writes_...`, `gapped_writes_...`,
+# `data_whose_reset_lands_in_the_same_batch_...`) cover the classifier that rests on the same private
+# behaviour. This crate's CI resolves fresh and runs the whole QUIC suite against each new 0.11.x; an
+# embedder who pins or upgrades quinn-proto themselves should run that suite — or at least those five
+# tests — as the compatibility check (both were verified against 0.11.17).
 quinn-proto = { version = "0.11", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 

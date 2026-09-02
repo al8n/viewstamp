@@ -1450,14 +1450,16 @@ fn recover_and_complete(
 }
 
 /// COMPONENT-LEVEL exercise of the recovery path over real cluster-private mTLS and real consensus
-/// traffic, with the receiver's stall and the redial schedule MODELLED.
+/// traffic, with THREE seams MODELLED: the receiver's stall, the redial schedule, and the client's
+/// stale-request rebroadcast — this test rebuilds and resubmits the pending request on its own
+/// cadence, so the driver's pending map, timeout scan and `retransmit_stale` never run here.
 ///
 /// The transport's stream receive window bounds an unread backlog's BYTES, not the number of spans
 /// the peer segments them into, so a sender producing sub-packet `Prepare`s to a receiver that is not
 /// draining walks the span count to quinn's per-stream ceiling and the connection is closed with a
 /// transport error. That is documented as recoverable rather than prevented. What follows is what
-/// this test drives — every step real except the two named above, and NOT a whole-chain proof, which
-/// would take a real-driver test that reaches the refusal and does not exist:
+/// this test drives — every step real except the three seams named above, and NOT a whole-chain
+/// proof, which would take a real-driver test that reaches the refusal and does not exist:
 ///
 /// 1. two coordinators mutually dial, authenticate and commit a client request;
 /// 2. a second request is submitted and left in flight;
@@ -1482,6 +1484,9 @@ fn recover_and_complete(
 /// therefore the way to exercise what happens AFTER it. The redial schedule is modelled here too
 /// (armed, then dialed when due); the real one lives in the drivers and is proved by
 /// `viewstamp-compio`'s `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff`.
+/// And so is the client's stale-request rebroadcast: [`recover_and_complete`] rebuilds the same
+/// `Request` on a fixed cadence, where production reaches it through the driver's pending map, its
+/// timeout scan and `retransmit_stale` — none of which run here.
 ///
 /// So this is COMPONENT-level evidence for the recovery path — connection-lost, unbind and reap,
 /// backoff redial, protocol retransmission — and nothing wider. There is no end-to-end real-driver

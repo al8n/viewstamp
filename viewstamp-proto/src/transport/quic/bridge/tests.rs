@@ -1278,7 +1278,8 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
 /// coordinator, the consensus layer and the driver's link reconcile, and the evidence for it is
 /// COMPONENT-level, not end to end:
 /// `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
-/// drives it over real mTLS with the stall and the redial schedule MODELLED, and `viewstamp-compio`'s
+/// drives it over real mTLS with three seams MODELLED — the stall, the redial schedule and the
+/// client's stale-request rebroadcast — and `viewstamp-compio`'s
 /// `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff` proves the schedule
 /// on the real reconcile. [`MAX_STREAM_RECEIVE_WINDOW`] carries the canonical statement of that
 /// claim. Asserting any of it here would mean building the state by hand instead of reaching it.
