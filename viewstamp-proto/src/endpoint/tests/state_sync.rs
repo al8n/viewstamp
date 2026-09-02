@@ -2145,15 +2145,26 @@ fn a_root_landing_mid_fetch_raises_the_fetch_target_to_its_frontier() {
   );
   assert_eq!(r.status(), Status::Recovering);
 
-  // A donor answers at the raised target; the install retires the debt and recovery completes.
-  // (Re-seed M's DAG: the helper's L re-seed swept it, and this recovery never walks L's.)
-  seed_donor_blocks(&mut blocks, 8);
+  // The raise governs donors only through the WIRE: the retarget's re-solicit must advertise the
+  // raised floor itself (a donor gates its serve on the advertised value, not on this endpoint's
+  // internal target), so donors in [4, 8) stay silent instead of answering with replies the
+  // timeline admission then refuses.
   let mut nonce = None;
+  let mut advertised = None;
   while let Some(out) = r.poll_message() {
     if let Message::RequestSync(rs) = out.msg_ref() {
       nonce = Some(rs.nonce());
+      advertised = Some(rs.checkpoint_op().get());
     }
   }
+  assert_eq!(
+    advertised,
+    Some(8),
+    "the re-solicit advertises the raised floor on the wire"
+  );
+  // A donor answers at the raised target; the install retires the debt and recovery completes.
+  // (Re-seed M's DAG: the helper's L re-seed swept it, and this recovery never walks L's.)
+  seed_donor_blocks(&mut blocks, 8);
   r.handle_message(
     t,
     &mut storage,
@@ -2177,6 +2188,180 @@ fn a_root_landing_mid_fetch_raises_the_fetch_target_to_its_frontier() {
   storage.sb_mut().flush_roots();
   r.storage_step(t, &mut storage, &mut blocks);
   assert_eq!(r.checkpoint_op(), OpNumber::with(8));
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completed at the landed frontier"
+  );
+  assert!(r.repersist_orphan.is_none(), "the install retired the debt");
+}
+
+#[test]
+fn a_below_target_reply_cannot_pin_or_displace_the_retargeted_recovery_fetch() {
+  // The retarget preserves the solicitation nonce, so a donor still at the OLD floor L=4 keeps
+  // answering the old solicitation with fresh-looking replies. Every install below the landed
+  // frontier M=8 is refused by the timeline admission at the very end of the transfer — so a
+  // below-target reply admitted at the ingress could only arm (or wholesale REPLACE) a transfer
+  // whose entire DAG is walked and then refused, displacing the one transfer that can install,
+  // once per delivery. The ingress must refuse it up front, before it can touch the transfer,
+  // exactly as the Normal-status ingress does.
+  let (mut storage, mut blocks, env8, id8, cfg) = store_with_orphan_root_in_flight();
+  // The local L envelope is gone: every checkpoint read faults, so the recovery escalates.
+  storage.sb_mut().checkpoints.remove(&4);
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 1, CountSm::default(), &mut storage)
+    .expect("recover over the live store")
+    .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Burn the checkpoint-read budget on the retry cadence until the peer fetch arms at L=4.
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    r.storage_step(t, &mut storage, &mut blocks);
+    if r.awaiting_peer_checkpoint_for_test() {
+      break;
+    }
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, &mut storage);
+    }
+  }
+  assert!(
+    r.awaiting_peer_checkpoint_for_test(),
+    "the exhausted checkpoint read escalated to the peer fetch"
+  );
+  // M=8 lands mid-fetch and retargets the solicitation.
+  storage.sb_mut().flush_roots();
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.sync_target_for_test(),
+    Some(8),
+    "the landing raised the in-flight fetch's target to the landed frontier"
+  );
+  let mut nonce = None;
+  while let Some(out) = r.poll_message() {
+    if let Message::RequestSync(rs) = out.msg_ref() {
+      nonce = Some(rs.nonce());
+    }
+  }
+  let nonce = nonce.expect("the fetch solicited");
+
+  // An L=4 donor answers the old solicitation BEFORE any transfer is pinned: the reply is fresh
+  // (same nonce) and reaches our own durable checkpoint, but it sits below the raised floor —
+  // refused at the ingress, arming nothing.
+  let (_d4, d4s) = donor_primary_at_checkpoint(4);
+  let (env4, id4) = donor_envelope(&d4s);
+  r.handle_message(
+    t,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id4,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      nonce,
+      env4.clone(),
+      Bytes::new(),
+    )),
+  );
+  assert!(
+    r.block_fetch.is_none(),
+    "a below-floor reply arms no transfer"
+  );
+  assert_eq!(
+    r.sync_target_for_test(),
+    Some(8),
+    "the fetch stays armed at the raised floor"
+  );
+
+  // The M=8 donor answers with M's DAG not yet local: a genuine in-flight transfer pinned to M
+  // (its frontier walk finds the root block missing and starts pulling).
+  r.handle_message(
+    t,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env8.clone(),
+      Bytes::new(),
+    )),
+  );
+  r.block_step(t, &mut storage, &mut blocks);
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.block_fetch
+      .as_ref()
+      .map(|bf| bf.checkpoint.checkpoint_op()),
+    Some(OpNumber::with(8)),
+    "the at-floor reply pinned the transfer to the landed frontier"
+  );
+
+  // A second L=4 reply lands DURING the M transfer. Its DAG is fully local (the helper seeded it),
+  // so admitting it would replace the pinned M transfer with one that drains instantly, walks to
+  // the admission, is refused there — and leaves the fetch to start over, repeatable on every
+  // delivery. The ingress floor refuses it before it can touch the transfer.
+  r.handle_message(
+    t,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id4,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      nonce,
+      env4,
+      Bytes::new(),
+    )),
+  );
+  assert_eq!(
+    r.block_fetch
+      .as_ref()
+      .map(|bf| bf.checkpoint.checkpoint_op()),
+    Some(OpNumber::with(8)),
+    "the below-floor reply neither replaced nor dropped the pinned transfer"
+  );
+
+  // Only M can install: its DAG arrives (seeded here) and a fresh at-floor reply re-pins the same
+  // roots; the drain installs, retires the debt, and recovery completes at the landed frontier.
+  seed_donor_blocks(&mut blocks, 8);
+  r.handle_message(
+    t,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env8,
+      Bytes::new(),
+    )),
+  );
+  r.block_step(t, &mut storage, &mut blocks);
+  r.storage_step(t, &mut storage, &mut blocks);
+  storage.sb_mut().flush_envelopes();
+  r.storage_step(t, &mut storage, &mut blocks);
+  storage.sb_mut().flush_roots();
+  r.storage_step(t, &mut storage, &mut blocks);
+  assert_eq!(
+    r.checkpoint_op(),
+    OpNumber::with(8),
+    "only the at-floor checkpoint installed"
+  );
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -2571,7 +2756,11 @@ fn a_debt_landing_behind_the_new_primary_root_is_reconciled_before_the_start_vie
     OpNumber::with(4),
     "the absorbed commit frontier now exceeds the formed head"
   );
-  assert_eq!(e.op(), OpNumber::with(2), "the formed head is the pre-sync 2");
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "the formed head is the pre-sync 2"
+  );
   assert_eq!(e.status(), Status::Normal);
 
   // The StartViewAsPrimary root lands: the completion arm must observe the owed debt BEFORE
