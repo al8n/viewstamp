@@ -574,7 +574,11 @@ impl ReplyTooLarge {
 /// Both arms are deliverable — the refusal is a handful of bytes — so a committed operation always
 /// has an outcome the client can observe, and a node-local [`Event::Committed`](crate::Event)
 /// consumer sees exactly what the wire carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+  Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
 pub enum ReplyOutcome {
   /// The state machine's reply, within the reply-body bound.
   Ok(ReplyBody),
@@ -598,18 +602,6 @@ impl ReplyOutcome {
     }
   }
 
-  /// True iff the state machine's reply fit the bound.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_ok(&self) -> bool {
-    matches!(self, Self::Ok(_))
-  }
-
-  /// True iff the reply was refused for exceeding the bound.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_too_large(&self) -> bool {
-    matches!(self, Self::TooLarge(_))
-  }
-
   /// The reply body when [`Ok`](Self::Ok), else `None`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn as_ok(&self) -> Option<&ReplyBody> {
@@ -625,19 +617,6 @@ impl ReplyOutcome {
     match self {
       Self::TooLarge(err) => Some(err),
       Self::Ok(_) => None,
-    }
-  }
-
-  /// Consumes the outcome, yielding the reply body when [`Ok`](Self::Ok), else the refusal.
-  ///
-  /// # Errors
-  ///
-  /// The carried [`ReplyTooLarge`] when the reply exceeded the bound.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn try_into_ok(self) -> Result<ReplyBody, ReplyTooLarge> {
-    match self {
-      Self::Ok(body) => Ok(body),
-      Self::TooLarge(err) => Err(err),
     }
   }
 
