@@ -618,13 +618,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // "no live correlation awaits any parked entry" is a structural fact — the session serves one
     // endpoint at a time and this one has minted nothing yet — so whoever parked a root is dead,
     // and a parked root was never handed to the medium (no completion can ever name it, nothing
-    // physical exists for quiescence to wait on). Baselining on it would be baselining on state
-    // only a dead endpoint ever promised to write; keeping it queued would let a driver that
-    // rebuilds endpoints faster than the backend lands roots grow the timeline without bound (one
-    // or two parked roots per dead incarnation, each a full header-bearing state). Collapsing
-    // reduces the timeline to what a crash restart would recover PLUS the still-owed submitted
-    // front — every schedule this produces, a crash at the same point also produces, minus the
-    // front the medium still owes either way.
+    // physical exists for quiescence to wait on). Depth needs no help here — a dead incarnation's
+    // parked root occupies the same role cell a live one's would — but BASELINING on it would be
+    // baselining on state only a dead endpoint ever promised to write, and leaving it parked
+    // would eventually LAND that promise. Collapsing reduces the timeline to what a crash
+    // restart would recover PLUS the still-owed submitted front — every schedule this produces,
+    // a crash at the same point also produces, minus the front the medium still owes either way.
     storage.collapse_parked_roots();
     let landed = storage.sb().state();
     let effective = storage.effective_root();
@@ -896,6 +895,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       pending_sb: None,
       pending_checkpoint: None,
       inherited_frontier: None,
+      // A successor baselines at/above every in-flight root (the effective root includes the
+      // front), so no landing it inherits can outrun its own frontier the way an orphaned
+      // re-persist outruns the incarnation that staged it.
+      repersist_orphan: None,
       checkpoint_op: OpNumber::with(checkpoint_op),
       // Set when the durable checkpoint envelope is read back + restored (`on_recover_sb_done`),
       // which decodes the `sm_root`; `None` until then (block GC skips a cycle without a live root).
@@ -1609,15 +1612,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // the restored snapshot subsumes is trimmed, the same filter `complete_state_sync` applies to
     // what an installed checkpoint subsumed.
     if checkpoint.op > self.checkpoint_op {
+      // An owed inherited frontier at/below the restore is met by it (the landing that set the
+      // marker is the same one that advanced the durable root this restore was verified
+      // against) — retired inside the pointer-advance choke.
       self.advance_checkpoint_op(checkpoint.op);
       self.set_commit_min(checkpoint.op);
       self.commit_max = self.commit_max.max(checkpoint.op);
       self.op = self.op.max(checkpoint.op);
-      // An owed inherited frontier at/below the restore is met by it: the landing that set the
-      // marker is the same one that advanced the durable root this restore was verified against.
-      if self.inherited_frontier.is_some_and(|f| f <= checkpoint.op) {
-        self.inherited_frontier = None;
-      }
       // The snapshot owns `[1..=checkpoint.op]`: drop the subsumed header-cache entries and every
       // piece of recovery bookkeeping below the restored frontier — a pending tail read's slot is
       // now vouched by the snapshot (a late completion for a dropped read finds no entry and is
@@ -1644,13 +1645,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// SM) and `handle_message` accepts the answering `SyncCheckpoint`. Idempotent: if already escalated, it
   /// just (re-)solicits.
   ///
-  /// Two callers, distinguished by `target` + `require_cross_epoch`:
+  /// Three callers, distinguished by `target` + `require_cross_epoch`:
   /// - the permanently-unreadable own-checkpoint recovery (`target = self.checkpoint_op`,
   ///   `require_cross_epoch = false`): any peer at/above our corrupt checkpoint subsumes it.
   /// - the cross-epoch crossing fetch ([`Self::enter_cross_epoch_peer_fetch`]) (`target` = the advertised
   ///   cluster checkpoint, `require_cross_epoch = true`): the fetch MUST cross into E+1 — `apply_sync`
   ///   rejects any non-crossing reply (see [`SyncState::require_cross_epoch`]).
-  fn escalate_checkpoint_to_peer_fetch(
+  /// - the orphaned-re-persist reconciliation ([`Self::maybe_enter_orphan_repersist_fetch`])
+  ///   (`target` = the orphaned root's landed frontier, at/above our own checkpoint,
+  ///   `require_cross_epoch = false`): the durable root already names the synced point, so only a
+  ///   reply that subsumes it can install — which `apply_sync`'s timeline admission enforces
+  ///   independently off the effective root.
+  pub(crate) fn escalate_checkpoint_to_peer_fetch(
     &mut self,
     now: Instant,
     target: OpNumber,
@@ -1770,11 +1776,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.view_change = None;
     // Only a Seal or SwapEpoch action can still be armed here (the `pending_durable_view` guard
     // above deferred the three view-changing actions): abandon it — its completion must not fire
-    // mid-recovery — and forfeit its root with the correlation, so a parked one leaves the queue.
+    // mid-recovery — and abandon its root with the correlation, so a parked one leaves its cell.
     // A SUBMITTED one still lands, and an epoch-advancing landing still installs the successor
     // through the landing absorb, exactly as any superseded swap's does.
     if let Some((abandoned, _)) = self.pending_sb.take() {
-      storage.forfeit_root(abandoned);
+      storage.abandon_root(RootRole::DurableView, abandoned);
     }
     // Sweep in-flight serve-reads: a Recovering node abandons its donor role. A leaked `sync_serving`
     // entry (its completion is dropped as foreign by `on_recover_sb_done` without removing the entry) would
@@ -3012,11 +3018,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.buffer.clear();
     // GetView is a catch-up probe, not a vote; no superblock write needed. ABANDON any prior-view
     // pending_sb: a stale completion from the prior view must not fire, and the abandoned root —
-    // if still parked — is forfeited with its correlation, or an alternating submit/catch-up
-    // schedule would strand one orphaned queue entry per cycle. (This is the distinguishing
+    // if still parked — leaves its cell with its correlation, so an alternating submit/catch-up
+    // schedule wastes no landing on a root nothing awaits. (This is the distinguishing
     // `pending_sb` action — the two durable-view-writing entries overwrite it instead.)
     if let Some((abandoned, _)) = self.pending_sb.take() {
-      storage.forfeit_root(abandoned);
+      storage.abandon_root(RootRole::DurableView, abandoned);
     }
     self.arm_timers(now);
     self.send_get_view(now);

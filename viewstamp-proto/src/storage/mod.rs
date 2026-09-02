@@ -153,7 +153,7 @@ use crate::{
 mod session;
 pub use session::Storage;
 pub(crate) use session::{
-  AppendSubmission, CheckpointSubmission, SbPolled, SettledCancellation, WalPolled,
+  AppendSubmission, CheckpointSubmission, RootRole, SbPolled, SettledCancellation, WalPolled,
 };
 
 /// On-disk header format version (bumped on any wire/disk layout change).

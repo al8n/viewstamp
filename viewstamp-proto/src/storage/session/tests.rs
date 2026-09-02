@@ -2,7 +2,7 @@ use std::{collections::VecDeque, vec::Vec};
 
 use bytes::Bytes;
 
-use super::{AppendSubmission, CheckpointSubmission, Storage};
+use super::{AppendSubmission, CheckpointSubmission, RootRole, Storage};
 use crate::{
   ClientId, JobId, OpNumber, RequestNumber, View,
   block_job::{BlockJobDone, BlockJobKind, BlockJobOutput, BlockJobTag, WalkPurpose},
@@ -330,7 +330,7 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
   );
 
   let a = WriteId::new(1, 1);
-  s.submit_root(a, root(4, 40));
+  s.submit_root(RootRole::Checkpoint, a, root(4, 40));
   assert_eq!(
     s.effective_checkpoint_pair(),
     (OpNumber::with(4), 40),
@@ -338,7 +338,7 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
   );
 
   let b = WriteId::new(1, 2);
-  s.submit_root(b, root(8, 80));
+  s.submit_root(RootRole::DurableView, b, root(8, 80));
   assert_eq!(
     s.effective_checkpoint_pair(),
     (OpNumber::with(8), 80),
@@ -347,7 +347,13 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
 
   s.sb_mut().land_root();
   let polled = s.poll_sb().expect("the first root lands");
-  let (landed_id, landed_state) = polled.landed_root.expect("a root landing is reported");
+  let (landed_role, landed_id, landed_state) =
+    polled.landed_root.expect("a root landing is reported");
+  assert_eq!(
+    landed_role,
+    RootRole::Checkpoint,
+    "the landing carries the role its write was submitted under"
+  );
   assert_eq!(landed_id, a);
   assert_eq!(landed_state.checkpoint_op(), OpNumber::with(4));
   assert_eq!(
@@ -358,7 +364,9 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
 
   s.sb_mut().land_root();
   let polled = s.poll_sb().expect("the second root lands");
-  assert_eq!(polled.landed_root.expect("reported").0, b);
+  let (landed_role, landed_id, _) = polled.landed_root.expect("reported");
+  assert_eq!(landed_role, RootRole::DurableView);
+  assert_eq!(landed_id, b);
   assert_eq!(
     s.effective_checkpoint_pair(),
     (OpNumber::with(8), 80),
@@ -368,7 +376,7 @@ fn the_effective_pair_reads_the_last_submitted_root_on_one_timeline() {
 }
 
 #[test]
-fn the_effective_root_is_the_back_of_the_timeline_else_the_durable_one() {
+fn the_effective_root_is_the_latest_submitted_root_else_the_durable_one() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   assert_eq!(
     s.effective_root(),
@@ -377,7 +385,7 @@ fn the_effective_root_is_the_back_of_the_timeline_else_the_durable_one() {
   );
 
   let submitted = root_at_view(3, 4, 40);
-  s.submit_root(WriteId::new(1, 1), submitted.clone());
+  s.submit_root(RootRole::DurableView, WriteId::new(1, 1), submitted.clone());
   assert_eq!(
     s.effective_root(),
     submitted,
@@ -385,7 +393,7 @@ fn the_effective_root_is_the_back_of_the_timeline_else_the_durable_one() {
   );
 
   s.sb_mut().land_root();
-  let (_, landed) = s
+  let (_, _, landed) = s
     .poll_sb()
     .expect("the root lands")
     .landed_root
@@ -404,14 +412,16 @@ fn a_successors_root_parks_behind_a_dead_predecessors_outstanding_one() {
   // A dead incarnation's root write is still with the device.
   let dead = WriteId::new(1, 1);
   let dead_state = root_at_view(2, 0, 0);
-  s.submit_root(dead, dead_state.clone());
+  s.submit_root(RootRole::DurableView, dead, dead_state.clone());
 
   // The successor's own root write PARKS: it enters the timeline (the effective root moves, and
   // quiescence waits for it) but the backend does not see it while the predecessor's is
-  // outstanding — the superblock analogue of the append fence.
+  // outstanding — the superblock analogue of the append fence. The role cell is REUSED across
+  // the rebuild: the predecessor's write occupies the front, so the successor's first same-role
+  // submission takes the very cell the predecessor's would have parked in.
   let own = WriteId::new(2, 1);
   let own_state = root_at_view(3, 0, 0);
-  s.submit_root(own, own_state.clone());
+  s.submit_root(RootRole::DurableView, own, own_state.clone());
   assert_eq!(
     s.sb_mut().staged_roots.len(),
     1,
@@ -425,13 +435,15 @@ fn a_successors_root_parks_behind_a_dead_predecessors_outstanding_one() {
   assert!(s.has_inflight(), "a parked root is still owed");
 
   // The predecessor's landing releases the fence: the session itself submits the parked root.
+  // The role rides the landing even though the submitting incarnation is dead — it is the
+  // session's record, not the endpoint's.
   s.sb_mut().land_root();
-  let (id, state) = s
+  let (role, id, state) = s
     .poll_sb()
     .expect("the predecessor's root lands")
     .landed_root
     .expect("reported");
-  assert_eq!((id, state), (dead, dead_state));
+  assert_eq!((role, id, state), (RootRole::DurableView, dead, dead_state));
   assert_eq!(
     s.sb_mut().staged_roots.len(),
     1,
@@ -439,12 +451,15 @@ fn a_successors_root_parks_behind_a_dead_predecessors_outstanding_one() {
   );
 
   s.sb_mut().land_root();
-  let (id, state) = s
+  let (role, id, state) = s
     .poll_sb()
     .expect("the released root lands")
     .landed_root
     .expect("reported");
-  assert_eq!((id, state), (own, own_state.clone()));
+  assert_eq!(
+    (role, id, state),
+    (RootRole::DurableView, own, own_state.clone())
+  );
   assert_eq!(s.effective_root(), own_state, "the medium converged to it");
   assert!(!s.has_inflight());
 }
@@ -454,13 +469,25 @@ fn a_slow_backend_never_holds_more_than_one_outstanding_root() {
   // A conforming backend may be arbitrarily slow, so the session must not hand it a second root
   // while one is outstanding: the physical pipeline is one deep, and everything behind it parks.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
-  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
-  s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
-  s.submit_root(WriteId::new(1, 3), root_at_view(4, 0, 0));
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_view(2, 0, 0),
+  );
+  s.submit_root(
+    RootRole::Checkpoint,
+    WriteId::new(1, 2),
+    root_at_view(3, 0, 0),
+  );
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 3),
+    root_at_view(4, 0, 0),
+  );
   assert_eq!(
     s.sb_mut().staged_roots.len(),
     1,
-    "an outstanding root gates every later submission into the parked tail"
+    "an outstanding root gates every later submission into the parked cells"
   );
   assert_eq!(
     s.roots_in_flight(),
@@ -470,12 +497,12 @@ fn a_slow_backend_never_holds_more_than_one_outstanding_root() {
   assert_eq!(
     s.effective_root(),
     root_at_view(4, 0, 0),
-    "the back of the queue is still the effective root while parked"
+    "the latest submission is still the effective root while parked"
   );
 
-  // Each landing hands exactly the next queued root to the backend, in queue order — an
-  // endpoint's own stacking still lands last-submitted-wins, with the order enforced by the
-  // queue rather than trusted to the backend's serialization.
+  // Each landing hands exactly the lowest-stamp parked root to the backend — an endpoint's own
+  // stacking still lands last-submitted-wins, with the order enforced by the stamps rather than
+  // trusted to the backend's serialization.
   s.sb_mut().land_root();
   assert!(s.poll_sb().expect("first landing").landed_root.is_some());
   assert_eq!(
@@ -486,7 +513,7 @@ fn a_slow_backend_never_holds_more_than_one_outstanding_root() {
   s.sb_mut().land_root();
   assert!(s.poll_sb().expect("second landing").landed_root.is_some());
   s.sb_mut().land_root();
-  let (id, state) = s
+  let (_, id, state) = s
     .poll_sb()
     .expect("third landing")
     .landed_root
@@ -501,22 +528,32 @@ fn a_slow_backend_never_holds_more_than_one_outstanding_root() {
 }
 
 #[test]
-fn a_forfeited_parked_root_leaves_the_timeline() {
-  // The submitter superseded (or abandoned) its parked root: forfeiture removes the entry — the
-  // backend never saw the write, so nothing physical remains to wait for — while the submitted
-  // front stays owed to the medium.
+fn a_same_role_resubmission_supersedes_the_parked_root_it_replaces() {
+  // Supersession is the submission itself: writing the role's cell replaces whatever parked root
+  // the same correlation staged before, in the same act that records the replacement — there is
+  // no removal call to pair with the submission and none to miss. The submitted front stays owed
+  // to the medium.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let outstanding = WriteId::new(1, 1);
   let superseded = WriteId::new(1, 2);
   let newest = WriteId::new(1, 3);
-  s.submit_root(outstanding, root_at_view(2, 0, 0));
-  s.submit_root(superseded, root_at_view(3, 0, 0));
-  s.forfeit_root(superseded);
-  s.submit_root(newest, root_at_view(4, 0, 0));
+  s.submit_root(RootRole::DurableView, outstanding, root_at_view(2, 0, 0));
+  s.submit_root(RootRole::DurableView, superseded, root_at_view(3, 0, 0));
+  assert_eq!(
+    s.roots_superseded(),
+    0,
+    "parking in a free cell replaces nothing"
+  );
+  s.submit_root(RootRole::DurableView, newest, root_at_view(4, 0, 0));
+  assert_eq!(
+    s.roots_superseded(),
+    1,
+    "the overwrite is counted — no depth arm can see it, so this is its only trace"
+  );
   assert_eq!(
     s.roots_in_flight(),
     2,
-    "the superseded parked root left the queue; the front and its successor remain"
+    "the superseded parked root left the timeline; the front and its successor remain"
   );
   assert_eq!(
     s.effective_root(),
@@ -524,55 +561,81 @@ fn a_forfeited_parked_root_leaves_the_timeline() {
     "the newest submission is the effective root"
   );
 
-  // The forfeited root never lands: the drain goes front → newest, nothing in between.
+  // The superseded root never lands: the drain goes front → newest, nothing in between.
   s.sb_mut().land_root();
-  let (id, _) = s
+  let (_, id, _) = s
     .poll_sb()
     .expect("the front lands")
     .landed_root
     .expect("reported");
   assert_eq!(id, outstanding);
   s.sb_mut().land_root();
-  let (id, state) = s
+  let (_, id, state) = s
     .poll_sb()
     .expect("the successor lands")
     .landed_root
     .expect("reported");
   assert_eq!(id, newest);
   assert_eq!(state, root_at_view(4, 0, 0));
-  assert!(!s.has_inflight(), "no forfeited entry is left owed");
+  assert!(!s.has_inflight(), "no superseded entry is left owed");
 }
 
 #[test]
-fn forfeiting_the_submitted_front_or_an_unknown_id_is_a_no_op() {
-  // An outstanding write is owed to the medium — forfeiture must not touch it — and an id the
-  // queue no longer holds (landed, or never submitted) has nothing to remove.
+fn abandoning_the_submitted_front_or_a_mismatched_call_is_a_no_op() {
+  // An outstanding write is owed to the medium — abandonment must not touch it, and it occupies
+  // no parked cell to be touched through — and a call whose id or role does not match the cell
+  // clears nothing: the guard is what makes every mis-call (stale, re-ordered, mis-roled)
+  // degrade to one stale parked entry that lands safely, instead of clearing a root some live
+  // correlation still awaits and stranding its await.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let outstanding = WriteId::new(1, 1);
-  s.submit_root(outstanding, root_at_view(2, 0, 0));
-  s.forfeit_root(outstanding);
+  s.submit_root(RootRole::DurableView, outstanding, root_at_view(2, 0, 0));
+  s.abandon_root(RootRole::DurableView, outstanding);
   assert_eq!(
     s.roots_in_flight(),
     1,
     "the submitted front survives its submitter's abandonment"
   );
-  s.forfeit_root(WriteId::new(9, 9));
-  assert_eq!(s.roots_in_flight(), 1, "an unknown id removes nothing");
+  let parked = WriteId::new(1, 2);
+  s.submit_root(RootRole::DurableView, parked, root_at_view(3, 0, 0));
+  s.abandon_root(RootRole::DurableView, WriteId::new(9, 9));
+  assert_eq!(s.roots_in_flight(), 2, "a mismatched id clears nothing");
+  s.abandon_root(RootRole::Checkpoint, parked);
+  assert_eq!(s.roots_in_flight(), 2, "a mis-stated role clears nothing");
+  assert_eq!(s.roots_abandoned(), 0, "a no-op is never counted");
 
+  // The un-cleared entry is the safe degradation the guard buys: promoted and landed, monotone —
+  // one wasted write, nothing stranded.
   s.sb_mut().land_root();
   assert!(s.poll_sb().expect("the front lands").landed_root.is_some());
+  s.sb_mut().land_root();
+  let (_, id, _) = s
+    .poll_sb()
+    .expect("the stale entry lands")
+    .landed_root
+    .expect("reported");
+  assert_eq!(id, parked);
   assert!(!s.has_inflight());
 }
 
 #[test]
-fn forfeiting_the_parked_back_steps_the_effective_root_to_the_previous_entry() {
-  // Abandonment without a successor (the catch-up shape): the parked back leaves, the effective
-  // root steps back to the previous timeline point, and the medium converges there.
+fn an_abandoned_parked_root_steps_the_effective_root_to_the_previous_entry() {
+  // Abandonment without a successor (the catch-up shape): the parked entry leaves its cell, the
+  // effective root steps back to the previous timeline point, and the medium converges there.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let abandoned = WriteId::new(1, 2);
-  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
-  s.submit_root(abandoned, root_at_view(3, 0, 0));
-  s.forfeit_root(abandoned);
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_view(2, 0, 0),
+  );
+  s.submit_root(RootRole::DurableView, abandoned, root_at_view(3, 0, 0));
+  s.abandon_root(RootRole::DurableView, abandoned);
+  assert_eq!(
+    s.roots_abandoned(),
+    1,
+    "the matching clear is counted — the efficiency witness for the abandonment sites"
+  );
   assert_eq!(
     s.effective_root(),
     root_at_view(2, 0, 0),
@@ -585,30 +648,38 @@ fn forfeiting_the_parked_back_steps_the_effective_root_to_the_previous_entry() {
   assert_eq!(
     s.sb_mut().staged_roots.len(),
     0,
-    "nothing was ever handed to the backend for the forfeited root"
+    "nothing was ever handed to the backend for the abandoned root"
   );
 }
 
 #[test]
 fn endpoint_construction_collapses_every_parked_root_keeping_the_owed_front() {
   // The rebuild collapse: at endpoint construction every parked root belongs to a dead
-  // incarnation and nothing awaits it, so the whole parked tail leaves the timeline while the
-  // submitted front — owed to the medium — stays. The effective root steps back to the front,
-  // which is what the successor soundly baselines on: everything above it was promised only by
-  // writes the medium never saw.
+  // incarnation and nothing awaits it, so every parked cell empties while the submitted front —
+  // owed to the medium — stays. The effective root steps back to the front, which is what the
+  // successor soundly baselines on: everything above it was promised only by writes the medium
+  // never saw.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let front = WriteId::new(1, 1);
   let front_state = root_at_view(2, 0, 0);
-  s.submit_root(front, front_state.clone());
-  s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
-  s.submit_root(WriteId::new(1, 3), root_at_view(4, 0, 0));
+  s.submit_root(RootRole::DurableView, front, front_state.clone());
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 2),
+    root_at_view(3, 0, 0),
+  );
+  s.submit_root(
+    RootRole::Checkpoint,
+    WriteId::new(1, 3),
+    root_at_view(4, 0, 0),
+  );
   assert_eq!(s.roots_in_flight(), 3, "front + the dead pair");
 
   s.collapse_parked_roots();
   assert_eq!(
     s.roots_in_flight(),
     1,
-    "the parked tail collapsed; the submitted front is still owed"
+    "the parked cells collapsed; the submitted front is still owed"
   );
   assert_eq!(
     s.effective_root(),
@@ -624,16 +695,16 @@ fn endpoint_construction_collapses_every_parked_root_keeping_the_owed_front() {
   // The successor's own submissions then run against the collapsed timeline as usual.
   let successor = WriteId::new(2, 1);
   let successor_state = root_at_view(5, 0, 0);
-  s.submit_root(successor, successor_state.clone());
+  s.submit_root(RootRole::DurableView, successor, successor_state.clone());
   s.sb_mut().land_root();
-  let (id, state) = s
+  let (_, id, state) = s
     .poll_sb()
     .expect("the front lands")
     .landed_root
     .expect("reported");
   assert_eq!((id, state), (front, front_state));
   s.sb_mut().land_root();
-  let (id, state) = s
+  let (_, id, state) = s
     .poll_sb()
     .expect("the successor lands")
     .landed_root
@@ -649,7 +720,11 @@ fn collapsing_an_all_parked_or_empty_timeline_is_safe() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.collapse_parked_roots();
   assert_eq!(s.roots_in_flight(), 0);
-  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_view(2, 0, 0),
+  );
   s.sb_mut().land_root();
   assert!(s.poll_sb().expect("lands").landed_root.is_some());
   s.collapse_parked_roots();
@@ -658,26 +733,87 @@ fn collapsing_an_all_parked_or_empty_timeline_is_safe() {
 }
 
 #[test]
-#[should_panic(expected = "the durable-root timeline exceeded its constant depth")]
-fn a_fourth_root_on_the_timeline_is_refused_fail_stop() {
-  // The constant depth cap at the submission choke: the front plus the live endpoint's two
-  // awaited roots is the whole timeline, so a fourth concurrent entry has no author — it is a
-  // leaked correlation, refused fail-stop in every profile rather than admitted as growth.
+fn the_timeline_holds_one_front_and_one_parked_root_per_role() {
+  // The depth bound, read off the containers: one front cell plus one parked cell per role, so a
+  // fourth concurrent root is UNREPRESENTABLE rather than asserted away. Where a leaked
+  // correlation once met a fail-stop at the fourth entry — a deterministic panic on an otherwise
+  // healthy replica — the same schedule is now absorbed as one supersession, and the depth stays
+  // at the constant the containers embody.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
-  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
-  s.submit_root(WriteId::new(1, 2), root_at_view(3, 0, 0));
-  s.submit_root(WriteId::new(1, 3), root_at_view(4, 0, 0));
-  s.submit_root(WriteId::new(1, 4), root_at_view(5, 0, 0));
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_view(2, 0, 0),
+  );
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 2),
+    root_at_view(3, 0, 0),
+  );
+  s.submit_root(
+    RootRole::Checkpoint,
+    WriteId::new(1, 3),
+    root_at_view(4, 0, 0),
+  );
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 4),
+    root_at_view(5, 0, 0),
+  );
+  assert_eq!(
+    s.roots_in_flight(),
+    3,
+    "four submissions, three cells: the same-role pair collapsed to its latest"
+  );
+  assert_eq!(s.roots_superseded(), 1, "and the overwrite left its trace");
+
+  // The drain is stamp-ordered across what survived: the front, the checkpoint root, then the
+  // replacement — every landing monotone, the overwritten root never among them, and each
+  // landing carrying the role its cell recorded.
+  s.sb_mut().land_root();
+  assert!(s.poll_sb().expect("the front lands").landed_root.is_some());
+  s.sb_mut().land_root();
+  let (role, id, _) = s
+    .poll_sb()
+    .expect("second landing")
+    .landed_root
+    .expect("reported");
+  assert_eq!(role, RootRole::Checkpoint);
+  assert_eq!(id, WriteId::new(1, 3));
+  s.sb_mut().land_root();
+  let (role, id, state) = s
+    .poll_sb()
+    .expect("third landing")
+    .landed_root
+    .expect("reported");
+  assert_eq!(role, RootRole::DurableView);
+  assert_eq!(id, WriteId::new(1, 4));
+  assert_eq!(state, root_at_view(5, 0, 0));
+  assert!(!s.has_inflight());
 }
 
 #[test]
-fn parked_roots_release_in_queue_order_across_generations() {
+fn parked_roots_release_in_stamp_order_across_generations() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   // Three incarnations' roots: the first submitted, each later one parked behind the foreign
-  // writes ahead of it (a rebuild-of-a-rebuild leaves exactly this queue).
-  s.submit_root(WriteId::new(1, 1), root_at_view(2, 0, 0));
-  s.submit_root(WriteId::new(2, 1), root_at_view(3, 0, 0));
-  s.submit_root(WriteId::new(3, 1), root_at_view(4, 0, 0));
+  // write ahead of it. The stamps are the session's, so submission order spans the rebuilds —
+  // sequences restart at 1 in each incarnation, which is why the ids cannot carry this order
+  // and the stamp does.
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_view(2, 0, 0),
+  );
+  s.submit_root(
+    RootRole::Checkpoint,
+    WriteId::new(2, 1),
+    root_at_view(3, 0, 0),
+  );
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(3, 1),
+    root_at_view(4, 0, 0),
+  );
   assert_eq!(s.sb_mut().staged_roots.len(), 1);
 
   s.sb_mut().land_root();
@@ -689,22 +825,41 @@ fn parked_roots_release_in_queue_order_across_generations() {
   );
 
   s.sb_mut().land_root();
-  assert!(s.poll_sb().expect("second landing").landed_root.is_some());
+  let (role, id, _) = s
+    .poll_sb()
+    .expect("second landing")
+    .landed_root
+    .expect("reported");
+  assert_eq!(
+    role,
+    RootRole::Checkpoint,
+    "the role survives to a landing another incarnation drains"
+  );
+  assert_eq!(id, WriteId::new(2, 1), "the lower stamp released first");
   assert_eq!(s.sb_mut().staged_roots.len(), 1, "the third released");
 
   s.sb_mut().land_root();
   assert!(s.poll_sb().expect("third landing").landed_root.is_some());
-  assert!(!s.has_inflight(), "the timeline drained in queue order");
+  assert!(!s.has_inflight(), "the timeline drained in stamp order");
 }
 
 #[test]
 #[should_panic(expected = "rewind the durable view")]
 fn a_root_below_the_effective_view_is_refused() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
-  s.submit_root(WriteId::new(1, 1), root_at_view(3, 0, 0));
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_view(3, 0, 0),
+  );
   // A writer that baselined below the timeline (the landed root, a stale scalar) is a bug the
-  // choke catches: landings arrive in queue order, so this root would regress the durable view.
-  s.submit_root(WriteId::new(2, 1), root_at_view(2, 0, 0));
+  // choke catches: landings arrive in stamp order, so this root would regress the durable view.
+  // The refusal runs BEFORE the cell write, so not even the parked entry is replaced.
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(2, 1),
+    root_at_view(2, 0, 0),
+  );
 }
 
 /// A v4 root at `(view, epoch)` — its membership carries three voters and chains from `config_id`.
@@ -738,12 +893,20 @@ fn root_at_epoch(view: u64, epoch: u64, config_id: u128) -> VsrState {
 fn a_root_below_the_effective_epoch_is_refused() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   // An in-flight SwapEpoch root carries the successor configuration at epoch 1.
-  s.submit_root(WriteId::new(1, 1), root_at_epoch(2, 1, 7));
+  s.submit_root(
+    RootRole::DurableView,
+    WriteId::new(1, 1),
+    root_at_epoch(2, 1, 7),
+  );
   // A root sourcing its configuration from state that lags the timeline (the writer's memory
   // before the swap installed, or a recovery baselined on a stale root) would land AFTER the swap
   // and republish the predecessor epoch — the durable-membership rewind. The view RISES here, so
   // only the epoch check can refuse it.
-  s.submit_root(WriteId::new(1, 2), root_at_epoch(3, 0, 3));
+  s.submit_root(
+    RootRole::Checkpoint,
+    WriteId::new(1, 2),
+    root_at_epoch(3, 0, 3),
+  );
 }
 
 // The assertions below the violation inspect the storage AFTER the panic surfaced, so the test
@@ -751,52 +914,51 @@ fn a_root_below_the_effective_epoch_is_refused() {
 // counterpart, and a build without `std` has no unwinding runtime to resume from at all.
 #[cfg(feature = "std")]
 #[test]
-fn an_out_of_order_landing_still_releases_the_parked_tail() {
+fn a_parked_completion_is_settled_before_the_violation_surfaces() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
-  let dead = WriteId::new(1, 1);
-  s.submit_root(dead, root_at_view(2, 0, 0));
+  let front = WriteId::new(1, 1);
+  s.submit_root(RootRole::DurableView, front, root_at_view(2, 0, 0));
   let parked = WriteId::new(2, 1);
-  s.submit_root(parked, root_at_view(3, 0, 0));
+  s.submit_root(RootRole::DurableView, parked, root_at_view(3, 0, 0));
   assert_eq!(
     s.sb_mut().staged_roots.len(),
     1,
     "the successor's root is parked behind the foreign one"
   );
-  // A single out-of-order completion always leaves the parked tail's blocker in the queue (the
-  // front retires through the in-order arm), so the stranding shape needs the COMPOUND violation:
-  // a backend that already desynced the submitted count. Construct that state directly — it is
-  // exactly what the settle-anyway branch exists to drain.
-  s.roots_submitted = 0;
-  s.sb_mut().done.push_back(SuperblockDone::Wrote(dead));
+  // A parked root was never handed to the backend, so no completion can legitimately name it:
+  // deliver one anyway — the violating-backend shape the settle-then-panic arm exists for.
+  s.sb_mut().done.push_back(SuperblockDone::Wrote(parked));
   let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.poll_sb()));
   assert!(
     polled.is_err(),
-    "the out-of-order landing surfaces the contract violation"
+    "the parked landing surfaces the contract violation"
   );
-  // The violating landing was settled BEFORE the panic surfaced it, and the settlement released
-  // the parked root to the backend — without the release nothing else ever would (the parked
-  // entry has no completion of its own to arrive), so `has_inflight` would hold forever.
+  // The violating completion was settled BEFORE the panic surfaced it: the parked entry left its
+  // cell — no completion could ever name it again, so without the settle `has_inflight` would
+  // hold (and `into_parts` refuse) forever — while the front stays the one write with the
+  // backend, still owed and still staged.
+  assert_eq!(s.roots_in_flight(), 1, "the parked entry was settled out");
   assert_eq!(
     s.sb_mut().staged_roots.len(),
-    2,
-    "settling the out-of-order landing released the parked tail"
+    1,
+    "the front is still the one write with the backend"
   );
-  // Drop the violating landing's stale stage entry (its completion already arrived above), then
-  // land the released root: it completes in order and drains the ledger.
-  let stale = s
-    .sb_mut()
-    .staged_roots
-    .pop_front()
-    .expect("the stale stage entry");
-  assert_eq!(stale.0, dead);
+  // The remaining ledger drains normally: the front lands and the session quiesces.
   s.sb_mut().land_root();
-  assert!(
-    s.poll_sb()
-      .expect("the released root lands")
-      .landed_root
-      .is_some()
-  );
+  assert!(s.poll_sb().expect("the front lands").landed_root.is_some());
   assert!(!s.has_inflight(), "the ledger drained");
+}
+
+#[test]
+#[should_panic(expected = "a superblock write completed that the session never submitted")]
+fn a_completion_the_session_never_submitted_is_refused_fail_stop() {
+  // The same untrusted-medium fail-stop as an invented cancellation: a backend inventing write
+  // facts is a medium whose ledger can no longer be trusted.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.sb_mut()
+    .done
+    .push_back(SuperblockDone::Wrote(WriteId::new(9, 9)));
+  s.poll_sb();
 }
 
 #[test]
@@ -810,7 +972,7 @@ fn an_envelope_landing_settles_without_claiming_the_root_timeline() {
     ),
     CheckpointSubmission::Submitted,
   );
-  s.submit_root(WriteId::new(1, 2), root(4, 40));
+  s.submit_root(RootRole::Checkpoint, WriteId::new(1, 2), root(4, 40));
   assert!(s.has_inflight());
 
   s.sb_mut().land_checkpoint();

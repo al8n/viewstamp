@@ -2092,13 +2092,32 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Defer while the LANE still owes a barrier. The gate reads the lane's own slot rather than this
     // endpoint's bookkeeping, because that is the reading a rebuild cannot reset: an inherited
     // barrier still owes the lane a completion after the endpoint that issued it is gone, and a
-    // successor's `pending_checkpoint` says nothing about it. Unreachable in the current tree — a
-    // barrier is issued only for an owed `pending_install`, and every path that ends this
-    // barrier's correlation (a view transition, a rebuild) drops that install with it, so a second
-    // barrier needs a fresh transfer whose arming waited on this lane delivering a frontier walk
-    // issued after it. So this is the structural backstop for a future issue site rather than a
-    // live path, and it costs nothing where it does fire: the install stays owed, its DAG stays
-    // GC-rooted, and the same cadences re-drive it.
+    // successor's `pending_checkpoint` says nothing about it.
+    //
+    // Unreachable in the current tree, and the argument needs BOTH legs below, because there are
+    // two ways to arrive here while a barrier is already queued.
+    //
+    // A FRESH barrier needs a fresh `pending_install`, which needs a transfer whose frontier drained
+    // — and every walk that drains one is admitted only when the lane's walk slot is free
+    // ([`Self::issue_walk`]). A walk issued after the queued barrier cannot be delivered before it,
+    // since the lane delivers in issue order, so by the time a second install exists the barrier has
+    // left the lane.
+    //
+    // The LOCAL RETRY is the leg that argument alone misses. [`Self::retry_install_flush`] re-drives
+    // this function for the SAME owed install off the solicit and recover cadences, and every gate
+    // above it (`pending_sb`, `pending_checkpoint`, the envelope lane) is endpoint state a view
+    // transition resets — so on those gates alone, a transition that dropped this barrier's
+    // `pending_checkpoint` at `FlushingBlocks` would let the next cadence tick issue a second
+    // barrier behind the queued one. It cannot, because the reset that drops that correlation
+    // (`reset_for_view_transition`) clears `pending_install` UNCONDITIONALLY in the same pass, and a
+    // rebuilt endpoint starts with it `None`: the retry then finds no install owed and returns at
+    // the top of this function. Ending the correlation and ending the obligation are ONE act, so the
+    // retry can only re-issue on the interleavings where the correlation survived — which are
+    // exactly the ones where the barrier it belongs to is still the only one.
+    //
+    // So this is the structural backstop for a future issue site rather than a live path, and it
+    // costs nothing where it does fire: the install stays owed, its DAG stays GC-rooted, and the
+    // same cadences re-drive it.
     if storage.flush_owed() {
       return;
     }
@@ -2139,6 +2158,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// install owed for the next cadence; a transient disk fault thus self-heals instead of stalling the sync
   /// forever if the donor crashes after the blocks were fetched. No-op once the install has STAGED (a
   /// SyncRepersist `pending_checkpoint` is in flight — the fence in `flush_and_stage_install` returns).
+  ///
+  /// This is the one path that re-drives a barrier for an install whose FIRST barrier may still be
+  /// on the lane, so it is the path the lane's one-barrier bound has to survive. It does, and not
+  /// through the fences this re-enters: the transition that would clear them ends the owed install
+  /// in the same pass, leaving this a no-op. The full argument is at the lane-slot gate in
+  /// [`Self::flush_and_stage_install`], which is where a change to either half would be made.
   pub(crate) fn retry_install_flush<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -2312,14 +2337,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // (the laggard never proposed one) this is a no-op, keeping that path byte-identical.
       self.pending_swap = None;
       if matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_)))) {
-        // The stale swap's correlation ends here, so its root is forfeited with it: a parked one
-        // leaves the session queue (nothing awaits it), a submitted one lands and is ignored. The
-        // same belt-and-suspenders as the clear itself — the sync staged only over a free
-        // superblock, and the crossing's own re-persist root has already LANDED to reach this
-        // install, so a swap root still queued here is not an expected state; ending the
-        // correlation and the queue entry together keeps the belt airtight either way.
+        // The stale swap's correlation ends here, so its root is abandoned with it: a parked one
+        // leaves its cell (nothing awaits it), a submitted one lands uncorrelated and the
+        // landing absorb holds its facts (its scalars sit at/below this install's, so the
+        // absorb no-ops; the configuration half already installs off any epoch-advancing
+        // landing). The same belt-and-suspenders as the clear itself — the sync staged only
+        // over a free superblock, and the crossing's own re-persist root has already LANDED to
+        // reach this install, so a swap root still queued here is not an expected state; ending
+        // the correlation and the cell entry together keeps the belt airtight either way.
         if let Some((abandoned, _)) = self.pending_sb.take() {
-          storage.forfeit_root(abandoned);
+          storage.abandon_root(RootRole::DurableView, abandoned);
         }
       }
     }

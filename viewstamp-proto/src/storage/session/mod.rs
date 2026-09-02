@@ -31,13 +31,14 @@
 //!     at the ring capacity — tighter than the quota only when `capacity` is below it. On the
 //!     DEFAULT ring-less backend distinct ops never alias, so the fence bounds NOTHING there; it
 //!     is a write-ordering guard, and the quota above is the only append bound.
-//! - **durable roots** — the CONSTANT-depth timeline: at most one root with the backend
-//!   ([`Storage::submit_root`] parks the rest in queue order), at most [`MAX_INFLIGHT_ROOTS`]
-//!   entries on the whole timeline (asserted at the submission choke in every profile) —
-//!   supersession forfeits a live correlation's replaced root ([`Storage::forfeit_root`]) and
-//!   endpoint construction collapses every parked leftover of the dead incarnations
-//!   ([`Storage::collapse_parked_roots`]), so the depth never scales with the rebuild count.
-//!   Unconditional: the constant holds in every configuration;
+//! - **durable roots** — the per-ROLE slots: at most one root with the backend (the front cell,
+//!   owed to the medium until it lands) plus one PARKED cell per correlation role ([`RootRole`] —
+//!   the endpoint's durable-view write and its checkpoint root, each a single-slot correlation).
+//!   A same-role resubmission OVERWRITES its parked cell, so supersession is the submission
+//!   itself rather than a release call the submitter owes, and the timeline's depth is the
+//!   cardinality of those containers ([`MAX_INFLIGHT_ROOTS`]) — never a function of caller
+//!   discipline or the endpoint rebuild count. Unconditional: the constant holds in every
+//!   configuration;
 //! - **checkpoint envelopes** — the one-outstanding fence: at most one envelope write on the
 //!   medium ([`Storage::submit_checkpoint`] returns [`CheckpointSubmission::EnvelopeFenced`]
 //!   otherwise). Unconditional;
@@ -53,6 +54,15 @@
 //! fixed at format time and fenced by recovery) — and each has a per-tick oracle in the
 //! simulation (the backend asserts and the boundedness checker), so a caller change that would
 //! re-open a lane trips a sweep instead of growing quietly.
+//!
+//! The rule the lanes share, stated once so a fifth lane has something to be measured against: a
+//! session container is either KEYED by a finite, session-owned key space (the root roles, the
+//! block-job kinds, the one envelope lane) or COUNTED at its own choke against a session-derived
+//! ceiling (the append quota, the serve cap — the two whose correlata are not enumerable).
+//! Nothing mechanical stops a new unbounded container from compiling; what this module maintains
+//! is that it contains zero counterexamples, so a deviation is conspicuous in review — and any
+//! new container must name its key space or ceiling here and ship with a per-tick arm in the
+//! simulation's boundedness checker.
 //!
 //! # Each choke counts its own refusals
 //!
@@ -85,7 +95,7 @@
 //! The counts are session-lifetime, so an endpoint rebuild cannot reset the evidence.
 
 use std::{
-  collections::{BTreeMap, BTreeSet, VecDeque},
+  collections::{BTreeMap, BTreeSet},
   vec::Vec,
 };
 
@@ -114,19 +124,68 @@ mod tests;
 /// a predecessor's.
 type SessionKey = (u64, u64);
 
-/// The CONSTANT depth cap of the durable-root timeline, asserted at the submission choke:
-/// the submitted front (at most one root is ever with the backend — possibly a dead
-/// predecessor's, owed to the medium until it lands) plus the live endpoint's two awaited
-/// roots (its one durable-view write and its one checkpoint root — each a single-slot
-/// correlation whose re-submission forfeits the root it supersedes).
+/// The correlation ROLE a durable-root write answers — the parked cell it occupies while an
+/// earlier root is with the backend. The two variants are not a modeling choice: the endpoint
+/// holds exactly two root correlations, each a single `Option` (`pending_sb` for its durable-view
+/// write, `pending_checkpoint`'s await-root step for its checkpoint root), so every submission
+/// maps onto exactly one cell, and a same-role resubmission is by construction a SUPERSESSION of
+/// whatever its cell holds — the one correlation of that role now awaits the new write, so
+/// nothing can ever await or complete the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootRole {
+  /// The durable-view / epoch-swap root the endpoint's `pending_sb` correlation awaits.
+  DurableView,
+  /// The checkpoint root the endpoint's `pending_checkpoint` correlation awaits.
+  Checkpoint,
+}
+
+/// How many parked cells the root timeline holds: one per [`RootRole`].
+const PARKED_ROOT_ROLES: usize = 2;
+
+impl RootRole {
+  /// The parked cell this role occupies.
+  const fn cell(self) -> usize {
+    match self {
+      Self::DurableView => 0,
+      Self::Checkpoint => 1,
+    }
+  }
+}
+
+/// The CONSTANT depth of the durable-root timeline: the submitted front (at most one root is
+/// ever with the backend — possibly a dead predecessor's, owed to the medium until it lands)
+/// plus one parked cell per correlation role.
 ///
-/// Independent of the endpoint rebuild count by construction: a rebuild collapses every parked
-/// root of the dead incarnations at endpoint construction ([`Storage::collapse_parked_roots`]),
-/// so dead incarnations contribute at most the submitted front. A fourth entry therefore has no
-/// author — it is a caller that either leaked a correlation or grew a third one — and the
-/// submission assert refuses it fail-stop rather than letting a leak grow the timeline (and this
-/// ledger, each entry cloning a header-bearing state) by one root per view-change window.
-const MAX_INFLIGHT_ROOTS: usize = 3;
+/// A cardinality of the containers, not a discipline: a fourth concurrent root has no cell to
+/// occupy — a same-role resubmission overwrites its cell instead of queueing behind it — so the
+/// depth cannot scale with the rebuild count, the view-change rate, or any caller's memory of
+/// what it once submitted. The simulation's boundedness checker re-asserts the depth per tick
+/// against its OWN independently specified constant, and separately pins
+/// [`Storage::roots_bound`] equal to it — so a future representation change is caught by the
+/// count arm if a schedule exceeds the contract, and by the equality arm the moment this
+/// constant moves at all.
+const MAX_INFLIGHT_ROOTS: usize = 1 + PARKED_ROOT_ROLES;
+
+/// One entry on the durable-root timeline: a submitted root write, the exact state it will make
+/// durable, and the session-owned stamp that orders it against every other submission.
+struct RootEntry {
+  /// The correlation role the write was submitted under. Carried onto the landing so the
+  /// endpoint can classify a completion whose correlation no longer exists: the id alone says
+  /// nothing once `pending_sb`/`pending_checkpoint` have moved on, and the state alone cannot
+  /// distinguish a checkpoint root (whose frontier the endpoint may owe a catch-up for) from a
+  /// view root that merely copied the same frontier forward.
+  role: RootRole,
+  /// The write's id — any incarnation's.
+  id: WriteId,
+  /// The exact [`VsrState`] the write will make durable.
+  state: VsrState,
+  /// The submission stamp: minted from [`Storage::next_root_stamp`] at the submission choke,
+  /// strictly increasing across every submission of the session's lifetime — every endpoint
+  /// incarnation's. The highest stamp on the timeline is therefore the LAST-submitted root (the
+  /// effective root) and the lowest is the next to release, and both orders survive any number
+  /// of endpoint rebuilds because the mint is the session's, not any endpoint's.
+  stamp: u64,
+}
 
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn key(id: WriteId) -> SessionKey {
@@ -221,12 +280,16 @@ pub(crate) struct WalPolled {
 pub(crate) struct SbPolled {
   /// The completion, to be routed through the endpoint's incarnation choke unchanged.
   pub(crate) done: SuperblockDone,
-  /// The root write this completion landed, with the exact state it made durable — any
-  /// incarnation's. `Some` exactly when the completion retired the FRONT of the session's root
-  /// queue (roots land in submission order; the single-serialized-writer contract). A successor
-  /// endpoint reads an inherited landing from here — the refused foreign completion itself carries
-  /// no state.
-  pub(crate) landed_root: Option<(WriteId, VsrState)>,
+  /// The root write this completion landed — its submission role, its id, and the exact state
+  /// it made durable — any incarnation's. `Some` exactly when the completion retired the FRONT
+  /// of the session's root timeline — the one root write with the backend. A parked cell can
+  /// never produce a landing (the backend was never handed its write), so this is the ONLY
+  /// channel an uncorrelated landing reaches an endpoint through — the refused foreign
+  /// completion itself carries no state, and a live endpoint's correlation tables no longer
+  /// name a root whose correlation ended without an abandon. The role rides along because the
+  /// endpoint's landing absorb classifies by it: a checkpoint-role landing can advance the
+  /// durable checkpoint past what the endpoint applied, a view-role landing never does.
+  pub(crate) landed_root: Option<(RootRole, WriteId, VsrState)>,
 }
 
 /// The storage session: owns the [`Wal`] and [`Superblock`] handles together with every physical
@@ -292,38 +355,49 @@ pub struct Storage<W, B, S: StateMachine> {
   /// it is capacity-independent. Stable for the session's lifetime: the geometry it derives from
   /// is pinned at format time and recovery refuses a restart under a different interval.
   append_quota: u64,
-  /// EVERY in-flight durable-root write, in queue order, each with the exact [`VsrState`] it
-  /// will make durable. The single-serialized-writer contract delivers their completions in this
-  /// order, so the BACK entry is the root the medium is guaranteed to converge to — the effective
-  /// root ([`Self::effective_root`]) — and the FRONT is the next landing. Holding the submitted
-  /// states here is what makes the effective root readable off ONE timeline: a root writer that
-  /// paired an in-memory scalar with a freshly-read durable half could mint a pair no checkpoint
-  /// ever had whenever an inherited root landed in between, and a rebuilt endpoint that baselined
-  /// on the landed root instead of the back of this queue would come up BELOW a state the medium
-  /// is already guaranteed to reach.
+  /// The one durable-root write WITH the backend — the front of the root timeline, owed to the
+  /// medium until it lands. The physical root pipeline is one deep: a conforming backend that is
+  /// merely slow holds this one write, never a backlog, and with one write ever out a
+  /// successor's root can never interleave with a dead predecessor's outstanding one. Holding
+  /// the submitted state here (and in every parked cell) is what makes the effective root
+  /// readable off ONE timeline: a root writer that paired an in-memory scalar with a
+  /// freshly-read durable half could mint a pair no checkpoint ever had whenever an inherited
+  /// root landed in between, and a rebuilt endpoint that baselined on the landed root instead of
+  /// the timeline's latest entry would come up BELOW a state the medium is already guaranteed to
+  /// reach.
   ///
-  /// Only the FRONT is ever WITH the backend ([`Self::roots_submitted`] counts the submitted
-  /// prefix — at most one entry): every later submission is PARKED, deferred in queue order until
-  /// the landings ahead of it settle, so a conforming backend that is merely slow holds one root
-  /// write, never a backlog. Parked or submitted, an entry is a committed point on the timeline:
-  /// the effective root includes it, and quiescence ([`Self::has_inflight`],
-  /// [`Self::into_parts`]) waits for it — unless it is FORFEITED: supersession removes a live
-  /// correlation's replaced parked root the moment nothing awaits it ([`Self::forfeit_root`]),
-  /// and endpoint construction collapses every parked leftover of the dead incarnations
-  /// ([`Self::collapse_parked_roots`] — a rebuild is the one moment "no live correlation awaits
-  /// any parked entry" is a structural fact rather than a caller promise). Together those keep
-  /// the timeline at a CONSTANT depth — the front plus the live endpoint's two awaited roots,
-  /// never a function of the rebuild count — and [`Self::submit_root`] asserts that cap
-  /// ([`MAX_INFLIGHT_ROOTS`]) in every profile, so a caller that leaks a correlation is refused
-  /// fail-stop instead of growing this ledger by one header-bearing state per view-change window.
-  roots: VecDeque<(WriteId, VsrState)>,
-  /// How many entries at the FRONT of [`Self::roots`] have been handed to
-  /// [`Superblock::submit_write`] — `0` or `1`, never more: the physical root pipeline is one
-  /// deep ([`Self::submit_root`]'s gate), so the backend can never accumulate a backlog of this
-  /// session's roots however slowly it completes them. Always a prefix: submission order is queue
-  /// order, so a parked entry can never overtake the front. Entries at/after this index are
-  /// parked and are submitted by [`Self::poll_sb`] as the landings ahead of them settle.
-  roots_submitted: usize,
+  /// Always the LOWEST stamp on the timeline ([`Self::release_next_root`] promotes the
+  /// lowest-stamp parked entry, and everything parked afterwards is stamped higher), which is
+  /// what keeps the effective root stable across a landing: retiring the minimum never moves the
+  /// maximum unless it was the only entry — and then the durable root EQUALS the departed front.
+  /// Once here an entry is irrevocable: abandonment touches only parked cells, because the
+  /// backend was handed this write and its landing is a medium fact no correlation's end can
+  /// retract.
+  root_front: Option<RootEntry>,
+  /// The PARKED durable-root writes — recorded on the timeline but not yet handed to the
+  /// backend — one cell per correlation role, indexed by [`RootRole::cell`]. Parked or
+  /// submitted, an entry is a committed point on the timeline: the effective root includes it
+  /// and quiescence ([`Self::has_inflight`], [`Self::into_parts`]) waits for it, unless it
+  /// leaves its cell without landing — a same-role resubmission OVERWRITES it (supersession is
+  /// the submission itself: the endpoint's one correlation of that role now awaits the new
+  /// write, so nothing can ever await or complete the old one), its submitter explicitly
+  /// disowns it ([`Self::abandon_root`]), or endpoint construction collapses it with every other
+  /// parked leftover of the dead incarnations ([`Self::collapse_parked_roots`]).
+  ///
+  /// The cells are the timeline's bound. A missed abandonment cannot grow anything: the stale
+  /// entry sits in the one cell its role owns until the next same-role submission replaces it or
+  /// [`Self::release_next_root`] promotes it and it lands — safe either way, because the entry
+  /// passed the no-rewind asserts at its submission and everything submitted after it was
+  /// asserted against it (a wasted write, still monotone). That is the failure mode the cells
+  /// buy: the depth growth a leaked correlation once fed — and the every-profile fail-stop that
+  /// refused it on an otherwise healthy replica — are both unrepresentable, because there is no
+  /// fourth cell to grow into.
+  parked_roots: [Option<RootEntry>; PARKED_ROOT_ROLES],
+  /// The submission-stamp mint for [`RootEntry::stamp`]: the next stamp to hand out, advanced at
+  /// every root submission. Session-owned so the order it defines spans endpoint rebuilds. A
+  /// `u64` cannot wrap here in any store's lifetime — each stamp is minted for one physical
+  /// superblock write.
+  next_root_stamp: u64,
   /// EVERY in-flight checkpoint-envelope write: full id → the checkpoint op it stages. Tracked so
   /// quiescence ([`Self::has_inflight`], [`Self::into_parts`]) covers the envelope leg of a
   /// checkpoint exactly as it covers appends and roots. CONTENT safety needs no fence — the
@@ -331,7 +405,7 @@ pub struct Storage<W, B, S: StateMachine> {
   /// next recovery (checksum mismatch → peer fetch) rather than silently restored — but
   /// BOUNDEDNESS does: an entry here was handed to the backend at submission (envelopes are never
   /// parked), so an orphan — a `SyncRepersist` correlation a view transition dropped at its
-  /// envelope step, or a dead incarnation's write — is owed to the medium and cannot be forfeited;
+  /// envelope step, or a dead incarnation's write — is owed to the medium and cannot be abandoned;
   /// it drains only at its completion. Admission is therefore the only available bound, and
   /// [`Self::submit_checkpoint`] enforces it: at most ONE envelope write outstanding, ever. The
   /// superblock's completion-order contract covers root writes only, so without the fence a
@@ -363,6 +437,20 @@ pub struct Storage<W, B, S: StateMachine> {
   /// step and its cadence re-forces one once the outstanding write drains. Exposed via
   /// [`Self::envelopes_fenced`].
   envelopes_fenced: u64,
+  /// Observability counter: how many parked roots a same-role resubmission OVERWROTE — the
+  /// supersessions the cells perform structurally, where a removal call once had to be paired
+  /// with the replacing submission. A growing count is healthy view-change churn outrunning a
+  /// slow backend (each overwrite is one root write the medium never had to take); the counter
+  /// exists so that traffic is observable at all, because no depth arm can see an overwrite — it
+  /// leaves the timeline exactly as deep as it found it. Session-lifetime, like every count
+  /// here. Exposed via [`Self::roots_superseded`].
+  roots_superseded: u64,
+  /// Observability counter: how many parked roots their submitter explicitly abandoned —
+  /// [`Self::abandon_root`] found the named root still parked and cleared its cell. Read as an
+  /// EFFICIENCY witness, not a bound: a cleared cell saves the medium one wasted (safe) landing,
+  /// and a missed or mismatched abandonment costs exactly that landing and nothing else.
+  /// Exposed via [`Self::roots_abandoned`].
+  roots_abandoned: u64,
   /// The block lane's front: every job issued over this store and not yet completed, the per-kind
   /// slots they occupy, and the order they must execute in.
   lane: LaneFront<S>,
@@ -383,12 +471,15 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
       wal_writes: BTreeMap::new(),
       wal_slots: BTreeSet::new(),
       append_quota: 0,
-      roots: VecDeque::new(),
-      roots_submitted: 0,
+      root_front: None,
+      parked_roots: [const { None }; PARKED_ROOT_ROLES],
+      next_root_stamp: 0,
       checkpoints: BTreeMap::new(),
       appends_slot_fenced: 0,
       appends_quota_refused: 0,
       envelopes_fenced: 0,
+      roots_superseded: 0,
+      roots_abandoned: 0,
       lane: LaneFront::new(),
     }
   }
@@ -417,7 +508,7 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
   /// incarnation issued it.
   pub fn has_inflight(&self) -> bool {
     !self.wal_writes.is_empty()
-      || !self.roots.is_empty()
+      || self.roots_in_flight() != 0
       || !self.checkpoints.is_empty()
       || self.lane.owes_completion()
   }
@@ -498,17 +589,30 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
     &self.sb
   }
 
-  /// The number of durable-root writes on the in-flight timeline — the submitted front plus every
-  /// parked entry behind it. Never exceeds [`MAX_INFLIGHT_ROOTS`]: the submission choke asserts
-  /// the constant cap, supersession forfeits replaced roots, and endpoint construction collapses
-  /// the dead incarnations' parked leftovers.
+  /// The number of durable-root writes on the in-flight timeline — the submitted front plus
+  /// every parked cell. Never exceeds [`MAX_INFLIGHT_ROOTS`], and that is a cardinality of the
+  /// containers this method counts (one front cell, one parked cell per role) rather than a
+  /// discipline any caller maintains.
   ///
-  /// Exposed for the simulation boundedness checker, which independently re-asserts the constant
-  /// per tick. Not part of the stable API.
+  /// Exposed for the simulation boundedness checker, which re-asserts the constant per tick —
+  /// the tripwire for a future representation change, since the containers themselves cannot
+  /// express a deeper timeline today. Not part of the stable API.
   #[doc(hidden)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn roots_in_flight(&self) -> usize {
-    self.roots.len()
+    usize::from(self.root_front.is_some()) + self.parked_roots.iter().flatten().count()
+  }
+
+  /// The root timeline's CONSTANT depth cap: the front cell plus the parked cells. Exposed so
+  /// the simulation boundedness checker can pin this reported value EQUAL to its own
+  /// independently specified contract — the checker's count arm asserts against its constant
+  /// (a bound read from the session could never fail with the count it bounds), and this
+  /// accessor is what lets the equality arm flag a container change (or a stale checker
+  /// contract) even on a schedule that never fills the cells. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn roots_bound(&self) -> usize {
+    MAX_INFLIGHT_ROOTS
   }
 
   /// The number of in-flight physical WAL appends over this medium — every endpoint incarnation's,
@@ -618,6 +722,25 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn envelopes_fenced(&self) -> u64 {
     self.envelopes_fenced
+  }
+
+  /// How many parked roots a same-role resubmission overwrote (see the field). Read as churn
+  /// observability, never a refusal count: an overwrite admits the new root and disowns the old
+  /// one in the same write, so nothing is deferred and nothing grows — this is the only trace
+  /// the supersession leaves. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn roots_superseded(&self) -> u64 {
+    self.roots_superseded
+  }
+
+  /// How many parked roots their submitter explicitly abandoned (see the field): the efficiency
+  /// witness for the abandonment calls, whose only stake is a saved (safe) landing. Not part of
+  /// the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn roots_abandoned(&self) -> u64 {
+    self.roots_abandoned
   }
 
   /// Test-only escape hatch to the raw WAL handle, for fixture knobs (staging, landing order,
@@ -794,10 +917,23 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     Some(WalPolled { done, freed_slot })
   }
 
-  /// The EFFECTIVE root: the state of the last root on the timeline — the BACK of the root queue
-  /// if any root is still in flight (submitted or parked), else the durable root. This is the state
-  /// the medium is guaranteed to converge to once the queue drains (root completions arrive in
-  /// submission order and the last-submitted root wins), so it is the sound recovery baseline for
+  /// The latest-submitted root still on the timeline: the HIGHEST-STAMP entry among the front
+  /// and the parked cells, `None` when the timeline is drained. Stamps are minted in submission
+  /// order, so the maximum is exactly the entry a submission-ordered queue would hold at its
+  /// back.
+  fn latest_root(&self) -> Option<&RootEntry> {
+    self
+      .root_front
+      .iter()
+      .chain(self.parked_roots.iter().flatten())
+      .max_by_key(|entry| entry.stamp)
+  }
+
+  /// The EFFECTIVE root: the state of the last root submitted to the timeline — the
+  /// highest-stamp entry across the front and parked cells ([`Self::latest_root`]) if any root
+  /// is still in flight, else the durable root. This is the state the medium is guaranteed to
+  /// converge to once the timeline drains (roots are released to the backend in stamp order and
+  /// the last-submitted root wins), so it is the sound recovery baseline for
   /// every field a rebuilt endpoint's own root writes stamp FROM LIVE MEMORY (`view`/`log_view`/
   /// `commit`): a successor that baselined those on the landed root instead would come up BELOW a
   /// state already owed to the medium, and its own root writes would then rewind the durable
@@ -805,20 +941,24 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// checkpoint pair and the configuration block) are instead COPIED FORWARD from here by every
   /// root writer, so a rebuilt endpoint holds them at the LANDED root — what a crash actually
   /// recovers — without its writes ever rewinding the timeline.
-  /// Invariant during any window in which no root is submitted or forfeited: landings drain the
-  /// queue's front without moving the back, and when the queue empties the durable root EQUALS the
-  /// last-submitted one — so this value is stable across the drain, never a snapshot of a moment.
-  /// A forfeiture ([`Self::forfeit_root`]) can retire the back itself: the value then steps back
-  /// to the previous timeline point, which is sound for the same reason the drain is — the
-  /// forfeited state was never handed to the medium, so the medium now converges to the new back,
+  ///
+  /// Invariant during any window in which no root is submitted, superseded, or abandoned: the
+  /// front holds the LOWEST stamp on the timeline (promotion takes the minimum, and everything
+  /// parked afterwards is stamped higher), so a landing retires the minimum and never moves the
+  /// highest-stamp entry this value reads — unless the front was the ONLY entry, in which case
+  /// the timeline empties and the durable root EQUALS the state that just landed. Either way the
+  /// value is stable across the drain, never a snapshot of a moment. A supersession or an
+  /// abandonment can retire the highest-stamp entry itself: the value then steps back to the
+  /// previous timeline point, which is sound for the same reason the drain is — the retired
+  /// state was never handed to the medium, so the medium now converges to the new latest entry,
   /// and every later writer re-derives from it under the same no-rewind asserts.
   ///
   /// What it deliberately does NOT claim: that this state is durable YET. Across a process death
   /// the in-flight tail dies with the process, so an endpoint recovering here must keep its
   /// DURABLE-view witness on the landed root and lift it only as the landings arrive.
   pub(crate) fn effective_root(&self) -> VsrState {
-    match self.roots.back() {
-      Some((_, state)) => state.clone(),
+    match self.latest_root() {
+      Some(entry) => entry.state.clone(),
       None => self.sb.state(),
     }
   }
@@ -827,12 +967,12 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// ([`Self::effective_root`]), projected without cloning the full state. Both halves come off ONE
   /// root value on one timeline, which is the whole point: a root writer pairing an in-memory op
   /// with a freshly-read durable id can mint a pair no checkpoint ever had the moment an inherited
-  /// root lands between the two reads. By the single-serialized-writer contract every in-flight
-  /// root lands before anything submitted after it, so a new root carrying this pair can never
-  /// rewind the durable checkpoint.
+  /// root lands between the two reads. Roots are released in stamp order and land in release
+  /// order, so every in-flight root lands before anything submitted after it, and a new root
+  /// carrying this pair can never rewind the durable checkpoint.
   pub(crate) fn effective_checkpoint_pair(&self) -> (OpNumber, u128) {
-    match self.roots.back() {
-      Some((_, state)) => (state.checkpoint_op(), state.checkpoint_id()),
+    match self.latest_root() {
+      Some(entry) => (entry.state.checkpoint_op(), entry.state.checkpoint_id()),
       None => {
         let state = self.sb.state();
         (state.checkpoint_op(), state.checkpoint_id())
@@ -840,12 +980,13 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     }
   }
 
-  /// Submit a durable-root write, recording `(id, state)` on the root timeline. The ONLY route to
-  /// [`Superblock::submit_write`] past genesis.
+  /// Submit a durable-root write for `role`'s correlation, recording `(id, state)` on the root
+  /// timeline. The ONLY route to [`Superblock::submit_write`] past genesis.
   ///
   /// While ANY root is outstanding — this incarnation's or a dead predecessor's — the submission
-  /// is PARKED: recorded on the timeline but not yet handed to the backend, and submitted by the
-  /// session itself, in queue order, as the landings ahead of it settle ([`Self::poll_sb`]). One
+  /// is PARKED in `role`'s cell: recorded on the timeline but not yet handed to the backend, and
+  /// promoted by the session itself, in stamp (= submission) order, as the landings ahead of it
+  /// settle ([`Self::poll_sb`]). One
   /// physical root write in flight is the whole pipeline. The gate is what keeps a conforming but
   /// arbitrarily slow backend from accumulating a write backlog: the backend owes completions in
   /// order but owes them at no particular time, so a submitter that stacked a root per view-change
@@ -854,10 +995,16 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// write ever out, a successor's root can never interleave with a dead predecessor's
   /// outstanding one. An endpoint may still have a checkpoint root and a view-change root in
   /// flight together — ordered delivery and last-submitted-wins hold exactly as before, with the
-  /// order now enforced by the queue rather than trusted to the backend's serialization — and a
-  /// stacked root a later submission supersedes is removed by [`Self::forfeit_root`] the moment
-  /// its correlation ends, which is what bounds the queue itself.
-  pub(crate) fn submit_root(&mut self, id: WriteId, state: VsrState) {
+  /// order enforced by the stamps rather than trusted to the backend's serialization.
+  ///
+  /// A submission whose role's cell is already occupied OVERWRITES it — that is the
+  /// supersession: the endpoint's one correlation of this role now awaits the new write, so
+  /// nothing can ever await or complete the overwritten one, and the disowned entry leaves the
+  /// timeline in the same act that replaces it. There is no removal call to pair with this
+  /// submission and none to miss; the cell admits one entry per role, so the timeline's depth is
+  /// the containers' cardinality ([`MAX_INFLIGHT_ROOTS`]) on every schedule, including the ones
+  /// where a correlation-ending path forgot to abandon its root.
+  pub(crate) fn submit_root(&mut self, role: RootRole, id: WriteId, state: VsrState) {
     // The no-rewind invariants ENFORCED at the submission choke, in every build profile. The
     // asserts run BEFORE `Superblock::submit_write`, so a violating root is REFUSED — it never
     // reaches the medium — and the refusal is fail-stop rather than a recoverable error because
@@ -870,7 +1017,8 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     // writers), so a rewinding root is a caller bug — unreachable by construction — and this
     // choke is the backstop that keeps it so under release schedules, where the simulator runs.
     // The view check is the durable-view-monotonicity invariant at its choke point: landings
-    // arrive in queue order, so a view-monotone queue is exactly a never-regressing durable view.
+    // arrive in stamp order, so a view-monotone timeline is exactly a never-regressing durable
+    // view.
     let effective = self.effective_root();
     assert!(
       state.view() >= effective.view(),
@@ -885,7 +1033,7 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
       effective.checkpoint_op().get(),
     );
     // The epoch/configuration half is monotone for the same reason the view is: landings arrive in
-    // queue order, so a root carrying an epoch below the timeline's would republish a superseded
+    // stamp order, so a root carrying an epoch below the timeline's would republish a superseded
     // configuration underneath a swap the medium already guaranteed — the durable-membership rewind
     // a crash then recovers. Every root writer sources this half from the timeline (recovery
     // baselines the configuration on the landed root and copies an in-flight successor forward at
@@ -920,57 +1068,81 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
       state.config_install_op().get(),
       effective.config_install_op().get(),
     );
-    if self.roots.is_empty() {
-      self.sb.submit_write(id, state.clone());
-      self.roots_submitted = 1;
+    // The stamp mint: submission order, session-owned so it survives endpoint rebuilds. (A u64
+    // cannot wrap here in any store's lifetime — each stamp is minted for one physical
+    // superblock write.)
+    let stamp = self.next_root_stamp;
+    self.next_root_stamp += 1;
+    let cell = &mut self.parked_roots[role.cell()];
+    if cell.is_some() {
+      self.roots_superseded += 1;
     }
-    self.roots.push_back((id, state));
-    // The constant depth cap, enforced AT the choke in every profile: the push above is refused
-    // (fail-stop, like the no-rewind asserts — the caller's correlation state already assumes the
-    // submission) rather than admitted as a fourth entry no live correlation can account for. See
-    // [`MAX_INFLIGHT_ROOTS`] for why three is the whole timeline.
-    assert!(
-      self.roots.len() <= MAX_INFLIGHT_ROOTS,
-      "the durable-root timeline exceeded its constant depth ({} > {MAX_INFLIGHT_ROOTS}) — a \
-       submitter leaked a root correlation instead of forfeiting or collapsing it",
-      self.roots.len(),
-    );
+    *cell = Some(RootEntry {
+      role,
+      id,
+      state,
+      stamp,
+    });
+    self.release_next_root();
   }
 
-  /// Hand the next queued root to the backend once nothing is outstanding. Runs after every root
-  /// settlement, so the one-deep pipeline refills the moment its slot frees — the same release
-  /// discipline as a fence-deferred append.
+  /// Hand the LOWEST-STAMP parked root to the backend once nothing is outstanding — the
+  /// promotion that keeps release order equal to submission order. Runs after every submission
+  /// and after every root settlement, so the one-deep pipeline refills the moment its slot
+  /// frees — the same release discipline as a fence-deferred append.
   fn release_next_root(&mut self) {
-    if self.roots_submitted == 0
-      && let Some((id, state)) = self.roots.front().cloned()
+    if self.root_front.is_some() {
+      return;
+    }
+    if let Some(cell) = self
+      .parked_roots
+      .iter_mut()
+      .filter(|cell| cell.is_some())
+      .min_by_key(|cell| cell.as_ref().map(|entry| entry.stamp))
+      && let Some(entry) = cell.take()
     {
-      self.sb.submit_write(id, state);
-      self.roots_submitted = 1;
+      self.sb.submit_write(entry.id, entry.state.clone());
+      self.root_front = Some(entry);
     }
   }
 
-  /// Remove a PARKED root whose submitter has ended its correlation — superseded it with a newer
-  /// submission, or abandoned it without one. A no-op for the submitted front (an outstanding
-  /// write is owed to the medium and must land) and for an id the queue no longer holds (already
-  /// landed).
+  /// Clear `role`'s parked cell if it still holds `id` — the caller's declaration that the
+  /// correlation which submitted that root has ended without a successor, so nothing will ever
+  /// await or complete it. A no-op when the cell holds anything else: the submitted front never
+  /// occupies a parked cell (an outstanding write is owed to the medium and must land), and an
+  /// id the cell no longer holds was already superseded, collapsed, or promoted.
   ///
-  /// Removal is sound exactly because the entry is parked and disowned. The backend never saw the
-  /// write, so nothing physical exists for quiescence to wait on; no completion can ever name it
-  /// (only submitted writes complete) and its owner awaits none (this call IS the correlation's
-  /// end), so nothing strands. And the landing sequence stays monotone: the queue is monotone in
-  /// every no-rewind dimension by the submission asserts, and removing one entry leaves a
-  /// subsequence, so no retained landing rewinds another. The back itself may be removed — the
-  /// effective root then steps back to the previous entry, which is again the state the medium
-  /// converges to, because the forfeited state was never handed to the medium and every later
-  /// writer re-derives from the post-removal effective root under the same asserts.
-  pub(crate) fn forfeit_root(&mut self, id: WriteId) {
-    if let Some(at) = self
-      .roots
-      .iter()
-      .skip(self.roots_submitted)
-      .position(|(qid, _)| *qid == id)
-    {
-      self.roots.remove(self.roots_submitted + at);
+  /// Nothing rests on this call being made, made once, or made with the right arguments — that
+  /// is its demotion from the removal discipline the parked cells replaced. A missed or
+  /// mismatched abandonment leaves one stale parked entry in its role's cell, where the next
+  /// same-role submission overwrites it or [`Self::release_next_root`] promotes it and it lands.
+  /// That is safe, but each half of the safety lives at its own layer. THIS layer holds the
+  /// timeline half: the entry passed the no-rewind asserts at its submission and every entry
+  /// after it was asserted against it, so the wasted landing rewinds nothing and the cells hold
+  /// the depth constant. What this layer CANNOT hold is the state the landing establishes: a
+  /// disowned root still advances the medium (a checkpoint root carries a frontier the endpoint
+  /// never advanced its own pointer for), and the write's role rides the landing
+  /// ([`SbPolled::landed_root`]) precisely so the ENDPOINT half — the uncorrelated-landing
+  /// absorb in `Endpoint::on_sb_done` — can absorb those facts and, for a checkpoint-role
+  /// landing past what the endpoint applied, reconcile before participating further. What a
+  /// matching call buys is efficiency — the medium is saved one wasted landing — and the id
+  /// guard is what makes every mis-call degrade to that stale-entry outcome instead of clearing
+  /// a cell some LIVE correlation still awaits, which would strand its await forever.
+  ///
+  /// Removal is sound exactly because the entry is parked and disowned. The backend never saw
+  /// the write, so nothing physical exists for quiescence to wait on; no completion can ever
+  /// name it (only submitted writes complete) and its owner awaits none (this call IS the
+  /// correlation's end), so nothing strands. And the landing sequence stays monotone: the
+  /// timeline is monotone in every no-rewind dimension by the submission asserts, and removing
+  /// one entry leaves a subsequence, so no retained landing rewinds another. The highest-stamp
+  /// entry itself may be cleared — the effective root then steps back to the previous timeline
+  /// point ([`Self::effective_root`]), which every later writer re-derives from under the same
+  /// asserts.
+  pub(crate) fn abandon_root(&mut self, role: RootRole, id: WriteId) {
+    let cell = &mut self.parked_roots[role.cell()];
+    if cell.as_ref().is_some_and(|entry| entry.id == id) {
+      *cell = None;
+      self.roots_abandoned += 1;
     }
   }
 
@@ -981,20 +1153,25 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// At endpoint construction every parked entry is DISOWNED as a structural fact, not a caller
   /// promise: the session serves one endpoint at a time, the constructing one has minted nothing
   /// yet, so whoever submitted a parked root is dead and awaits nothing. Removal is then sound
-  /// entry-by-entry for exactly [`Self::forfeit_root`]'s reasons — the backend never saw the
+  /// entry-by-entry for exactly [`Self::abandon_root`]'s reasons — the backend never saw the
   /// write, no completion can ever name it, and the retained entries are a subsequence of a
-  /// monotone queue, so no landing rewinds another. The effective root steps back to the
+  /// monotone timeline, so no landing rewinds another. The effective root steps back to the
   /// submitted front (or the landed root), which is precisely what a crash restart would recover
   /// PLUS the still-owed front — every promise the dead incarnation made was gated on landings,
   /// never on parked writes, so nothing durable-licensed is retracted.
   ///
-  /// This collapse is what makes the timeline's constant depth ([`MAX_INFLIGHT_ROOTS`])
-  /// independent of the rebuild count: without it, every incarnation that died awaiting roots
-  /// behind a slow front would leave its parked pair queued, and a driver rebuilding endpoints
-  /// faster than the backend lands roots would grow the timeline — and the backend's eventual
-  /// service queue — without bound, each entry holding a full header-bearing state.
+  /// The collapse is a BASELINE-SEMANTICS choice, not a bound: the cells hold the timeline at
+  /// its constant depth with or without it (a dead incarnation's parked root occupies the same
+  /// role cell a live one's would, and the successor's first same-role submission overwrites
+  /// it). What the collapse decides is what the successor baselines ON and what the medium
+  /// eventually HOLDS: without it, construction would baseline the effective root on — and the
+  /// release would eventually land — a state only a dead endpoint ever promised to write.
+  /// Collapsing keeps the successor's starting point at exactly what a crash restart would
+  /// produce, plus the front the medium still owes either way.
   pub(crate) fn collapse_parked_roots(&mut self) {
-    self.roots.truncate(self.roots_submitted);
+    for cell in &mut self.parked_roots {
+      *cell = None;
+    }
   }
 
   /// Fenced checkpoint-envelope submission — the ONLY route to
@@ -1003,7 +1180,7 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// orphan a dead correlation left) and submits nothing.
   ///
   /// One outstanding envelope is the whole lane. Unlike a root, an envelope is never parked — the
-  /// write goes to the backend at submission — and unlike a parked root it cannot be forfeited
+  /// write goes to the backend at submission — and unlike a parked root it cannot be abandoned
   /// once disowned: an orphaned envelope is owed to the medium until its completion drains it. So
   /// the bound has to hold at admission, and it has to hold HERE rather than in the callers'
   /// staging gates: those gates read endpoint correlation state, which a view transition or an
@@ -1034,42 +1211,43 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   }
 
   /// Drain the next superblock completion, settling its medium fact first: a root landing — ANY
-  /// incarnation's — pops the front of the root timeline and rides alongside the completion with
-  /// the exact state it made durable, so a successor endpoint can adopt an inherited landing even
-  /// though the completion itself is refused as foreign. An envelope landing leaves the envelope
-  /// ledger the same way. Each root settlement also refills the one-deep root pipeline: the next
-  /// parked root — a later write of this incarnation's, or a successor's deferred behind a dead
-  /// predecessor's — is handed to the backend the moment the landing frees the slot.
+  /// incarnation's — retires the front of the root timeline and rides alongside the completion
+  /// with the exact state it made durable, so a successor endpoint can adopt an inherited landing
+  /// even though the completion itself is refused as foreign. An envelope landing leaves the
+  /// envelope ledger the same way. Each root settlement also refills the one-deep root pipeline:
+  /// the lowest-stamp parked root — a later write of this incarnation's, or a successor's
+  /// deferred behind a dead predecessor's — is handed to the backend the moment the landing
+  /// frees the slot.
   pub(crate) fn poll_sb(&mut self) -> Option<SbPolled> {
     let done = self.sb.poll()?;
     let landed_root = match &done {
       SuperblockDone::Wrote(id) => {
-        // Only a SUBMITTED root can land, so the front matches only within the submitted prefix
-        // (a parked front has never been with the backend and no completion can name it).
-        if self.roots_submitted > 0 && self.roots.front().is_some_and(|(fid, _)| fid == id) {
-          self.roots_submitted -= 1;
-          let landed = self.roots.pop_front();
+        // Only the front is ever WITH the backend, so only the front can land (a parked cell's
+        // write was never handed over and no completion can legitimately name it).
+        if let Some(front) = self.root_front.take_if(|entry| entry.id == *id) {
           self.release_next_root();
-          landed
+          Some((front.role, front.id, front.state))
         } else if self.checkpoints.remove(&key(*id)).is_some() {
           None
-        } else if let Some(at) = self.roots.iter().position(|(fid, _)| fid == id) {
-          // With one root outstanding, a completion matching the queue anywhere but the submitted
-          // front can only name a PARKED root — a write the backend was never handed — or arrive
-          // against a desynced submitted count; either shape is a backend violation. Settle it
-          // anyway so the ledger drains — including refilling the pipeline exactly as the
-          // in-order arm does, else the parked roots would strand with nothing left to release
-          // them (`has_inflight` true forever, `into_parts` refused forever) — then surface the
-          // violation, in every profile: out-of-order root landings break the
-          // last-submitted-wins convergence every effective-root read stands on, so continuing
-          // would be consensus over a medium whose durable root is no longer the one the timeline
-          // promised. The settle precedes the panic so the ledger is coherent at the panic point.
-          if at < self.roots_submitted {
-            self.roots_submitted -= 1;
-          }
-          self.roots.remove(at);
+        } else if let Some(cell) = self
+          .parked_roots
+          .iter_mut()
+          .find(|cell| cell.as_ref().is_some_and(|entry| entry.id == *id))
+        {
+          // A completion naming a PARKED root is a backend violation however it arose: the
+          // backend was never handed this write. Settle it anyway so the ledger drains — clear
+          // the cell and refill the pipeline, else the entry would strand with nothing left to
+          // retire it (`has_inflight` true forever, `into_parts` refused forever) — then
+          // surface the violation, in every profile: a root landing outside the front breaks
+          // the last-submitted-wins convergence every effective-root read stands on, so
+          // continuing would be consensus over a medium whose durable root is no longer the one
+          // the timeline promised. The settle precedes the panic so the ledger is coherent at
+          // the panic point. The release is expected to no-op — a parked cell is only ever
+          // occupied behind a live front — but it stays so this settle drains the ledger even
+          // if that occupancy fact is ever broken by a second bug.
+          *cell = None;
           self.release_next_root();
-          panic!("a root write completed out of submission order: {id:?} at queue position {at}");
+          panic!("a parked root write completed that was never handed to the backend: {id:?}");
         } else {
           // A completion for a write the session never submitted — the same untrusted-medium
           // fail-stop as the cancellation arm above.

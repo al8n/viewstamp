@@ -8428,7 +8428,11 @@ fn a_cross_epoch_sync_below_an_inherited_in_flight_configuration_is_refused() {
     OpNumber::new(),
   )
   .expect("a well-formed inherited E2 root");
-  storage.submit_root(crate::WriteId::new(u64::MAX - 7, 1), e2_root);
+  storage.submit_root(
+    crate::storage::RootRole::DurableView,
+    crate::WriteId::new(u64::MAX - 7, 1),
+    e2_root,
+  );
 
   // The rebuilt endpoint armed a crossing (a higher-epoch hint) toward the E1 checkpoint.
   let m1: u64 = 1;

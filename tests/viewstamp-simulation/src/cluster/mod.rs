@@ -1361,12 +1361,20 @@ impl Cluster {
     self.wals[i].borrow().len()
   }
 
-  /// Replica `i`'s in-flight durable-root queue length — the submitted front plus every parked
-  /// entry (for the boundedness checker). Constant at most three: the session's submission gate
-  /// keeps the backend at one outstanding root, supersession forfeits a live correlation's
-  /// replaced root, and endpoint construction collapses the dead incarnations' parked leftovers.
+  /// Replica `i`'s in-flight durable-root count — the submitted front plus every parked cell
+  /// (for the boundedness checker). Constant at most [`Self::replica_roots_bound`]: the
+  /// session's containers hold one front (the one root write with the backend) and one parked
+  /// cell per correlation role, and a same-role resubmission overwrites its cell rather than
+  /// queueing behind it.
   pub fn replica_roots_in_flight(&self, i: usize) -> usize {
     self.storages[i].roots_in_flight()
+  }
+
+  /// The root timeline's depth cap as the session itself reports it (for the boundedness
+  /// checker's equality arm, which pins this against the checker's own independently specified
+  /// contract — a count checked only against this value could never fail with it).
+  pub fn replica_roots_bound(&self, i: usize) -> usize {
+    self.storages[i].roots_bound()
   }
 
   /// Replica `i`'s in-flight WAL append count — every endpoint incarnation's, across every

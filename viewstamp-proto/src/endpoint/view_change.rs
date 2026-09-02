@@ -465,18 +465,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         || matches!(pc.step, CheckpointStep::FlushingBlocks(_))
     }) {
       // A dropped re-persist can already have its ROOT staged (`AwaitRoot`): the drop ends the
-      // only correlation that awaited it, so the root is forfeited with it — a parked one leaves
-      // the session queue (nothing will ever await or complete it), a submitted one lands and is
-      // ignored. The ordinary-checkpoint KEEP above never reaches here, so a root that is still
-      // awaited is never forfeited. (The view-change triggers defer while a re-persist root is
-      // staged — `sync_repersist_root_staged` — so this arm is the backstop for any teardown path
-      // that reaches the reset outside those triggers.)
+      // only correlation that awaited it, so the root is abandoned with it — a parked one leaves
+      // its cell (nothing will ever await or complete it), a submitted one lands UNCORRELATED
+      // and the landing absorb holds its facts (`on_sb_done` lifts `commit_max`, owes the
+      // frontier catch-up, and enters the orphaned-re-persist reconciliation — the synced state
+      // the root names was never installed here, so the node must re-fetch it before
+      // participating further). The ordinary-checkpoint KEEP above never reaches here, so a root
+      // that is still awaited is never abandoned. (The view-change triggers defer while a
+      // re-persist root is staged — `sync_repersist_root_staged` — so this arm is the backstop
+      // for any teardown path that reaches the reset outside those triggers.)
       if let Some(PendingCheckpoint {
         step: CheckpointStep::AwaitRoot(abandoned, _),
         ..
       }) = self.pending_checkpoint
       {
-        storage.forfeit_root(abandoned);
+        storage.abandon_root(RootRole::Checkpoint, abandoned);
       }
       self.pending_checkpoint = None;
     }
