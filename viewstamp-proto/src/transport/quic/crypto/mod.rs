@@ -150,13 +150,17 @@ pub const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
 /// internal transport error, so this is a ceiling on the SPAN COUNT of an unread backlog — not on
 /// its bytes.
 ///
-/// Restated here because `quinn-proto` does not export it, which is why the dependency is pinned
-/// exactly: an upgrade has to be audited against its `connection/assembler.rs` rather than resolved
-/// silently.  The compaction that runs before the refusal merges only POORLY UTILIZED spans — ones
-/// whose payload is under 5/6 of the packet they arrived in — so spans from a peer that fills its
-/// packets survive it, and a backlog already at the ceiling cannot be compacted back under it.  The
-/// sizing below therefore holds at this count, not at the higher one that merely triggers a
-/// compaction.
+/// Restated here because `quinn-proto` does not export it. The value is the 0.11 series', read from
+/// `connection/assembler.rs`; nothing holds a release to it, so the guarantee comes from the tests
+/// instead — a release that moves the bound fails
+/// `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound`, and one that changes
+/// the segmentation this sizing assumes fails the receiver-side span regression.
+///
+/// The compaction that runs before the refusal merges only POORLY UTILIZED spans — ones whose
+/// payload is under 5/6 of the packet they arrived in (in quinn-proto 0.11.17, the version this was
+/// verified against) — so spans from a peer that fills its packets survive it, and a backlog already
+/// at the ceiling cannot be compacted back under it.  The sizing below therefore holds at this
+/// count, not at the higher one that merely triggers a compaction.
 pub(crate) const QUINN_REASSEMBLY_MAX_SPANS: u64 = 1024;
 
 /// STREAM-frame payload assumed for a peer that fills its packets, in bytes.  QUIC guarantees a
@@ -201,7 +205,8 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// pump rate and the receiver's: the receiver drains a 64 KiB budget per pump and re-arms itself
 /// while bytes remain, far outpacing a sub-packet sender.
 ///
-/// **Reachability, stated once.** The pinned reassembler compacts when EITHER its raw heap length
+/// **Reachability, stated once.** The reassembler — as of quinn-proto 0.11.17, the version this was
+/// verified against — compacts when EITHER its raw heap length
 /// exceeds 2048 spans OR its over-allocation (allocated bytes minus buffered) exceeds
 /// `max(32 KiB, 1.5 x buffered)`, and it refuses the insert only when more than 1024 spans SURVIVE
 /// that compaction. Compaction merges only poorly utilized spans, so what survives is whatever

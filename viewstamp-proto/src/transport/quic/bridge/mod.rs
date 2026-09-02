@@ -44,11 +44,12 @@
 //! that endpoint-owned state under reconnect / failed-handshake churn.
 //!
 //! **Inbound memory: an ESTIMATE, not an upper bound.** The figures below are derived from this
-//! implementation and from `quinn-proto` 0.11.17's internals; they are the right order of magnitude
-//! for sizing, and they are NOT a proof. What is enumerated: allocations this crate makes, plus the
-//! ones quinn's reassembler makes that its own constants bound. What is not: allocator overhead and
-//! fragmentation, transient copies inside quinn beyond the one called out, and anything a future
-//! quinn changes — which is part of why the dependency is pinned exactly.
+//! implementation and from the internals of `quinn-proto` 0.11.17, the version this was verified
+//! against; they are the right order of magnitude for sizing, and they are NOT a proof. What is
+//! enumerated: allocations this crate makes, plus the ones quinn's reassembler makes that its own
+//! constants bound. What is not: allocator overhead and fragmentation, transient copies inside quinn
+//! beyond the one called out, and anything a future quinn changes — which is why the sizing is held
+//! by regressions rather than by a version, so a release that moves the bound fails a named test.
 //!
 //! Per recv stream, inbound only:
 //!
@@ -83,8 +84,8 @@
 //! ceiling well below a window's worth of bytes, so the connection would close anyway, on a path that
 //! first pays a per-datagram cost and hands the peer a churn lever. (`STOP_SENDING` on that half
 //! would be the tidier refusal, but sending it for a bidi stream the peer has not yet allocated
-//! underflows `allocated_remote_count` in quinn 0.11.17's `stream_freed` and would corrupt the
-//! peer's `MAX_STREAMS` accounting.)
+//! underflows `allocated_remote_count` in `stream_freed` — in quinn-proto 0.11.17, the version this
+//! was verified against — and would corrupt the peer's `MAX_STREAMS` accounting.)
 //!
 //! That is roughly 40 MiB per recv stream at the extreme, and a connection carries at most two
 //! (Control + Bulk). Reaching it needs a peer actually sending a maximum-sized frame; [`decoder_max`]
@@ -891,8 +892,9 @@ impl Bridge {
         //
         // CONTRACT, and its limit: this closes when a STREAM frame is CURRENTLY OBSERVABLE on a half
         // this side never reads. It does not claim to see data a `RESET_STREAM` already released —
-        // pinned quinn processes frames before the bridge drains application events, and
-        // `received_reset` clears the assembler, so data followed by a reset in one batch reads as
+        // quinn processes frames before the bridge drains application events, and (in quinn-proto
+        // 0.11.17, the version this was verified against) `received_reset` clears the assembler, so
+        // data followed by a reset in one batch reads as
         // `Reset` and the connection stays open. That is an enforcement and observability gap, not a
         // memory exposure: the reset is what frees those bytes.
         //

@@ -1711,8 +1711,9 @@ fn a_peer_fin_of_our_opened_streams_recv_half_does_not_close() {
 
 /// DOCUMENTED GAP: data whose RESET is processed in the same batch is not classified as data.
 ///
-/// Pinned quinn processes a datagram batch's frames before the bridge drains application events, and
-/// `received_reset` clears the stream's assembler. So when the peer's write and its reset reach the
+/// quinn processes a datagram batch's frames before the bridge drains application events, and — in
+/// quinn-proto 0.11.17, the version this was verified against — `received_reset` clears the stream's
+/// assembler. So when the peer's write and its reset reach the
 /// receiver before one drain, the peek that follows sees `Reset` — the write is no longer among the
 /// classifier's inputs — and the connection stays open.
 ///

@@ -33,11 +33,13 @@ buffa = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
-# Pinned EXACTLY, not caret-compatible. The QUIC bridge sizes its stream receive window against
-# `MAX_CHUNKS`, a private constant in quinn-proto's `connection/assembler.rs` that no API exposes; a
-# patch release is free to change it or the compaction around it, which would silently move the
-# ceiling the transport is configured for. Upgrades are audited against that file.
-quinn-proto = { version = "=0.11.17", default-features = false, optional = true }
+# The QUIC bridge sizes its stream receive window against `MAX_CHUNKS`, a private constant in
+# quinn-proto's `connection/assembler.rs` that no API exposes, so a release is free to move that
+# ceiling. Drift is caught by tests rather than held off by a version pin:
+# `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` fails if a full window
+# no longer fits the bound, and the receiver-side span regression fails if the segmentation the
+# sizing assumes stops holding.
+quinn-proto = { version = "0.11", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 
 [build-dependencies]
