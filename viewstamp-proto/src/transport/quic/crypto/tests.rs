@@ -128,7 +128,8 @@ fn a_non_default_tuning_takes_effect_through_cluster_tls() {
   let tuning = QuicTuning::new()
     .with_idle_timeout_millis(4_000)
     .with_initial_rtt_millis(200)
-    .with_stream_receive_window(512 * 1024);
+    .try_with_stream_receive_window(512 * 1024)
+    .expect("512 KiB is under the per-stream ceiling");
   let opts = ClusterTls::new(ca.roots(), cert0.chain(), cert0.key())
     .with_tuning(tuning)
     .build();
@@ -161,26 +162,21 @@ fn a_non_default_tuning_takes_effect_through_cluster_tls() {
   );
 }
 
-/// The tuning setters clamp instead of failing: zero values (a wedge, not a tuning) raise to 1,
-/// values past the QUIC `VarInt` range clamp down, and a per-stream window past
-/// [`MAX_STREAM_RECEIVE_WINDOW`] clamps to that ceiling — an unread backlog deeper than quinn's
-/// stream reassembler holds closes the connection, so an over-sized request is a wedge too.  With
-/// every extreme clamped, `build_transport`'s `VarInt` conversions can never panic on embedder input.
+/// The tuning setters clamp instead of failing: zero values (a wedge, not a tuning) raise to 1 and
+/// values past the QUIC `VarInt` range clamp down, so `build_transport`'s `VarInt` conversions can
+/// never panic on embedder input.
 #[test]
 fn quic_tuning_setters_clamp_zero_and_varint_overflow() {
   let t = QuicTuning::new()
     .with_idle_timeout_millis(0)
     .with_initial_rtt_millis(0)
     .with_connection_receive_window(0)
-    .with_stream_receive_window(u64::MAX);
+    .try_with_stream_receive_window(0)
+    .expect("zero is under the ceiling, and raises to 1 like the others");
   assert_eq!(t.idle_timeout_millis(), 1);
   assert_eq!(t.initial_rtt_millis(), 1);
   assert_eq!(t.connection_receive_window(), 1);
-  assert_eq!(
-    t.stream_receive_window(),
-    MAX_STREAM_RECEIVE_WINDOW,
-    "a per-stream window past the reassembly ceiling clamps to it, not to the VarInt maximum"
-  );
+  assert_eq!(t.stream_receive_window(), 1);
   // The values with no tighter ceiling still clamp at the VarInt range.
   let wide = QuicTuning::new()
     .with_idle_timeout_millis(u64::MAX)
@@ -190,6 +186,51 @@ fn quic_tuning_setters_clamp_zero_and_varint_overflow() {
   // The clamped extremes still build a TransportConfig (no VarInt panic).
   let _ = QuicOptions::build_transport(&t);
   let _ = QuicOptions::build_transport(&wide);
+}
+
+/// The per-stream window is REFUSED above its ceiling rather than clamped, and the error carries
+/// both the request and the ceiling so an embedder can report or re-derive from it.
+///
+/// It is the one tuning whose nearest legal value is not the obvious intent: an over-sized window
+/// does not merely run faster, it lets a filled-packet backlog outgrow quinn's reassembler and close
+/// the connection, so silently substituting a different window would hide which failure mode the
+/// deployment gets. A refused request must also leave the tuning untouched.
+#[test]
+fn an_over_ceiling_stream_window_is_refused_with_the_request_and_the_ceiling() {
+  let err = QuicTuning::new()
+    .try_with_stream_receive_window(MAX_STREAM_RECEIVE_WINDOW + 1)
+    .expect_err("one byte over the ceiling is refused");
+  assert_eq!(err.requested(), MAX_STREAM_RECEIVE_WINDOW + 1);
+  assert_eq!(err.max(), MAX_STREAM_RECEIVE_WINDOW);
+  assert!(
+    format!("{err}").contains(&MAX_STREAM_RECEIVE_WINDOW.to_string()),
+    "the message names the ceiling: {err}"
+  );
+
+  let err = QuicTuning::new()
+    .try_with_stream_receive_window(u64::MAX)
+    .expect_err("a VarInt-overflowing window is refused, not clamped to the VarInt maximum");
+  assert_eq!(err.requested(), u64::MAX);
+
+  // A refused set leaves the tuning at its previous value.
+  let mut t = QuicTuning::new();
+  assert!(
+    t.try_set_stream_receive_window(MAX_STREAM_RECEIVE_WINDOW * 2)
+      .is_err()
+  );
+  assert_eq!(
+    t.stream_receive_window(),
+    DEFAULT_STREAM_RECEIVE_WINDOW,
+    "a refused override must not disturb the tuning"
+  );
+  // Exactly at the ceiling is accepted.
+  assert_eq!(
+    QuicTuning::new()
+      .try_with_stream_receive_window(MAX_STREAM_RECEIVE_WINDOW)
+      .expect("the ceiling itself is legal")
+      .stream_receive_window(),
+    MAX_STREAM_RECEIVE_WINDOW
+  );
 }
 
 #[test]

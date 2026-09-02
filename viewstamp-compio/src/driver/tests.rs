@@ -870,14 +870,12 @@ fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
     viewstamp_proto::DEFAULT_STREAM_RECEIVE_WINDOW,
     viewstamp_proto::QuicTuning::new().stream_receive_window()
   );
-  // The per-stream ceiling an embedder computes a relative override against: a larger request is
-  // clamped to it, so the value has to be readable from out here.
-  assert_eq!(
-    viewstamp_proto::QuicTuning::new()
-      .with_stream_receive_window(u64::MAX)
-      .stream_receive_window(),
-    viewstamp_proto::MAX_STREAM_RECEIVE_WINDOW
-  );
+  // The per-stream ceiling an embedder computes a relative override against, and the typed refusal
+  // a larger request returns — both have to be nameable from out here.
+  let err: viewstamp_proto::StreamWindowTooLarge = viewstamp_proto::QuicTuning::new()
+    .try_with_stream_receive_window(viewstamp_proto::MAX_STREAM_RECEIVE_WINDOW + 1)
+    .expect_err("over the ceiling is refused");
+  assert_eq!(err.max(), viewstamp_proto::MAX_STREAM_RECEIVE_WINDOW);
   assert_eq!(
     viewstamp_driver::DriverConfig::new().max_conns(),
     viewstamp_driver::MAX_CONNS

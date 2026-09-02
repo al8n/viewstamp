@@ -142,45 +142,71 @@ pub(crate) const MAX_BIDI_STREAMS: u32 = 8;
 /// and one class stalling its reader cannot starve the other of connection window.
 pub const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
 
-/// Upper bound on the number of distinct unread spans `quinn-proto` keeps per recv stream
-/// (`MAX_CHUNKS` in its stream reassembler).  Exceeding it after a compaction closes the whole
-/// connection with an internal transport error, so it is a hard ceiling on how deep an unread
-/// backlog may get — counted in SPANS, not bytes.
+/// Number of distinct unread spans `quinn-proto` keeps per recv stream before it refuses more
+/// (`MAX_CHUNKS` in its stream reassembler).  A refused insert closes the whole connection with an
+/// internal transport error, so this is a ceiling on the SPAN COUNT of an unread backlog — not on
+/// its bytes.
 ///
-/// Restated here because `quinn-proto` does not export it.  The compaction that runs before the
-/// rejection merges only POORLY UTILIZED spans — ones whose payload is under 5/6 of the packet they
-/// arrived in — so spans from a peer that fills its packets survive compaction and a deep backlog
-/// cannot be compacted back under the ceiling.  The derivation below therefore has to hold at this
-/// count, not at the higher count that merely triggers a compaction.
+/// Restated here because `quinn-proto` does not export it, which is why the dependency is pinned
+/// exactly: an upgrade has to be audited against its `connection/assembler.rs` rather than resolved
+/// silently.  The compaction that runs before the refusal merges only POORLY UTILIZED spans — ones
+/// whose payload is under 5/6 of the packet they arrived in — so spans from a peer that fills its
+/// packets survive it, and a backlog already at the ceiling cannot be compacted back under it.  The
+/// sizing below therefore holds at this count, not at the higher one that merely triggers a
+/// compaction.
 pub(crate) const QUINN_REASSEMBLY_MAX_SPANS: u64 = 1024;
 
-/// Smallest STREAM-frame payload assumed for a peer that fills its packets, in bytes.  QUIC
-/// guarantees a 1200-byte path, which leaves ~1160 bytes for frames once the short header, the
-/// packet number and the AEAD tag are paid for; 1024 rounds that down for margin.  A peer with a
-/// backlog to send fills every packet, so this is the span size that matters while an unread backlog
-/// builds: a trickling peer makes smaller spans but has too little in flight to build one.
+/// STREAM-frame payload assumed for a peer that fills its packets, in bytes.  QUIC guarantees a
+/// 1200-byte path, which leaves ~1160 bytes for frames once the short header, the packet number and
+/// the AEAD tag are paid for; 1024 rounds that down for margin.
 pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 
-/// Ceiling on the per-stream receive window, and what the tuning setters clamp to.
+/// Largest per-stream receive window this transport accepts.
 ///
-/// The receive window is what bounds an unread backlog: a peer may not send past
+/// **What the window bounds.** Stream flow control bounds OFFSETS: a peer may not send past
 /// `bytes_read + stream_receive_window`, so at most that many bytes sit unread in the reassembler.
-/// Dividing by the smallest span a packet-filling peer produces gives the deepest span count
-/// reachable, which must stay inside what the reassembler will hold:
+/// It does not bound how many spans those bytes arrive as — that is the sender's segmentation
+/// choice, and it is what the reassembler's ceiling counts.
+///
+/// **What this sizing covers.** For a peer that fills its packets, span count is bytes over packet
+/// payload, and the window is sized so that stays inside the ceiling:
 ///
 /// ```text
 /// MAX_STREAM_RECEIVE_WINDOW / MIN_FILLED_STREAM_FRAME_PAYLOAD <= QUINN_REASSEMBLY_MAX_SPANS
 ///           1 MiB           /              1024 B             =            1024
 /// ```
 ///
-/// A larger window admits a backlog deeper than the reassembler will hold, which closes the
-/// connection mid-transfer instead of throttling it.  Frame size is NOT bounded by this: a frame
-/// spans as many window grants as it needs, so the transport's frame ceiling
-/// ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is unchanged.
+/// That covers the case a bulk transfer actually produces — a sender with a backlog fills every
+/// packet — and it is why a window above this must be refused: at 8 MiB the same filled-packet
+/// backlog is ~6000 spans and a large transfer dies partway rather than being throttled.
+///
+/// **What it does NOT cover.** Span count is not a function of bytes. A peer that trickles
+/// sub-packet writes, or leaves gaps that compaction cannot merge, reaches the ceiling inside any
+/// window worth having: ~2050 writes of a few hundred bytes each, or ~20 KB of gapped one-byte
+/// frames, exceed it. No window setting prevents that, so this is a sizing for the supported
+/// sender, NOT a guarantee over all legal STREAM segmentation.
+///
+/// **Supported sender.** This transport's own bridge stages a class's frames in one buffer and
+/// writes the whole buffer to quinn in a single call per pump, so quinn fills packets whenever a
+/// backlog exists and a pump contributes at most one sub-packet span. Nothing bounds how many such
+/// spans accumulate — that is the ratio between the sender's pump rate and the receiver's, and the
+/// receiver drains a 64 KiB budget per pump and re-arms itself while bytes remain, so a backlog
+/// builds only while a receiver's loop is stalled outright.
+///
+/// **When a peer exceeds it.** quinn closes the connection; the bridge classifies that loss, unbinds
+/// the peer's routing and queues the connection for reaping, the driver's redial reconciler
+/// re-establishes it on a backoff, and consensus retransmission re-drives whatever was in flight.
+/// The failure mode is a bounded reconnect, not a wedge —
+/// `a_sub_packet_flood_that_outruns_the_reader_reaps_and_re_establishes` is the regression that
+/// holds that path in place.
+///
+/// Frame size is not bounded by any of this: a frame spans as many window grants as it needs, so the
+/// transport's frame ceiling ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is
+/// unchanged.
 pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
   QUINN_REASSEMBLY_MAX_SPANS * MIN_FILLED_STREAM_FRAME_PAYLOAD;
 
-/// Per-stream receive window: the largest window the reassembly bound admits
+/// Per-stream receive window: the largest window the reassembly ceiling admits
 /// ([`MAX_STREAM_RECEIVE_WINDOW`]), so a stalled reader throttles its peer rather than stranding it,
 /// and a frame larger than the window still flows — across the window updates its reader's drain
 /// produces.
@@ -203,17 +229,31 @@ const fn clamp_tuning(v: u64) -> u64 {
   }
 }
 
-/// Clamp an embedder-supplied per-stream window into `1..=MAX_STREAM_RECEIVE_WINDOW`.  Above the
-/// ceiling is a wedge rather than a tuning, exactly like zero: the window is what bounds the unread
-/// backlog, and a backlog deeper than the reassembler holds closes the connection mid-transfer
-/// (see [`MAX_STREAM_RECEIVE_WINDOW`] for the arithmetic).  Clamping turns that into a throughput
-/// ceiling, which regrants as the reader drains.
-const fn clamp_stream_window(v: u64) -> u64 {
-  let v = clamp_tuning(v);
-  if v > MAX_STREAM_RECEIVE_WINDOW {
-    MAX_STREAM_RECEIVE_WINDOW
-  } else {
-    v
+/// A per-stream receive window above [`MAX_STREAM_RECEIVE_WINDOW`] was requested.
+///
+/// Returned rather than clamped: the other tuning values are performance knobs where the nearest
+/// legal value is the obvious intent, but this one changes which failure mode a slow reader gets —
+/// an over-sized window lets a filled-packet backlog outgrow the reassembler and close the
+/// connection instead of throttling the peer. An embedder asking for more bandwidth-delay product
+/// than the transport can carry should see that, not a silently different configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stream receive window {requested} B exceeds the maximum {max} B")]
+pub struct StreamWindowTooLarge {
+  requested: u64,
+  max: u64,
+}
+
+impl StreamWindowTooLarge {
+  /// The window that was asked for, in bytes.
+  #[must_use]
+  pub const fn requested(&self) -> u64 {
+    self.requested
+  }
+
+  /// The largest window the transport accepts, in bytes — [`MAX_STREAM_RECEIVE_WINDOW`].
+  #[must_use]
+  pub const fn max(&self) -> u64 {
+    self.max
   }
 }
 
@@ -229,8 +269,9 @@ const fn clamp_stream_window(v: u64) -> u64 {
 /// No tuning value can disable or weaken authentication.
 ///
 /// Setters clamp to `1..=2^62-1` (the QUIC `VarInt` range) so no embedder value can wedge the
-/// transport with a zero timeout/window or fail the `VarInt` conversions at construction; the
-/// per-stream window clamps tighter still, to [`MAX_STREAM_RECEIVE_WINDOW`].
+/// transport with a zero timeout/window or fail the `VarInt` conversions at construction. The
+/// per-stream window is the one value that is REFUSED rather than clamped above its ceiling — see
+/// [`QuicTuning::try_set_stream_receive_window`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuicTuning {
   /// `max_idle_timeout`, milliseconds. Default [`DEFAULT_IDLE_TIMEOUT_MILLIS`].
@@ -358,20 +399,46 @@ impl QuicTuning {
     self
   }
 
-  /// Override the per-stream receive window (bytes; clamped to `1..=`[`MAX_STREAM_RECEIVE_WINDOW`]).
-  /// Lowering it only throttles a stream (credit regrants as its reader drains); the ceiling is what
-  /// keeps an unread backlog inside the reassembly bound, so a larger request is clamped, not
-  /// honoured.
-  #[must_use]
-  pub const fn with_stream_receive_window(mut self, bytes: u64) -> Self {
-    self.set_stream_receive_window(bytes);
-    self
+  /// Override the per-stream receive window, in bytes.
+  ///
+  /// Lowering it only throttles a stream — credit regrants as its reader drains. Raising it past
+  /// [`MAX_STREAM_RECEIVE_WINDOW`] is refused with [`StreamWindowTooLarge`] rather than clamped:
+  /// that ceiling is what keeps a filled-packet backlog inside the reassembly bound, and exceeding
+  /// it changes a throttle into a connection close. Zero still raises to 1, like every other tuning
+  /// (a zero window is a wedge, and the nearest legal value is unambiguous).
+  ///
+  /// # Errors
+  ///
+  /// [`StreamWindowTooLarge`] when `bytes` exceeds [`MAX_STREAM_RECEIVE_WINDOW`]; the tuning is
+  /// left unchanged.
+  pub const fn try_with_stream_receive_window(
+    mut self,
+    bytes: u64,
+  ) -> Result<Self, StreamWindowTooLarge> {
+    match self.try_set_stream_receive_window(bytes) {
+      Ok(_) => Ok(self),
+      Err(e) => Err(e),
+    }
   }
 
-  /// In-place form of [`Self::with_stream_receive_window`] — same clamp/semantics, chainable.
-  pub const fn set_stream_receive_window(&mut self, bytes: u64) -> &mut Self {
-    self.stream_receive_window = clamp_stream_window(bytes);
-    self
+  /// In-place form of [`Self::try_with_stream_receive_window`] — same semantics, chainable.
+  ///
+  /// # Errors
+  ///
+  /// [`StreamWindowTooLarge`] when `bytes` exceeds [`MAX_STREAM_RECEIVE_WINDOW`]; the tuning is
+  /// left unchanged.
+  pub const fn try_set_stream_receive_window(
+    &mut self,
+    bytes: u64,
+  ) -> Result<&mut Self, StreamWindowTooLarge> {
+    if bytes > MAX_STREAM_RECEIVE_WINDOW {
+      return Err(StreamWindowTooLarge {
+        requested: bytes,
+        max: MAX_STREAM_RECEIVE_WINDOW,
+      });
+    }
+    self.stream_receive_window = clamp_tuning(bytes);
+    Ok(self)
   }
 }
 

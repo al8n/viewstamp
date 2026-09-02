@@ -33,7 +33,11 @@ buffa = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
-quinn-proto = { version = "0.11.17", default-features = false, optional = true }
+# Pinned EXACTLY, not caret-compatible. The QUIC bridge sizes its stream receive window against
+# `MAX_CHUNKS`, a private constant in quinn-proto's `connection/assembler.rs` that no API exposes; a
+# patch release is free to change it or the compaction around it, which would silently move the
+# ceiling the transport is configured for. Upgrades are audited against that file.
+quinn-proto = { version = "=0.11.17", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 
 [build-dependencies]

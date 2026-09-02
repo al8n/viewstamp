@@ -1094,6 +1094,11 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
 /// It fails in both directions the end-to-end tests only fail indirectly: raising the window (or
 /// shrinking the packets a window holds) drives the span count over the ceiling, and a quinn release
 /// that lowers its own bound errors this stream while the count assertion still passes.
+///
+/// Scope: this is the FILLED-PACKET case the sizing covers — the shape a bulk transfer produces.
+/// A sender whose segmentation is not packet-filling reaches the ceiling on far fewer bytes, and no
+/// window prevents that; `a_sub_packet_flood_that_outruns_the_reader_reaps_and_re_establishes`
+/// covers that case and the recovery it gets.
 #[test]
 fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
   let Linked {
@@ -1180,7 +1185,7 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
   assert!(
     unread_datagrams as u64 <= QUINN_REASSEMBLY_MAX_SPANS,
     "a window's worth of unread datagrams ({unread_datagrams}) must stay within the \
-     {QUINN_REASSEMBLY_MAX_SPANS}-span reassembly bound — the window is derived as \
+     {QUINN_REASSEMBLY_MAX_SPANS}-span reassembly ceiling — the window is sized as \
      {MAX_STREAM_RECEIVE_WINDOW} B / {MIN_FILLED_STREAM_FRAME_PAYLOAD} B per full packet"
   );
 
@@ -1220,6 +1225,198 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
     got.map(|f| f.len()),
     Some(BODY),
     "the whole {BODY}-byte frame must arrive after a full window sat unread in the reassembler"
+  );
+}
+
+/// A sub-packet write flood that outruns its reader closes the connection — and it RE-ESTABLISHES.
+///
+/// The receive window bounds an unread backlog's BYTES; it does not bound how many spans quinn
+/// buffers those bytes as, and quinn refuses a stream more spans than its reassembler will hold.
+/// This drives the shape that reaches that ceiling inside any usable window, and it needs neither
+/// loss nor reordering: a sender that hands quinn a few hundred bytes per pump gives it less than a
+/// packet's worth each time, so every packet carries a sub-packet span well-utilized enough that
+/// compaction will not merge it into its neighbours. Roughly
+/// [`QUINN_REASSEMBLY_MAX_SPANS`] * 2 such writes cross the ceiling on well under a megabyte —
+/// which is the point: the bytes never approach the window, so no window setting prevents this.
+///
+/// The design therefore does NOT promise the connection survives it. It promises the failure is a
+/// bounded reconnect: quinn closes the connection, the bridge classifies the loss, unbinds the
+/// peer's routing and queues the connection for reaping, and a redial — what the drivers'
+/// `reconcile_peer_links` issues for any peer left with no bound connection — re-establishes it with
+/// frame delivery resuming. Each of those steps is asserted, so dropping the classify/unbind/queue
+/// tail leaves this test with no queued loss, routing still pointing at a dead connection, and no
+/// frame after the redial.
+///
+/// The flood stages already-framed bytes and flushes them through the production `flush_outbound`
+/// write path, which is where the coalescing that shapes the spans lives.
+#[test]
+fn a_sub_packet_flood_that_outruns_the_reader_reaps_and_re_establishes() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  assert_eq!(
+    b.handle_for(peer_a),
+    Some(hb),
+    "B routes to A before the flood"
+  );
+
+  // One small frame per pump: too little for quinn to fill a packet with, so each pump puts one
+  // sub-packet STREAM frame on the wire. B never reads, so they all stay buffered as separate spans.
+  const TRICKLE_BODY: usize = 396;
+  let mut framed = Vec::new();
+  encode_frame(&vec![0x77u8; TRICKLE_BODY], &mut framed);
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut writes = 0u64;
+  let mut lost = None;
+  let mut tick = now;
+  for k in 1..(QUINN_REASSEMBLY_MAX_SPANS * 6) {
+    // Micro-second ticks keep the whole flood inside one PTO and far inside the idle timeout, so the
+    // loss under test is the reassembler's refusal and not a timer.
+    tick = now + Duration::from_micros(k * 20);
+    if a.table.entry(ha).is_none() {
+      // A's own side of the connection drained away first: stop feeding it and let the assertions
+      // below report what B did — or failed to do — with the loss.
+      break;
+    }
+    a.test_stage_outbound(ha, StreamClass::Bulk, &framed);
+    writes += 1;
+    a.flush_stream(tick, ha);
+    while let Some((dst, bytes)) = a.poll_transmit() {
+      assert_eq!(dst, b_addr);
+      pipe_to_b.push(a_addr, bytes);
+    }
+    while let Some((dst, bytes)) = b.poll_transmit() {
+      assert_eq!(dst, a_addr);
+      pipe_to_a.push(b_addr, bytes);
+    }
+    while let Some((from, bytes)) = pipe_to_b.pop() {
+      b.handle_datagram(tick, from, None, &bytes);
+    }
+    while let Some((from, bytes)) = pipe_to_a.pop() {
+      a.handle_datagram(tick, from, None, &bytes);
+    }
+    a.handle_timeout(tick);
+    b.handle_timeout(tick);
+    if let Some(h) = b.take_lost() {
+      lost = Some(h);
+      break;
+    }
+  }
+
+  // The promised classification and teardown, in the order the recovery depends on.
+  assert_eq!(
+    lost,
+    Some(hb),
+    "the reassembler's refusal must surface as a LOST connection queued for reaping, not a silent \
+     stall — after {writes} sub-packet writes"
+  );
+  assert_eq!(
+    b.conn_close_count(CloseCause::RecordRejected),
+    1,
+    "and be classified as the QUIC layer rejecting the connection, not an idle-out or a peer close"
+  );
+  assert_eq!(
+    b.handle_for(peer_a),
+    None,
+    "routing to the peer must be unbound the instant the connection is lost, so nothing is sent \
+     into a dead connection"
+  );
+  // Non-vacuity, and the finding this pins: it was the SPAN count that closed it, not the window.
+  // The flood crossed the span ceiling while the bytes stayed far under a window's worth.
+  assert!(
+    writes > QUINN_REASSEMBLY_MAX_SPANS,
+    "the flood must actually cross the span ceiling ({QUINN_REASSEMBLY_MAX_SPANS}), took {writes} \
+     writes"
+  );
+  let flooded = writes * framed.len() as u64;
+  assert!(
+    flooded < MAX_STREAM_RECEIVE_WINDOW,
+    "and it must do so on less than a window ({MAX_STREAM_RECEIVE_WINDOW} B) of stream bytes — \
+     {flooded} B — since a window that admitted this would have to be smaller than any usable one"
+  );
+
+  // Recovery: reap both ends, redial as the drivers' link reconciler does for an unbound peer, and
+  // require a frame to flow again on the fresh connection.
+  b.reap(hb);
+  while let Some(h) = a.take_lost() {
+    a.reap(h);
+  }
+  let mut redial = tick + Duration::from_millis(1);
+  let ha2 = a
+    .connect(redial, b_addr, "viewstamp.local", peer_b)
+    .expect("the redial an unbound peer link issues");
+  for k in 1..400u64 {
+    redial = tick + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      redial,
+    );
+    while a.take_connected().is_some() {}
+    while b.take_connected().is_some() {}
+    if a.any_handshook() && b.any_handshook() {
+      break;
+    }
+  }
+  let hb2 = b.first_handshook().expect("B accepted the redial");
+  assert_ne!(
+    hb2, hb,
+    "the redial is a FRESH connection, not the reaped one"
+  );
+  a.open_send_and_preface(redial, ha2, &[]);
+  a.bind_validated(redial, ha2, peer_b);
+  b.bind_validated(redial, hb2, peer_a);
+  assert_eq!(
+    b.handle_for(peer_a),
+    Some(hb2),
+    "the redial rebinds the peer's routing"
+  );
+
+  let mut resumed = Vec::new();
+  encode_frame(b"delivery resumes", &mut resumed);
+  a.test_stage_outbound(ha2, StreamClass::Bulk, &resumed);
+  let mut got = None;
+  for k in 400..800u64 {
+    let t = tick + Duration::from_millis(k);
+    a.flush_stream(t, ha2);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      t,
+    );
+    b.ingest_recv(t, hb2);
+    if let Some(f) = b.next_frame(hb2, StreamClass::Bulk) {
+      got = Some(f);
+      break;
+    }
+  }
+  assert_eq!(
+    got.as_deref(),
+    Some(&b"delivery resumes"[..]),
+    "frame delivery must resume on the re-established connection — the reconnect is what makes the \
+     reassembler's refusal recoverable rather than a wedge"
   );
 }
 
