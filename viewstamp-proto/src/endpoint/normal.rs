@@ -725,8 +725,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // ordinary commit after it regained primacy, must not linger to admit a stale SyncCheckpoint.
     self.cancel_forced_sync_if_satisfied();
     // Adopt an owed INHERITED checkpoint frontier first (commit_min may have just reached it), so
-    // the cadence below computes its boundary off the adopted pointer in the same tail.
+    // the cadence below computes its boundary off the adopted pointer in the same tail — then
+    // re-drive an owed orphaned-re-persist reconciliation the settle site had to defer (its
+    // deferral conditions clear on events this tail observes).
     self.maybe_adopt_inherited_frontier();
+    self.maybe_enter_orphan_repersist_fetch(now, storage);
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(storage);
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
@@ -1583,8 +1586,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // SyncCheckpoint for that target never reaches `apply_sync` below the advanced frontier.
     self.cancel_forced_sync_if_satisfied();
     // Adopt an owed INHERITED checkpoint frontier first (commit_min may have just reached it), so
-    // the cadence below computes its boundary off the adopted pointer in the same tail.
+    // the cadence below computes its boundary off the adopted pointer in the same tail — then
+    // re-drive an owed orphaned-re-persist reconciliation the settle site had to defer (its
+    // deferral conditions clear on events this tail observes).
     self.maybe_adopt_inherited_frontier();
+    self.maybe_enter_orphan_repersist_fetch(now, storage);
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(storage);
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just

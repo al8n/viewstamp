@@ -250,7 +250,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     polled: crate::storage::SbPolled,
   ) {
     let crate::storage::SbPolled { done, landed_root } = polled;
-    if let Some((id, state)) = &landed_root {
+    if let Some((role, id, state)) = &landed_root {
       // EVERY root landing — own, inherited, or superseded — advances the durable-view witness:
       // the medium's durable root now holds `state`, whichever incarnation submitted it and
       // whether or not a `pending_sb` entry still correlates it, so the view it carries is
@@ -277,21 +277,38 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // arms below re-reach `install_membership` and no-op on its already-installed guard; with no
       // epoch-advancing landing this is a no-op and every off-axis path is unchanged.)
       self.adopt_landed_configuration(now, state);
-      // An INHERITED root landing: a dead incarnation's root write just became the durable root.
-      // The session settled the timeline before this router saw the completion, and the landed
-      // state rides alongside it — the refused foreign completion itself carries none. Absorb the
-      // remaining landed facts this endpoint can hold: the known-committed frontier is a monotone
-      // learned scalar (exactly as a `Commit` message teaches it — deferred while recovering,
-      // whose canonical-band bookkeeping re-learns commit from peers), and a checkpoint frontier
-      // past this endpoint's own becomes the owed catch-up
-      // [`Self::maybe_adopt_inherited_frontier`] adopts once the applied frontier reaches it —
-      // immediately, when it already has. (A successor recovered over the live session baselines
-      // on the effective root, so an inherited landing at or below that baseline advances
-      // neither scalar — both absorbs are the belt for landings the baseline already covers.) An
-      // OWN root landing takes none of this: its advance runs through its matching
-      // `pending_sb`/`pending_checkpoint` arm below.
-      if id.op_id().incarnation() != self.incarnation {
-        if !self.status.is_recovering() && !self.status.is_recovering_head() {
+      // An UNCORRELATED root landing: a root write no live correlation names just became the
+      // durable root. Classified by CORRELATION, not incarnation — the session's parked cells
+      // let a correlation end without an abandon (the missed/mismatched-abandon tolerance is the
+      // SESSION's half of that claim: the wasted landing rewinds nothing on the timeline), so a
+      // root of THIS incarnation can land exactly as disowned as a dead predecessor's, and the
+      // ENDPOINT's half of the claim is this absorb: the landed facts are held whichever
+      // incarnation wrote them. A foreign id can never match a live correlation (the tables hold
+      // only this incarnation's mints), so the inherited case is the same branch. Absorb what
+      // this endpoint can hold: the known-committed frontier is a monotone learned scalar
+      // (exactly as a `Commit` message teaches it — deferred while recovering, whose
+      // canonical-band bookkeeping re-learns commit from peers), and a checkpoint frontier past
+      // this endpoint's own becomes the owed catch-up [`Self::maybe_adopt_inherited_frontier`]
+      // adopts once the applied frontier reaches it — immediately, when it already has. (A
+      // successor recovered over the live session baselines on the effective root, so an
+      // inherited landing at or below that baseline advances neither scalar — both absorbs are
+      // the belt for landings the baseline already covers.) A CORRELATED landing takes none of
+      // this: its advance runs through its matching `pending_sb`/`pending_checkpoint` arm below,
+      // which does strictly more (the action dispatch, the install, GC).
+      let correlated = self.pending_sb.as_ref().is_some_and(|(pid, _)| pid == id)
+        || self.pending_checkpoint.and_then(|pc| pc.step.write_id()) == Some(*id);
+      if !correlated {
+        // The commit half is absorbed only from a landing that PROVES it: a checkpoint-role
+        // root's commit is vouched by the checkpoint it names (a re-persist's frontier is a
+        // quorum's committed+applied point), and a foreign incarnation's root carries a dead
+        // predecessor's real knowledge that survives nowhere else. A view-role root of THIS
+        // incarnation proves nothing new — its commit is this endpoint's own scalar at submit,
+        // and re-importing it would resurrect a value a later reset deliberately discarded
+        // (the forming primary's re-establishment of a poisoned `commit_max` is exactly such a
+        // reset).
+        let commit_proven =
+          *role == RootRole::Checkpoint || id.op_id().incarnation() != self.incarnation;
+        if commit_proven && !self.status.is_recovering() && !self.status.is_recovering_head() {
           self.commit_max = self.commit_max.max(state.commit());
         }
         if state.checkpoint_op() > self.checkpoint_op {
@@ -299,7 +316,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             .inherited_frontier
             .map_or(state.checkpoint_op(), |f| f.max(state.checkpoint_op()));
           self.inherited_frontier = Some(frontier);
+          // A CHECKPOINT-role landing past the APPLIED frontier is an orphaned state-sync
+          // re-persist: an ordinary checkpoint targets the `commit_min` that produced it (its
+          // landing can never outrun the applied frontier, so it adopts immediately below), and
+          // a view-role root only copies an existing frontier forward. The synced state this
+          // root names was never installed — the correlation drop also dropped the staged
+          // install — so passive adoption may never converge (the band below the synced point
+          // can be pruned cluster-wide); latch the owed reconciliation instead.
+          if matches!(role, RootRole::Checkpoint) && self.commit_min < state.checkpoint_op() {
+            let owed = self
+              .repersist_orphan
+              .map_or(state.checkpoint_op(), |o| o.max(state.checkpoint_op()));
+            self.repersist_orphan = Some(owed);
+          }
           self.maybe_adopt_inherited_frontier();
+          self.maybe_enter_orphan_repersist_fetch(now, storage);
         }
       }
     }
@@ -522,7 +553,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               headers,
             ),
           };
-          storage.submit_root(root_id, state);
+          storage.submit_root(RootRole::Checkpoint, root_id, state);
           self.pending_checkpoint = Some(PendingCheckpoint {
             step: CheckpointStep::AwaitRoot(root_id, dag),
             ..pc
@@ -704,8 +735,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
-  /// Adopt a durable checkpoint frontier an INHERITED root landing established
-  /// ([`Self::inherited_frontier`]), once this endpoint can hold it. Called from the settle site
+  /// Adopt a durable checkpoint frontier an UNCORRELATED root landing established
+  /// ([`Self::inherited_frontier`] — a dead incarnation's inherited root, or an own root whose
+  /// correlation ended without an abandon), once this endpoint can hold it. Called from the settle site
   /// (`on_sb_done`, the moment the landing is known) and from every commit-advance tail (ahead of
   /// [`Self::maybe_checkpoint`], so an adoption re-bases the cadence boundary in the same tail) —
   /// the sticky-cadence shape `maybe_pay_checkpoint_debt` uses, and for the same reason: the
@@ -750,10 +782,93 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.commit_min < frontier {
       return;
     }
+    // The advance retires the marker inside the pointer-advance choke; the DAG roots go
+    // conservative because the adopted frontier's envelope — not this endpoint — knows them.
     self.advance_checkpoint_op(frontier);
     self.checkpoint_sm_root = None;
     self.checkpoint_sessions_root = None;
-    self.inherited_frontier = None;
+  }
+
+  /// Enter the recovery peer-fetch for an orphaned state-sync re-persist ([`Self::repersist_orphan`])
+  /// — the reconciliation an uncorrelated checkpoint-role landing owes before this endpoint
+  /// participates further. The durable root now names a synced point this endpoint never
+  /// installed (the correlation drop also dropped the staged install), commits may never reach
+  /// it (the band below a synced checkpoint can be pruned cluster-wide), and an own checkpoint
+  /// below it would be refused at the session's no-rewind submit choke — so the one clean exit
+  /// is the same "rebuild from the cluster, end Normal" mechanism every other stranded shape
+  /// uses: flip to `Recovering` and arm the forced peer fetch at/above the landed frontier
+  /// ([`Self::escalate_checkpoint_to_peer_fetch`]). The fetched install advances
+  /// `checkpoint_op` to at least the frontier ([`Self::apply_sync`]'s timeline admission floors
+  /// every reply at the effective root), which retires the latch in
+  /// [`Self::advance_checkpoint_op`].
+  ///
+  /// Called from the settle site and re-driven from the commit tails and the quiescent-primary
+  /// heartbeat, because every deferral below waits on an event those sites observe:
+  /// - already `Recovering`/`RecoveringHead`: a recovery is in flight, and every recovery
+  ///   completion restores or fetches to the durable checkpoint — at/above the owed frontier —
+  ///   so the latch retires with it; `Retired` participates in nothing, so nothing is owed.
+  /// - an in-flight durable-view write: never torn down mid-write (the view it vouches could
+  ///   regress); its completion arm runs and the next tail re-drives this.
+  /// - an own-advance window (`pending_checkpoint` / an owed SM reconstruct / a retained
+  ///   install): those arcs advance the pointer themselves — a staged re-persist and a retained
+  ///   install both target at/above the effective root's frontier, so they meet the debt — and
+  ///   interleaving a teardown under them would orphan their own correlations.
+  ///
+  /// `commit_min` reaching the frontier retires the latch instead (repair recovered the band
+  /// after all; [`Self::maybe_adopt_inherited_frontier`] — always run just before this — then
+  /// completes the catch-up in place), so the fetch fires only while the reconciliation is
+  /// genuinely unreachable by commits.
+  pub(crate) fn maybe_enter_orphan_repersist_fetch<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    let Some(target) = self.repersist_orphan else {
+      return;
+    };
+    if self.checkpoint_op >= target || self.commit_min >= target {
+      self.repersist_orphan = None;
+      return;
+    }
+    if self.status.is_recovering() || self.status.is_recovering_head() || self.status.is_retired() {
+      return;
+    }
+    if self.pending_durable_view() {
+      return;
+    }
+    if self.pending_checkpoint.is_some()
+      || self.sm_reconstruct_owed()
+      || self.pending_install.is_some()
+    {
+      return;
+    }
+    // The teardown mirrors the cross-epoch peer-fetch entry: end the old generation's in-flight
+    // state at the shared chokepoint, drop the pipeline/buffer and the ViewChange-only
+    // collection (the Recovering flip keeps the `view_change.is_some() == is_view_change()`
+    // coupling), and abandon any remaining `pending_sb` — only a Seal or SwapEpoch action can
+    // still be armed (the durable-view guard above deferred the view-changing three), and an
+    // epoch-advancing landing still installs through the landing absorb whether or not its
+    // correlation survives.
+    self.reset_for_view_transition(now, storage);
+    self.pending_install = None;
+    self.block_fetch = None;
+    self.inflight.clear();
+    self.buffer.clear();
+    self.view_change = None;
+    if let Some((abandoned, _)) = self.pending_sb.take() {
+      storage.abandon_root(RootRole::DurableView, abandoned);
+    }
+    // A Recovering node abandons its donor role; a leaked serving entry would dedupe every
+    // future `RequestSync` from that requester once Normal again.
+    self.sync_serving.clear();
+    self.set_status(Status::Recovering);
+    self.recover = Some(RecoverState::default());
+    // At/above the owed frontier AND this endpoint's own checkpoint, so the only satisfiable
+    // reply subsumes both; `require_cross_epoch` is false because any successor configuration
+    // the orphaned root carried was already installed at its landing (the configuration half of
+    // the absorb), so the fetch runs at the configuration this endpoint already holds.
+    let target = OpNumber::with(target.get().max(self.checkpoint_op.get()));
+    self.escalate_checkpoint_to_peer_fetch(now, target, false);
   }
 
   /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
@@ -1454,8 +1569,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Persist the durable VSR root for the current `(view, log_view, commit_max)` and arm the
   /// participation deferred until the write completes.
   /// Overwrites any prior `pending_sb` (supersession): an older-view completion is then ignored,
-  /// and the superseded root — if still parked in the session — is forfeited rather than left to
-  /// accumulate one queue entry per view-change window.
+  /// and the superseded root — if still parked in the session — is overwritten in its role's
+  /// cell by this very submission, so nothing accumulates per view-change window.
   ///
   /// **Persists the KNOWN-committed frontier, not the applied one.** The `VsrState`
   /// commit is `self.commit_max` (the highest op KNOWN committed cluster-wide), NOT `self.commit_min`
@@ -1581,16 +1696,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.committed_band_headers(checkpoint_op),
     );
     let id = self.mint_write_id();
-    // Supersession: this write replaces any prior `pending_sb` correlation, so the root that
-    // correlation named is disowned here — forfeit it, AFTER the mint above so the new state
-    // copy-forwarded everything the superseded root carried (the checkpoint pair and the
-    // configuration ride the effective-root read). A parked superseded root then leaves the queue
-    // (nothing awaits it, nothing will ever complete it); a SUBMITTED one is owed to the medium
-    // and the forfeit leaves it to land, its completion ignored by the overwritten correlation.
-    if let Some((superseded, _)) = &self.pending_sb {
-      storage.forfeit_root(*superseded);
-    }
-    storage.submit_root(id, state);
+    // Supersession is the submission itself: writing the durable-view cell replaces the parked
+    // root any prior `pending_sb` correlation named, in the same act that records the new one —
+    // lossless, because `state` was derived off the effective root ABOVE, so everything the
+    // superseded root carried (the checkpoint pair and the configuration) was copy-forwarded
+    // before the cell was overwritten. A SUBMITTED predecessor is not touched: it is owed to the
+    // medium and lands, its completion ignored by the overwritten correlation.
+    storage.submit_root(RootRole::DurableView, id, state);
     self.pending_sb = Some((id, action));
   }
 

@@ -1381,6 +1381,18 @@ pub struct BoundednessChecker {
   max_clients: usize,
 }
 
+/// The CONTRACTUAL depth of the durable-root timeline: one submitted front (the single root write
+/// with the backend) plus one parked cell per correlation role (the endpoint's durable-view write
+/// and its checkpoint root). Specified here INDEPENDENTLY of the session's own constant, because a
+/// value read from the subject under test cannot fail with it: widen the session's representation
+/// — a third role, a deeper pipeline — and a count checked against the session-reported bound
+/// moves in lockstep and stays green. So the roots arm asserts BOTH halves: the observed count
+/// against this constant (which a representation change can genuinely exceed), and the
+/// session-reported bound EQUAL to this constant (which flags the widening — or this constant
+/// going stale — even on a schedule that never fills the cells). Each half catches exactly the
+/// failure the other cannot.
+const MAX_INFLIGHT_ROOTS: usize = 3;
+
 impl BoundednessChecker {
   /// A checker bounding each per-op map (`log`, `inflight`, `deferred_appends`) + WAL to
   /// `max_per_op` entries and each client-session table to `max_clients` entries.
@@ -1442,21 +1454,32 @@ impl BoundednessChecker {
           self.max_clients
         ));
       }
-      // The durable-root queue: CONSTANT three — one submitted front (possibly a dead
-      // predecessor's, owed to the medium) + the live endpoint's two awaited roots (its
-      // durable-view write and its checkpoint root). NO per-incarnation concession: an in-place
-      // rebuild collapses the dead incarnations' parked roots at endpoint construction and a
-      // crash restart rebuilds the session, so the restart count buys nothing — a bound that
-      // scaled with it would bless exactly the lifetime growth it exists to refuse (a driver
-      // rebuilding endpoints faster than the backend lands roots would grow the queue without
-      // limit, one parked header-bearing state per rebuild/view cycle, and the checker would
-      // never fail). An unbounded backlog under a slow superblock now trips within one window.
+      // The durable-root timeline: CONSTANT three — one submitted front (possibly a dead
+      // predecessor's, owed to the medium) + one parked cell per correlation role (the live
+      // endpoint's durable-view write and its checkpoint root). NO per-incarnation concession:
+      // the bound is the cardinality of the session's own containers — a same-role resubmission
+      // overwrites its cell and the construction collapse empties the dead incarnations' cells,
+      // so neither the restart count nor a leaked correlation can deepen the timeline. Two arms
+      // ([`MAX_INFLIGHT_ROOTS`] for why both): the observed count against the INDEPENDENT
+      // contractual three — the tripwire a representation change can genuinely trip, which a
+      // session-read bound never could (both sides would move together) — and the
+      // session-reported bound pinned EQUAL to the contract, so a widened session constant (or
+      // this one going stale against a deliberate change) is flagged even on a schedule that
+      // never occupies the cells.
       let roots = cluster.replica_roots_in_flight(i);
-      let roots_bound = 3;
-      if roots > roots_bound {
+      if roots > MAX_INFLIGHT_ROOTS {
         return CheckResult::violation(format!(
-          "replica {i}: durable-root queue {roots} exceeds bound {roots_bound} \
-           (the submission gate / forfeiture / rebuild collapse is not bounding the root timeline)"
+          "replica {i}: durable-root timeline {roots} exceeds the contractual {MAX_INFLIGHT_ROOTS} \
+           (the root containers regressed — the timeline no longer holds one front cell plus \
+           one parked cell per role)"
+        ));
+      }
+      let roots_bound = cluster.replica_roots_bound(i);
+      if roots_bound != MAX_INFLIGHT_ROOTS {
+        return CheckResult::violation(format!(
+          "replica {i}: session-reported root bound {roots_bound} != contractual \
+           {MAX_INFLIGHT_ROOTS} (the session's containers changed shape, or the checker's \
+           contract went stale against a deliberate change)"
         ));
       }
       // The in-flight append ledger against the session append quota — the session-enforced
@@ -1509,6 +1532,15 @@ impl BoundednessChecker {
       // releasing, or a cap entry was freed by a completion that never took one. The bound is read
       // from the session rather than transcribed, so a change to either term moves both sides at
       // once instead of leaving a stale constant that passes.
+      //
+      // SCOPE — what this arm cannot see. It reads the depth the lane is holding AT the
+      // observation, so it is VACUOUS on any schedule where jobs settle inline: a runner that polls
+      // and executes within the same storage step leaves the lane empty every time the checker
+      // looks, and no depth is compared against the bound at all — not even against a bound
+      // deliberately lowered to zero. What exercises it is the lanes that hold jobs ACROSS ticks
+      // (the block-delay runners), where a slot that stopped releasing accumulates somewhere the
+      // checker can reach. A clean run of the inline-settling lanes says nothing about this bound
+      // either way, and must not be read as covering it.
       let jobs = cluster.replica_block_jobs_in_flight(i);
       let bound = cluster.replica_block_jobs_bound(i);
       if jobs > bound {

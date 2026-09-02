@@ -163,6 +163,90 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
 }
 
 #[test]
+fn an_ordinary_root_landing_after_a_missed_abandon_is_absorbed_not_dropped() {
+  // An ordinary checkpoint root whose correlation ended WITHOUT its abandon — the session's
+  // parked-cell contract tolerates exactly this (a mismatched abandon clears nothing and the
+  // submitted front lands regardless), and the tolerance has two halves at two layers: the
+  // SESSION half is that the landing rewinds nothing on the timeline; the ENDPOINT half —
+  // asserted here — is that the uncorrelated landing's facts are ABSORBED rather than dropped
+  // as stale. Same incarnation, no live correlation: the durable root advances to the
+  // checkpoint the write carried, and the endpoint must follow it (the frontier catch-up
+  // adopts immediately, since an ordinary checkpoint's target never outruns the commit floor
+  // that produced it) — otherwise the durable pointer leads the in-memory one with no owed
+  // catch-up recorded, which the settled-lockstep assertion in `handle_storage` trips on.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
+  let (wal, sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let req = |rn: u64| {
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(rn),
+      Bytes::from(std::vec![rn as u8]),
+    ))
+  };
+  let mut storage = Storage::new(wal, sb);
+  // Commit through the interval: the checkpoint sequence starts (snapshot write in flight).
+  for rn in 1..=2u64 {
+    e.handle_message(now, &mut storage, Peer::Client(ClientId::new(7)), req(rn));
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(e.commit(), OpNumber::with(2));
+  // Snapshot durable → the ROOT write is submitted and stays in flight (StepSb withholds it).
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    matches!(
+      e.pending_checkpoint,
+      Some(PendingCheckpoint {
+        step: CheckpointStep::AwaitRoot(..),
+        ..
+      })
+    ),
+    "the checkpoint root write is staged and in flight"
+  );
+
+  // The missed/mismatched abandonment: the correlation ends, but its abandon names the wrong id
+  // (clearing nothing — the session's id guard) and the root itself is the submitted front (an
+  // abandon never touches it). The endpoint is left holding no correlation for a root write the
+  // medium still owes.
+  storage.abandon_root(RootRole::Checkpoint, WriteId::new(0, 999));
+  e.pending_checkpoint = None;
+
+  // The root lands: same incarnation, no live correlation. The absorb must follow the durable
+  // pointer — `handle_storage`'s settled-lockstep assertion runs inside this step, so reaching
+  // the assertions below at all proves the landing left no untracked divergence.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    storage.sb_mut().state().checkpoint_op(),
+    OpNumber::with(2),
+    "the durable root advanced to the checkpoint the disowned write carried"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "the uncorrelated landing's frontier was absorbed and adopted (commit_min already covers it)"
+  );
+  assert!(
+    e.inherited_frontier.is_none(),
+    "the owed catch-up settled at the landing — nothing left owed"
+  );
+  assert!(
+    e.repersist_orphan.is_none(),
+    "an ordinary root never classifies as an orphaned re-persist: its target sits at/below the \
+     commit floor that produced it"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "an immediately-adoptable landing needs no reconciliation posture"
+  );
+  assert_eq!(e.commit(), OpNumber::with(2), "commit did not move");
+}
+
+#[test]
 fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
   // DURABLE-CHECKPOINT-TRANSACTION GUARD: the blocks a checkpoint names must be flushed durable BEFORE
   // its superblock pointer advances. If the block-store flush barrier FAILS, the checkpoint must NOT be

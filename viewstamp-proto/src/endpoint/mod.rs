@@ -8,7 +8,7 @@ use crate::{
   Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status, Superblock,
   SuperblockDone, View, Wal, WalDone,
   block_job::{BlockJobKind, BlockJobOutput, RecoveredCheckpoint, RestorePurpose, WalkPurpose},
-  storage::Storage,
+  storage::{RootRole, Storage},
 };
 
 pub(crate) mod block_sync;
@@ -1519,22 +1519,48 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// is in flight at a time; a newer transition supersedes by overwriting this field.
   /// `on_sb_done` runs the action only when the completed `WriteId` matches the stored one.
   pending_sb: Option<(crate::WriteId, PendingSbAction)>,
-  /// A durable checkpoint frontier a PREDECESSOR endpoint's root write established past this
-  /// endpoint's own — the owed catch-up an inherited root landing leaves behind.
+  /// A durable checkpoint frontier an UNCORRELATED root landing established past this endpoint's
+  /// own — the owed catch-up such a landing leaves behind. Two producers share the marker: a dead
+  /// incarnation's inherited root landing on a successor endpoint (a restart in place — the belt,
+  /// since construction baselines at/above the in-flight front), and a root of THIS incarnation
+  /// whose correlation ended without an abandon (`pending_sb`/`pending_checkpoint` moved on while
+  /// the write stayed with the medium — an own root's advance runs through its matching arm only
+  /// while the correlation is live).
   ///
   /// Set when the [`Storage`] session settles a root landing whose `checkpoint_op` exceeds
-  /// `self.checkpoint_op` and the id names a dead incarnation (an own root's advance runs through
-  /// its own `on_sb_done` arm instead). The durable pointer now legitimately LEADS the in-memory
-  /// one: the landed envelope and its DAG are durable (the flush gate ordered them before the root
-  /// submit), but this endpoint's SM has not necessarily applied through the frontier, and
-  /// `commit_min >= checkpoint_op` is load-bearing for GC's log trim — so the pointer cannot be
-  /// adopted until the applied frontier reaches it. [`Self::maybe_adopt_inherited_frontier`] runs
-  /// at the settle site and at every commit-advance tail, adopting (and clearing this) as soon as
-  /// `commit_min` catches up — which the cluster guarantees it does, since a checkpoint at the
-  /// frontier proves the cluster committed through it. While set, it is the third excluded window
-  /// of the settled-lockstep assertion in [`Self::handle_storage`], exactly parallel to
-  /// `pending_checkpoint` (an own advance mid-flight) and `sm_reconstruct` (own content owed).
+  /// `self.checkpoint_op` and no live correlation names the id. The durable pointer now
+  /// legitimately LEADS the in-memory one: the landed envelope and its DAG are durable (the flush
+  /// gate ordered them before the root submit), but this endpoint's SM has not necessarily
+  /// applied through the frontier, and `commit_min >= checkpoint_op` is load-bearing for GC's log
+  /// trim — so the pointer cannot be adopted until the applied frontier reaches it.
+  /// [`Self::maybe_adopt_inherited_frontier`] runs at the settle site and at every commit-advance
+  /// tail, adopting (and clearing this) as soon as `commit_min` catches up — which ordinary
+  /// commits deliver for every producer except an orphaned re-persist (whose frontier this
+  /// endpoint may hold no log band toward; `repersist_orphan` drives the active reconciliation
+  /// for exactly that case). While set, it is the third excluded window of the settled-lockstep
+  /// assertion in [`Self::handle_storage`], exactly parallel to `pending_checkpoint` (an own
+  /// advance mid-flight) and `sm_reconstruct` (own content owed). (An own snapshot below the
+  /// owed frontier would be refused at the session's no-rewind submit choke, but that fence is
+  /// [`Self::force_checkpoint`]'s effective-pair deferral, which reads the timeline directly
+  /// rather than this marker.)
   inherited_frontier: Option<OpNumber>,
+  /// The frontier of a CHECKPOINT-role root that landed with no live correlation while
+  /// `commit_min` sat below it — an orphaned state-sync re-persist. Only a re-persist can land
+  /// this shape: an ordinary checkpoint targets the `commit_min` that produced it (so its landing
+  /// can never outrun the applied frontier), while a re-persist names a synced point this
+  /// endpoint never applied — and the view transition that dropped its correlation also dropped
+  /// the staged install, so the state the durable root now names was never installed and no
+  /// commit path may ever reach it (the band below the synced point can be pruned cluster-wide).
+  ///
+  /// While owed, [`Self::maybe_enter_orphan_repersist_fetch`] flips this endpoint into the
+  /// recovery peer-fetch — reconciliation before further participation — deferring only across
+  /// an in-flight durable-view write or an own-advance window, each of which re-drives it from
+  /// the commit tails or the primary heartbeat. Cleared when [`Self::advance_checkpoint_op`]
+  /// reaches the frontier (any reconciling install or restore satisfies it) or when `commit_min`
+  /// catches up after all (repair recovered the band; the passive adoption then completes the
+  /// catch-up). Set only alongside `inherited_frontier`, so the settled-lockstep exclusion
+  /// already covers its window.
+  repersist_orphan: Option<OpNumber>,
   /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
   /// (their ids never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
   pending_checkpoint: Option<PendingCheckpoint>,
@@ -2204,6 +2230,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       pending_sb: None,
       pending_checkpoint: None,
       inherited_frontier: None,
+      repersist_orphan: None,
       checkpoint_op: OpNumber::new(),
       checkpoint_sm_root: None,
       checkpoint_sessions_root: None,
@@ -2319,6 +2346,17 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       self.checkpoint_op.get(),
     );
     self.checkpoint_op = to;
+    // Reaching an owed frontier retires it, whichever arc delivered the advance — a fetched
+    // install, a recovery restore, or a fresh sync that subsumed it. This is the single
+    // pointer-advance choke, so neither marker can outlive its satisfaction — which also keeps
+    // `inherited_frontier` strictly ABOVE the pointer whenever set, so the adoption path's own
+    // call here can never name a frontier this assert would refuse as a rewind.
+    if self.inherited_frontier.is_some_and(|owed| owed <= to) {
+      self.inherited_frontier = None;
+    }
+    if self.repersist_orphan.is_some_and(|owed| owed <= to) {
+      self.repersist_orphan = None;
+    }
     // The own durable snapshot vouches every op `<= to` the log may omit, so the carried-log floor
     // keeps pace (it never falls below `checkpoint_op`).
     self.raise_log_floor(to);
@@ -3104,7 +3142,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // legitimately-reconfigured node behind an offline migration for no reason.
     .with_wal_geometry(self.config.checkpoint_ops(), self.wal_capacity);
     let id = self.mint_write_id();
-    storage.submit_root(id, state);
+    storage.submit_root(RootRole::DurableView, id, state);
     self.pending_sb = Some((
       id,
       PendingSbAction::SwapEpoch(EpochSwap::new(reconfigure_op, successor)),
@@ -6466,8 +6504,11 @@ where
         // otherwise, so the steady-state heartbeat is unchanged.
         // Adopt an owed INHERITED checkpoint frontier on the same heartbeat cadence: a quiescent
         // replica has no commit-advance tail to re-drive the adoption, and the settled-lockstep
-        // assertion holds its excluded window open until this clears it.
+        // assertion holds its excluded window open until this clears it. Then re-drive an owed
+        // orphaned-re-persist reconciliation for the same reason — a quiescent primary is the one
+        // Normal posture with no commit tail to re-drive a deferral.
         self.maybe_adopt_inherited_frontier();
+        self.maybe_enter_orphan_repersist_fetch(now, storage);
         self.maybe_pay_checkpoint_debt(now, storage);
         // Re-attempt a due ORDINARY checkpoint a prior commit-tail tried but whose block-store flush
         // faulted: a backup re-fires the cadence off the primary's Commit heartbeats, but a QUIESCENT
@@ -6589,9 +6630,11 @@ where
     // SyncRepersist stages install state the landed side leads mid-window); an owed
     // SM-content reconstruction (`sm_reconstruct` — `self.checkpoint_op` is already M while the SM
     // catches up, still consistent with the durable root that names M); and an owed INHERITED
-    // frontier (`inherited_frontier` — an inherited landing advanced the durable pointer past this
-    // endpoint's own across a restart in place, and the pointer is adopted the moment `commit_min`
-    // reaches it, `maybe_adopt_inherited_frontier`).
+    // frontier (`inherited_frontier` — an UNCORRELATED landing advanced the durable pointer past
+    // this endpoint's own: a dead incarnation's root across a restart in place, or an own root
+    // whose correlation ended without an abandon. The pointer is adopted the moment `commit_min`
+    // reaches it, `maybe_adopt_inherited_frontier`, or delivered by the reconciling fetch an
+    // orphaned re-persist owes, `maybe_enter_orphan_repersist_fetch`).
     #[cfg(debug_assertions)]
     if self.pending_checkpoint.is_none()
       && self.sm_reconstruct.is_none()

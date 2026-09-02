@@ -27,15 +27,16 @@ use viewstamp_simulation::{
 #[test]
 fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
   // The durable-root timeline's CONSTANT bound, driven through the checker at exactly the shape
-  // that grows the queue without the endpoint-construction collapse: a superblock so slow the
-  // front root write never lands, a view-change escalation that keeps a durable-view root
-  // submitted behind it, and an endpoint rebuilt in place over the live session faster than the
-  // backend services roots. No correlation-ending path runs at a rebuild, so nothing else
-  // forfeits a dead incarnation's parked durable-view root — leaving it on the timeline would add
-  // one header-bearing state per rebuild cycle, and an affine allowance (three plus two per
-  // incarnation) would grow right along with it and could never fail. The collapse drops those
-  // parked roots at endpoint construction, so the checker holds the queue to the constant three:
-  // the held front plus the live endpoint's awaited roots.
+  // that once grew the timeline one parked header-bearing state per rebuild cycle: a superblock
+  // so slow the front root write never lands, a view-change escalation that keeps a durable-view
+  // root parked behind it, and an endpoint rebuilt in place over the live session faster than
+  // the backend services roots. The session's containers hold the bound structurally — one front
+  // cell owed to the medium plus one parked cell per correlation role, with a same-role
+  // resubmission overwriting its cell and the construction collapse emptying the dead
+  // incarnations' cells — so this run is the regression net that the constant SURVIVES the
+  // adversarial schedule end to end: held front, rebuild storm, per-tick checker arm, and the
+  // non-vacuity floor below proving the parked cells were genuinely occupied behind the held
+  // front rather than the schedule never reaching them.
   for seed in 0..4u64 {
     let mut c = Cluster::new(3, 1, 1, seed);
     // Every superblock write stays staged for the whole run: the first root any survivor submits
@@ -72,7 +73,11 @@ fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
       drive(&mut c, &mut max_roots, &format!("rebuild round {round}"));
     }
     // Non-vacuity: submissions genuinely queued behind the held front (the accumulation shape was
-    // reachable), and the front itself is still owed — the run never quietly drained.
+    // reachable), and the front itself is still owed — the run never quietly drained. This
+    // schedule occupies the front plus the DURABLE-VIEW cell (with the superblock held forever no
+    // envelope ever completes, so no checkpoint root is ever minted to fill the checkpoint cell);
+    // the full three-cell occupancy is
+    // `a_checkpoint_root_and_a_view_change_storm_fill_every_timeline_cell`'s floor.
     assert!(
       max_roots >= 2,
       "seed {seed}: VACUOUS — no root was ever parked behind the held front (max {max_roots})"
@@ -80,6 +85,98 @@ fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
     assert!(
       c.replica_roots_in_flight(victim) >= 1,
       "seed {seed}: VACUOUS — the front was not held to the end"
+    );
+  }
+}
+
+#[test]
+fn a_checkpoint_root_and_a_view_change_storm_fill_every_timeline_cell() {
+  // The durable-root timeline's CONTRACTUAL MAXIMUM, reached and asserted: one submitted front
+  // plus BOTH parked cells occupied at once, under the per-tick checker arm that bounds the
+  // count at the independent constant three. The held-front rebuild storm above can never get
+  // there (its forever-held superblock starves the envelope, so no checkpoint root exists);
+  // this schedule uses a FINITE superblock delay sized so all three roots overlap:
+  //
+  //   1. the cluster runs normally until a backup's checkpoint ENVELOPE write is in flight
+  //      (the delay makes that window thousands of ticks wide);
+  //   2. the primary crashes inside that window — the survivors' view-change escalation begins,
+  //      and the victim's first durable-view root becomes the timeline's FRONT (the envelope is
+  //      not a root, so the root lane was empty);
+  //   3. the envelope completes and the checkpoint root is minted behind the held front — the
+  //      CHECKPOINT cell fills (an ordinary checkpoint's correlation survives the transition,
+  //      so this is the kept-in-flight shape, not an abandonment);
+  //   4. the escalation cadence (view_change_status, far shorter than the write delay) supersedes
+  //      the in-flight view root with the next view's — the DURABLE-VIEW cell fills. Three at
+  //      once, until the front lands and promotes the lowest stamp.
+  //
+  // The per-tick maximum then proves the parked cells were both genuinely occupied — the arm's
+  // non-vacuity witness — and a rebuild inside the storm exercises the construction collapse
+  // with a parked CHECKPOINT root (the storm test's collapse only ever sees a view root).
+  for seed in 0..4u64 {
+    // 3 voters, 3 clients x 60 requests, checkpoint interval 4: the first checkpoint is due
+    // within the first ~hundred ticks of commits.
+    let mut c = Cluster::with_checkpoint_ops(3, 3, 60, seed, 4);
+    // Every superblock write takes 3000 polls: long enough that the crash-to-escalation latency
+    // (primary_idle ~200 ticks) and one escalation window (~500 ticks) both fit INSIDE a single
+    // write's flight, short enough that the envelope genuinely completes (step 3 above needs its
+    // completion — the storm test's u32::MAX hold proves the opposite regime).
+    c.set_async_superblock_delay(Some(3_000));
+    let bound = BoundednessChecker::new(64, 8);
+    let victim = 2usize;
+    let mut max_roots = 0usize;
+    let check = |c: &Cluster, phase: &str| {
+      assert_eq!(
+        check_safety(c),
+        CheckResult::Ok,
+        "seed {seed}: safety ({phase})"
+      );
+      assert_eq!(
+        bound.observe(c),
+        CheckResult::Ok,
+        "seed {seed}: the root timeline stays under the contractual three ({phase})"
+      );
+    };
+
+    // Phase 1: run until the victim's checkpoint envelope is with the backend.
+    let mut envelope_seen = false;
+    for _ in 0..30_000 {
+      c.tick();
+      check(&c, "normal run to the first envelope");
+      if c.replica_checkpoints_in_flight(victim) == 1 {
+        envelope_seen = true;
+        break;
+      }
+    }
+    assert!(
+      envelope_seen,
+      "seed {seed}: VACUOUS — the victim never had a checkpoint envelope in flight"
+    );
+
+    // Phase 2: crash the primary inside the envelope's flight; the survivors escalate a view
+    // change whose durable-view writes are slower than the escalation cadence, so the victim's
+    // timeline reaches front + checkpoint cell + durable-view cell before the front lands.
+    c.crash(0);
+    for _ in 0..12_000 {
+      c.tick();
+      max_roots = max_roots.max(c.replica_roots_in_flight(victim));
+      check(&c, "post-crash escalation");
+    }
+    assert_eq!(
+      max_roots, 3,
+      "seed {seed}: the schedule must occupy the front AND both parked cells at once \
+       (the contractual maximum the checker arm bounds)"
+    );
+
+    // Phase 3: rebuild the victim in place mid-storm — the construction collapse now runs over
+    // a timeline that can hold a parked checkpoint root — and keep the per-tick arm on it.
+    c.restart_in_place(victim);
+    for _ in 0..4_000 {
+      c.tick();
+      check(&c, "rebuild inside the storm");
+    }
+    assert!(
+      c.replica_roots_in_flight(victim) >= 1,
+      "seed {seed}: VACUOUS — the storm drained before the run ended"
     );
   }
 }

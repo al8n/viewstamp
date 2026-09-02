@@ -1667,6 +1667,170 @@ fn state_sync_view_change_defers_while_a_re_persist_root_is_staged() {
 }
 
 #[test]
+fn an_orphaned_sync_repersist_root_enters_the_recovery_fetch_at_its_landing() {
+  // A staged re-persist ROOT (AwaitRoot) whose correlation a teardown drops while the write is
+  // with the backend — the backstop arm of `reset_for_view_transition`, reachable by any
+  // teardown path outside the `sync_repersist_root_staged` deferrals. The abandon inside that
+  // arm cannot touch the submitted front, so the root lands later: same incarnation, no live
+  // correlation, naming a synced checkpoint this endpoint NEVER INSTALLED (the drop also
+  // discarded the staged install), above a commit floor it may hold no log band toward. The
+  // landing must not pass as stale: the durable root now leads the in-memory pointer, and the
+  // one clean exit is the recovery peer-fetch — reconciliation before further participation —
+  // whose install then advances the pointer to the landed frontier and retires the debt.
+  let (_donor, dstorage) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dstorage);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let wal = TestWal::default();
+  let sb = StepSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  // The laggard holds a live WAL band {1,2} below the synced point; the trigger Commit carries
+  // commit=0, so its applied frontier stays at 0 — strictly below the synced checkpoint.
+  for op in 1..=2u64 {
+    e.handle_message(now, &mut storage, primary_peer(), prepare(op, 0));
+    e.storage_step(now, &mut storage, &mut blocks);
+    storage.sb_mut().flush();
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  // Snapshot durable → the re-persist ROOT is submitted and stays in flight (StepSb withholds it).
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sync_repersist_root_staged(),
+    "the re-persist root is staged and in flight"
+  );
+
+  // The teardown that orphans it: the shared reset drops the SyncRepersist correlation at every
+  // step, abandoning a root the medium still owes (the abandon inside the backstop arm no-ops on
+  // the submitted front) and clearing the staged install and the sync handshake with it.
+  e.reset_for_view_transition(now, &mut storage);
+  assert!(e.pending_checkpoint.is_none(), "the correlation is gone");
+  assert!(
+    e.sync_target_for_test().is_none() && e.pending_install.is_none(),
+    "the staged install and the sync handshake died with the correlation"
+  );
+
+  // The orphaned root lands: uncorrelated, checkpoint-role, frontier 4 past the applied floor 0.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    storage.sb_mut().state().checkpoint_op(),
+    OpNumber::with(4),
+    "the durable root advanced to the synced checkpoint the orphan carried"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(0),
+    "the in-memory pointer holds until the reconciling install delivers the state"
+  );
+  assert_eq!(
+    e.inherited_frontier,
+    Some(OpNumber::with(4)),
+    "the owed catch-up is recorded — the lockstep window stays open, in release too"
+  );
+  assert_eq!(
+    e.repersist_orphan,
+    Some(OpNumber::with(4)),
+    "the landing classified as an orphaned re-persist (checkpoint role, frontier past commit_min)"
+  );
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(4),
+    "the landed commit frontier was absorbed"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the endpoint entered recovery instead of participating over state it does not hold"
+  );
+  let refetch_nonce = captured_sync_nonce(&mut e);
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the reconciling fetch is armed at the landed frontier — no reply below it can install"
+  );
+
+  // The reconciliation completes: a donor answers the re-fetch, the re-persist runs while
+  // Recovering (the staged-write peel routes its completions), and the install + recovery
+  // completion land the endpoint Normal at the synced point.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      refetch_nonce,
+      env,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the fetched install advanced the pointer to the landed frontier"
+  );
+  assert_eq!(e.status(), Status::Normal, "recovery completed");
+  assert!(
+    e.repersist_orphan.is_none(),
+    "reaching the frontier retired the owed reconciliation"
+  );
+  assert!(e.inherited_frontier.is_none(), "nothing left owed");
+  assert_eq!(
+    e.state_machine_ref().applied().len(),
+    4,
+    "the SM holds the synced state the durable root names"
+  );
+  assert_eq!(e.state_syncs_applied(), 1, "the reconciling sync applied");
+}
+
+#[test]
 fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_clearing_it() {
   // REGRESSION. The `on_sb_done` root-completion arm must route by whether THIS
   // root is the sync's re-persist (`pc.sync`), NOT by `self.sync.is_some()`. A sync can be merely
