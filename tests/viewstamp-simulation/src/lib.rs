@@ -25,6 +25,7 @@ pub use checker::{
 };
 pub use cluster::{AppliedEvent, Cluster, OfflineReconfig};
 pub use network::{Faults, SlowProfile};
+pub use sm::ReplySize;
 pub use storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
 pub use vopr::{
   DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,

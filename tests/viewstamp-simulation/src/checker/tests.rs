@@ -811,9 +811,17 @@ fn staleness_checker_resolves_acked_ops_from_the_apply_stream() {
     (5, Bytes::from_static(b"a")),
     (6, Bytes::from_static(b"b")),
   ]];
-  let acks: &[(u64, Bytes, Instant)] = &[
-    (1, Bytes::from_static(b"a"), Instant::from_nanos(50)),
-    (2, Bytes::from_static(b"b"), Instant::from_nanos(60)),
+  let acks: &[(u64, ReplyOutcome, Instant)] = &[
+    (
+      1,
+      ReplyOutcome::from_applied(Bytes::from_static(b"a")),
+      Instant::from_nanos(50),
+    ),
+    (
+      2,
+      ReplyOutcome::from_applied(Bytes::from_static(b"b")),
+      Instant::from_nanos(60),
+    ),
   ];
   assert!(
     stale

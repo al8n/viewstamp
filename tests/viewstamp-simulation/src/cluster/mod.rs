@@ -8,7 +8,8 @@ use viewstamp_proto::{
   AcceptReducedFaultTolerance, BlockAddress, BlockResponse, BlockStore, Committed, Config,
   DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership, MembershipChanged,
   Message, OpNumber, Outgoing, Peer, Prng, ProposeMembershipError, Recipient, Recovered, ReplicaId,
-  SingleChange, SingleVoterDelta, Status, Storage, Wal, block_address, prepare_restart,
+  ReplyOutcome, SingleChange, SingleVoterDelta, Status, Storage, Wal, block_address,
+  prepare_restart,
 };
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
   client::ClientModel,
   clock::Clock,
   network::{Faults, InFlight, Network, SlowProfile, Target},
-  sm::{BatchSm, LogSm, SimSm},
+  sm::{BatchSm, LogSm, ReplySize, SimSm},
   storage::{InMemorySuperblock, InMemoryWal, PermanentLossBudget, Shared, StorageFaults},
 };
 
@@ -251,14 +252,13 @@ pub struct Cluster {
   /// `restart`/`wipe_and_restart` rebuild a replica with the same state-machine variant (the mode
   /// is cluster configuration, identical on every replica).
   batch_mode: bool,
-  /// `None` (default) ⇒ every replica's [`LogSm`] replies with the bare 8-byte applied count, so
-  /// per-seed schedules stay byte-identical. `Some(len)` ⇒ every reply is padded to exactly `len`
-  /// bytes — the reply-size lever the endpoint's reply ceiling is walked with. Set via
-  /// [`set_fixed_reply_len`](Self::set_fixed_reply_len) BEFORE running; retained so
+  /// How large a reply every replica's [`LogSm`] produces. [`ReplySize::Count`] (the default) is
+  /// the bare 8-byte applied count, so per-seed schedules stay byte-identical. Set via
+  /// [`set_reply_size`](Self::set_reply_size) BEFORE running; retained so
   /// `restart`/`wipe_and_restart` rebuild a replica with the same state machine (the reply size is
   /// cluster configuration, identical on every replica — which is what makes the outcome every
   /// replica derives identical too).
-  fixed_reply_len: Option<usize>,
+  reply_size: ReplySize,
   crashed: Vec<bool>,
   /// Per-replica RETIRED flag: `true` once this node has resolved [`Recovered::Retired`] on recover
   /// (absent from its durable membership) and is parked. A retired node stays in the vectors (so
@@ -665,7 +665,7 @@ impl Cluster {
       checkpoint_ops,
       max_client_sessions: None,
       batch_mode: false,
-      fixed_reply_len: None,
+      reply_size: ReplySize::default(),
       crashed: vec![false; n],
       retired: vec![false; n],
       wiped_storage: vec![false; n],
@@ -1743,12 +1743,12 @@ impl Cluster {
     &self.clients[i]
   }
 
-  /// Client `i`'s acked replies STAMPED with their ack instant (for the staleness oracle):
-  /// `(request, reply_body, ack_instant)` per recorded reply, in reply order. Mirrors how
-  /// [`ClientModel::replies`] is surfaced via [`Self::client`], but carries the virtual instant each
-  /// reply was delivered — observation-only bookkeeping, like the apply-stream capture.
-  pub fn client_replies_at(&self, i: usize) -> &[(u64, Bytes, Instant)] {
-    self.clients[i].replies_at()
+  /// Client `i`'s single acknowledgement history: `(request, outcome, ack_instant)` per request
+  /// that reached a terminal outcome, in ack order. BOTH arms — a body and a refusal are equally an
+  /// ack of a committed op — so the staleness floor and the ordering checks see every committed
+  /// write the client heard about. Observation-only bookkeeping, like the apply-stream capture.
+  pub fn client_acked(&self, i: usize) -> &[(u64, ReplyOutcome, Instant)] {
+    self.clients[i].acked()
   }
 
   /// Mutable access to client `i`'s batching model (`None` for a plain client) — the scripted
@@ -2564,19 +2564,17 @@ impl Cluster {
     if self.batch_mode {
       SimSm::Batch(BatchSm::default())
     } else {
-      SimSm::Plain(match self.fixed_reply_len {
-        None => LogSm::default(),
-        Some(len) => LogSm::with_reply_len(len),
-      })
+      SimSm::Plain(LogSm::with_reply_size(self.reply_size))
     }
   }
 
-  /// Pad every replica's reply to exactly `len` bytes (`None` restores the bare count). Call BEFORE
-  /// running: like [`Cluster::set_batch_mode`], this REBUILDS each replica's endpoint fresh, and the
-  /// retained value makes every later `restart`/`wipe_and_restart` rebuild the same state machine —
-  /// the reply size is cluster configuration, so every replica applies to the same outcome.
-  pub fn set_fixed_reply_len(&mut self, len: Option<usize>) {
-    self.fixed_reply_len = len;
+  /// Set how large a reply every replica produces ([`ReplySize::Count`] restores the bare count).
+  /// Call BEFORE running: like [`Cluster::set_batch_mode`], this REBUILDS each replica's endpoint
+  /// fresh, and the retained value makes every later `restart`/`wipe_and_restart` rebuild the same
+  /// state machine — the reply size is cluster configuration, so every replica applies to the same
+  /// outcome.
+  pub fn set_reply_size(&mut self, reply_size: ReplySize) {
+    self.reply_size = reply_size;
     self.rebuild_endpoints();
   }
 
