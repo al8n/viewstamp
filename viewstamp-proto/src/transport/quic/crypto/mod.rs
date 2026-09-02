@@ -196,9 +196,20 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 ///
 /// Nothing bounds how many such spans ACCUMULATE at a peer. That is the ratio between the sender's
 /// pump rate and the receiver's: the receiver drains a 64 KiB budget per pump and re-arms itself
-/// while bytes remain, far outpacing a sub-packet sender, so a backlog builds only while a
-/// receiver's loop is stalled outright — and then the ceiling is reachable, which is what the
-/// recovery below is for.
+/// while bytes remain, far outpacing a sub-packet sender.
+///
+/// **Reachability, stated once.** The refusal's condition is more than 2048 unmerged spans — twice
+/// the reassembler's span ceiling, the count past which it compacts and then refuses — behind a
+/// SINGLE gap within one loss-detection interval: a lost packet stops the ordered reader, and every small-frame packet
+/// that arrives before the retransmit fills that gap lands as its own unmergeable span. The count
+/// reached is therefore the small-frame packets in flight across that interval — roughly
+/// `send rate x (RTT + loss-detection delay)`. On a loopback path that is a handful of packets,
+/// measured, because the interval is microseconds; on a high-RTT path carrying a high small-frame
+/// rate it is plausible. "Not reached" is a measurement of the paths tested, not a property of the
+/// transport. `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
+/// models that condition and proves the RECOVERY from it; `viewstamp-compio`'s
+/// `a_lossy_real_link_keeps_the_cluster_committing_and_recovers` drives the production chain under
+/// real loss and is where the loopback measurement comes from.
 ///
 /// **When a peer exceeds it.** quinn closes the connection; the bridge classifies that loss, unbinds
 /// the peer's routing and queues the connection for reaping, the driver's redial reconciler

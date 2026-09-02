@@ -99,7 +99,11 @@
 //!
 //! The window bounds the backlog's BYTES, not the number of spans quinn buffers them as; a peer
 //! whose segmentation drives the span count past what quinn's reassembler holds gets the connection
-//! closed. That path is recoverable, not a wedge: the close arrives as `Event::ConnectionLost`,
+//! closed. The condition for that — more than 2048 unmerged spans behind a single gap within one
+//! loss-detection interval, and what it takes to reach it — is stated once at
+//! [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW); the table above sizes
+//! the memory, not the reachability. That path is recoverable, not a wedge: the close arrives as
+//! `Event::ConnectionLost`,
 //! [`Bridge::on_app_event`] classifies it, unbinds the peer's routing and queues the connection on
 //! [`Bridge::lost`] for the coordinator to reap, the driver's redial reconciler re-establishes it on
 //! a backoff, and consensus retransmission re-drives what was in flight. See
