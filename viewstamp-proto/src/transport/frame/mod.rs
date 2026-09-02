@@ -52,6 +52,16 @@ pub const STAGE_CHUNK: usize = 64 * 1024;
 /// The `[u32 length]` prefix size that precedes every frame body.
 pub const LEN_PREFIX: usize = 4;
 
+/// Capacity [`FrameDecoder`] carries forward in its partial buffer between frames.
+///
+/// A completed frame at most this large is copied out of the retained buffer, so the steady path of
+/// small consensus frames reuses one allocation and never reallocates.  A larger one hands the
+/// buffer over as the frame instead of copying it, and the partial buffer restarts from nothing —
+/// otherwise a maximum-sized frame would leave its whole capacity retained while its copy sat in the
+/// ready queue, two frame-sized allocations for one frame.  Set to the per-pass read budget
+/// ([`STAGE_CHUNK`]), which is already what one read may hand the decoder at a time.
+const RETAINED_PARTIAL_CAP: usize = STAGE_CHUNK;
+
 /// Appends `[u32 len][payload]` to `out`.
 #[cfg_attr(not(tarpaulin), inline)]
 pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
@@ -113,17 +123,62 @@ impl FrameDecoder {
       }
       let total = LEN_PREFIX + len as usize;
       let take = (total - self.partial.len()).min(bytes.len());
+      self.reserve_for(total);
       self.partial.extend_from_slice(&bytes[..take]);
       bytes = &bytes[take..];
       if self.partial.len() == total {
-        let frame = self.partial[LEN_PREFIX..].to_vec();
-        self.partial.clear();
+        let frame = self.take_completed_frame(total);
         self.ready.push_back(frame);
       } else {
         break;
       }
     }
     Ok(())
+  }
+
+  /// Land the partial buffer's LAST growth exactly on `total` instead of doubling past it.
+  ///
+  /// `Vec`'s amortized doubling would reserve 32 MiB to hold a 16 MiB frame, and that buffer is the
+  /// one handed over as the delivered frame — as much slack as payload, carried for as long as the
+  /// frame is. Reserving the exact remainder on the step that would otherwise overshoot lands it on
+  /// the frame's own size. Every earlier growth keeps the doubling, so appending stays amortized
+  /// O(1); the exact reserve happens at most once per frame.
+  ///
+  /// The declared length is NOT trusted into an allocation: this only fires once the buffer has
+  /// already grown to at least half the total, which the peer's DELIVERED bytes are what drive. A
+  /// peer that declares a maximum frame and then sends nothing still holds nothing.
+  fn reserve_for(&mut self, total: usize) {
+    if self.partial.capacity() >= total || self.partial.capacity().saturating_mul(2) < total {
+      return;
+    }
+    self.partial.reserve_exact(total - self.partial.len());
+  }
+
+  /// Move the `total`-byte frame at the front of `partial` out as its own `Vec`, leaving `partial`
+  /// carrying at most [`RETAINED_PARTIAL_CAP`] of capacity.
+  ///
+  /// Exactly ONE frame-sized allocation is live at a time.  A frame within the retained capacity is
+  /// copied out and the buffer reused, which keeps the steady path allocation-free.  A larger frame
+  /// HANDS OVER the buffer — the frame IS `partial`'s storage, with the length prefix shifted off —
+  /// so no second frame-sized allocation is made and none is retained.  A pipelined tail behind the
+  /// frame (only after [`Self::extend_first`] buffered one) is kept, and any capacity left over
+  /// above the retained bound is released.
+  fn take_completed_frame(&mut self, total: usize) -> Vec<u8> {
+    debug_assert!(self.partial.len() >= total);
+    let frame = if self.partial.len() == total && self.partial.capacity() > RETAINED_PARTIAL_CAP {
+      let mut frame = core::mem::take(&mut self.partial);
+      frame.drain(..LEN_PREFIX);
+      frame
+    } else {
+      let frame = self.partial[LEN_PREFIX..total].to_vec();
+      self.partial.drain(..total);
+      frame
+    };
+    if self.partial.capacity() > RETAINED_PARTIAL_CAP {
+      // A no-op while `partial` still holds more than the bound (a buffered tail keeps its bytes).
+      self.partial.shrink_to(RETAINED_PARTIAL_CAP);
+    }
+    frame
   }
 
   /// Parses every COMPLETE frame currently held in `partial` onto `ready`, stopping on the first
@@ -151,8 +206,7 @@ impl FrameDecoder {
         // caller's loop (or the next call) to resume.
         break;
       }
-      let frame = self.partial[LEN_PREFIX..total].to_vec();
-      self.partial.drain(..total);
+      let frame = self.take_completed_frame(total);
       self.ready.push_back(frame);
     }
     Ok(())
@@ -205,11 +259,11 @@ impl FrameDecoder {
     }
     let total = LEN_PREFIX + len as usize;
     let take = (total - self.partial.len()).min(bytes.len());
+    self.reserve_for(total);
     self.partial.extend_from_slice(&bytes[..take]);
     bytes = &bytes[take..];
     if self.partial.len() == total {
-      let frame = self.partial[LEN_PREFIX..].to_vec();
-      self.partial.clear();
+      let frame = self.take_completed_frame(total);
       self.ready.push_back(frame);
       // The hello is complete: buffer the pipelined remainder (a peer that already validated us may flush
       // queued consensus Control behind its hello), but gate each tail frame on its length prefix against

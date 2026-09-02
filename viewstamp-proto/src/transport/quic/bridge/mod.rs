@@ -43,28 +43,42 @@
 //! no post-free replay). Dropping `Drained` entirely (the original behaviour) leaked
 //! that endpoint-owned state under reconnect / failed-handshake churn.
 //!
-//! **Inbound memory, per recv stream.** Received bytes sit in two places on the way to a
-//! delivered frame, and each is bounded on its own:
+//! **Inbound memory, per recv stream.** Received bytes are live in three places on the way to a
+//! delivered frame:
 //!
-//! - quinn's reassembler holds what has ARRIVED but not yet been read. Stream flow control
-//!   caps that at `stream_receive_window` bytes, and that window is itself derived so the
-//!   bytes it admits cannot span more chunks than the reassembler will hold — see
-//!   [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW) for the
-//!   arithmetic (`1 MiB / 1024 B per packet-filling STREAM frame = 1024 chunks`, exactly its
-//!   ceiling). Past that ceiling quinn closes the CONNECTION rather than throttling the
-//!   peer, so the window is what keeps a slow reader from stranding a transfer.
-//! - the class [`FrameDecoder`] holds the frame being assembled, capped at [`MAX_FRAME_LEN`]
-//!   (16 MiB) — [`decoder_max`] lowers that to the hello cap while the connection is still
-//!   `Authenticating`.
+//! - quinn's reassembler holds what has ARRIVED but not yet been read. Stream flow control caps the
+//!   PAYLOAD at `stream_receive_window` (1 MiB). Its allocation runs ahead of that payload — spans
+//!   reference the packet buffers they arrived in, and quinn compacts only once over-allocation
+//!   passes `1.5x` the buffered bytes — so allow ~2.5 MiB of allocation, plus ~48 bytes of
+//!   bookkeeping per span (bounded by
+//!   [`QUINN_REASSEMBLY_MAX_SPANS`](super::crypto::QUINN_REASSEMBLY_MAX_SPANS), so under 100 KiB).
+//! - the read scratch a single pass moves between the two: [`STAGE_CHUNK`], 64 KiB.
+//! - the class [`FrameDecoder`]: the frame being assembled, capped at [`MAX_FRAME_LEN`] (16 MiB) and
+//!   reserved to exactly that rather than doubling past it, plus the frames a pass completed.
 //!
-//! One recv stream therefore holds at most `stream_receive_window + MAX_FRAME_LEN`, plus the
-//! [`STAGE_CHUNK`] (64 KiB) scratch one read pass moves between the two; a connection carries
-//! at most two such streams (Control + Bulk).
+//! The decoder holds ONE frame-sized buffer, not two: a completed frame IS the buffer that assembled
+//! it, handed over rather than copied out of a retained one, and what stays behind is bounded working
+//! capacity. Across a pass the ready queue takes at most the one frame the pass completed plus a
+//! budget's worth of smaller ones, and `drain_bridge` pops the queue after every `ingest_recv`, so a
+//! second frame-sized buffer never accumulates behind the first.
 //!
-//! Reading a budget is also what frees flow-control credit, so the peer's next window opens as
-//! the decoder fills: a frame LARGER than the window still arrives, across as many window
-//! grants as it takes. The deliverable frame ceiling is the decoder cap alone —
-//! [`MAX_FRAME_LEN`], unchanged by the window it crosses.
+//! Per recv stream that totals roughly `2.5 MiB + 64 KiB + 16 MiB`, and a connection carries at most
+//! two such streams (Control + Bulk). Reaching it requires a peer actually sending a maximum-sized
+//! frame; [`decoder_max`] holds the frame cap down to the hello size until the connection validates.
+//!
+//! Reading a budget is also what frees flow-control credit, so the peer's next window opens as the
+//! decoder fills: a frame LARGER than the window still arrives, across as many window grants as it
+//! takes. The deliverable frame ceiling is the decoder cap alone — [`MAX_FRAME_LEN`], unchanged by
+//! the window it crosses.
+//!
+//! The window bounds the backlog's BYTES, not the number of spans quinn buffers them as; a peer
+//! whose segmentation drives the span count past what quinn's reassembler holds gets the connection
+//! closed. That path is recoverable, not a wedge: the close arrives as `Event::ConnectionLost`,
+//! [`Bridge::on_app_event`] classifies it, unbinds the peer's routing and queues the connection on
+//! [`Bridge::lost`] for the coordinator to reap, the driver's redial reconciler re-establishes it on
+//! a backoff, and consensus retransmission re-drives what was in flight. See
+//! [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW) for which senders the
+//! window's sizing covers and which it does not.
 //!
 //! The `Bridge` works natively in [`std::time::Instant`] — quinn's time
 //! currency. The viewstamp-time adapter lives one layer up (the coordinator).

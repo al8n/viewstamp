@@ -285,3 +285,88 @@ fn extend_first_preserves_a_legitimate_over_hello_cap_tail() {
   );
   assert_eq!(dec.partial_len(), 0);
 }
+
+/// A maximum-sized frame leaves exactly ONE frame-sized allocation live.
+///
+/// The decoder assembles a frame in `partial`, so a 16 MiB frame grows that buffer to 16 MiB. If the
+/// completed frame were COPIED out and `partial` merely cleared, the copy and the retained capacity
+/// would both be live — 32 MiB held for one 16 MiB frame, and retained for the connection's life.
+/// Handing the buffer over instead keeps one allocation and restarts `partial` from the bounded
+/// working capacity.
+///
+/// Fed one read budget at a time, exactly as the QUIC receive path feeds it, so the capacity the
+/// assembly actually grows to is the one observed.
+#[test]
+fn a_max_sized_frame_retains_no_second_frame_allocation() {
+  let body = vec![0xA5u8; MAX_FRAME_LEN as usize];
+  let mut wire = Vec::new();
+  encode_frame(&body, &mut wire);
+
+  let mut dec = FrameDecoder::new(MAX_FRAME_LEN);
+  let mut assembling = core::ptr::null();
+  for chunk in wire.chunks(STAGE_CHUNK) {
+    dec.extend(chunk).unwrap();
+    if dec.partial_len() > 0 {
+      assembling = dec.partial.as_ptr();
+    }
+  }
+  assert!(
+    dec.partial.capacity() <= RETAINED_PARTIAL_CAP,
+    "the completed frame's storage must be handed over, not copied out of a retained \
+     {}-byte buffer",
+    dec.partial.capacity()
+  );
+  assert_eq!(dec.partial_len(), 0, "nothing follows the frame");
+  let frame = dec.next_frame().expect("the whole frame decodes");
+  assert_eq!(frame.len(), MAX_FRAME_LEN as usize);
+  assert_eq!(
+    frame, body,
+    "the handed-over storage carries the body intact"
+  );
+  assert_eq!(
+    frame.as_ptr(),
+    assembling,
+    "the delivered frame must BE the buffer the assembly grew — a copy would allocate a second \
+     frame-sized buffer alongside it, which is the peak this pins"
+  );
+  assert_eq!(
+    frame.capacity(),
+    MAX_FRAME_LEN as usize + LEN_PREFIX,
+    "and that buffer must be reserved to the frame's own size, not doubled past it"
+  );
+  assert!(
+    dec.partial.capacity() <= RETAINED_PARTIAL_CAP,
+    "and nothing frame-sized is retained after the drain"
+  );
+}
+
+/// The steady path keeps its buffer: a frame within the retained capacity is copied out and the
+/// partial buffer REUSED, so a stream of small consensus frames does not reallocate per frame. This
+/// is the half of the hand-over rule that the max-frame regression would otherwise let regress into
+/// "allocate a fresh buffer for every frame".
+#[test]
+fn small_frames_reuse_the_retained_partial_buffer() {
+  let mut dec = FrameDecoder::new(MAX_FRAME_LEN);
+  let mut wire = Vec::new();
+  encode_frame(&[0x11u8; 512], &mut wire);
+  dec.extend(&wire).unwrap();
+  assert_eq!(dec.next_frame().map(|f| f.len()), Some(512));
+  let retained = dec.partial.capacity();
+  assert!(
+    retained >= 512 + LEN_PREFIX,
+    "the small-frame path keeps its buffer for the next frame, got {retained}"
+  );
+  assert!(
+    retained <= RETAINED_PARTIAL_CAP,
+    "and never carries more than the bounded working capacity, got {retained}"
+  );
+  for _ in 0..64 {
+    dec.extend(&wire).unwrap();
+    assert_eq!(dec.next_frame().map(|f| f.len()), Some(512));
+    assert_eq!(
+      dec.partial.capacity(),
+      retained,
+      "a steady stream of small frames must not grow or replace the buffer"
+    );
+  }
+}
