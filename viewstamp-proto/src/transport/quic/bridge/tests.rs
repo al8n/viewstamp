@@ -827,7 +827,7 @@ fn a_tiny_frame_burst_in_one_window_is_drained_in_bounded_passes() {
 
   // Many zero-body frames (4 bytes each: just the length prefix) — the smallest possible frame, so
   // the queue-depth blowup an unbounded read would cause is maximal. BURST spans several STAGE_CHUNK
-  // passes and fits well inside the 8 MiB stream_receive_window, so B can buffer the whole burst
+  // passes and fits inside the 1 MiB stream_receive_window, so B can buffer the whole burst
   // before it reads a byte (the realistic exhaustion setup).
   const BURST: usize = 8 * STAGE_CHUNK / LEN_PREFIX; // = 8 budgets' worth of minimal frames
   let mut blob = Vec::new();
@@ -844,7 +844,7 @@ fn a_tiny_frame_burst_in_one_window_is_drained_in_bounded_passes() {
   let mut pipe_to_b = PacketPipe::default();
 
   // Phase 1: push the whole burst to B WITHOUT B reading, so its recv buffer fills past one budget.
-  // B's stream window (8 MiB) exceeds the burst, so A drains all of it even though B never reads.
+  // B's stream window (1 MiB) exceeds the burst, so A drains all of it even though B never reads.
   // Ferry until A has emptied its staged outbound, then a few extra ticks to land the last in-flight
   // datagrams in B's recv buffer (A pacing means the tail arrives a tick or two after the last write).
   let mut settle = 0u64;
@@ -929,9 +929,9 @@ fn a_tiny_frame_burst_in_one_window_is_drained_in_bounded_passes() {
 /// dropped-`ShouldTransmit` fix.
 ///
 /// quinn only queues `MAX_STREAM_DATA` once the application has consumed at least
-/// `stream_receive_window / 8` (1 MiB of the 8 MiB window) past the last advertised limit, so a
+/// `stream_receive_window / 8` (128 KiB of the 1 MiB window) past the last advertised limit, so a
 /// single 64 KiB budget read does not cross it; the receiver must read several budgets first. The
-/// test fills B's whole stream window with one large frame (between the 8 MiB window and the 16 MiB
+/// test fills B's whole stream window with one large frame (between the 1 MiB window and the 16 MiB
 /// frame cap), so the sender A blocks behind flow control, then reads budgets on B with NO inbound
 /// datagram and NO `handle_timeout` between reads — the ONLY thing that can push a datagram onto B's
 /// outbound is `ingest_recv` servicing the connection after a read that freed the window. It asserts
@@ -960,8 +960,8 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
   a.bind_validated(now, ha, peer_b);
   b.bind_validated(now, hb, peer_a);
 
-  // One frame larger than B's 8 MiB stream_receive_window but under the 16 MiB frame cap. A can only
-  // push 8 MiB onto the wire before B's window blocks it; the rest stays staged in A's outbound.
+  // One frame larger than B's 1 MiB stream_receive_window but under the 16 MiB frame cap. A can only
+  // push a window's worth onto the wire before B blocks it; the rest stays staged in A's outbound.
   const FRAME_BODY: usize = 12 * 1024 * 1024;
   let mut framed = Vec::new();
   encode_frame(&vec![0xC3u8; FRAME_BODY], &mut framed);
@@ -1008,7 +1008,7 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
   };
   assert!(
     a_blocked > 0,
-    "A must be flow-control blocked with a staged tail (frame {total_len} B exceeds B's 8 MiB \
+    "A must be flow-control blocked with a staged tail (frame {total_len} B exceeds B's 1 MiB \
      stream window), so the transfer depends on B's credit"
   );
 
@@ -1042,7 +1042,7 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
      traffic servicing the connection"
   );
 
-  // End-to-end: with credit flowing, the WHOLE >8 MiB frame is delivered. Resume the ferry (B now
+  // End-to-end: with credit flowing, the WHOLE over-window frame is delivered. Resume the ferry (B now
   // emits credit each time it frees window, so A drains its staged tail) until B decodes the frame.
   let mut got: Option<Vec<u8>> = None;
   for k in 0..8000u64 {
@@ -1066,7 +1066,8 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
   assert_eq!(
     got.map(|f| f.len()),
     Some(FRAME_BODY),
-    "the full >8 MiB frame must be delivered once flow-control credit flows after each budget read"
+    "the full over-window frame must be delivered once flow-control credit flows after each budget \
+     read"
   );
 }
 
@@ -3904,13 +3905,13 @@ fn a_send_path_close_unbinds_routing_atomically_so_later_frames_do_not_grow_the_
 /// unconditional `flush_stream` and NO second `write_framed`. If the tail were dropped, or the flush
 /// path stopped retrying, the frame would never fully arrive.
 ///
-/// The frame is sized OVER the 8 MiB `stream_receive_window`, so its first write is necessarily
+/// The frame is sized OVER the 1 MiB `stream_receive_window`, so its first write is necessarily
 /// partial (the peer's per-stream flow-control budget caps it) and the remainder must be pushed only
 /// as the peer reads and reopens its window. Draining the staged tail therefore depends entirely on
 /// the connection making progress under flow control between pumps, with no application traffic to
 /// piggyback on.
 ///
-/// NOTE on scope: under this transport's flow-control parameters the per-stream window (8 MiB) is the
+/// NOTE on scope: under this transport's flow-control parameters the per-stream window (1 MiB) is the
 /// binding limit on every partial write, never the connection-level send window (~9.5 MiB) — so the
 /// `Writable` that retries the tail always originates from the peer freeing its STREAM window
 /// (`MAX_STREAM_DATA`) as it reads, a signal independent of whether `flush_outbound` writes once or
@@ -3938,7 +3939,7 @@ fn a_large_frame_partial_write_drains_its_tail_across_pumps_without_a_follow_on_
   a.bind_validated(now, ha, peer_b);
   b.bind_validated(now, hb, peer_a);
 
-  // A Bulk frame larger than B's 8 MiB stream_receive_window: the first write can only be partial,
+  // A Bulk frame larger than B's 1 MiB stream_receive_window: the first write can only be partial,
   // so the tail MUST be carried out across later pumps as B reads and reopens its window.
   const BODY: usize = 12 * 1024 * 1024;
   let mut framed = Vec::new();

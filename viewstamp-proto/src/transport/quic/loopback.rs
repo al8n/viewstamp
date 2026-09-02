@@ -1222,7 +1222,7 @@ fn public_submit_client_request_converges() {
 }
 
 /// End-to-end coverage of a frame that CROSSES the per-stream receive window: a single consensus op
-/// whose `Prepare` is larger than the 8 MiB `stream_receive_window` (but within the 16 MiB frame cap)
+/// whose `Prepare` is larger than the 1 MiB `stream_receive_window` (but within the 16 MiB frame cap)
 /// commits on both replicas over real mTLS, its body routed to the Bulk class under `ControlBulk`.
 /// Such a frame cannot fit the receiver's stream window in one shot, so it can only complete if the
 /// receiver keeps issuing `MAX_STREAM_DATA` as it drains each budget — exercising the multi-window
@@ -1236,7 +1236,7 @@ fn public_submit_client_request_converges() {
 /// `a_budget_read_emits_flow_control_credit_this_pump`.
 #[test]
 fn a_prepare_larger_than_the_stream_window_commits_over_bulk() {
-  // Strictly larger than the 8 MiB stream window, comfortably under the 16 MiB frame cap.
+  // Strictly larger than the 1 MiB stream window, comfortably under the 16 MiB frame cap.
   let big = vec![0x5Au8; 9 * 1024 * 1024];
 
   let ca = test_ca();
@@ -1261,17 +1261,17 @@ fn a_prepare_larger_than_the_stream_window_commits_over_bulk() {
   let converged = run_until_converged(&mut r0, addr0, &mut r1, addr1);
   assert!(
     converged,
-    "the >8 MiB Prepare must commit on both replicas — only possible if the receiver emits \
+    "the over-window Prepare must commit on both replicas — only possible if the receiver emits \
      flow-control credit after each budget read so the sender keeps feeding past the first window"
   );
   assert_eq!(
     r0.0.endpoint().state_machine_ref().applied(),
     applied_one(&big).as_slice(),
-    "primary applied the full >8 MiB op"
+    "primary applied the full over-window op"
   );
   assert_eq!(
     r1.0.endpoint().state_machine_ref().applied(),
     applied_one(&big).as_slice(),
-    "backup converged on the full >8 MiB op across the per-budget flow-control window updates"
+    "backup converged on the full over-window op across the per-budget flow-control window updates"
   );
 }

@@ -43,6 +43,29 @@
 //! no post-free replay). Dropping `Drained` entirely (the original behaviour) leaked
 //! that endpoint-owned state under reconnect / failed-handshake churn.
 //!
+//! **Inbound memory, per recv stream.** Received bytes sit in two places on the way to a
+//! delivered frame, and each is bounded on its own:
+//!
+//! - quinn's reassembler holds what has ARRIVED but not yet been read. Stream flow control
+//!   caps that at `stream_receive_window` bytes, and that window is itself derived so the
+//!   bytes it admits cannot span more chunks than the reassembler will hold — see
+//!   [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW) for the
+//!   arithmetic (`1 MiB / 1024 B per packet-filling STREAM frame = 1024 chunks`, exactly its
+//!   ceiling). Past that ceiling quinn closes the CONNECTION rather than throttling the
+//!   peer, so the window is what keeps a slow reader from stranding a transfer.
+//! - the class [`FrameDecoder`] holds the frame being assembled, capped at [`MAX_FRAME_LEN`]
+//!   (16 MiB) — [`decoder_max`] lowers that to the hello cap while the connection is still
+//!   `Authenticating`.
+//!
+//! One recv stream therefore holds at most `stream_receive_window + MAX_FRAME_LEN`, plus the
+//! [`STAGE_CHUNK`] (64 KiB) scratch one read pass moves between the two; a connection carries
+//! at most two such streams (Control + Bulk).
+//!
+//! Reading a budget is also what frees flow-control credit, so the peer's next window opens as
+//! the decoder fills: a frame LARGER than the window still arrives, across as many window
+//! grants as it takes. The deliverable frame ceiling is the decoder cap alone —
+//! [`MAX_FRAME_LEN`], unchanged by the window it crosses.
+//!
 //! The `Bridge` works natively in [`std::time::Instant`] — quinn's time
 //! currency. The viewstamp-time adapter lives one layer up (the coordinator).
 
@@ -73,7 +96,7 @@ use crate::{
 /// Per-class outbound staging cap. When a class's `outbound` would exceed this, the bridge RESETs
 /// just that class's send stream (clearing its buffer + reopening on the next write) rather than
 /// growing without bound or tearing down the connection — consensus retransmission re-drives the
-/// dropped (bulk) message. Pinned at 64 MiB: well above the 16 MiB max frame and 8 MiB stream
+/// dropped (bulk) message. Pinned at 64 MiB: well above the 16 MiB max frame and 1 MiB stream
 /// window, so a single legitimate bulk frame never false-trips it, yet bounded against a wedged
 /// peer that stops reading.
 const PER_CLASS_OUTBOUND_CAP: usize = 64 * 1024 * 1024;
@@ -2031,8 +2054,8 @@ impl Bridge {
       // `ReadError::Reset` mid-drain means the peer reset this class.
       //
       // Read at most `STAGE_CHUNK` bytes per pass rather than the whole stream window: a single pass
-      // over a multi-megabyte `stream_receive_window` packed with tiny frames would otherwise push
-      // millions of complete frames onto the decoder's ready queue before `drain_bridge` (which only
+      // over a full `stream_receive_window` packed with tiny frames would otherwise push a window's
+      // worth of complete frames onto the decoder's ready queue before `drain_bridge` (which only
       // pops AFTER this returns) drains any. Bounding the read bounds the queue to one budget's worth
       // of frames; `leftover` then reschedules the rest so the stream still fully drains across passes.
       let mut scratch: Vec<u8> = Vec::new();

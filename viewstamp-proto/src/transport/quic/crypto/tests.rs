@@ -40,9 +40,11 @@ fn quic_options_carry_layout_and_size_the_connection_window() {
     .with_layout(StreamLayout::ControlBulk)
     .build();
   assert_eq!(opts.layout(), StreamLayout::ControlBulk);
-  // Connection window must be at least MAX_FRAME_LEN (16 MiB) so a bulk frame
-  // cannot exhaust it and block the control stream.
+  // Stream-level flow control must be the binding one: the connection window stays above what all
+  // of a connection's streams can hold unread together, so a stalled reader on one class throttles
+  // its own stream instead of starving the other class of connection credit.
   assert!(opts.connection_receive_window() >= 16 * 1024 * 1024);
+  assert!(opts.connection_receive_window() >= 8 * opts.stream_receive_window());
 }
 
 /// Keep-alive must be armed strictly under the idle timeout on the PRODUCTION constructor path:
@@ -100,7 +102,7 @@ fn quic_tuning_defaults_equal_the_pinned_constants() {
   );
   assert_eq!(t.initial_rtt_millis(), 50);
   assert_eq!(t.connection_receive_window(), 17 * 1024 * 1024);
-  assert_eq!(t.stream_receive_window(), 8 * 1024 * 1024);
+  assert_eq!(t.stream_receive_window(), 1024 * 1024);
   assert_eq!(QuicTuning::default(), t, "Default delegates to new()");
 
   // The production constructor path without an override carries exactly these defaults.
@@ -111,7 +113,7 @@ fn quic_tuning_defaults_equal_the_pinned_constants() {
   assert_eq!(opts.keep_alive_interval_millis(), 1_000 / 3);
   assert_eq!(opts.initial_rtt_millis(), 50);
   assert_eq!(opts.connection_receive_window(), 17 * 1024 * 1024);
-  assert_eq!(opts.stream_receive_window(), 8 * 1024 * 1024);
+  assert_eq!(opts.stream_receive_window(), 1024 * 1024);
 }
 
 /// A non-default tuning passed through `ClusterTls::tuning` takes effect end to end: the built
@@ -126,7 +128,7 @@ fn a_non_default_tuning_takes_effect_through_cluster_tls() {
   let tuning = QuicTuning::new()
     .with_idle_timeout_millis(4_000)
     .with_initial_rtt_millis(200)
-    .with_stream_receive_window(2 * 1024 * 1024);
+    .with_stream_receive_window(512 * 1024);
   let opts = ClusterTls::new(ca.roots(), cert0.chain(), cert0.key())
     .with_tuning(tuning)
     .build();
@@ -137,7 +139,7 @@ fn a_non_default_tuning_takes_effect_through_cluster_tls() {
     "an un-overridden keep-alive re-derives idle/3 from the raised idle timeout"
   );
   assert_eq!(opts.initial_rtt_millis(), 200);
-  assert_eq!(opts.stream_receive_window(), 2 * 1024 * 1024);
+  assert_eq!(opts.stream_receive_window(), 512 * 1024);
   assert!(
     opts.requires_client_auth(),
     "tuning cannot weaken the mandatory-mTLS construction"
@@ -154,14 +156,16 @@ fn a_non_default_tuning_takes_effect_through_cluster_tls() {
     "the overridden idle timeout reaches the TransportConfig: {rendered}"
   );
   assert!(
-    rendered.contains("stream_receive_window: 2097152"),
+    rendered.contains("stream_receive_window: 524288"),
     "the overridden stream window reaches the TransportConfig: {rendered}"
   );
 }
 
-/// The tuning setters clamp instead of failing: zero values (a wedge, not a tuning) raise to 1 and
-/// values past the QUIC `VarInt` range clamp down, so `build_transport`'s `VarInt` conversions can
-/// never panic on embedder input.
+/// The tuning setters clamp instead of failing: zero values (a wedge, not a tuning) raise to 1,
+/// values past the QUIC `VarInt` range clamp down, and a per-stream window past
+/// [`MAX_STREAM_RECEIVE_WINDOW`] clamps to that ceiling — an unread backlog deeper than quinn's
+/// stream reassembler holds closes the connection, so an over-sized request is a wedge too.  With
+/// every extreme clamped, `build_transport`'s `VarInt` conversions can never panic on embedder input.
 #[test]
 fn quic_tuning_setters_clamp_zero_and_varint_overflow() {
   let t = QuicTuning::new()
@@ -172,9 +176,20 @@ fn quic_tuning_setters_clamp_zero_and_varint_overflow() {
   assert_eq!(t.idle_timeout_millis(), 1);
   assert_eq!(t.initial_rtt_millis(), 1);
   assert_eq!(t.connection_receive_window(), 1);
-  assert_eq!(t.stream_receive_window(), (1 << 62) - 1);
+  assert_eq!(
+    t.stream_receive_window(),
+    MAX_STREAM_RECEIVE_WINDOW,
+    "a per-stream window past the reassembly ceiling clamps to it, not to the VarInt maximum"
+  );
+  // The values with no tighter ceiling still clamp at the VarInt range.
+  let wide = QuicTuning::new()
+    .with_idle_timeout_millis(u64::MAX)
+    .with_connection_receive_window(u64::MAX);
+  assert_eq!(wide.idle_timeout_millis(), (1 << 62) - 1);
+  assert_eq!(wide.connection_receive_window(), (1 << 62) - 1);
   // The clamped extremes still build a TransportConfig (no VarInt panic).
   let _ = QuicOptions::build_transport(&t);
+  let _ = QuicOptions::build_transport(&wide);
 }
 
 #[test]

@@ -33,7 +33,7 @@ buffa = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
-quinn-proto = { version = "0.11", default-features = false, optional = true }
+quinn-proto = { version = "0.11.17", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 
 [build-dependencies]

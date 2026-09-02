@@ -11,11 +11,13 @@
 //!   datagram retransmits before a backup view-changes off a not-yet-connected primary.
 //! - `max_concurrent_bidi_streams` = 8 (each side opens up to 2 send streams under
 //!   `ControlBulk`; 8 gives per-side pair headroom across the cluster mesh).
-//! - `receive_window` (connection-level) = 17 MiB (16 MiB max frame + 1 MiB headroom)
-//!   so a maximum-sized bulk frame on one stream cannot exhaust the connection window
-//!   and stall the control stream.
-//! - `stream_receive_window` = 8 MiB: a checkpoint can flow in one shot but a single
-//!   stream cannot itself consume the full connection window.
+//! - `stream_receive_window` = 1 MiB: the largest per-stream window whose unread backlog
+//!   still fits `quinn-proto`'s stream reassembly bound (see [`MAX_STREAM_RECEIVE_WINDOW`]).
+//!   A frame larger than the window still flows, across the window updates its reader
+//!   produces as it drains.
+//! - `receive_window` (connection-level) = 17 MiB, clear of the 8 MiB the connection's
+//!   streams can hold unread together, so stream-level flow control is what throttles a
+//!   slow reader and one class can never starve the other of connection window.
 //!
 //! Use [`ClusterTls`] to build a `QuicOptions` with mandatory mutual TLS over
 //! cluster-private roots: the stock WebPki verifiers perform chain-only
@@ -133,15 +135,56 @@ pub const DEFAULT_INITIAL_RTT_MILLIS: u64 = 50;
 /// mutual-dial doubling where both peers open streams concurrently.
 pub(crate) const MAX_BIDI_STREAMS: u32 = 8;
 
-/// Connection-level receive window: max frame (16 MiB) plus control headroom
-/// (1 MiB) so a single max-sized bulk frame on the Bulk stream cannot exhaust
-/// the connection window and block the Control stream.
+/// Connection-level receive window.  Stream-level flow control is the binding constraint: each recv
+/// stream holds at most [`MAX_STREAM_RECEIVE_WINDOW`] unread, and a connection carries at most 8 of
+/// them (the pinned concurrent-bidi-stream limit), so 17 MiB stays clear of the 8 MiB those streams
+/// can hold unread together.  Connection credit therefore never runs out before stream credit does,
+/// and one class stalling its reader cannot starve the other of connection window.
 pub const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
 
-/// Per-stream receive window: a checkpoint snapshot can arrive in one shot but
-/// a single stream is bounded below the connection window so it cannot itself
-/// exhaust connection-level flow control.
-pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+/// Upper bound on the number of distinct unread spans `quinn-proto` keeps per recv stream
+/// (`MAX_CHUNKS` in its stream reassembler).  Exceeding it after a compaction closes the whole
+/// connection with an internal transport error, so it is a hard ceiling on how deep an unread
+/// backlog may get — counted in SPANS, not bytes.
+///
+/// Restated here because `quinn-proto` does not export it.  The compaction that runs before the
+/// rejection merges only POORLY UTILIZED spans — ones whose payload is under 5/6 of the packet they
+/// arrived in — so spans from a peer that fills its packets survive compaction and a deep backlog
+/// cannot be compacted back under the ceiling.  The derivation below therefore has to hold at this
+/// count, not at the higher count that merely triggers a compaction.
+const QUINN_REASSEMBLY_MAX_SPANS: u64 = 1024;
+
+/// Smallest STREAM-frame payload assumed for a peer that fills its packets, in bytes.  QUIC
+/// guarantees a 1200-byte path, which leaves ~1160 bytes for frames once the short header, the
+/// packet number and the AEAD tag are paid for; 1024 rounds that down for margin.  A peer with a
+/// backlog to send fills every packet, so this is the span size that matters while an unread backlog
+/// builds: a trickling peer makes smaller spans but has too little in flight to build one.
+const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
+
+/// Ceiling on the per-stream receive window, and what the tuning setters clamp to.
+///
+/// The receive window is what bounds an unread backlog: a peer may not send past
+/// `bytes_read + stream_receive_window`, so at most that many bytes sit unread in the reassembler.
+/// Dividing by the smallest span a packet-filling peer produces gives the deepest span count
+/// reachable, which must stay inside what the reassembler will hold:
+///
+/// ```text
+/// MAX_STREAM_RECEIVE_WINDOW / MIN_FILLED_STREAM_FRAME_PAYLOAD <= QUINN_REASSEMBLY_MAX_SPANS
+///           1 MiB           /              1024 B             =            1024
+/// ```
+///
+/// A larger window admits a backlog deeper than the reassembler will hold, which closes the
+/// connection mid-transfer instead of throttling it.  Frame size is NOT bounded by this: a frame
+/// spans as many window grants as it needs, so the transport's frame ceiling
+/// ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is unchanged.
+pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
+  QUINN_REASSEMBLY_MAX_SPANS * MIN_FILLED_STREAM_FRAME_PAYLOAD;
+
+/// Per-stream receive window: the largest window the reassembly bound admits
+/// ([`MAX_STREAM_RECEIVE_WINDOW`]), so a stalled reader throttles its peer rather than stranding it,
+/// and a frame larger than the window still flows — across the window updates its reader's drain
+/// produces.
+pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = MAX_STREAM_RECEIVE_WINDOW;
 
 /// The largest value a QUIC `VarInt` can carry (`2^62 - 1`).  The tuning setters clamp to this so an
 /// embedder-supplied window/timeout can never make the `VarInt` conversions in
@@ -160,6 +203,20 @@ const fn clamp_tuning(v: u64) -> u64 {
   }
 }
 
+/// Clamp an embedder-supplied per-stream window into `1..=MAX_STREAM_RECEIVE_WINDOW`.  Above the
+/// ceiling is a wedge rather than a tuning, exactly like zero: the window is what bounds the unread
+/// backlog, and a backlog deeper than the reassembler holds closes the connection mid-transfer
+/// (see [`MAX_STREAM_RECEIVE_WINDOW`] for the arithmetic).  Clamping turns that into a throughput
+/// ceiling, which regrants as the reader drains.
+const fn clamp_stream_window(v: u64) -> u64 {
+  let v = clamp_tuning(v);
+  if v > MAX_STREAM_RECEIVE_WINDOW {
+    MAX_STREAM_RECEIVE_WINDOW
+  } else {
+    v
+  }
+}
+
 /// Embedder-tunable timer and flow-control values for the QUIC `TransportConfig`, with `Default` =
 /// the pinned LAN-tuned constants (see each field's constant for the rationale).
 /// A geo-replicated cluster — where the defaults' assumptions (sub-50 ms RTT, 200 ms primary-idle
@@ -172,7 +229,8 @@ const fn clamp_tuning(v: u64) -> u64 {
 /// No tuning value can disable or weaken authentication.
 ///
 /// Setters clamp to `1..=2^62-1` (the QUIC `VarInt` range) so no embedder value can wedge the
-/// transport with a zero timeout/window or fail the `VarInt` conversions at construction.
+/// transport with a zero timeout/window or fail the `VarInt` conversions at construction; the
+/// per-stream window clamps tighter still, to [`MAX_STREAM_RECEIVE_WINDOW`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuicTuning {
   /// `max_idle_timeout`, milliseconds. Default [`DEFAULT_IDLE_TIMEOUT_MILLIS`].
@@ -283,10 +341,11 @@ impl QuicTuning {
     self
   }
 
-  /// Override the connection-level receive window (bytes; clamped to `1..=2^62-1`). Keep it at or
-  /// above `MAX_FRAME_LEN` (16 MiB) plus control headroom so one maximum-sized bulk frame cannot
-  /// consume the whole connection window and stall the control stream; a smaller window only
-  /// throttles bulk throughput (credit regrants as the reader drains), it cannot deadlock.
+  /// Override the connection-level receive window (bytes; clamped to `1..=2^62-1`). Keep it above
+  /// what the connection's streams can hold unread together (the concurrent-bidi-stream limit ×
+  /// [`MAX_STREAM_RECEIVE_WINDOW`]) so stream-level flow control stays the binding one and a stalled
+  /// reader on one class cannot starve the other; a smaller window only throttles bulk throughput
+  /// (credit regrants as the reader drains), it cannot deadlock.
   #[must_use]
   pub const fn with_connection_receive_window(mut self, bytes: u64) -> Self {
     self.set_connection_receive_window(bytes);
@@ -299,8 +358,10 @@ impl QuicTuning {
     self
   }
 
-  /// Override the per-stream receive window (bytes; clamped to `1..=2^62-1`). Sized so a checkpoint
-  /// flows in one shot but a single stream stays bounded below the connection window.
+  /// Override the per-stream receive window (bytes; clamped to `1..=`[`MAX_STREAM_RECEIVE_WINDOW`]).
+  /// Lowering it only throttles a stream (credit regrants as its reader drains); the ceiling is what
+  /// keeps an unread backlog inside the reassembly bound, so a larger request is clamped, not
+  /// honoured.
   #[must_use]
   pub const fn with_stream_receive_window(mut self, bytes: u64) -> Self {
     self.set_stream_receive_window(bytes);
@@ -309,7 +370,7 @@ impl QuicTuning {
 
   /// In-place form of [`Self::with_stream_receive_window`] — same clamp/semantics, chainable.
   pub const fn set_stream_receive_window(&mut self, bytes: u64) -> &mut Self {
-    self.stream_receive_window = clamp_tuning(bytes);
+    self.stream_receive_window = clamp_stream_window(bytes);
     self
   }
 }
@@ -591,15 +652,17 @@ impl QuicOptions {
     // defensive ignore.
     tc.max_concurrent_uni_streams(VarInt::from_u32(0));
     tc.datagram_receive_buffer_size(None);
-    // Connection-level window: must accommodate a max bulk frame (16 MiB) without
-    // blocking the control stream.  A Bulk stream exhausts stream_receive_window
-    // before it can exhaust this larger connection window.
+    // Connection-level window: sized above what this connection's streams can hold unread
+    // together, so a Bulk stream exhausts stream_receive_window long before it can exhaust the
+    // connection window and starve Control of credit.
     tc.receive_window(
       VarInt::from_u64(tuning.connection_receive_window())
         .expect("connection window within VarInt range (clamped by the tuning setter)"),
     );
-    // Per-stream window: large enough for a checkpoint snapshot in one shot but
-    // bounded below the connection window so a single stream cannot monopolise it.
+    // Per-stream window: what bounds the unread backlog a slow reader lets build up, capped by
+    // the tuning setter at MAX_STREAM_RECEIVE_WINDOW so that backlog stays inside quinn's stream
+    // reassembly bound.  A frame larger than the window still flows, across the window updates the
+    // reader's drain produces.
     tc.stream_receive_window(
       VarInt::from_u64(tuning.stream_receive_window())
         .expect("stream window within VarInt range (clamped by the tuning setter)"),

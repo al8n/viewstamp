@@ -44,8 +44,8 @@ pub use passthrough::Passthrough;
 pub use quic::{
   AttestedId, CertOid, ClusterTls, DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_IDLE_TIMEOUT_MILLIS,
   DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, DialError, Hello, Identified,
-  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, ProvidedIdentity, QuicCoordinator,
-  QuicOptions, QuicTuning, StreamLayout,
+  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, MAX_STREAM_RECEIVE_WINDOW,
+  ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning, StreamLayout,
 };
 pub use router::{ConnId, PeerRouter};
 pub use stream::{Intake, StreamTransport};
