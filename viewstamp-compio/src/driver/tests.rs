@@ -942,16 +942,40 @@ async fn the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_back
   );
 }
 
-/// The shipped driver carries no loss-injection seam.
+/// TRIPWIRE, not a guarantee: the inbound path reaches `handle_udp` unconditionally, and the known
+/// loss-injection identifiers are absent.
 ///
 /// A seam gated on this workspace's internal-testkit cfg would still compile into every artifact the
 /// workspace builds, because that cfg is a repo-wide rustflag — putting a datagram-drop branch on the
-/// inbound hot path of the real driver. The loss-tolerance test injects its loss from a relay socket
-/// it owns instead, so no such branch exists here; this reads the driver's own source to keep it
-/// that way, since a reintroduction would otherwise be invisible until someone audits the hot path.
+/// real driver's inbound hot path. The loss-tolerance test injects its loss from a relay socket it
+/// owns instead, and this keeps it that way by reading the driver's own source.
+///
+/// Two checks, with different strengths. The SHAPE check is structural: the body of
+/// `handle_inbound_datagram` must reach `handle_udp` with no branch in front of it, so a
+/// conditionally-skipped feed fails however it is spelled. The IDENTIFIER check is a blacklist and
+/// only catches the seam that was removed here — a renamed one would pass it. Neither proves the
+/// absence of every possible seam; they make the known regression loud.
 #[test]
-fn the_driver_carries_no_loss_injection_seam() {
+fn the_inbound_path_reaches_handle_udp_unconditionally() {
   const DRIVER_SRC: &str = include_str!("mod.rs");
+
+  // Structural: nothing may stand between the function's opening brace and the `handle_udp` call.
+  let body = DRIVER_SRC
+    .split_once("fn handle_inbound_datagram(")
+    .expect("the inbound helper exists")
+    .1;
+  let (before_feed, _) = body
+    .split_once(".handle_udp(")
+    .expect("the inbound helper feeds the coordinator");
+  for branch in ["if ", "match ", "return", "?"] {
+    assert!(
+      !before_feed.contains(branch),
+      "the inbound path must reach handle_udp unconditionally — found `{branch}` before the feed, \
+       which is how a datagram-drop seam would look"
+    );
+  }
+
+  // Tripwire: the identifiers the removed seam used.
   for needle in [
     "InboundLoss",
     "inbound_loss",

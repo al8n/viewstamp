@@ -247,9 +247,12 @@ pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
   QUINN_REASSEMBLY_MAX_SPANS * MIN_FILLED_STREAM_FRAME_PAYLOAD;
 
 /// Per-stream receive window: the largest window the reassembly ceiling admits
-/// ([`MAX_STREAM_RECEIVE_WINDOW`]), so a stalled reader throttles its peer rather than stranding it,
-/// and a frame larger than the window still flows — across the window updates its reader's drain
-/// produces.
+/// ([`MAX_STREAM_RECEIVE_WINDOW`]). For the supported sender shape — a peer that fills its packets,
+/// which is what a backlog produces — a stalled reader throttles that peer rather than stranding the
+/// connection, and a frame larger than the window still flows across the window updates its reader's
+/// drain produces. It is NOT a promise over all segmentation: sub-packet or gapped frames reach the
+/// reassembler's span ceiling inside this window and close the connection, which then recovers
+/// through the path [`MAX_STREAM_RECEIVE_WINDOW`] documents.
 pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = MAX_STREAM_RECEIVE_WINDOW;
 
 /// The largest value a QUIC `VarInt` can carry (`2^62 - 1`).  The tuning setters clamp to this so an
