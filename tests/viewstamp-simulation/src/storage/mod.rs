@@ -645,22 +645,40 @@ impl InMemoryWal {
 
   /// Bounded-ring physical slot reuse: when a durable append at `op` lands in slot `op mod n`,
   /// EVICT whatever DIFFERENT op last held that slot (op `op - n`) — its bytes are physically gone (a
-  /// clean wrap), so it leaves `entries`/`rotted`/`staged` and a subsequent read of it returns `Absent`.
+  /// clean wrap), so it leaves `entries`/`rotted` and a subsequent read of it returns `Absent`.
   /// A no-op in unbounded mode (`capacity == None`). Called at the moment a slot is PHYSICALLY written:
   /// inline in `submit_append` (sync) or on release in `poll` (async). Removing the wrapped op from
   /// `rotted` too is correct — overwriting a bit-rotted slot rewrites the media, clearing the verdict.
+  ///
+  /// What a wrap must NEVER take is an IN-FLIGHT append: dropping a staged write here would end it
+  /// with neither its completion nor a place in a `truncate`/`prune` cancellation list — the swallowed
+  /// write [`Wal::submit_append`]'s exactly-once clause forbids, and one that surfaces on the endpoint
+  /// side as a slot fenced forever with its cause already erased. The endpoint's slot-quiescence fence
+  /// is what keeps it away: it parks every append to a physical slot until the slot's prior write
+  /// completes, over the SAME `op mod capacity` placement this eviction uses and across every
+  /// incarnation sharing the medium, so no landing can wrap a slot whose previous occupant is still
+  /// with the device. This ASSERTS that rather than coping with its absence — a hard fail-stop in
+  /// every profile, like the one-outstanding-write asserts this backend already holds the session to,
+  /// because the simulator runs `--release` and a silently completed eviction would hide exactly the
+  /// defect worth finding.
   fn evict_wrapped_slot(&mut self, op: u64) {
     let Some(n) = self.capacity else {
       return;
     };
     let slot = op % n;
+    if let Some(s) = self.staged.iter().find(|s| s.op != op && s.op % n == slot) {
+      panic!(
+        "a landing at op {op} wrapped ring slot {slot} while op {}'s append {:?} was still in \
+         flight for it",
+        s.op, s.id
+      );
+    }
     // The resident set keeps at most one op per slot, so this removes the single congruent occupant
     // (`op - n`) if present, never `op` itself.
     self.entries.retain(|&o, _| o == op || o % n != slot);
     self.rotted.retain(|&o| o == op || o % n != slot);
     self.torn_headers.retain(|&o| o == op || o % n != slot);
     self.head_read_faults.retain(|&o| o == op || o % n != slot);
-    self.staged.retain(|s| s.op == op || s.op % n != slot);
     self.landed_by.retain(|&o, _| o == op || o % n != slot);
     // The evicted occupant's bytes are physically gone, so this replica no longer holds a destroyed
     // copy of it and its budget seat goes with them.
