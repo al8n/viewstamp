@@ -2371,6 +2371,96 @@ fn a_below_target_reply_cannot_pin_or_displace_the_retargeted_recovery_fetch() {
 }
 
 #[test]
+fn an_owed_debt_withholds_the_canonical_head_handouts() {
+  // `on_get_view` and `on_recovery` hand out the primary's `(op, commit_max)` canonical head.
+  // With an orphaned-re-persist debt owed, the landing that latched it also absorbed a commit
+  // frontier that can exceed the held head while the fetch is deferred behind an own-advance arc
+  // (an in-flight ordinary checkpoint, an owed reconstruct, a retained install) — the durable-view
+  // fence both handlers already carry does not cover that window, and either handout would
+  // fail-stop its adopter at the `commit <= op` guard. Both stay silent while the debt is owed
+  // (the solicitors' timers re-solicit) and answer again once it is retired.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.repersist_orphan = Some(OpNumber::with(4));
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::GetView(crate::GetView::new(
+      View::new(),
+      ReplicaId::new(2),
+      7,
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Recovery(crate::Recovery::new(
+      ReplicaId::new(2),
+      0x1234,
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(
+        out.msg_ref(),
+        Message::StartView(_) | Message::RecoveryResponse(_)
+      ),
+      "no canonical head is handed out while the reconciliation is owed"
+    );
+  }
+  // The debt retired (the arc it deferred to delivered the frontier): both handouts resume.
+  e.repersist_orphan = None;
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::GetView(crate::GetView::new(
+      View::new(),
+      ReplicaId::new(2),
+      7,
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Recovery(crate::Recovery::new(
+      ReplicaId::new(2),
+      0x1234,
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let (mut saw_sv, mut saw_rr) = (false, false);
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::StartView(_) => saw_sv = true,
+      Message::RecoveryResponse(_) => saw_rr = true,
+      _ => {}
+    }
+  }
+  assert!(
+    saw_sv && saw_rr,
+    "both handouts resume once the debt is retired"
+  );
+}
+
+#[test]
 fn a_recovering_head_adoption_over_an_owed_orphan_debt_enters_the_fetch_instead_of_normal() {
   // The RecoveringHead exit is the one recovery completion that does not route through
   // `complete_recovery`: the canonical-head adoption settles the terminal status itself. With an

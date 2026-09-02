@@ -3133,6 +3133,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   pub(crate) fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
+    // An owed orphaned-re-persist reconciliation withholds the answer: handing out a canonical
+    // head is participation, and the uncorrelated landing that latched the debt also absorbed a
+    // commit frontier that can exceed the held head while the fetch is deferred behind an
+    // own-advance arc — a StartView built then would carry `commit > op` straight into the
+    // adopter's fail-stop. The requester's timer re-solicits; the debt clears through the arc it
+    // deferred to (or the next commit tail's fetch), after which the answer resumes.
+    if self.repersist_orphan_owed().is_some() {
+      return;
+    }
     // Only a Normal primary at the requested view (or higher) can answer authoritatively — AND only
     // once its view is DURABLE: `participates_as_primary` adds the `!pending_durable_view()`
     // clause, so a primary that just adopted its view but has not yet persisted it does NOT hand out a
@@ -3145,8 +3154,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // (which stalls below an unrepaired committed `Repairing` hole) — see `start_view_participate`.
       // A catching-up peer that adopts a committed op (op <= commit_max) thereby learns it is committed
       // and HOLDS at the hole until peer-repair fills the body, instead of treating it as a truncatable
-      // uncommitted tail. `commit_max <= self.op` on a Normal primary, so the receiver's `commit <= op`
-      // adopt guard holds.
+      // uncommitted tail. `commit_max <= self.op` is the formation/commit-tail bound; the owed-debt
+      // refusal above is what re-establishes it at THIS emission (the only in-window raiser either
+      // latched the debt or lifted a frontier the applied prefix covers), so the receiver's
+      // `commit <= op` adopt guard holds.
       let entries = self.log_entries();
       self.emit(Outgoing::new(
         Recipient::To(Peer::Replica(m.replica())),
@@ -3191,6 +3202,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.pending_durable_view() {
       return;
     }
+    // An owed orphaned-re-persist reconciliation withholds the whole answer, exactly as
+    // `on_get_view` withholds its StartView: answering is participation, and the landing that
+    // latched the debt also absorbed a commit frontier that can exceed the held head while the
+    // fetch is deferred behind an own-advance arc — the primary's `(op, commit)` head would then
+    // fail-stop its adopter at the `commit <= op` guard. The requester's `recover_head` timer
+    // re-solicits; the answer resumes once the debt clears.
+    if self.repersist_orphan_owed().is_some() {
+      return;
+    }
     if m.replica().get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
@@ -3200,7 +3220,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // equivalent of `start_view_participate`'s StartView. A recovering peer that adopts a committed
       // op (op <= commit_max) thereby learns it is committed and HOLDS at the hole until peer-repair
       // fills the body, never re-classifying it as a truncatable uncommitted tail. `commit_max <=
-      // self.op` on a Normal primary, so the receiver's `commit <= op` adopt guard holds. The
+      // self.op` is the formation/commit-tail bound; the owed-debt refusal above re-establishes it
+      // at THIS emission, so the receiver's `commit <= op` adopt guard holds. The
       // vouched log floor rides along so the adopter trims its own sub-floor band + records the
       // floor for its force-sync escalation (same as a StartView).
       (self.op, self.commit_max, self.log_floor, self.log_entries())
