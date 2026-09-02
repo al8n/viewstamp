@@ -1848,6 +1848,128 @@ fn an_orphaned_sync_repersist_root_enters_the_reconciling_recovery_at_its_landin
   );
 }
 
+#[test]
+fn a_local_restore_landing_after_an_escalation_cancels_the_peer_fetch() {
+  // A peer-fetch escalation latched WHILE the local reconstruct is queued with the lane,
+  // CONSTRUCTED by calling the escalation chokepoint directly. No production schedule reaches
+  // the coexistence: the retry budget freezes while `rec.reconstruct` is with the lane (so the
+  // budget-exhaustion escalation cannot fire over it), and the cross-epoch entry defers while
+  // any local read phase is live. What this pins is the RESTORE'S DISPOSITION over the latched
+  // flag, and that is production behaviour: the escalation exists to stand in for a medium
+  // presumed unable to serve the snapshot, so a verified local restore that lands afterwards is
+  // the same debt met from the medium itself — it must cancel the fetch (the awaiting flag that
+  // blocks completion, the armed sync, its solicit cadence) rather than complete the restore
+  // into a replica held `Recovering` for a donor that need not exist.
+  let (_donor, dstorage) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dstorage);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let wal = TestWal::default();
+  let sb = StepSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  // Install the synced checkpoint L=4, stage its re-persist root, and orphan the root mid-write
+  // (the shared reset drops the correlation) — the same entry the landing test above drives.
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.sync_repersist_root_staged(),
+    "the re-persist root is staged and in flight"
+  );
+  e.reset_for_view_transition(now, &mut storage);
+  // The orphaned root lands and the reconciling recovery enters: the read of the landed
+  // checkpoint serves and verifies, and the presence probe is QUEUED with the lane — the
+  // reconstruct is live local work, not yet executed.
+  storage.sb_mut().flush();
+  e.handle_storage(now, &mut storage);
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the landing entered the reconciling recovery"
+  );
+  assert!(
+    storage.walk_owed(),
+    "the presence probe is queued with the lane"
+  );
+  while e.poll_message().is_some() {}
+
+  // The escalation latches over the queued reconstruct: awaiting flips, the local read marker
+  // drops, and a forced sync solicits a donor at/above the landed frontier.
+  e.escalate_checkpoint_to_peer_fetch(now, OpNumber::with(4), false);
+  assert!(
+    e.awaiting_peer_checkpoint_for_test() && e.sync_target_for_test().is_some(),
+    "the constructed escalation armed the peer fetch"
+  );
+  while e.poll_message().is_some() {}
+
+  // The lane gets to the queued job: the probe walks the local DAG and the reconstruct restores
+  // the landed checkpoint — the medium answers the very debt the fetch was standing in for, so
+  // the restore supersedes the fetch and recovery completes.
+  e.block_step(now, &mut storage, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the local restore advanced the pointer to the landed frontier"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the restore completed recovery — the stale escalation did not hold it Recovering"
+  );
+  assert!(
+    !e.awaiting_peer_checkpoint_for_test(),
+    "the restore cancelled the awaiting flag its own success made moot"
+  );
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the restore tore down the armed fetch with the flag"
+  );
+  assert!(
+    e.repersist_orphan.is_none() && e.inherited_frontier.is_none(),
+    "nothing left owed"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "no sync reply was applied — the reconciliation was satisfied locally"
+  );
+}
+
 /// Build the restart-in-place store the mid-recovery orphan-landing tests recover over: a backup
 /// that installed a synced checkpoint L=4, then staged a second re-persist to M=8 whose ROOT is
 /// still with the medium when the process dies. Returns the live storage (holding the in-flight
@@ -13461,6 +13583,28 @@ fn cluster_settle(cluster: &mut [ClusterVoter; 3], now: Instant, links: &[[bool;
   }
 }
 
+/// One settle pass over a healthy medium whose BLOCK LANES all LAG: land every queued durable
+/// write, drain the WAL/superblock completions, and deliver the resulting messages — but leave
+/// every queued block job with the lane, unexecuted. The jobs are not lost, and nothing is
+/// reordered: a later [`cluster_settle`] executes them in issue order, exactly as a lane whose
+/// worker runs behind the submit cadence.
+fn cluster_settle_holding_block_lanes(
+  cluster: &mut [ClusterVoter; 3],
+  now: Instant,
+  links: &[[bool; 3]; 3],
+) {
+  for _ in 0..8 {
+    for (e, s, _) in cluster.iter_mut() {
+      s.sb_mut().flush_envelopes();
+      s.sb_mut().flush_roots();
+      e.handle_storage(now, s);
+    }
+    if cluster_deliver(cluster, now, links) == 0 {
+      break;
+    }
+  }
+}
+
 /// A view `v > 0` that actually FORMED: a voting quorum reports `Normal` with `log_view == view
 /// == v` — the liveness event the cluster owes, whoever leads it.
 fn cluster_formed_view(cluster: &[ClusterVoter; 3]) -> Option<u64> {
@@ -13683,6 +13827,229 @@ fn successive_debtor_candidates_reconcile_from_their_own_landed_roots_and_a_view
       e.state_syncs_applied(),
       0,
       "no peer reply fed the reconciliation — it was satisfied locally"
+    );
+  }
+}
+
+#[test]
+fn successive_debtors_reconcile_locally_when_the_block_lane_outwaits_the_read_budget() {
+  // The successive-debtor reconciliation schedule again — three real voters, production entry
+  // points only, fault-free media, and no voter that could ever donate (the only debt-free voter
+  // holds checkpoint 0) — with ONE more production condition layered on: every BLOCK LANE lags.
+  // Queued jobs are executed late, and the delay spans more checkpoint-read retransmit deadlines
+  // than the read budget holds retries. Nothing here is a fault: the reads serve and verify on
+  // the first attempt, the probe is queued the moment the read verifies, and the lane executes
+  // every job it was given — just later than the retry cadence assumes.
+  //
+  // The contract pinned: the checkpoint-read budget is a timeout on the READ. Once the read has
+  // verified and its continuation is with the lane (the queued-or-executing probe/reconstruct),
+  // the budget must FREEZE — a budget spent against a lane delay escalates a replica whose own
+  // disk holds the whole checkpoint into a peer fetch, and in this cluster no donor can ever
+  // answer it. The delayed restore must instead land as if the lane had been prompt: both debts
+  // paid from the debtors' OWN media, not one SyncCheckpoint applied, and a view formed.
+  let now = Instant::ZERO;
+
+  // Voter 0 — the genesis view-0 primary over a formatted store: Normal, checkpoint 0, no debt.
+  let cfg0 = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+  let wal0 = TestWal::default();
+  let mut sb0 = TestSb::default();
+  crate::format(&cfg0, &genesis(3), &wal0, &mut sb0).expect("format the genesis store");
+  let sb0 = KindSb {
+    state: sb0.state(),
+    ..KindSb::default()
+  };
+  let mut s0 = Storage::new(wal0, sb0);
+  let b0 = InMemoryBlockStore::new();
+  let mut e0 = Endpoint::recover(cfg0, genesis(3), 10, CountSm::default(), &mut s0)
+    .expect("recover the formatted store")
+    .expect_active();
+  assert_eq!(
+    e0.status(),
+    Status::Normal,
+    "the formatted genesis primary resumes Normal"
+  );
+  e0.arm_timers(now);
+  while e0.poll_message().is_some() {}
+
+  // Voters 1 and 2 — each a successor recovered over a live store whose predecessor installed
+  // L=4 and died with the M=8 re-persist root still with the medium.
+  let debtor = |member: u128, seed: u64| -> ClusterVoter {
+    let (mut s, mut b, _env8, _id8, cfg) = store_with_orphan_root_in_flight_as(member, 1_000);
+    let mut e = Endpoint::recover(cfg, genesis(3), seed, CountSm::default(), &mut s)
+      .expect("recover over the live store")
+      .expect_active();
+    let mut t = now;
+    for _ in 0..12 {
+      e.storage_step(t, &mut s, &mut b);
+      if e.status().is_normal() {
+        break;
+      }
+      if let Some(deadline) = e.poll_timeout() {
+        t = deadline;
+        e.handle_timeout(t, &mut s);
+      }
+    }
+    assert_eq!(
+      e.status(),
+      Status::Normal,
+      "the successor resumes Normal at L with the M root still in flight"
+    );
+    assert_eq!(e.checkpoint_op(), OpNumber::with(4), "baselined on L");
+    // The predecessor's transfer completed its durability barrier before staging the root, so
+    // this store held M's blocks when the process died; restore the durable truth the fixture's
+    // trailing L re-seed swept.
+    seed_donor_blocks(&mut b, 8);
+    e.arm_timers(now);
+    while e.poll_message().is_some() {}
+    (e, s, b)
+  };
+  let v1 = debtor(1, 11);
+  let v2 = debtor(2, 12);
+  let mut cluster: [ClusterVoter; 3] = [(e0, s0, b0), v1, v2];
+
+  let full = [[true; 3]; 3];
+  // Voter 0 partitioned away: its heartbeats stop reaching the backups, and nothing reaches it.
+  let isolate0 = [
+    [true, false, false],
+    [false, true, true],
+    [false, true, true],
+  ];
+
+  // The backups' idle timers expire behind the partition: both enter the view-1 change. No root
+  // has landed yet, so neither debt is latched and the DoViewChange casts are deferred behind
+  // their durable-view writes.
+  let mut now = [1, 2]
+    .iter()
+    .map(|&i| {
+      cluster[i]
+        .0
+        .poll_timeout()
+        .expect("a Normal backup arms its idle timer")
+    })
+    .max()
+    .unwrap();
+  cluster_fire_due(&mut cluster, now);
+  cluster_deliver(&mut cluster, now, &isolate0);
+  assert!(cluster[1].0.status().is_view_change());
+  assert!(cluster[2].0.status().is_view_change());
+
+  // Land each backup's queued roots: the inherited M=8 root lands first and latches the debt,
+  // and a second landing round completes the durable-view write, releasing the deferred cast.
+  for i in [1, 2] {
+    cluster[i].1.sb_mut().flush_roots();
+    let (e, s, b) = &mut cluster[i];
+    e.storage_step(now, s, b);
+    assert_eq!(
+      e.repersist_orphan,
+      Some(OpNumber::with(8)),
+      "the inherited landing latched the owed reconciliation"
+    );
+    s.sb_mut().flush_roots();
+    e.storage_step(now, s, b);
+  }
+
+  // The DoViewChange casts reach candidate 1: the formation consumes the debt and the candidate
+  // stands down into the reconciling recovery instead of broadcasting StartView(1).
+  cluster_deliver(&mut cluster, now, &isolate0);
+  assert_eq!(
+    cluster[1].0.status(),
+    Status::Recovering,
+    "candidate 1 entered the reconciliation instead of leading view 1"
+  );
+
+  // The partition heals and the cluster free-runs — but from here every block lane LAGS: queued
+  // jobs stay with the lane while durable writes, completions, timers, and messages all flow.
+  // Run until both debtors sit Recovering with the presence probe QUEUED (the lane owes the
+  // walk), the reconciliation's steady state under a lane that has not yet reached the job.
+  let mut both_probing = false;
+  for _ in 0..96 {
+    cluster_fire_due(&mut cluster, now);
+    cluster_settle_holding_block_lanes(&mut cluster, now, &full);
+    if [1, 2]
+      .iter()
+      .all(|&i| cluster[i].0.status() == Status::Recovering && cluster[i].1.walk_owed())
+    {
+      both_probing = true;
+      break;
+    }
+    now = cluster
+      .iter()
+      .filter_map(|(e, _, _)| e.poll_timeout())
+      .min()
+      .map_or(now + core::time::Duration::from_millis(50), |d| d.max(now));
+  }
+  assert!(
+    both_probing,
+    "both debtors reach the reconciling recovery with the probe queued behind the lagging lane"
+  );
+
+  // The lag now outlasts the whole read budget: hold the jobs queued across more retransmit
+  // deadlines than the budget holds retries, every timer firing on cadence. The reads already
+  // served and verified — the wait is on a lane completion the medium owes — so the budget must
+  // not move, and neither debtor may escalate to a peer fetch.
+  for _ in 0..(RECOVER_READ_RETRIES as u64 + 4) {
+    now = now + RECOVER_READ_RETRANSMIT;
+    cluster_fire_due(&mut cluster, now);
+    cluster_settle_holding_block_lanes(&mut cluster, now, &full);
+  }
+  for i in [1, 2] {
+    let (e, s, _) = &cluster[i];
+    assert_eq!(
+      e.status(),
+      Status::Recovering,
+      "voter {i} is still reconciling behind the lane"
+    );
+    assert!(s.walk_owed(), "voter {i}'s probe is still with the lane");
+    assert!(
+      !e.awaiting_peer_checkpoint_for_test(),
+      "voter {i} escalated a queued local reconstruct into a peer fetch: the read budget ran \
+       against a lane delay, and no donor in this cluster can ever answer the solicitation"
+    );
+  }
+
+  // The lanes catch up: every queued job executes in issue order — the probe walks the local
+  // DAG, the reconstruct restores the landed checkpoint — and the cluster converges exactly as
+  // it does under a prompt lane.
+  let mut formed = None;
+  for _ in 0..400 {
+    cluster_fire_due(&mut cluster, now);
+    cluster_settle(&mut cluster, now, &full);
+    if let Some(v) = cluster_formed_view(&cluster) {
+      formed = Some(v);
+      break;
+    }
+    now = cluster
+      .iter()
+      .filter_map(|(e, _, _)| e.poll_timeout())
+      .min()
+      .map_or(now + core::time::Duration::from_millis(50), |d| d.max(now));
+  }
+  let posture: std::vec::Vec<(Status, u64, u64)> = cluster
+    .iter()
+    .map(|(e, _, _)| (e.status(), e.view().get(), e.log_view.get()))
+    .collect();
+  assert!(
+    formed.is_some(),
+    "no view ever formed after the lanes released: the cluster stranded with \
+     (status, view, log_view) = {posture:?}",
+  );
+  for i in [1, 2] {
+    let e = &cluster[i].0;
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(8),
+      "the delayed reconstruct still installed the landed frontier"
+    );
+    assert!(e.repersist_orphan.is_none(), "the debt retired");
+    assert_eq!(
+      e.state_machine_ref().applied().len(),
+      8,
+      "the SM holds the synced state the durable root names"
+    );
+    assert_eq!(
+      e.state_syncs_applied(),
+      0,
+      "the late lane, not a donor, satisfied the reconciliation"
     );
   }
 }

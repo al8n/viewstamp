@@ -490,7 +490,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// - `status = Status::Recovering`, and a fresh `RecoverState`: every `op in (checkpoint_op ..
   ///   head]` is submitted via `submit_read` (minted `OpId` recorded in `recover.reads`) with a
   ///   `RECOVER_READ_RETRIES` budget in `recover.pending`; if `checkpoint_op > 0` the checkpoint
-  ///   read is submitted too (its `OpId` in `recover.checkpoint`).
+  ///   read is submitted too (its `OpId` on `recover.checkpoint` and in the
+  ///   outstanding-completion fence `recover.checkpoint_reads`).
   ///
   /// It submits the reads (a sync, infallible trait call, mirroring `on_request`'s `submit_append`)
   /// but performs **no `poll()`** — completion handling, checksum verification, and retry all live in
@@ -1013,10 +1014,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     endpoint.recover = Some(rec);
     endpoint.submit_recover_tail_batch(storage, lo, hi);
     if checkpoint_op > 0 {
-      let id = endpoint.mint_read_id();
-      storage.submit_checkpoint_read(id);
+      endpoint.submit_tracked_checkpoint_read(storage);
       if let Some(rec) = endpoint.recover.as_mut() {
-        rec.checkpoint = Some(id.seq());
         rec.checkpoint_retries = RECOVER_READ_RETRIES;
       }
     }
@@ -1065,23 +1064,39 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// mid-session reconciliation entries ([`Self::enter_orphan_repersist_recovery`],
   /// [`Self::complete_recovery`]'s owed-debt refusal). From here the established plumbing owns
   /// the phase end to end: the completion verifies the bytes against the durable root before
-  /// anything restores ([`Self::on_recover_sb_done`]), `recover_timeouts` re-reads on its
-  /// cadence and escalates to the peer fetch when the budget exhausts (the medium lost what the
-  /// root names — the one case a donor is genuinely required), and a successful reconstruct
-  /// restores the SM/sessions and advances the pointer to the read generation's frontier
-  /// ([`Self::on_recovered_checkpoint_restored`]).
+  /// anything restores ([`Self::on_recover_sb_done`]), `recover_timeouts` re-reads after each
+  /// completed-and-failed attempt and escalates to the peer fetch when the budget exhausts (the
+  /// medium lost what the root names — the one case a donor is genuinely required), and a
+  /// successful reconstruct restores the SM/sessions and advances the pointer to the read
+  /// generation's frontier ([`Self::on_recovered_checkpoint_restored`]).
   pub(crate) fn submit_recover_checkpoint_read<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    self.submit_tracked_checkpoint_read(storage);
+    if let Some(rec) = self.recover.as_mut() {
+      rec.checkpoint_retries = RECOVER_READ_RETRIES;
+    }
+    self.arm_timers(now);
+  }
+
+  /// Mint and submit ONE checkpoint read, tracked in the recovery bookkeeping: the latest id on
+  /// `rec.checkpoint` (the phase marker) and the id in `rec.checkpoint_reads` (the
+  /// outstanding-completion fence `recover_timeouts` waits on and `on_recover_sb_done` accepts
+  /// against). Every checkpoint-read submission routes through here, so no read can exist that
+  /// the fence does not track: an untracked read's completion would be refused as foreign, and a
+  /// tracked-but-never-submitted id would hold the fence closed forever.
+  fn submit_tracked_checkpoint_read<W: Wal, B: Superblock>(
+    &mut self,
     storage: &mut Storage<W, B, S>,
   ) {
     let id = self.mint_read_id();
     storage.submit_checkpoint_read(id);
     if let Some(rec) = self.recover.as_mut() {
       rec.checkpoint = Some(id.seq());
-      rec.checkpoint_retries = RECOVER_READ_RETRIES;
+      rec.checkpoint_reads.insert(id.seq());
     }
-    self.arm_timers(now);
   }
 
   /// Handles a WAL completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). Adopts a
@@ -1455,12 +1470,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Handles a superblock completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). A VALID
   /// `CheckpointRead` (verified against the durable root) restores the SM + client sessions and drives
-  /// `recover_progress`; a `Fault` or a verify-mismatch is DISCARDED — `recover_timeouts` is the sole owner
-  /// of the checkpoint retry + ABSOLUTE budget (decremented per tick), re-submitting until a valid read
-  /// lands or the budget exhausts into a peer fetch. A valid read that cannot start its presence
-  /// probe because the lane still owes an inherited walk is neither restored nor discarded: it is
-  /// RETAINED as a verified obligation (`probe_deferred`) the walk's settle re-drives, outside the
-  /// read budget — deferral is not a read fault.
+  /// `recover_progress`; a `Fault` or a verify-mismatch is DISCARDED after retiring its
+  /// outstanding-completion entry (`checkpoint_reads`) — the retirement is what marks the attempt
+  /// COMPLETED-AND-FAILED, so `recover_timeouts`, the sole owner of the checkpoint retry + ABSOLUTE
+  /// budget (decremented per completed-and-failed attempt, never per tick), re-submits until a
+  /// valid read lands or the budget exhausts into a peer fetch. A valid read that cannot start its
+  /// presence probe because the lane still owes an inherited walk is neither restored nor
+  /// discarded: it is RETAINED as a verified obligation (`probe_deferred`) the walk's settle
+  /// re-drives, outside the read budget — deferral is not a read fault.
   pub(crate) fn on_recover_sb_done<W: Wal, B: Superblock>(
     &mut self,
     storage: &mut Storage<W, B, S>,
@@ -1468,20 +1485,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ) {
     match done {
       SuperblockDone::CheckpointRead(cr) => {
-        // React to ANY checkpoint read while one is OUTSTANDING (`recover.checkpoint.is_some()`), not only
-        // the latest id: the recover-retry timer re-submits ADDITIVELY (a fresh id without retiring the
-        // prior), so on a real async superblock a slow read completing after a retransmit arrives under an
-        // EARLIER id and must still be accepted (matching only the latest id would drop it and wedge). The
-        // bytes are checksum-verified below regardless of which submission delivered them, and once a valid
-        // read restores the SM (`checkpoint = None`) any late duplicate is ignored. A completion while NO
-        // checkpoint read is outstanding is foreign/stale — never trusted.
-        let is_ours = self.recover.as_ref().and_then(|r| r.checkpoint).is_some();
-        if !is_ours {
+        // The read's exactly-once completion has arrived: retire its outstanding-completion entry
+        // UNCONDITIONALLY, whatever becomes of the bytes below. `checkpoint_reads` is the fence
+        // `recover_timeouts` refuses to re-submit, spend budget, or escalate across, so an entry
+        // that outlived its own completion would hold the recovery waiting forever.
+        let tracked = self
+          .recover
+          .as_mut()
+          .is_some_and(|rec| rec.checkpoint_reads.remove(&cr.id().seq()));
+        // Only a read THIS recovery submitted (and still awaited) may drive the local phase: any
+        // other id is a dead phase's read or a donor serve-read — refused before verification, so
+        // it can neither restore nor count as this phase's attempt. Every id the phase submits IS
+        // tracked (the single submit choke, `submit_tracked_checkpoint_read`), so a slow read
+        // completing after a later re-submission — under an id the phase marker has moved past —
+        // is still accepted (matching only the latest id would drop it and wedge); the bytes are
+        // checksum-verified below regardless of which submission delivered them.
+        if !tracked {
           return;
         }
-        // A reconstruct is already executing for this checkpoint: the retry timer re-submits reads
-        // ADDITIVELY, so a duplicate can land mid-reconstruct. Starting a second one would waste a
-        // seed capture and leave the loser's verdict answering a token it no longer holds.
+        // A reconstruct is already executing for this checkpoint: the cadence submits at most one
+        // read at a time, but a second tracked read can still complete mid-reconstruct behind a
+        // mid-session phase re-arm. Starting a second reconstruct would waste a seed capture and
+        // leave the loser's verdict answering a token it no longer holds — the duplicate's entry
+        // was retired above, so dropping it here spends nothing and blocks nothing.
         if self.recover.as_ref().and_then(|r| r.reconstruct).is_some() {
           return;
         }
@@ -1515,11 +1541,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         let Some((_, sm_root, sessions_root)) = decoded.filter(|_| id_ok && op_ok && bound_ok)
         else {
           // Any mismatch (wrong op / wrong hash / wrong bound op / unparsable) is treated as a FAULT:
-          // DISCARD the bytes and leave the checkpoint outstanding for `recover_timeouts` to re-submit — it
-          // owns the checkpoint retry + ABSOLUTE budget (decremented per tick), exactly as for a real
-          // `SuperblockDone::Fault`. Do NOT restore, do NOT panic. A permanently root-inconsistent snapshot
-          // (mismatch on EVERY read) thus exhausts the budget on the timer and escalates to a peer fetch,
-          // identical to a permanently-faulting read.
+          // DISCARD the bytes. The attempt has now COMPLETED AND FAILED (its outstanding entry was
+          // retired above), so `recover_timeouts` — the sole owner of the checkpoint retry +
+          // ABSOLUTE budget — sees the phase quiescent and re-submits with a budget decrement,
+          // exactly as for a real `SuperblockDone::Fault`. Do NOT restore, do NOT panic. A
+          // permanently root-inconsistent snapshot (mismatch on EVERY read) thus fails a bounded
+          // number of attempts and escalates to a peer fetch, identical to a permanently-faulting
+          // read.
           return;
         };
         // The envelope is valid, but the SM state AND the client-session table live in the
@@ -1580,15 +1608,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           rec.probe_deferred = None;
         }
       }
-      SuperblockDone::Fault(_) => {
-        // A checkpoint-read FAULT needs no in-band handling: `recover_timeouts` is the SOLE checkpoint
-        // retry+budget owner (it re-submits ADDITIVELY and decrements the ABSOLUTE budget per tick,
-        // escalating to a peer fetch on exhaustion), the exact mirror of the tail-read `Fault` arm in
-        // `on_recover_wal_done`. Counting the budget on the TIMER rather than here is what makes it robust
-        // both to a fault STORM (several superseded additive reads faulting out of order) and to a fault
-        // landing AFTER a re-mint (latency over the retransmit interval): neither over- nor under-counts.
-        // The checkpoint stays outstanding (`recover.checkpoint` still `Some`), so the timer keeps retrying
-        // until a valid read restores it or the budget exhausts.
+      SuperblockDone::Fault(id) => {
+        // The read's exactly-once completion arrived as a FAULT: retire its outstanding entry —
+        // that retirement is the fault's whole in-band effect, marking the attempt
+        // COMPLETED-AND-FAILED. `recover_timeouts` remains the SOLE checkpoint retry+budget owner:
+        // seeing the phase quiescent (no completion owed), it re-submits with a budget decrement,
+        // or escalates to a peer fetch on exhaustion. Counting the budget on the TIMER rather than
+        // here pins each decrement to exactly one completed-and-failed attempt of THIS phase — a
+        // fault under an id the phase never submitted (a dead phase's read, a donor serve-read)
+        // finds no entry and spends nothing, so a storm of foreign faults can never exhaust a
+        // budget it does not own. The phase stays open (`recover.checkpoint` still `Some`), so the
+        // timer keeps retrying until a valid read restores it or the budget exhausts.
+        if let Some(rec) = self.recover.as_mut() {
+          rec.checkpoint_reads.remove(&id.seq());
+        }
       }
       SuperblockDone::Wrote(_) => {
         // A stale durable-root/checkpoint write completion from before the crash cannot occur
@@ -1601,11 +1634,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// The cold-start reconstruct of this replica's OWN durable checkpoint completed.
   ///
   /// On success the restored SM + session table install together, the two DAG roots become the live
-  /// GC roots, the outstanding checkpoint read retires, and recovery resumes. On a missing/corrupt
+  /// GC roots, the outstanding checkpoint read retires, and recovery resumes — cancelling any
+  /// same-epoch peer fetch escalated while the job was with the lane (the restore subsumes what the
+  /// fetch solicited; a latched `awaiting_peer_checkpoint` would otherwise block completion behind
+  /// a donor that need not exist). On a missing/corrupt
   /// block in either DAG NOTHING is installed (the live SM was never touched — the job filled a
-  /// detached seed): the checkpoint read stays outstanding, so `recover_timeouts` — the sole owner of
-  /// the retry + ABSOLUTE budget — re-reads until a clean reconstruct lands or the budget exhausts
-  /// into a peer fetch. That is the identical disposition a faulted read gets.
+  /// detached seed): the attempt has completed and FAILED with the checkpoint phase still open, so
+  /// `recover_timeouts` — the sole owner of the retry + ABSOLUTE budget — re-reads (decrementing)
+  /// until a clean reconstruct lands or the budget exhausts into a peer fetch. That is the
+  /// identical disposition a faulted read gets.
   pub(super) fn on_recovered_checkpoint_restored<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -1659,8 +1696,34 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         rec.reads.retain(|_, &mut op| op > floor);
       }
     }
+    // A peer fetch escalated concurrently with this restore is SUPERSEDED by it: the escalation
+    // stands in for a local medium presumed unable to serve this snapshot, and the medium just
+    // served it — the restore was verified against the durable root the fetch's floor was pinned
+    // at/below, so the restored checkpoint subsumes anything a donor could install. Cancel the
+    // fetch wholesale: the awaiting flag (which blocks `recover_progress` from ever completing —
+    // left latched it holds the replica `Recovering` for a donor that need not exist), the armed
+    // sync, any block transfer it started, and its solicit cadence. The one fetch a same-epoch
+    // local restore can NEVER satisfy is the cross-epoch crossing (`require_cross_epoch` — its
+    // debt is the successor epoch's configuration, not this snapshot), so that one stays armed;
+    // the target comparison guards the same subsumption the reachable paths already guarantee.
+    let fetch_superseded = self
+      .recover
+      .as_ref()
+      .is_some_and(|rec| rec.awaiting_peer_checkpoint)
+      && match self.sync {
+        Some(s) => !s.require_cross_epoch && self.checkpoint_op >= s.target,
+        None => true,
+      };
     if let Some(rec) = self.recover.as_mut() {
       rec.checkpoint = None;
+      if fetch_superseded {
+        rec.awaiting_peer_checkpoint = false;
+      }
+    }
+    if fetch_superseded {
+      self.sync = None;
+      self.block_fetch = None;
+      self.timers.sync_solicit = None;
     }
     self.recover_progress(now, storage);
   }
@@ -1691,6 +1754,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     target: OpNumber,
     require_cross_epoch: bool,
   ) {
+    // Structural local/peer exclusion: no submitted checkpoint read may still owe its completion
+    // when the peer fetch arms — the exhaustion caller requires the outstanding-completion fence
+    // empty, and every other caller arms over a fresh or already-escalated recovery — so a late
+    // valid completion never races an armed fetch (it would arrive untracked and be refused, its
+    // snapshot lost to a donor that need not exist).
+    debug_assert!(
+      self
+        .recover
+        .as_ref()
+        .is_none_or(|rec| rec.checkpoint_reads.is_empty()),
+      "peer-fetch escalation while a local checkpoint read still owes its completion"
+    );
     // Stop local checkpoint reads and latch the awaiting-peer state.
     if let Some(rec) = self.recover.as_mut() {
       rec.checkpoint = None;
@@ -2116,9 +2191,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(rec) = self.recover.as_ref() else {
       return; // (defensive; the helper never clears `recover`)
     };
-    // The checkpoint snapshot not yet restored, OR awaiting a PEER checkpoint after our own read
-    // exhausted. Stay Recovering and re-arm: an owner re-submits any dropped/slow checkpoint read
-    // AND re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion:
+    // The checkpoint snapshot not yet restored, OR awaiting a PEER checkpoint after our own reads
+    // exhausted. Stay Recovering and re-arm: an owner waits out an owed read completion (re-reading
+    // once it fails) AND re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion:
     // we must NEVER reach Normal with the SM unrestored (`commit_min == checkpoint_op` would then be
     // a silent committed-prefix loss) — recovery completes only once a verified `SyncCheckpoint`
     // restores the SM (via `on_recover_sync_checkpoint` → `apply_sync`), which drops the faulty slots
@@ -2359,20 +2434,26 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let _ = self.try_commit(now, storage);
   }
 
-  /// Recover-retry timer: the SOLE retry+budget owner for the tail reads (and the checkpoint read), so
-  /// the loop terminates even when a real async driver delivers a completion later than this cadence
-  /// or drops one. For each still-PENDING op it re-submits an ADDITIVE read (a fresh id WITHOUT
-  /// retiring the op's existing in-flight ids) and decrements the op's ABSOLUTE retransmission budget;
-  /// once that budget reaches zero the op is resolved via [`Self::resolve_exhausted_tail_read`].
+  /// Recover-retry timer: the SOLE retry+budget owner for the tail reads and the checkpoint read.
+  /// For each still-PENDING tail op it re-submits an ADDITIVE read (a fresh id WITHOUT retiring the
+  /// op's existing in-flight ids) and decrements the op's ABSOLUTE retransmission budget; once that
+  /// budget reaches zero the op is resolved via [`Self::resolve_exhausted_tail_read`], so the tail
+  /// loop terminates even when a real async driver delivers a completion later than this cadence or
+  /// drops one. The CHECKPOINT read is retried on the opposite discipline: its completion is
+  /// contract-guaranteed (exactly one per submitted read), so an owed completion is WAITED ON —
+  /// re-submission (with a budget decrement) runs only after the prior attempt completed and
+  /// FAILED, and exhaustion escalates to the peer fetch only once no read remains outstanding (see
+  /// the checkpoint block below).
   ///
-  /// The budget is ABSOLUTE (seeded once at the Phase-1 submit to `RECOVER_READ_RETRIES`, decremented
-  /// ONLY here, never reset and never decremented by the Fault completion arm). Additivity is what
-  /// fixes the slow-read wedge: every retransmission of an op shares the SAME op, so a (late)
-  /// completion arriving under ANY still-live id resolves the op — whereas retiring the prior ids on
-  /// each retry (the old behaviour) dropped a completion slower than `RECOVER_READ_RETRANSMIT` (its id
-  /// was always already retired) and the budget — being reset — never reached zero, wedging recovery
-  /// forever. A genuinely-dead slot still terminates: its budget counts down to zero across a bounded
-  /// number of retransmissions and `resolve_exhausted_tail_read` routes it to peer-repair.
+  /// Each budget is ABSOLUTE (seeded once at its phase's submit to `RECOVER_READ_RETRIES`,
+  /// decremented ONLY here, never reset and never decremented by a completion arm). Tail additivity
+  /// is what fixes the tail slow-read wedge: every retransmission of an op shares the SAME op, so a
+  /// (late) completion arriving under ANY still-live id resolves the op — whereas retiring the
+  /// prior ids on each retry (the old behaviour) dropped a completion slower than
+  /// `RECOVER_READ_RETRANSMIT` (its id was always already retired) and the budget — being reset —
+  /// never reached zero, wedging recovery forever. A genuinely-dead slot still terminates: its
+  /// budget counts down to zero across a bounded number of retransmissions and
+  /// `resolve_exhausted_tail_read` routes it to peer-repair.
   ///
   /// Faulty ops are NOT re-read here: a `rec.faulty` op is already resolved (a peer-repaired hole), and
   /// the read fault that produced it is replayed by neither the completion arm nor this timer — only a
@@ -2402,7 +2483,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Snapshot the PENDING ops (the in-flight tail reads) so we can re-borrow `recover` per op while
     // iterating. Faulty ops are NOT re-read (already resolved to a peer-repaired hole).
-    let (ops, want_checkpoint, checkpoint_retries, awaiting_peer, probe_deferred) =
+    let (ops, want_checkpoint, checkpoint_retries, awaiting_peer, probe_deferred, reconstructing) =
       match self.recover.as_ref() {
         Some(rec) => (
           rec.pending.keys().copied().collect::<std::vec::Vec<u64>>(),
@@ -2410,9 +2491,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           rec.checkpoint_retries,
           rec.awaiting_peer_checkpoint,
           rec.probe_deferred.is_some(),
+          rec.reconstruct.is_some(),
         ),
-        None => (std::vec::Vec::new(), None, 0, false, false),
+        None => (std::vec::Vec::new(), None, 0, false, false, false),
       };
+    // A submitted checkpoint read whose exactly-once completion has not yet arrived: the wait the
+    // checkpoint block below parks on instead of retrying against.
+    let checkpoint_read_owed = self
+      .recover
+      .as_ref()
+      .is_some_and(|rec| !rec.checkpoint_reads.is_empty());
     // Peer-fetch: if our own checkpoint read exhausted and we are awaiting a PEER `SyncCheckpoint`,
     // re-broadcast the `RequestSync` on this cadence (the Normal-only `sync_timeouts` does not run
     // while Recovering). A peer holding a checkpoint `>= ours` answers; until then we stay here.
@@ -2449,27 +2537,36 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         None => {}
       }
     }
-    // Re-issue the checkpoint read if it is still outstanding (a prior completion was dropped or is slow),
-    // decrementing the ABSOLUTE budget — `recover_timeouts` is the SOLE checkpoint retry+budget owner, the
-    // exact mirror of the tail-read ownership above. ADDITIVE: submit a fresh id but do NOT retire prior
-    // in-flight reads (`on_recover_sb_done` accepts any VALID read while one is outstanding, so a slow read
-    // completing after this retransmit still resolves). Counting the budget per TICK here — never per FAULT
-    // in the completion arm — is what makes it robust BOTH to a fault STORM (several superseded additive
-    // reads faulting out of order would each over-count a per-fault budget) AND to a fault that lands AFTER
-    // this re-mint (latency over the retransmit interval would be missed by a strict per-id fault match):
-    // the count is independent of which id any fault arrives under. On exhaustion (budget zero) escalate to
-    // a PEER FETCH — the durable root names a permanently-unreadable or root-inconsistent snapshot
-    // (bit-rot/torn write in this replica's single durable copy), unrecoverable from local disk.
+    // Re-issue the checkpoint read only once the PRIOR attempt has COMPLETED AND FAILED — never
+    // while a submitted read's completion is still owed (`checkpoint_read_owed`): the superblock
+    // owes every submitted read exactly one completion (`CheckpointRead` or `Fault`) with no
+    // latency ceiling, so an owed completion is WAITED ON — the `pending_checkpoint` early-return
+    // shape — with the cadence re-armed below purely to re-observe its aftermath. The ABSOLUTE
+    // budget is decremented at each re-submission, and a re-submission runs only after a failure
+    // verdict (a read `Fault`, a verify-mismatch, a probe/reconstruct abort) retired the
+    // outstanding read or job — so the budget counts completed-and-failed attempts, never elapsed
+    // time: a merely-SLOW read spends nothing, and the escalation below cannot fire while its
+    // completion is owed. That exclusion is what keeps a valid-but-late read from being traded
+    // for a peer fetch no donor may exist to answer (solo, partitioned, or every reachable peer
+    // itself a debtor — a permanent Recovering wedge over a healthy local checkpoint), and it
+    // makes local-read/peer-fetch coexistence structurally impossible rather than resolved by
+    // discarding the late completion. On exhaustion — every attempt completed and FAILED —
+    // escalate to a PEER FETCH: the durable root names a permanently-unreadable or
+    // root-inconsistent snapshot (bit-rot/torn write in this replica's single durable copy),
+    // unrecoverable from local disk.
     //
-    // NOT while a verified read is retained as a deferred probe obligation (`probe_deferred`): the
-    // read phase already SUCCEEDED — the wait is on the inherited walk's completion, which the
-    // lane owes and whose settle re-drives the probe directly. Re-reading would only duplicate a
-    // verified result, and decrementing here would spend the READ-fault budget on lane contention:
+    // NOT while the verified read's continuation is with the BLOCK LANE — retained as a deferred
+    // probe obligation (`probe_deferred`), or live as the queued-or-executing probe/reconstruct
+    // job (`rec.reconstruct`, set at every job submit and held until its completion delivers): the
+    // read phase already SUCCEEDED — the wait is on a lane completion the medium owes (an
+    // inherited walk's settle re-drives a deferred probe; a live job's completion either restores
+    // or re-opens the read phase with the budget intact). Re-reading would only duplicate a
+    // verified result, and decrementing here would spend the READ-fault budget on lane latency:
     // exhausted, it escalates to a peer fetch that nothing ever re-arms the local path from — on a
     // solo replica (or any replica with no reachable donor) a permanent wedge over a perfectly
-    // valid local checkpoint, strictly worse than the wait. This mirrors the `pending_checkpoint`
-    // early-return above: an owed completion is waited on, never retried against.
-    if want_checkpoint.is_some() && !probe_deferred {
+    // valid local checkpoint, strictly worse than the wait, and reached by nothing more than a job
+    // outliving the retry deadlines.
+    if want_checkpoint.is_some() && !probe_deferred && !reconstructing && !checkpoint_read_owed {
       if checkpoint_retries == 0 {
         // Permanently-unreadable OWN checkpoint: any peer at/above it subsumes ours — NOT a cross-epoch
         // crossing (no epoch target to pin), so target our own `checkpoint_op` with the requirement off.
@@ -2483,12 +2580,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         };
         self.escalate_checkpoint_to_peer_fetch(now, target, false);
       } else {
-        let new_id = self.mint_read_id();
+        self.submit_tracked_checkpoint_read(storage);
         if let Some(rec) = self.recover.as_mut() {
-          rec.checkpoint = Some(new_id.seq());
           rec.checkpoint_retries = checkpoint_retries - 1;
         }
-        storage.submit_checkpoint_read(new_id);
       }
     }
     // Re-arm so we keep retrying until the loop completes.
@@ -3013,10 +3108,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// re-checks the durable root against it: an inherited checkpoint root landing between the
   /// deferral and this settle moves the root to a NEWER generation, and walking the stale roots
   /// would probe (and then restore) a checkpoint the durable root no longer names. A stale
-  /// obligation is dropped instead — the checkpoint read is still outstanding, so
-  /// `recover_timeouts` re-reads the new generation on its cadence with the budget intact (one
+  /// obligation is dropped instead — the checkpoint phase stays open with no completion owed, so
+  /// `recover_timeouts` re-reads the new generation on its cadence, spending one attempt (one
   /// extra retransmit interval, never a wedge; the same one-extra-round shape as the read-time
-  /// race in `on_recover_sb_done`).
+  /// race in `on_recover_sb_done`, and root landings are finitely many so the rounds are bounded).
   pub(super) fn redrive_deferred_recover_probe<W: Wal, B: Superblock>(
     &mut self,
     storage: &mut Storage<W, B, S>,
@@ -3055,9 +3150,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// replica's own durable checkpoint was walked against the local store alone.
   ///
   /// Complete ⇒ issue the reconstruct. A MISSING block, or a reachable-block-bound breach on a
-  /// malformed/oversized DAG, is treated exactly like a corrupt read: DISCARD and leave the checkpoint
-  /// read outstanding, so `recover_timeouts` — the sole owner of the retry + ABSOLUTE budget —
-  /// exhausts it into a peer block-fetch.
+  /// malformed/oversized DAG, is treated exactly like a corrupt read: DISCARD — the attempt has
+  /// completed and FAILED with the checkpoint phase still open, so `recover_timeouts` — the sole
+  /// owner of the retry + ABSOLUTE budget — re-reads (decrementing) and, on exhaustion, escalates
+  /// into a peer block-fetch.
   pub(super) fn on_recover_probe_walked<W: Wal, B: Superblock>(
     &mut self,
     storage: &mut Storage<W, B, S>,
@@ -3088,8 +3184,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Defer while the LANE still owes a reconstruct — the same lane-slot gate the synced-checkpoint
     // reconstruct observes, and for the same reason: an inherited reconstruct still occupies the
     // lane after the endpoint that issued it is gone, and this incarnation's recovery bookkeeping
-    // cannot see it. The disposition matches the missing-block arm just above — leave the checkpoint
-    // read outstanding so `recover_timeouts` re-drives on its own cadence with the budget intact.
+    // cannot see it. The disposition matches the missing-block arm just above — the checkpoint
+    // phase stays open with no completion owed, so `recover_timeouts` re-drives on its own cadence.
     // Unreachable in the current tree for the reason stated at the synced-checkpoint site (a
     // reconstruct only ever follows a frontier walk's delivery, and the walk slot serializes those),
     // so it is the structural backstop for a future issue site.
