@@ -37,7 +37,7 @@
 //! ([`Superblock::submit_read_checkpoint`]) is the one superblock op that may fault:
 //! recovery/state-sync treat it as faults-as-data (retry within budget, then peer-fetch).
 //!
-//! ## Every append completes exactly once — and released slots stay theirs until it does
+//! ## Every submitted op completes exactly once — and released slots stay theirs until it does
 //!
 //! Every [`Wal::submit_append`] resolves exactly once: [`WalDone::Appended`] (landed durably),
 //! [`WalDone::Cancelled`] (discarded after submission, can no longer land), or membership in the
@@ -53,6 +53,16 @@
 //! Bounded backends place op `N` at ring slot `N mod` [`Wal::capacity`] (the placement the
 //! ring-window guard and recovery geometry already assume). Full statement: the exactly-once clause
 //! on [`Wal::submit_append`] + the cancellation contracts on [`Wal::truncate`]/[`Wal::prune`].
+//!
+//! Every [`Wal::submit_read`] resolves exactly once too — as [`WalDone::ReadOk`],
+//! [`WalDone::BodyFaulty`], [`WalDone::Absent`], or [`WalDone::Fault`] — and a read can never be
+//! cancelled synchronously (truncate/prune return [`WriteId`]s), so releasing its slot changes only
+//! the verdict it will carry. The obligation binds however LATE the device is: the proto stops
+//! WAITING on a slow read (recovery's budget) but keeps its correlation, and a late verified body
+//! still fills the header-only repair hole that read was resolving — the only fill that will ever
+//! arrive on a replica with no reachable donor. Full statement: the exactly-once clause on
+//! [`Wal::submit_read`]. A checkpoint read carries the same obligation
+//! ([`Superblock::submit_read_checkpoint`], under the superblock's stricter exactly-once contract).
 //!
 //! ## Headers survive their bodies
 //!
@@ -1496,15 +1506,19 @@ impl SuperblockDone {
 /// that advanced [`op_head`](Wal::op_head) (or flipped a slot to [`Clean`](SlotStatus::Clean)) on
 /// SUBMIT rather than on COMPLETION would silently let a `PrepareOk` be cast for a not-yet-durable op,
 /// breaking the invariant — so the "only-durable" rule above is a CONTRACT, not an implementation
-/// detail. Append completions ([`WalDone::Appended`]) are correlated by [`OpId`] and MAY arrive in
-/// ANY order — a real proactor (io_uring with several SQEs in flight) reorders completions — so the
-/// proto MUST NOT assume FIFO completion; the synchronous views above MUST stay consistent with
-/// "only-durable" regardless of the order completions are drained in. The freedom is ordering ONLY,
-/// never delivery: every submitted append resolves exactly once — [`WalDone::Appended`],
-/// [`WalDone::Cancelled`], or the synchronous cancellation list [`truncate`](Wal::truncate)/
-/// [`prune`](Wal::prune) return — see the exactly-once clause on
-/// [`submit_append`](Wal::submit_append), which the endpoint's slot-quiescence fence (defer a
-/// re-append to a physical slot until the slot's prior write completes) depends on.
+/// detail. Completions ([`WalDone::Appended`] for an append, the four read verdicts for a read) are
+/// correlated by [`OpId`] and MAY arrive in ANY order — a real proactor (io_uring with several SQEs
+/// in flight) reorders completions — so the proto MUST NOT assume FIFO completion; the synchronous
+/// views above MUST stay consistent with "only-durable" regardless of the order completions are
+/// drained in. The freedom is ordering ONLY, never delivery: every submitted op resolves exactly
+/// once. An APPEND resolves as [`WalDone::Appended`], [`WalDone::Cancelled`], or membership in the
+/// synchronous cancellation list [`truncate`](Wal::truncate)/[`prune`](Wal::prune) return — see the
+/// exactly-once clause on [`submit_append`](Wal::submit_append), which the endpoint's
+/// slot-quiescence fence (defer a re-append to a physical slot until the slot's prior write
+/// completes) depends on. A READ resolves as exactly one of its four verdicts, with no synchronous
+/// ending available to it at all — see the exactly-once clause on
+/// [`submit_read`](Wal::submit_read), which the endpoint's carried-read repair lane (fill a kept
+/// header-only hole from a completion slower than the recovery budget) depends on.
 ///
 /// **Header-durability contract (load-bearing for committed-op survival).** Slot HEADERS MUST be
 /// durable INDEPENDENTLY of their bodies — redundant or atomically-replaced header storage,
@@ -1613,6 +1627,32 @@ pub trait Wal {
   /// entry, [`WalDone::BodyFaulty`] with the durable header alone, [`WalDone::Absent`] for a slot
   /// holding no completed append, or [`WalDone::Fault`]. Reads are where faults live — the proto
   /// treats every one as data (retry within budget, then peer-repair).
+  ///
+  /// **Exactly-once completion (load-bearing for the carried-read repair lane).** EVERY submitted
+  /// read resolves exactly once, as one of those four verdicts — the read half of what the
+  /// exactly-once clause on [`submit_append`](Wal::submit_append) requires of a write. No
+  /// synchronous ending substitutes for it: [`truncate`](Wal::truncate)/[`prune`](Wal::prune)
+  /// return [`WriteId`]s, so a read can never appear in a cancellation list, and releasing a read's
+  /// slot changes only the VERDICT it will carry — a backend that has already dropped the slot
+  /// resolves it [`WalDone::Absent`], one still holding the bytes may resolve it
+  /// [`WalDone::ReadOk`], and either ending is safe (the endpoint re-validates a late body against
+  /// the entry it CURRENTLY holds, and refuses one for an op it no longer keeps). No LATENCY
+  /// CEILING is owed either: the completion may arrive long after the proto stopped waiting for it
+  /// — the recovery read budget bounds how long recovery WAITS, never how long the device may take
+  /// — which is exactly why the ending itself must be delivered. The endpoint carries a read
+  /// correlation past that budget: an op whose reads exhausted it is kept header-only as a repair
+  /// hole ALONG WITH its outstanding read ids, and a late verified body admitted under one of them
+  /// fills the hole from local storage. On a replica with no reachable donor (solo, partitioned, an
+  /// all-restart quorum of slow readers) that is the only fill that will ever come, so a swallowed
+  /// read completion wedges the repair its correlation would have resolved — delivering it is a
+  /// liveness requirement, not a courtesy.
+  ///
+  /// Unlike an append's, a read's completion carries no physical-write fact: it frees no slot and
+  /// releases no deferred re-append, so what a swallowed one wedges is the unfillable repair hole,
+  /// not the slot. Read completions correlate by [`ReadId`] and MAY be delivered in ANY order
+  /// relative to their submission — including a read completing after a LATER read of the same op
+  /// already has; the recovery loop's additive retransmission (a retry mints a fresh id without
+  /// retiring the older one) exists so the slow original still resolves its op.
   fn submit_read(&mut self, id: ReadId, op: OpNumber);
   /// Drop all slots strictly above `above` (view-change tail truncation), returning the `WriteId`s of
   /// any in-flight appends this call CANCELLED — submissions the backend can prove will now neither
@@ -1644,6 +1684,13 @@ pub trait Wal {
   /// already assume), and NO backend may reuse the physical extent of an un-quiesced write for a
   /// DIFFERENT op (a ring-less backend recycling storage must quiesce it first — ordinary allocator
   /// discipline for an extent with outstanding I/O).
+  ///
+  /// **Submitted READS are untouched.** The return value names writes ([`WriteId`]), so this call
+  /// cannot cancel a read at all: an outstanding read of a slot it releases still resolves, on its
+  /// own, exactly once (the clause on [`submit_read`](Wal::submit_read)) — as [`WalDone::Absent`]
+  /// once the slot is gone, or with the released bytes if the backend already had them. The
+  /// endpoint re-validates any late body against the entry it currently holds, so either ending is
+  /// safe; SWALLOWING the read because its slot was released is not.
   fn truncate(&mut self, above: OpNumber) -> Vec<WriteId>;
   /// Free all slots strictly below `below` (post-checkpoint GC), returning the `WriteId`s of any
   /// in-flight appends this call CANCELLED — same semantics as the [`truncate`](Wal::truncate) return
@@ -1661,7 +1708,8 @@ pub trait Wal {
   /// to a DIFFERENT op while the old write is un-quiesced. A bounded ring honors this for free through
   /// its `op mod capacity` placement plus the endpoint-side fence (the endpoint defers the aliasing
   /// re-append `op + capacity` until the old write's completion); a recycling backend must honor it
-  /// explicitly.
+  /// explicitly. And like truncate, prune touches no submitted READ: an outstanding read of a freed
+  /// slot still resolves exactly once on its own terms (see [`Wal::truncate`]).
   fn prune(&mut self, below: OpNumber) -> Vec<WriteId>;
   /// Drain the next completed op, if any. Completions for appends ([`WalDone::Appended`]) MAY be
   /// delivered in ANY order relative to their submission (a real proactor reorders); see the

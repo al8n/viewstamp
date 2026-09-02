@@ -824,11 +824,12 @@ struct ScriptedWal {
   body_faulty: std::collections::BTreeSet<u64>,
   /// Ops whose READ is HELD (deferred), modelling a real async WAL whose read latency exceeds the
   /// recover-retry cadence: `submit_read` records the submitted id in `deferred_reads` but enqueues NO
-  /// completion. `release_deferred(op)` later completes the OLDEST still-held submission under its
-  /// ORIGINAL id — the way a real proactor completes the read that was actually submitted first, long
-  /// after a retry has minted a newer id. Additive-id retransmission keeps that original id live, so the
-  /// late completion resolves; the old retire-on-retry behavior had retired it (the completion would be
-  /// ignored and the pending set never empty — the wedge this models).
+  /// completion YET. The completion is still OWED — the contract caps a read's latency at nothing but
+  /// requires its ending — and `release_deferred(op)` delivers it, completing the OLDEST still-held
+  /// submission under its ORIGINAL id, the way a real proactor completes the read that was actually
+  /// submitted first long after a retry has minted a newer id. Additive-id retransmission keeps that
+  /// original id live, so the late completion resolves; the old retire-on-retry behavior had retired it
+  /// (the completion would be ignored and the pending set never empty — the wedge this models).
   deferred: std::collections::BTreeSet<u64>,
   /// Per deferred op: the submitted read ids still HELD, oldest-first. Each `submit_read` of a deferred
   /// op pushes its id; `release_deferred` pops the front (the original slow read finally completing).
@@ -880,9 +881,11 @@ impl ScriptedWal {
   fn remove_entry_for_test(&mut self, op: OpNumber) {
     self.entries.remove(&op.get());
   }
-  /// HOLD every read of `op`: `submit_read` records the submitted id (pushed oldest-first) but enqueues
-  /// NO completion, modelling a real async WAL whose read latency exceeds the recover-retry cadence.
-  /// `release_deferred(op)` later completes the OLDEST held submission under its original id.
+  /// HOLD every read of `op`: `submit_read` records the submitted id (pushed oldest-first) and enqueues
+  /// no completion until it is released, modelling a real async WAL whose read latency exceeds the
+  /// recover-retry cadence. `release_deferred(op)` delivers the OLDEST held submission's completion
+  /// under its original id — a held read is a SLOW read, never a swallowed one; a slot released by
+  /// `truncate`/`prune` meanwhile simply releases as `Absent`.
   fn script_defer_read(&mut self, op: OpNumber) {
     self.deferred.insert(op.get());
   }

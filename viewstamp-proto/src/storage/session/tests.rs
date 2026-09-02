@@ -98,7 +98,12 @@ impl Wal for MockWal {
   fn submit_append(&mut self, id: WriteId, op: OpNumber, _header: Header, _body: Bytes) {
     self.staged.push((id, op.get()));
   }
-  fn submit_read(&mut self, _id: ReadId, _op: OpNumber) {}
+  fn submit_read(&mut self, id: ReadId, _op: OpNumber) {
+    // This medium materializes no entry (`header` is always `None`), so every read resolves
+    // `Absent` — the one verdict consistent with its synchronous views. Enqueued rather than
+    // dropped because the contract owes every submitted read exactly one completion.
+    self.done.push_back(WalDone::Absent(id));
+  }
   fn truncate(&mut self, above: OpNumber) -> Vec<WriteId> {
     let (cancelled, kept) = self.staged.drain(..).partition(|&(_, op)| op > above.get());
     self.staged = kept;
@@ -161,7 +166,11 @@ impl Superblock for MockSb {
   fn submit_write_checkpoint(&mut self, id: WriteId, _op: OpNumber, _snapshot: Bytes) {
     self.staged_checkpoints.push_back(id);
   }
-  fn submit_read_checkpoint(&mut self, _id: ReadId) {}
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
+    // No snapshot is ever readable from this medium, and a checkpoint read owes exactly one
+    // completion, so it resolves as a read fault rather than silently.
+    self.done.push_back(SuperblockDone::Fault(id));
+  }
   fn poll(&mut self) -> Option<SuperblockDone> {
     self.done.pop_front()
   }
