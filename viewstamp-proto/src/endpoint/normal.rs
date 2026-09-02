@@ -394,15 +394,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // Duplicate of the latest accepted request.
         // Clone the cached reply data out before dropping the session borrow so
         // that pushing to self.outgoing (which requires &mut self) is borrow-safe.
-        let cached = session.reply.as_ref().and_then(|(rn, body)| {
+        let cached = session.reply.as_ref().and_then(|(rn, outcome)| {
           if *rn == r.request() {
-            Some((*rn, body.clone()))
+            Some((*rn, outcome.clone()))
           } else {
             None
           }
         });
-        if let Some((rn, body)) = cached {
-          let reply = Reply::new(self.view, r.client(), rn, body);
+        if let Some((rn, outcome)) = cached {
+          let reply = Reply::new(self.view, r.client(), rn, outcome);
           self.emit(Outgoing::new(
             Recipient::To(Peer::Client(r.client())),
             Message::Reply(reply),
@@ -805,18 +805,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.request_repair_run(now, op);
       return false;
     };
-    let reply_body = self.sm.apply(OpNumber::with(op), body);
+    // The reply-size choke (see [`ReplyOutcome::from_applied`]): a reply past the frame-bound body
+    // becomes a small `TooLarge` outcome the transport can always deliver, instead of a `Reply` no
+    // send path could frame. Deterministic, so every replica derives the identical outcome for this
+    // op — the session cache, the duplicate resend and the checkpoint all agree.
+    let outcome = ReplyOutcome::from_applied(self.sm.apply(OpNumber::with(op), body));
     self.note_sm_advanced(OpNumber::with(op));
-    // Reply-size contract (see `StateMachine::apply`): an over-bound reply encodes past the frame
-    // cap and the transport refuses the send — unrecoverable, since the op is already committed.
-    debug_assert!(
-      reply_body.len() <= crate::message::max_reply_body_len(),
-      "StateMachine::apply returned a {}-byte reply for op {} (> max_reply_body_len {}): the Reply \
-       cannot be framed and the committed result is undeliverable",
-      reply_body.len(),
-      op,
-      crate::message::max_reply_body_len(),
-    );
+    if outcome.is_too_large() {
+      self.replies_too_large += 1;
+    }
     self.set_commit_min(OpNumber::with(op));
     if let Some(inflight) = self.inflight.get_mut(&op) {
       inflight.committed = true;
@@ -824,7 +821,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // The SHARED apply-time session update (watermark + reply cache + last-activity stamp +
     // deterministic cap eviction) — identical to the backup path in `advance_commit`, so primary and
     // backups converge on identical tables at identical applied ops.
-    self.note_applied_session(op, entry.client, entry.request, &reply_body);
+    self.note_applied_session(op, entry.client, entry.request, &outcome);
 
     self.emit(Outgoing::new(
       Recipient::To(Peer::Client(entry.client)),
@@ -832,7 +829,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.view,
         entry.client,
         entry.request,
-        reply_body.clone(),
+        outcome.clone(),
       )),
     ));
     self
@@ -841,7 +838,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         OpNumber::with(op),
         entry.client,
         entry.request,
-        reply_body,
+        outcome,
       )));
     true
   }
@@ -1578,29 +1575,26 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.request_repair_run(now, op);
         break;
       };
-      let reply = self.sm.apply(OpNumber::with(op), body);
+      // The SAME reply-size choke the primary applies in `commit_op`: one classification of the
+      // deterministic apply result, so a backup's cached outcome is byte-identical to the
+      // primary's and survives failover unchanged.
+      let outcome = ReplyOutcome::from_applied(self.sm.apply(OpNumber::with(op), body));
       self.note_sm_advanced(OpNumber::with(op));
-      // Reply-size contract (see `StateMachine::apply`): mirrors the primary's apply-site assert.
-      debug_assert!(
-        reply.len() <= crate::message::max_reply_body_len(),
-        "StateMachine::apply returned a {}-byte reply for op {} (> max_reply_body_len {}): the \
-         Reply cannot be framed and the committed result is undeliverable",
-        reply.len(),
-        op,
-        crate::message::max_reply_body_len(),
-      );
+      if outcome.is_too_large() {
+        self.replies_too_large += 1;
+      }
       self.set_commit_min(OpNumber::with(op));
       // The SHARED apply-time session update (watermark + reply cache + last-activity stamp +
       // deterministic cap eviction; see [`Self::note_applied_session`]) — identical to the primary's
       // `commit_op`, so primary and backups converge on identical tables at identical applied ops.
-      self.note_applied_session(op, entry.client, entry.request, &reply);
+      self.note_applied_session(op, entry.client, entry.request, &outcome);
       self
         .events
         .push_back(Event::Committed(crate::Committed::new(
           OpNumber::with(op),
           entry.client,
           entry.request,
-          reply,
+          outcome,
         )));
     }
     // If applying past a filled repair hole has carried `commit_min` to/past an
@@ -1666,7 +1660,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     op: u64,
     client: ClientId,
     request: RequestNumber,
-    reply: &Bytes,
+    outcome: &ReplyOutcome,
   ) {
     let session = self.clients.entry(client.get()).or_default();
     let newly_applied = session.last_op.get() == 0;
@@ -1679,7 +1673,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .as_ref()
       .is_none_or(|(rn, _)| rn.get() <= request.get())
     {
-      session.reply = Some((request, reply.clone()));
+      session.reply = Some((request, outcome.clone()));
     }
     // The applied count can only have GROWN if this apply turned a provisional/absent row applied;
     // the (rare) count + eviction scan runs only then, never on the steady per-op path.

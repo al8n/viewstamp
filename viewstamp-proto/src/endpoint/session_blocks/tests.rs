@@ -4,12 +4,24 @@ use super::*;
 use crate::block_store::{InMemoryBlockStore, block_address};
 
 /// Builds a session record with the given fields. `reply` is the cached `(request_number, body)` or
-/// `None`.
+/// `None`; the body is classified through the same choke the endpoint uses.
 fn session(request: u64, last_op: u64, reply: Option<(u64, Bytes)>) -> Session {
   Session {
     request: RequestNumber::with(request),
     last_op: crate::OpNumber::with(last_op),
-    reply: reply.map(|(rn, body)| (RequestNumber::with(rn), body)),
+    reply: reply.map(|(rn, body)| (RequestNumber::with(rn), ReplyOutcome::from_applied(body))),
+  }
+}
+
+/// Builds a session record whose cached outcome is the over-bound-reply REFUSAL rather than a body.
+fn refused_session(request: u64, last_op: u64, rn: u64, len: usize) -> Session {
+  Session {
+    request: RequestNumber::with(request),
+    last_op: crate::OpNumber::with(last_op),
+    reply: Some((
+      RequestNumber::with(rn),
+      ReplyOutcome::TooLarge(ReplyTooLarge::new(len, ReplyBody::max_len())),
+    )),
   }
 }
 

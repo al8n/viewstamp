@@ -20,20 +20,21 @@ const HELLO_TAG: u8 = 0x0C;
 /// [`CodecError::UnknownMessage`](crate::CodecError::UnknownMessage)), so a bump is reserved for a
 /// structural or semantic wire break, never for a new message.
 ///
-/// Version `2` names the contract under which `SyncCheckpoint.config_install_op` is
-/// PRESENCE-BEARING: a compliant peer stamps the producing op on every membership-bearing sync
-/// answer (an explicit zero included) and refuses the pair split apart. The superseded numbering
-/// `1` — BOTH the original hand-rolled era and the immediately-prior protobuf era, whose encoders
-/// cannot express that presence (an omitted field was indistinguishable from a producing op of 0)
-/// — is refused right here at the version byte, as is the superseded protobuf-cutover numbering
-/// `3`. One superseded numbering collides: a hand-rolled-frame era also spoke `2`, so a peer from
-/// that era passes this version byte — and is fenced one layer later, structurally: its
+/// Version `4` names the contract under which a `Reply` carries a terminal OUTCOME rather than a
+/// bare body: exactly one `Reply.outcome` arm is always present — the bounded reply body (an empty
+/// one included) or the refusal that replaces an over-bound one — and a peer refuses a `Reply` with
+/// the oneof absent. A version-`2` peer omits the field entirely for an empty reply and has no arm
+/// at all for a refusal, so its replies cannot be told apart from a truncated envelope; version `2`
+/// (which additionally named the `SyncCheckpoint.config_install_op` presence contract), the
+/// numbering `1` — BOTH the original hand-rolled era and an early protobuf era, whose encoders
+/// could not express that presence either — and the superseded protobuf-cutover numbering `3` are
+/// all refused right here at the version byte. One superseded numbering collides: a
+/// hand-rolled-frame era also spoke `2`, and it is fenced one layer later, structurally — its
 /// hand-rolled frames cannot decode under the protobuf envelope every current message rides, so no
-/// consensus traffic is ever accepted from it. The
-/// durable sibling is [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION): together they close both
-/// ways an unfenced writer's state could re-enter — through a recovered store, or through a live
-/// peer.
-const HELLO_VERSION: u8 = 2;
+/// consensus traffic is ever accepted from it. The durable sibling is
+/// [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION): together they close both ways an unfenced
+/// writer's state could re-enter — through a recovered store, or through a live peer.
+const HELLO_VERSION: u8 = 4;
 
 /// Exposes [`HELLO_VERSION`] to sibling transport layers OUTSIDE this module — namely the QUIC
 /// transport's ALPN (`transport::quic::crypto::alpn_protocols`), which folds it into the negotiated

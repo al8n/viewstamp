@@ -862,7 +862,10 @@ fn committed_session_projection_drops_provisionals_and_lowers_accept_ahead_water
     2,
     Session {
       request: RequestNumber::with(4),
-      reply: Some((RequestNumber::with(3), Bytes::copy_from_slice(&[3u8]))),
+      reply: Some((
+        RequestNumber::with(3),
+        ReplyOutcome::from_applied(Bytes::copy_from_slice(&[3u8])),
+      )),
       last_op: OpNumber::with(5),
     },
   );
@@ -922,7 +925,10 @@ fn adoption_rolls_back_an_orphaned_accept_ahead_watermark() {
     1,
     Session {
       request: RequestNumber::with(2), // accept-ahead: op 2 minted, not yet committed
-      reply: Some((RequestNumber::with(1), Bytes::copy_from_slice(&[1u8]))),
+      reply: Some((
+        RequestNumber::with(1),
+        ReplyOutcome::from_applied(Bytes::copy_from_slice(&[1u8])),
+      )),
       last_op: OpNumber::with(1),
     },
   );

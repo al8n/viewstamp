@@ -4545,7 +4545,14 @@ fn recover_restores_real_bodies() {
   let mut applied = std::vec::Vec::new();
   while let Some(ev) = recovered.poll_event() {
     if let Ok(c) = ev.try_unwrap_committed() {
-      applied.push((c.op().get(), c.reply().to_vec()));
+      applied.push((
+        c.op().get(),
+        c.outcome()
+          .as_ok()
+          .expect("a small applied reply is within the bound")
+          .as_bytes()
+          .to_vec(),
+      ));
     }
   }
   assert_eq!(

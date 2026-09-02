@@ -9,9 +9,9 @@ use crate::{
   BlockAddress, BlockResponse, ClientId, CodecError, Commit, DoViewChange, Epoch, EpochAhead,
   GetView, HealthProof, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare,
   PrepareBatch, PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse,
-  RepairBatch, ReplicaId, Reply, Request, RequestHealthProof, RequestLearnerProof, RequestNumber,
-  RequestPrepare, RequestPrepareRange, RequestSync, StartView, StartViewChange, SyncCheckpoint,
-  View,
+  RepairBatch, ReplicaId, Reply, ReplyBody, ReplyOutcome, ReplyTooLarge, Request,
+  RequestHealthProof, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange,
+  RequestSync, StartView, StartViewChange, SyncCheckpoint, View,
 };
 use buffa::Message as _;
 
@@ -309,10 +309,79 @@ fn reply_round_trips() {
     View::with(301),
     ClientId::new(0xEEEE_1111_2222_3333_4444_5555_6666_7777),
     RequestNumber::with(302),
-    Bytes::from_static(b"reply-body"),
+    ReplyOutcome::from_applied(Bytes::from_static(b"reply-body")),
   );
   let back = messages_a::reply_from(messages_a::pb_reply(&m)).expect("round-trip");
   assert_eq!(back, m);
+}
+
+#[test]
+fn an_empty_reply_body_survives_the_wire_as_a_present_outcome() {
+  // Presence is the reason the outcome is a oneof: an EMPTY body is a real result, and must not
+  // decode back as "no outcome" (which the conversion rejects).
+  let m = Reply::new(
+    View::with(1),
+    ClientId::new(2),
+    RequestNumber::with(3),
+    ReplyOutcome::Ok(ReplyBody::empty()),
+  );
+  let back = messages_a::reply_from(messages_a::pb_reply(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert_eq!(back.outcome().as_ok().map(ReplyBody::len), Some(0));
+}
+
+#[test]
+fn a_refused_reply_round_trips_with_both_lengths() {
+  let err = ReplyTooLarge::new(ReplyBody::max_len() + 7, ReplyBody::max_len());
+  let m = Reply::new(
+    View::with(4),
+    ClientId::new(5),
+    RequestNumber::with(6),
+    ReplyOutcome::TooLarge(err),
+  );
+  let back = messages_a::reply_from(messages_a::pb_reply(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert_eq!(back.outcome().as_too_large(), Some(&err));
+}
+
+#[test]
+fn a_reply_with_no_outcome_is_rejected() {
+  // A wire reply whose oneof is absent names no outcome this build can deliver — a peer from a
+  // pre-outcome era, or a corrupt envelope. It is refused at the conversion, never defaulted to an
+  // empty body.
+  let w = pb::Reply {
+    view: 1,
+    client: convert::u128_bytes(2),
+    request: 3,
+    outcome: None,
+    ..Default::default()
+  };
+  assert!(matches!(
+    messages_a::reply_from(w),
+    Err(CodecError::Malformed {
+      what: "Reply.outcome"
+    })
+  ));
+}
+
+#[test]
+fn a_reply_body_past_the_bound_is_rejected_at_the_conversion() {
+  // No compliant peer emits one — its own choke would have produced a refusal instead — so an
+  // over-bound body on the wire is malformed, not a success to admit.
+  let w = pb::Reply {
+    view: 1,
+    client: convert::u128_bytes(2),
+    request: 3,
+    outcome: Some(pb::reply::Outcome::Body(Bytes::from(std::vec![
+      0u8;
+      ReplyBody::max_len() + 1
+    ]))),
+    ..Default::default()
+  };
+  assert!(matches!(
+    messages_a::reply_from(w),
+    Err(CodecError::Malformed { what: "Reply.body" })
+  ));
 }
 
 #[test]
@@ -833,7 +902,7 @@ fn one_of_each_message() -> std::vec::Vec<Message> {
       View::with(10),
       client,
       RequestNumber::with(80),
-      body.clone(),
+      ReplyOutcome::from_applied(body.clone()),
     )),
     Message::Commit(Commit::new(
       View::with(10),

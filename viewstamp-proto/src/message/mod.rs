@@ -66,24 +66,28 @@ pub const REQUEST_ENCODE_OVERHEAD: usize =
 pub const PREPARE_ENCODE_OVERHEAD: usize =
   ENVELOPE_ARM_OVERHEAD + 6 * WORST_UINT64_FIELD + 2 * WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
-/// Worst-case bytes a [`Reply`] envelope wraps around its body, field by field (`view` + `request`
-/// two uint64s, `client` a 16-byte id, `body` bytes): `ENVELOPE_ARM_OVERHEAD` (7) plus
-/// 2 × `WORST_UINT64_FIELD` (22) plus `WORST_ID_FIELD` (18) plus the body's `LEN_FIELD_OVERHEAD`
-/// (6) = 53. The `Reply` is the ONLY carrier of a reply body on the wire (the checkpoint envelope
-/// also embeds cached reply bodies, but that envelope is chunk-transferable and so unbounded by any
-/// single frame), so this is the binding overhead behind [`max_reply_body_len`].
+/// Worst-case bytes a [`Reply`] envelope wraps around its outcome payload, field by field (`view` +
+/// `request` two uint64s, `client` a 16-byte id, and the `outcome` oneof's length-delimited arm):
+/// `ENVELOPE_ARM_OVERHEAD` (7) plus 2 × `WORST_UINT64_FIELD` (22) plus `WORST_ID_FIELD` (18) plus
+/// the arm's `LEN_FIELD_OVERHEAD` (6) = 53. Both outcome arms are length-delimited under a
+/// single-byte tag (fields 4 and 5), so the SAME framing bounds either; what the arm then carries
+/// is [`ReplyOutcome::wire_payload_bound`]. The `Reply` is the ONLY carrier of a reply body on the
+/// wire (the checkpoint envelope also embeds cached reply bodies, but that envelope is
+/// chunk-transferable and so unbounded by any single frame), so this is the binding overhead behind
+/// [`max_reply_body_len`].
 pub const REPLY_ENCODE_OVERHEAD: usize =
   ENVELOPE_ARM_OVERHEAD + 2 * WORST_UINT64_FIELD + WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
-/// The largest reply body a [`crate::StateMachine::apply`] may return: a reply of this many bytes
-/// encodes as a [`Reply`] of AT MOST `MAX_FRAME_LEN` — the largest frame the transport will send or
-/// accept — even with every other field at its varint-widest ([`REPLY_ENCODE_OVERHEAD`] is the
-/// worst-case overhead). Past the bound the encoded `Reply` can exceed the frame cap — the
-/// transport refuses the send, the client never hears the result, and since the op is ALREADY
-/// COMMITTED there is no in-protocol recovery (the request cannot be re-executed; the cached
-/// over-bound reply re-fails on every resend). The bound is therefore an EMBEDDER OBLIGATION
-/// documented on [`crate::StateMachine::apply`] and debug-asserted at both apply sites, mirroring
-/// how `max_request_body_len()` bounds the request body at driver submit.
+/// The largest body a [`Reply`] can carry: a body of this many bytes encodes as a `Reply` of AT
+/// MOST `MAX_FRAME_LEN` — the largest frame the transport will send or accept — even with every
+/// other field at its varint-widest ([`REPLY_ENCODE_OVERHEAD`] is the worst-case overhead).
+///
+/// The bound is STRUCTURAL, not an obligation: [`ReplyBody`] is the only payload an
+/// [`ReplyOutcome::Ok`] carries and refuses anything longer, and the endpoint routes every applied
+/// reply through [`ReplyOutcome::from_applied`], so an over-bound reply becomes the small,
+/// frameable [`ReplyOutcome::TooLarge`] instead of a `Reply` the transport would refuse to send.
+/// [`ReplyBody::max_len`] is the same number under the name the batch codec and the driver-side
+/// aggregator consume, so the ceiling has exactly one definition.
 pub const fn max_reply_body_len() -> usize {
   MAX_FRAME_LEN as usize - REPLY_ENCODE_OVERHEAD
 }
@@ -456,24 +460,222 @@ impl PrepareOk {
   }
 }
 
+/// The opaque application result of one committed operation, held to the largest body a [`Reply`]
+/// can frame ([`max_reply_body_len`]).
+///
+/// This is the ONLY payload [`ReplyOutcome::Ok`] carries, so a successful reply past the bound is
+/// unrepresentable: the endpoint classifies whatever
+/// [`StateMachine::apply`](crate::StateMachine::apply) returned through
+/// [`ReplyOutcome::from_applied`], and an over-bound result becomes [`ReplyOutcome::TooLarge`]
+/// rather than a `Reply` no transport could send.
+///
+/// An EMPTY body is a meaningful result (an operation whose reply carries nothing), distinct from
+/// both a refused one and an absent outcome — hence [`Self::empty`] rather than an `Option`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyBody(Bytes);
+
+impl ReplyBody {
+  /// Wraps `bytes` as a reply body.
+  ///
+  /// # Errors
+  ///
+  /// [`ReplyTooLarge`] when `bytes` is longer than [`Self::max_len`].
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn try_new(bytes: Bytes) -> Result<Self, ReplyTooLarge> {
+    if bytes.len() > Self::max_len() {
+      return Err(ReplyTooLarge::new(bytes.len(), Self::max_len()));
+    }
+    Ok(Self(bytes))
+  }
+
+  /// The empty reply body — the result of an operation whose reply carries nothing.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn empty() -> Self {
+    Self(Bytes::new())
+  }
+
+  /// The largest body this type admits, the single reply ceiling ([`max_reply_body_len`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_len() -> usize {
+    max_reply_body_len()
+  }
+
+  /// The body as a slice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn as_bytes(&self) -> &[u8] {
+    &self.0
+  }
+
+  /// The body as owned, cheap-clone [`Bytes`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_bytes(self) -> Bytes {
+    self.0
+  }
+
+  /// The body length in bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn len(&self) -> usize {
+    self.0.len()
+  }
+
+  /// True iff the body carries no bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn is_empty(&self) -> bool {
+    self.0.is_empty()
+  }
+}
+
+impl Default for ReplyBody {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::empty()
+  }
+}
+
+/// A committed operation's state-machine reply exceeded [`max_reply_body_len`], so no [`Reply`] can
+/// carry it.
+///
+/// The operation itself STAYS COMMITTED and applied — it is the reply, not the mutation, that is
+/// undeliverable. Because `apply` is deterministic and the classification is pure, every replica
+/// derives this identical value, so the cached session reply, its duplicate-request resend, a
+/// failover primary's resend, and the checkpointed session table all carry the same small,
+/// frameable outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the state machine returned a {len}-byte reply, past the {max}-byte reply bound")]
+pub struct ReplyTooLarge {
+  len: usize,
+  max: usize,
+}
+
+impl ReplyTooLarge {
+  /// Records a reply of `len` bytes refused against the `max`-byte bound.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(len: usize, max: usize) -> Self {
+    Self { len, max }
+  }
+
+  /// The length of the reply the state machine returned.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn reply_len(&self) -> usize {
+    self.len
+  }
+
+  /// The bound it was refused against ([`max_reply_body_len`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_len(&self) -> usize {
+    self.max
+  }
+}
+
+/// The terminal result of one committed operation, as carried on the wire and delivered to the
+/// client: the state machine's bounded reply, or the deterministic refusal that replaces an
+/// over-bound one.
+///
+/// Both arms are deliverable — the refusal is a handful of bytes — so a committed operation always
+/// has an outcome the client can observe, and a node-local [`Event::Committed`](crate::Event)
+/// consumer sees exactly what the wire carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyOutcome {
+  /// The state machine's reply, within the reply-body bound.
+  Ok(ReplyBody),
+  /// The state machine's reply exceeded the bound, so no body could be framed. The operation is
+  /// committed and applied regardless.
+  TooLarge(ReplyTooLarge),
+}
+
+impl ReplyOutcome {
+  /// Classifies the bytes [`StateMachine::apply`](crate::StateMachine::apply) returned.
+  ///
+  /// The SINGLE choke both of the endpoint's apply sites route through: `apply` is deterministic
+  /// and this classification is pure, so primary and backups derive byte-identical outcomes for
+  /// the same op — which is what lets the session cache, the duplicate resend, failover, and the
+  /// session checkpoint all carry one agreed value.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn from_applied(reply: Bytes) -> Self {
+    match ReplyBody::try_new(reply) {
+      Ok(body) => Self::Ok(body),
+      Err(too_large) => Self::TooLarge(too_large),
+    }
+  }
+
+  /// True iff the state machine's reply fit the bound.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_ok(&self) -> bool {
+    matches!(self, Self::Ok(_))
+  }
+
+  /// True iff the reply was refused for exceeding the bound.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_too_large(&self) -> bool {
+    matches!(self, Self::TooLarge(_))
+  }
+
+  /// The reply body when [`Ok`](Self::Ok), else `None`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_ok(&self) -> Option<&ReplyBody> {
+    match self {
+      Self::Ok(body) => Some(body),
+      Self::TooLarge(_) => None,
+    }
+  }
+
+  /// The refusal when [`TooLarge`](Self::TooLarge), else `None`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_too_large(&self) -> Option<&ReplyTooLarge> {
+    match self {
+      Self::TooLarge(err) => Some(err),
+      Self::Ok(_) => None,
+    }
+  }
+
+  /// Consumes the outcome, yielding the reply body when [`Ok`](Self::Ok), else the refusal.
+  ///
+  /// # Errors
+  ///
+  /// The carried [`ReplyTooLarge`] when the reply exceeded the bound.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn try_into_ok(self) -> Result<ReplyBody, ReplyTooLarge> {
+    match self {
+      Self::Ok(body) => Ok(body),
+      Self::TooLarge(err) => Err(err),
+    }
+  }
+
+  /// The worst-case bytes this outcome contributes to a [`Reply`] encoding, beyond the outcome
+  /// field's own framing (already charged by [`REPLY_ENCODE_OVERHEAD`]): the body bytes for
+  /// [`Ok`](Self::Ok), and the two widest `uint64`s of the refusal for [`TooLarge`](Self::TooLarge).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub(crate) fn wire_payload_bound(&self) -> usize {
+    match self {
+      Self::Ok(body) => body.len(),
+      Self::TooLarge(_) => 2 * WORST_UINT64_FIELD,
+    }
+  }
+}
+
 /// Primary → client: the result of a committed operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
   view: View,
   client: ClientId,
   request: RequestNumber,
-  body: Bytes,
+  outcome: ReplyOutcome,
 }
 
 impl Reply {
-  /// Creates a client reply.
+  /// Creates a client reply carrying the operation's terminal outcome.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(view: View, client: ClientId, request: RequestNumber, body: Bytes) -> Self {
+  pub const fn new(
+    view: View,
+    client: ClientId,
+    request: RequestNumber,
+    outcome: ReplyOutcome,
+  ) -> Self {
     Self {
       view,
       client,
       request,
-      body,
+      outcome,
     }
   }
 
@@ -495,16 +697,16 @@ impl Reply {
     self.request
   }
 
-  /// The opaque application result as a slice.
+  /// The committed operation's terminal outcome.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn body(&self) -> &[u8] {
-    &self.body
+  pub const fn outcome(&self) -> &ReplyOutcome {
+    &self.outcome
   }
 
-  /// The opaque application result as owned `Bytes`.
+  /// Consumes the reply, yielding its outcome.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn body_bytes(&self) -> Bytes {
-    self.body.clone()
+  pub fn into_outcome(self) -> ReplyOutcome {
+    self.outcome
   }
 }
 
@@ -2755,7 +2957,7 @@ impl Message {
       Self::Request(m) => REQUEST_ENCODE_OVERHEAD.saturating_add(m.body().len()),
       Self::Prepare(m) => PREPARE_ENCODE_OVERHEAD.saturating_add(m.body().len()),
       Self::PrepareOk(_) => fixed_fields_bound(5, 2),
-      Self::Reply(m) => REPLY_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::Reply(m) => REPLY_ENCODE_OVERHEAD.saturating_add(m.outcome().wire_payload_bound()),
       Self::Commit(_) => fixed_fields_bound(4, 1),
       Self::StartViewChange(_) => fixed_fields_bound(3, 1),
       Self::DoViewChange(m) => {
