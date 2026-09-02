@@ -64,13 +64,20 @@
 //! | decoder, ready-queue slots — one budget of minimal frames is `STAGE_CHUNK / LEN_PREFIX` = 16384 of them | 16384 x 24 B = 384 KiB |
 //!
 //! The recv half of a stream this side OPENED adds nothing to the table. A class's stream is bidi but
-//! only its send half is ours — the peer's frames arrive on the streams IT opened — so data on that
-//! half is something no conforming peer produces, and it is answered as a protocol violation rather
-//! than buffered: the first such `Readable` closes the connection with
-//! [`CloseCause::UnsolicitedStream`], after a one-byte peek that tells real data apart from this
-//! transport's own retire (`retire_local_send` resets that half, and a `RESET_STREAM` is readable
-//! too). Nothing is read into a decoder and nothing is retained, so the bound is the close itself —
-//! pinned by `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection`.
+//! only its send half is ours — the peer's frames arrive on the streams IT opened — so a frame on
+//! that half is something no conforming peer produces, and it is answered as a protocol violation
+//! rather than buffered. On a `Readable` for one of our own send ids a one-byte peek runs, and the
+//! connection is closed with [`CloseCause::UnsolicitedStream`] when a STREAM frame is CURRENTLY
+//! OBSERVABLE there. Nothing is read into a decoder and nothing is retained.
+//!
+//! That close is not the whole bound, and the summary must not be read as an unconditional one. A
+//! `RESET_STREAM` processed in the same batch as the data it releases erases the evidence: quinn's
+//! `received_reset` clears the assembler before the bridge drains the event, the peek then sees
+//! `Reset`, and the connection stays OPEN — while those bytes are already freed. So what bounds this
+//! half is quinn's release on reset PLUS the close on observable data, not the close alone. The two
+//! halves are pinned by
+//! `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
+//! `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open`.
 //!
 //! Left alone it would NOT have been window-bounded: sub-packet writes reach the reassembler's span
 //! ceiling well below a window's worth of bytes, so the connection would close anyway, on a path that
@@ -1154,6 +1161,37 @@ impl Bridge {
   /// span the reassembler was handed. The direct observable for the sender-side segmentation
   /// contract: a datagram can carry several STREAM frames (retransmit recovery packs disjoint ranges
   /// into one), so counting datagrams would under-report exactly where it matters.
+  /// Feed one datagram into quinn WITHOUT running the service pump, so SEVERAL datagrams can be
+  /// processed before a single application-event drain.
+  ///
+  /// Test-only, and it exists for one reason: the unsolicited-half classifier's contract turns on
+  /// frame-processing order — a `RESET_STREAM` handled in the same batch as the data it releases
+  /// leaves nothing for the peek to observe. `handle_datagram` services after every datagram, so
+  /// that batch cannot be built through it. Established connections only; the accept and refuse
+  /// paths are deliberately not reachable here.
+  #[cfg(test)]
+  pub(crate) fn test_feed_datagram_unserviced(
+    &mut self,
+    now: Instant,
+    remote: SocketAddr,
+    data: &[u8],
+  ) {
+    let mut scratch = Vec::new();
+    let ev = self.endpoint.handle(
+      now,
+      remote,
+      /*local_ip=*/ None,
+      /*ecn=*/ None,
+      bytes::BytesMut::from(data),
+      &mut scratch,
+    );
+    if let Some(DatagramEvent::ConnectionEvent(h, conn_ev)) = ev
+      && let Some(e) = self.table.entry(h)
+    {
+      e.conn.handle_event(conn_ev);
+    }
+  }
+
   #[cfg(test)]
   pub(crate) fn rx_stream_frames_total(&mut self) -> u64 {
     self

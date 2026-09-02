@@ -1394,10 +1394,12 @@ fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_strea
 /// per-datagram cost first and gives the peer a churn lever.
 ///
 /// So it is treated as what it is — a protocol violation no conforming peer produces — and answered
-/// once: the connection closes with [`CloseCause::UnsolicitedStream`], nothing is read into a
-/// decoder, and nothing is retained. The one classification needed is that this transport's own
-/// retire protocol resets that half, and a `RESET_STREAM` surfaces as readable too; a one-byte peek
-/// separates the reset from real data.
+/// once: when a STREAM frame is OBSERVABLE on that half at the peek, the connection closes with
+/// [`CloseCause::UnsolicitedStream`], nothing is read into a decoder, and nothing is retained. The
+/// classification is what the peek can see, not a claim about everything the peer sent: this
+/// transport's own retire protocol resets that half and a `RESET_STREAM` surfaces as readable too,
+/// and a reset processed in the same batch as data releases it before the peek runs (see
+/// `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open`).
 ///
 /// The writes here are deliberately sub-packet, the shape that would otherwise reach the span
 /// ceiling rather than the window.
@@ -1707,18 +1709,26 @@ fn a_peer_fin_of_our_opened_streams_recv_half_does_not_close() {
   assert!(a.is_validated(ha), "and the connection stays up");
 }
 
-/// DOCUMENTED GAP: data followed by a RESET in the same batch is not classified as data.
+/// DOCUMENTED GAP: data whose RESET is processed in the same batch is not classified as data.
 ///
-/// Pinned quinn processes a datagram's frames before the bridge drains application events, and
-/// `received_reset` clears the stream's assembler. So when a peer writes into the half and resets it
-/// close enough together, the peek that follows sees `Reset` — the classifier's inputs no longer
-/// contain the write — and the connection stays open.
+/// Pinned quinn processes a datagram batch's frames before the bridge drains application events, and
+/// `received_reset` clears the stream's assembler. So when the peer's write and its reset reach the
+/// receiver before one drain, the peek that follows sees `Reset` — the write is no longer among the
+/// classifier's inputs — and the connection stays open.
 ///
-/// That is an enforcement and observability gap, not a memory exposure: the RESET is precisely what
-/// released those bytes, so nothing is retained either way. This pins the behaviour so the gap stays
-/// visible and cannot be mistaken for a classifier that saw the data and chose to allow it.
+/// Building that batch takes care, because it is easy to write a test that proves nothing. A reset
+/// issued before packetization moves the send stream to `ResetSent` and quinn then emits no STREAM
+/// frame at all, which is just the reset-only control wearing a different name. Here the data is
+/// PACKETIZED FIRST, the reset queued after, and both datagrams are fed through
+/// [`Bridge::test_feed_datagram_unserviced`] so no drain runs between them. The receiver's own
+/// STREAM-frame counter is asserted to have advanced, which is what makes the case non-vacuous: the
+/// bytes really did arrive before the reset released them.
+///
+/// The gap is an enforcement and observability one, not a memory exposure — the reset is precisely
+/// what frees those bytes — and pinning it keeps it from being mistaken for a classifier that saw
+/// the data and chose to allow it.
 #[test]
-fn data_then_reset_of_our_opened_streams_recv_half_leaves_the_connection_open() {
+fn data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open() {
   let Linked {
     mut a,
     mut b,
@@ -1762,29 +1772,55 @@ fn data_then_reset_of_our_opened_streams_recv_half_leaves_the_connection_open() 
       break;
     }
   }
+  while a.poll_transmit().is_some() {}
+  while b.poll_transmit().is_some() {}
+  let frames_before = a.rx_stream_frames_total();
 
-  // Write into the reverse half and reset it before anything is delivered, so both reach A together.
-  let batch = now + Duration::from_millis(40);
-  let _ = b.test_write_raw(hb, victim, &std::vec![0x6Du8; 396]);
-  b.test_reset_raw(hb, victim);
-  for k in 40..120u64 {
-    let tick = now + Duration::from_millis(k);
-    ferry_once(
-      &mut a,
-      &mut b,
-      a_addr,
-      b_addr,
-      &mut pipe_to_a,
-      &mut pipe_to_b,
-      tick,
-    );
-    a.ingest_recv(tick, ha);
+  // 1. Write into the reverse half and PACKETIZE it — this is the datagram carrying the STREAM frame.
+  let t_data = now + Duration::from_millis(40);
+  b.test_write_raw(hb, victim, &std::vec![0x6Du8; 396])
+    .expect("the write is accepted");
+  b.handle_timeout(t_data);
+  let mut with_data: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    with_data.push(bytes);
   }
-  let _ = batch;
+  assert!(
+    !with_data.is_empty(),
+    "the write must be packetized BEFORE the reset, or quinn emits no STREAM frame at all and the \
+     case collapses into the reset-only control"
+  );
+
+  // 2. Now reset, and packetize that.
+  let t_reset = now + Duration::from_millis(41);
+  b.test_reset_raw(hb, victim);
+  b.handle_timeout(t_reset);
+  let mut with_reset: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    with_reset.push(bytes);
+  }
+  assert!(!with_reset.is_empty(), "the reset must reach the wire too");
+
+  // 3. Both into the receiver's quinn with NO drain in between, then exactly one drain.
+  for bytes in with_data.iter().chain(with_reset.iter()) {
+    a.test_feed_datagram_unserviced(t_reset, b_addr, bytes);
+  }
+  let drained = now + Duration::from_millis(42);
+  a.handle_timeout(drained);
+  a.ingest_recv(drained, ha);
+
+  assert!(
+    a.rx_stream_frames_total() > frames_before,
+    "the data must actually have reached the receiver — without that this proves nothing about a \
+     reset erasing it"
+  );
   assert_eq!(
     a.conn_close_count(CloseCause::UnsolicitedStream),
     0,
-    "the classifier sees the RESET, not the write it released — the documented gap"
+    "with the reset processed in the same batch the classifier sees `Reset`, not the write it \
+     released — the documented gap"
   );
   assert!(
     a.is_validated(ha),
