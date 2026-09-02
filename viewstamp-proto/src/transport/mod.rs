@@ -86,11 +86,15 @@ pub enum CloseCause {
   /// A live conn was retired by newer state — a fresher validated conn for the same peer won the
   /// duplicate race, or a membership change removed/re-slotted the member it was bound to.
   Superseded,
+  /// The peer wrote into the reverse direction of a stream THIS side opened. Each class uses only
+  /// the send half of the stream it opens — the peer's frames ride the streams it opens itself — so
+  /// data arriving on that half is a protocol violation no conforming peer produces.
+  UnsolicitedStream,
 }
 
 impl CloseCause {
   /// The number of causes — sizes a per-cause counter array (`[u64; CloseCause::COUNT]`).
-  pub const COUNT: usize = Self::Superseded as usize + 1;
+  pub const COUNT: usize = Self::UnsolicitedStream as usize + 1;
 
   /// The dense counter-array slot of this cause (`0..COUNT`).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -113,6 +117,7 @@ impl CloseCause {
       Self::AcceptCapacity => "accept_capacity",
       Self::IdleTimeout => "idle_timeout",
       Self::Superseded => "superseded",
+      Self::UnsolicitedStream => "unsolicited_stream",
     }
   }
 }

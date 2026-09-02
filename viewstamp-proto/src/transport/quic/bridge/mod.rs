@@ -63,16 +63,21 @@
 //! | decoder, frames one pass completed — the one that was already assembling, plus what one budget can complete | 16 MiB + 64 KiB |
 //! | decoder, ready-queue slots — one budget of minimal frames is `STAGE_CHUNK / LEN_PREFIX` = 16384 of them | 16384 x 24 B = 384 KiB |
 //!
-//! Plus, per CLASS, the recv half of the stream this side OPENED. A class's stream is bidi but only
-//! its send half is ours — the peer's frames arrive on the streams IT opened — so that half is never
-//! read. A peer may still write into it, and what that costs is one more `stream_receive_window`
-//! (1 MiB) plus its reassembler allocation: quinn buffers a window and then the peer is
-//! flow-control blocked for good, because nothing ever reads to release credit. The bridge itself
-//! retains none of it. Refusing it outright with `STOP_SENDING` would be better, but sending that
-//! for a bidi stream the peer has not yet allocated underflows `allocated_remote_count` in
-//! quinn 0.11.17's `stream_freed`, which would corrupt the peer's `MAX_STREAMS` accounting — so it
-//! is accounted for here instead, and pinned by
-//! `a_peer_writing_into_our_opened_streams_recv_half_is_window_bounded_and_retained_nowhere`.
+//! The recv half of a stream this side OPENED adds nothing to the table. A class's stream is bidi but
+//! only its send half is ours — the peer's frames arrive on the streams IT opened — so data on that
+//! half is something no conforming peer produces, and it is answered as a protocol violation rather
+//! than buffered: the first such `Readable` closes the connection with
+//! [`CloseCause::UnsolicitedStream`], after a one-byte peek that tells real data apart from this
+//! transport's own retire (`retire_local_send` resets that half, and a `RESET_STREAM` is readable
+//! too). Nothing is read into a decoder and nothing is retained, so the bound is the close itself —
+//! pinned by `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection`.
+//!
+//! Left alone it would NOT have been window-bounded: sub-packet writes reach the reassembler's span
+//! ceiling well below a window's worth of bytes, so the connection would close anyway, on a path that
+//! first pays a per-datagram cost and hands the peer a churn lever. (`STOP_SENDING` on that half
+//! would be the tidier refusal, but sending it for a bidi stream the peer has not yet allocated
+//! underflows `allocated_remote_count` in quinn 0.11.17's `stream_freed` and would corrupt the
+//! peer's `MAX_STREAMS` accounting.)
 //!
 //! That is roughly 40 MiB per recv stream at the extreme, and a connection carries at most two
 //! (Control + Bulk). Reaching it needs a peer actually sending a maximum-sized frame; [`decoder_max`]
@@ -857,7 +862,40 @@ impl Bridge {
         // (`accept`) and reads the preface deterministically, rather than waiting on a retransmit.
         self.stream_ready.push_back(h);
       }
-      Event::Stream(StreamEvent::Readable { .. }) => {
+      Event::Stream(StreamEvent::Readable { id }) => {
+        // A class opens its stream BIDI (that is the only shape carrying the per-stream flow control
+        // the classes need) but uses only the SEND half: the peer's frames ride the streams IT
+        // opens. Data on the reverse direction of one of ours is therefore something no conforming
+        // peer produces — and left alone it is a hole, since nothing ever reads it: quinn would
+        // buffer for a read that never comes, and sub-packet writes into it reach the reassembler's
+        // span ceiling well before a window's worth of bytes, closing the connection anyway on a
+        // path that costs a per-datagram check first.
+        //
+        // So it is a protocol violation, handled once and deterministically: close the connection.
+        // No read, no allocation for it, no per-datagram cost — a `Readable` for one of our own send
+        // ids cannot occur on a conforming link, so this arm is off the hot path entirely.
+        //
+        // One classification is needed first: this transport's OWN retire protocol resets the unused
+        // half ([`retire_local_send`]), and a peer's `RESET_STREAM` surfaces as a `Readable` too. So
+        // peek a single byte — `Err(Reset)` / FIN / nothing is the retire and is ignored, `Ok(Some)`
+        // is data no conforming peer sends. The peek runs only for an id that is one of OUR send
+        // streams, so it is off the conforming hot path.
+        let unsolicited = self.table.entry(h).is_some_and(|e| {
+          e.classes.iter().any(|c| c.send == Some(id))
+            && e
+              .conn
+              .recv_stream(id)
+              .read(/*ordered=*/ true)
+              .is_ok_and(|mut chunks| {
+                let got = matches!(chunks.next(1), Ok(Some(_)));
+                let _ = chunks.finalize();
+                got
+              })
+        });
+        if unsolicited {
+          self.close_local(now, h, CloseCause::UnsolicitedStream);
+          return;
+        }
         self.stream_ready.push_back(h);
       }
       Event::Stream(StreamEvent::Writable { .. }) => {

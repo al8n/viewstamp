@@ -1368,21 +1368,24 @@ fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_strea
   );
 }
 
-/// The recv half of a stream WE opened is bounded by flow control and retained by nothing.
+/// Data on the reverse direction of a stream WE opened closes the connection, deterministically.
 ///
-/// Each class opens a BIDI stream and uses only its send half — the peer's frames arrive on the
-/// streams IT opened — so the recv half is never read. A valid-cert peer may still write into it.
-/// What that costs is one `stream_receive_window` per unused half: quinn buffers up to the window
-/// and then the peer is flow-control blocked forever, since nothing ever reads to release credit.
-/// The bridge itself retains none of it — those bytes are not the class's adopted recv stream, so
-/// they never reach the class decoder.
+/// Each class opens a BIDI stream and uses only its send half — the peer's frames ride the streams IT
+/// opens — so the reverse direction is never read. Leaving it alone is not a bound: quinn buffers for
+/// a read that never comes, and SUB-PACKET writes into it reach the reassembler's span ceiling long
+/// before a window's worth of bytes, so the connection dies anyway, on a path that pays a
+/// per-datagram cost first and gives the peer a churn lever.
 ///
-/// The inbound bound counts these halves for exactly that reason. Refusing them outright with
-/// `STOP_SENDING` would be better, but sending it for a bidi stream the peer has not allocated
-/// underflows `allocated_remote_count` in quinn 0.11.17 (`connection/streams/state.rs`
-/// `stream_freed`), which would corrupt the peer's `MAX_STREAMS` accounting in a release build.
+/// So it is treated as what it is — a protocol violation no conforming peer produces — and answered
+/// once: the connection closes with [`CloseCause::UnsolicitedStream`], nothing is read into a
+/// decoder, and nothing is retained. The one classification needed is that this transport's own
+/// retire protocol resets that half, and a `RESET_STREAM` surfaces as readable too; a one-byte peek
+/// separates the reset from real data.
+///
+/// The writes here are deliberately sub-packet, the shape that would otherwise reach the span
+/// ceiling rather than the window.
 #[test]
-fn a_peer_writing_into_our_opened_streams_recv_half_is_window_bounded_and_retained_nowhere() {
+fn sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection() {
   let Linked {
     mut a,
     mut b,
@@ -1402,21 +1405,21 @@ fn a_peer_writing_into_our_opened_streams_recv_half_is_window_bounded_and_retain
   let victim = a
     .test_send_id(ha, StreamClass::Control)
     .expect("A opened its Control stream");
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "nothing is unsolicited before the peer misbehaves"
+  );
 
-  // B writes into the OTHER direction of that same bidi stream — the half A never reads — until
-  // flow control refuses more.
+  // B writes into the OTHER direction of that same bidi stream, a few hundred bytes at a time — the
+  // sub-packet shape, one write per pump.
   let mut pipe_to_a = PacketPipe::default();
   let mut pipe_to_b = PacketPipe::default();
-  let payload = std::vec![0x5Cu8; 64 * 1024];
-  let mut written = 0usize;
-  let mut blocked = false;
-  for k in 1..2_000u64 {
+  let payload = std::vec![0x5Cu8; 396];
+  let mut closed = false;
+  for k in 1..400u64 {
     let tick = now + Duration::from_millis(k);
-    match b.test_write_raw(hb, victim, &payload) {
-      Ok(n) => written += n,
-      Err(WriteError::Blocked) => blocked = true,
-      Err(e) => panic!("the unused half must only ever block, got {e:?}"),
-    }
+    let _ = b.test_write_raw(hb, victim, &payload);
     ferry_once(
       &mut a,
       &mut b,
@@ -1427,24 +1430,25 @@ fn a_peer_writing_into_our_opened_streams_recv_half_is_window_bounded_and_retain
       tick,
     );
     a.ingest_recv(tick, ha);
-    if blocked && written > 0 {
+    if a.conn_close_count(CloseCause::UnsolicitedStream) > 0 {
+      closed = true;
       break;
     }
   }
   assert!(
-    blocked,
-    "the unused half must run out of flow-control window and STAY blocked — nothing reads it, so \
-     no credit is ever regranted; wrote {written} B"
+    closed,
+    "reverse-direction data on a stream we opened must close the connection under its own cause, \
+     not accumulate for a read that never comes"
   );
   assert!(
-    written as u64 <= MAX_STREAM_RECEIVE_WINDOW,
-    "and what it absorbs before blocking is one window, not more: {written} B"
+    !a.is_validated(ha),
+    "and the connection must actually be down, not merely counted"
   );
-  // The bridge retains none of it: those bytes are not the class's adopted recv stream.
+  // Nothing of it was read into the class: no partial, no frame.
   assert_eq!(
     a.test_partial_len(ha, StreamClass::Control),
     0,
-    "the unused half's bytes must not reach the class decoder"
+    "the unsolicited half's bytes must not reach the class decoder"
   );
   assert!(
     a.next_frame(ha, StreamClass::Control).is_none(),
