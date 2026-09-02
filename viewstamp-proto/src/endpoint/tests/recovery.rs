@@ -4269,6 +4269,38 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit_tick() {
     "op 2's read has not completed yet — still recovering",
   );
 
+  // The fence state the tick must leave untouched: op 2 pending with its FULL budget, and exactly
+  // one live read id for it.
+  let ids_for_op_2 = |r: &Endpoint<CountSm>| -> std::vec::Vec<u64> {
+    r.recover
+      .as_ref()
+      .expect("the recovery is open")
+      .reads
+      .iter()
+      .filter(|&(_, &op)| op == 2)
+      .map(|(&id, _)| id)
+      .collect()
+  };
+  let budget_for_op_2 = |r: &Endpoint<CountSm>| -> Option<u8> {
+    r.recover
+      .as_ref()
+      .expect("the recovery is open")
+      .pending
+      .get(&2)
+      .copied()
+  };
+  assert_eq!(
+    budget_for_op_2(&r),
+    Some(RECOVER_READ_RETRIES),
+    "op 2 enters the tick with its whole failure budget unspent",
+  );
+  let ids_before = ids_for_op_2(&r);
+  assert_eq!(
+    ids_before.len(),
+    1,
+    "exactly one read id is live for op 2 — the discipline never has two",
+  );
+
   // One recover-retry tick: op 2's read is STILL outstanding, so `recover_timeouts` WAITS on it —
   // no re-submission, no budget spend — and the recovery stays open.
   now = now + RECOVER_READ_RETRANSMIT;
@@ -4277,6 +4309,18 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit_tick() {
     r.status(),
     Status::Recovering,
     "still recovering after the tick (op 2's read remains in flight, waited on)",
+  );
+  // The distinguishing behaviour, asserted directly rather than through its consequence: the tick
+  // neither spent a budget unit nor minted a second id over the outstanding read.
+  assert_eq!(
+    budget_for_op_2(&r),
+    Some(RECOVER_READ_RETRIES),
+    "the tick spent budget on an outstanding read — the budget pays for DELIVERED failures only",
+  );
+  assert_eq!(
+    ids_for_op_2(&r),
+    ids_before,
+    "the tick re-submitted over an outstanding read — a second live id for one op",
   );
 
   // The slow op-2 read now completes under its ORIGINAL id — still live, because nothing ever
@@ -5953,6 +5997,33 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   );
 }
 
+/// Fire the recover cadence at its next deadline and report that instant plus whether the endpoint
+/// re-SOLICITED the peer checkpoint on it.
+///
+/// What a deferral rests on. A reply the read fence defers is dropped whole, so it is re-served only
+/// because the recovering replica keeps ASKING — `recover_timeouts` re-broadcasts `RequestSync`
+/// while it awaits a peer, over a cadence `recover_progress` re-arms while any read is pending. The
+/// tests below then model the re-service by re-injecting the reply, which cannot observe the
+/// solicitation itself: without this check a lost re-arm would leave every one of them green while
+/// a real replica wedged waiting on a reply nobody is asking for again.
+fn re_solicits_sync_on_the_cadence<W: Wal, B: Superblock>(
+  e: &mut Endpoint<CountSm>,
+  storage: &mut Storage<W, B, CountSm>,
+) -> (Instant, bool) {
+  while e.poll_message().is_some() {}
+  let deadline = e
+    .poll_timeout()
+    .expect("a recovering replica keeps its cadence armed");
+  e.handle_timeout(deadline, storage);
+  let mut solicited = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::RequestSync(_)) {
+      solicited = true;
+    }
+  }
+  (deadline, solicited)
+}
+
 #[test]
 fn a_peer_sync_checkpoint_defers_while_a_committed_tail_read_is_outstanding() {
   // A peer `SyncCheckpoint` can answer the checkpoint escalation while a committed tail read is
@@ -5964,7 +6035,7 @@ fn a_peer_sync_checkpoint_defers_while_a_committed_tail_read_is_outstanding() {
   // re-solicited reply installs over a settled tail — no empty apply is representable, and the
   // local WAL (not the checkpoint donor) supplies the committed body.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let now = Instant::ZERO;
+  let mut now = Instant::ZERO;
   let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
   let body3 = Bytes::copy_from_slice(b"OP3-REAL-BODY");
   let h2 = Header::new(
@@ -6083,6 +6154,14 @@ fn a_peer_sync_checkpoint_defers_while_a_committed_tail_read_is_outstanding() {
     matches!(e.log.get(&2).map(|entry| &entry.body), Some(Body::Present(b)) if b.is_empty()),
     "op 2 still holds its Phase-1 placeholder; its resolution is owed by the outstanding read",
   );
+  // The replica ASKS again on its own cadence — what makes the deferral cost one round trip rather
+  // than the reply.
+  let (ticked_at, re_solicited) = re_solicits_sync_on_the_cadence(&mut e, &mut storage);
+  assert!(
+    re_solicited,
+    "the cadence tick emitted no RequestSync — a deferred reply would never be re-served",
+  );
+  now = ticked_at;
   // The slow device delivers op 2's read: the committed op's REAL body lands in the recovering log
   // and the tail settles — the local WAL, not the checkpoint donor, supplied the body.
   assert!(storage.wal_mut().release_deferred(OpNumber::with(2)));
@@ -6327,7 +6406,7 @@ fn a_peer_sync_checkpoint_defers_while_an_uncommitted_tail_read_is_outstanding()
   // the outstanding read then delivers the op's real body, and the re-solicited reply installs a
   // tail whose every retained entry is faithfully resolved.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let now = Instant::ZERO;
+  let mut now = Instant::ZERO;
   let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
   let body3 = Bytes::copy_from_slice(b"OP3-REAL-BODY");
   let h2 = Header::new(
@@ -6431,6 +6510,14 @@ fn a_peer_sync_checkpoint_defers_while_an_uncommitted_tail_read_is_outstanding()
     e.block_fetch.is_none() && e.pending_checkpoint.is_none(),
     "nothing was staged over the open read fence",
   );
+  // The replica ASKS again on its own cadence — what makes the deferral cost one round trip rather
+  // than the reply.
+  let (ticked_at, re_solicited) = re_solicits_sync_on_the_cadence(&mut e, &mut storage);
+  assert!(
+    re_solicited,
+    "the cadence tick emitted no RequestSync — a deferred reply would never be re-served",
+  );
+  now = ticked_at;
   // The device delivers op 3's read: the current-generation uncommitted tail op is kept with its
   // real body, and the tail settles.
   assert!(storage.wal_mut().release_deferred(OpNumber::with(3)));
@@ -6500,7 +6587,7 @@ fn a_superseded_above_commit_tail_read_resolves_stale_and_is_never_kept_or_adver
   // to the deferred head decision, which solicits the canonical head instead of advertising the
   // stale one.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let now = Instant::ZERO;
+  let mut now = Instant::ZERO;
   let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
   let stale3 = Bytes::copy_from_slice(b"OP3-STALE-V0");
   let h2 = Header::new(
@@ -6600,6 +6687,14 @@ fn a_superseded_above_commit_tail_read_resolves_stale_and_is_never_kept_or_adver
     e.status().is_recovering() && e.block_fetch.is_none(),
     "the reply deferred: nothing was staged over the open read fence",
   );
+  // The replica ASKS again on its own cadence — what makes the deferral cost one round trip rather
+  // than the reply.
+  let (ticked_at, re_solicited) = re_solicits_sync_on_the_cadence(&mut e, &mut storage);
+  assert!(
+    re_solicited,
+    "the cadence tick emitted no RequestSync — a deferred reply would never be re-served",
+  );
+  now = ticked_at;
   // The device delivers op 3's read: the slot self-verifies but its view is BELOW the durable
   // log_view, so the verdict is StaleCommitted — the abandoned proposal is refused, never kept.
   assert!(storage.wal_mut().release_deferred(OpNumber::with(3)));
@@ -9020,6 +9115,25 @@ fn a_slow_head_read_and_an_owed_checkpoint_read_are_waited_on_together() {
     !r.awaiting_peer_checkpoint_for_test(),
     "the owed checkpoint read spent no budget, so no peer fetch was armed"
   );
+  // Zero spend, read off the budgets themselves rather than inferred from the absence of an
+  // escalation — and no tick re-submitted over either outstanding read.
+  {
+    let rec = r.recover.as_ref().expect("the recovery is open");
+    assert_eq!(
+      rec.pending.get(&3).copied(),
+      Some(RECOVER_READ_RETRIES),
+      "the head op's failure budget was spent on ticks that only observed an outstanding read",
+    );
+    assert_eq!(
+      rec.checkpoint_retries, RECOVER_READ_RETRIES,
+      "the checkpoint read's budget was spent while its completion was still owed",
+    );
+    assert_eq!(
+      rec.reads.values().filter(|&&op| op == 3).count(),
+      1,
+      "a tick minted a second read id over the head's outstanding one",
+    );
+  }
   // The head read delivers its captured healthy bytes while the checkpoint completion is still
   // owed: the head resolves in place, and the recovery keeps waiting on the checkpoint.
   assert!(storage.wal_mut().release_deferred(OpNumber::with(3)));

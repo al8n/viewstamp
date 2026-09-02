@@ -1074,6 +1074,20 @@ impl Cluster {
     self.wals[i].borrow().late_bodies_delivered()
   }
 
+  /// Whether reads of `op`'s slot are DEGRADED on replica `i`'s medium — every read of it answers
+  /// only past [`READ_GIVE_UP_HORIZON`]. `false` with the read-delay axis off.
+  ///
+  /// [`READ_GIVE_UP_HORIZON`]: crate::storage::READ_GIVE_UP_HORIZON
+  ///
+  /// The degraded set is a pure function of (medium seed, op) and has no counterpart in the delivery
+  /// counters, which carry no slot identity. A lane that means to stall a PARTICULAR slot — the
+  /// recovery head, an interior op — asks here rather than stating its intent in a comment: a shift
+  /// in the warm-up, the checkpoint geometry or the client schedule then FAILS the lane instead of
+  /// quietly moving the stall somewhere else and leaving it green.
+  pub fn wal_slot_read_degraded(&self, i: usize, op: u64) -> bool {
+    self.wals[i].borrow().slot_read_degraded(op)
+  }
+
   /// Enables (or, with `None`, disables) **bounded ring mode** on every replica's WAL: each WAL becomes
   /// a fixed RING of `n` slots, so the proto STALLS op-assignment before it would physically
   /// wrap an un-pruned slot (one not yet checkpoint-subsumed on a quorum). Composes with the current

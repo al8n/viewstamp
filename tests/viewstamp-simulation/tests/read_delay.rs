@@ -20,7 +20,7 @@ use core::time::Duration;
 
 use viewstamp_simulation::{
   Cluster,
-  storage::{READ_STALL_FLOOR, RECOVERY_READ_BUDGET},
+  storage::{READ_GIVE_UP_HORIZON, READ_STALL_FLOOR},
 };
 
 /// The read-delay base for these lanes. Per-replica derivation happens inside the cluster, so this is
@@ -51,6 +51,12 @@ struct Cycle {
   normal_at: Option<Duration>,
   /// Virtual time from the restart to the commit frontier first passing `before_commit`.
   resumed_at: Option<Duration>,
+  /// The durable head the restart's recovery window opens at.
+  head: u64,
+  /// Whether reads of that head's slot are DEGRADED on this medium. The delivery counters carry no
+  /// slot identity, so a lane that means to stall the HEAD read reads this rather than describing
+  /// its intent in a comment.
+  head_degraded: bool,
 }
 
 /// Run one solo voter through a crash and restart, with the read-delay axis `armed` or not, and
@@ -70,6 +76,9 @@ fn solo_cycle(seed: u64, armed: bool) -> Cycle {
      durable tail to recover"
   );
   c.crash(0);
+  // The durable head the restart is about to recover over, read before the recovery touches it.
+  let head = c.wal_head_for_test(0);
+  let head_degraded = c.wal_slot_read_degraded(0, head);
   c.restart(0);
   let restart_at = c.now().as_nanos();
   let since_restart = |c: &Cluster| Duration::from_nanos(c.now().as_nanos() - restart_at);
@@ -96,6 +105,8 @@ fn solo_cycle(seed: u64, armed: bool) -> Cycle {
     statuses,
     normal_at,
     resumed_at,
+    head,
+    head_degraded,
   }
 }
 
@@ -121,12 +132,21 @@ fn a_solo_voter_waits_out_slow_interior_reads_and_rejoins_whole() {
     .resumed_at
     .expect("the control run resumes committing");
   assert!(
-    control_resumed < RECOVERY_READ_BUDGET,
-    "the control resumed after {control_resumed:?}, past the whole retry allowance — the fixture \
-     is not measuring what the axis changes"
+    control_resumed < READ_GIVE_UP_HORIZON,
+    "the control resumed after {control_resumed:?}, past the give-up horizon — the fixture is \
+     not measuring what the axis changes"
   );
 
   let armed = solo_cycle(SEED, /*armed*/ true);
+  // What makes this the INTERIOR lane: the head of the window the restart recovers over is NOT one
+  // of the medium's degraded slots, so every stall it waits out sits below the head. The head lane
+  // below asserts the mirror image on its own seed, so neither can drift into the other's shape.
+  assert!(
+    !armed.head_degraded,
+    "seed {SEED}: the recovery head (op {}) is a degraded slot — the stalls are no longer purely \
+     interior and this lane has drifted onto the head",
+    armed.head
+  );
   assert!(
     armed.late_bodies > 0,
     "seed {SEED}: no read outlived the retry allowance with bytes to deliver — the axis is \
@@ -182,6 +202,16 @@ fn a_solo_voters_slow_head_read_never_routes_through_recovering_head() {
   );
 
   let armed = solo_cycle(SEED, /*armed*/ true);
+  // What makes this the HEAD lane rather than the interior one: the slot the medium stalls IS the
+  // head of the window the restart recovers over. The degraded set is a pure function of (medium
+  // seed, op), so a drift in the warm-up, the checkpoint geometry or the client schedule that moved
+  // the stall off the head fails here instead of leaving the lane green over an interior stall.
+  assert!(
+    armed.head_degraded,
+    "seed {SEED}: the recovery head (op {}) is not a degraded slot on this medium — the stall \
+     moved off the head and this lane no longer exercises the head read",
+    armed.head
+  );
   assert!(
     !armed.statuses.iter().any(|s| s == "recovering_head"),
     "seed {SEED}: the restart entered RecoveringHead (statuses {:?}) — a merely-slow head read \
@@ -200,9 +230,9 @@ fn a_solo_voters_slow_head_read_never_routes_through_recovering_head() {
   );
   let normal_at = armed.normal_at.expect("the armed run reaches Normal");
   assert!(
-    normal_at > RECOVERY_READ_BUDGET,
-    "seed {SEED}: recovery finished after {normal_at:?}, inside the {RECOVERY_READ_BUDGET:?} \
-     retry allowance — the head cannot have been waited out past it"
+    normal_at > READ_GIVE_UP_HORIZON,
+    "seed {SEED}: recovery finished after {normal_at:?}, inside the {READ_GIVE_UP_HORIZON:?} \
+     give-up horizon — the head cannot have been waited out past it"
   );
   assert!(
     armed.after_commit > armed.before_commit,

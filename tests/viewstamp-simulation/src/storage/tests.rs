@@ -1654,8 +1654,8 @@ fn a_degraded_slot_answers_past_the_recovery_read_budget_and_a_healthy_one_well_
   let mut clock = DeviceClock(0);
   let slow = read_latency(&mut w, &mut clock, degraded, 1);
   assert!(
-    slow > RECOVERY_READ_BUDGET,
-    "a degraded slot answered in {slow:?}, inside the {RECOVERY_READ_BUDGET:?} recovery read budget"
+    slow > READ_GIVE_UP_HORIZON,
+    "a degraded slot answered in {slow:?}, inside the {READ_GIVE_UP_HORIZON:?} give-up horizon"
   );
   assert!(
     slow < READ_STALL_FLOOR + READ_STALL_SPAN,
@@ -1664,8 +1664,8 @@ fn a_degraded_slot_answers_past_the_recovery_read_budget_and_a_healthy_one_well_
   );
   let fast = read_latency(&mut w, &mut clock, healthy, 2);
   assert!(
-    fast < RECOVERY_READ_BUDGET,
-    "a healthy slot answered in {fast:?}, outside the {RECOVERY_READ_BUDGET:?} recovery read budget"
+    fast < READ_GIVE_UP_HORIZON,
+    "a healthy slot answered in {fast:?}, outside the {READ_GIVE_UP_HORIZON:?} give-up horizon"
   );
   assert_eq!(
     w.reads_past_budget(),
@@ -1688,7 +1688,7 @@ fn every_read_of_a_degraded_slot_is_late_however_often_it_is_retried() {
   for attempt in 0..9 {
     let latency = read_latency(&mut w, &mut clock, degraded, attempt);
     assert!(
-      latency > RECOVERY_READ_BUDGET,
+      latency > READ_GIVE_UP_HORIZON,
       "retransmission {attempt} of a degraded slot answered in {latency:?}, inside the budget"
     );
   }
@@ -1746,7 +1746,7 @@ fn a_crash_discards_the_reads_in_flight() {
     assert!(w.poll().is_none(), "a discarded read never resurfaces");
   }
   assert_eq!(w.status(OpNumber::with(degraded)), SlotStatus::Clean);
-  assert!(read_latency(&mut w, &mut clock, degraded, 3) > RECOVERY_READ_BUDGET);
+  assert!(read_latency(&mut w, &mut clock, degraded, 3) > READ_GIVE_UP_HORIZON);
 }
 
 #[test]
@@ -1762,6 +1762,6 @@ fn a_held_read_stays_held_while_the_device_clock_stands_still() {
   for _ in 0..1_000 {
     assert!(w.poll().is_none(), "a held read waits on the device clock");
   }
-  w.advance_device_clock(Instant::from_nanos(RECOVERY_READ_BUDGET.as_nanos() as u64));
+  w.advance_device_clock(Instant::from_nanos(READ_GIVE_UP_HORIZON.as_nanos() as u64));
   assert!(matches!(w.poll(), Some(WalDone::ReadOk(_))));
 }
