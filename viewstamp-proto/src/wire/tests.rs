@@ -1299,3 +1299,134 @@ fn golden_byte_vectors() {
     );
   }
 }
+
+/// One `Reply.outcome` arm as raw wire bytes: the `body` arm (field 4) carrying `payload`, or the
+/// `too_large` arm (field 5) carrying an encoded `ReplyTooLarge{len, max}`.
+fn outcome_arm_bytes(field: u8, payload: &[u8]) -> Vec<u8> {
+  let mut out = std::vec![(field << 3) | 2, payload.len() as u8];
+  out.extend_from_slice(payload);
+  out
+}
+
+/// Builds a raw `Message` envelope carrying a `Reply` whose `outcome` arms are exactly `arms`, in
+/// the given order. A compliant encoder emits exactly one; more than one is the shape the decoder
+/// must refuse, whatever the order or repetition.
+fn reply_envelope_with_arms(arms: &[Vec<u8>]) -> Bytes {
+  let mut reply = std::vec![0x08, 0x01]; // view = 1
+  reply.push(0x12); // client, length-delimited
+  reply.push(16);
+  reply.extend_from_slice(&[0u8; 16]);
+  reply.extend_from_slice(&[0x18, 0x01]); // request = 1
+  for arm in arms {
+    reply.extend_from_slice(arm);
+  }
+  // `Message.body`'s `reply` arm is field 4, length-delimited.
+  let mut envelope = std::vec![0x22];
+  envelope.push(reply.len() as u8);
+  envelope.extend_from_slice(&reply);
+  Bytes::from(envelope)
+}
+
+/// The `body` arm carrying a short payload.
+fn body_arm() -> Vec<u8> {
+  outcome_arm_bytes(4, b"ok")
+}
+
+/// The `too_large` arm carrying `ReplyTooLarge { len: 9, max: 8 }`.
+fn too_large_arm() -> Vec<u8> {
+  outcome_arm_bytes(5, &[0x08, 0x09, 0x10, 0x08])
+}
+
+#[test]
+fn a_single_outcome_arm_decodes_in_either_form() {
+  // The control for the rejection tests below: each arm ALONE is a well-formed reply, so a
+  // rejection there is about the repetition and nothing else.
+  let with_body = decode_message(reply_envelope_with_arms(&[body_arm()])).expect("one body arm");
+  assert_eq!(
+    with_body
+      .try_unwrap_reply_ref()
+      .expect("a Reply")
+      .outcome()
+      .as_ok()
+      .map(ReplyBody::as_bytes),
+    Some(&b"ok"[..])
+  );
+  let with_refusal =
+    decode_message(reply_envelope_with_arms(&[too_large_arm()])).expect("one too_large arm");
+  assert_eq!(
+    with_refusal
+      .try_unwrap_reply_ref()
+      .expect("a Reply")
+      .outcome()
+      .as_too_large(),
+    Some(&ReplyTooLarge::new(9, 8))
+  );
+}
+
+#[test]
+fn a_reply_carrying_two_outcome_arms_is_rejected_in_either_order() {
+  // Protobuf's merge rule makes the LAST arm win, so accepting this would let the sender decide —
+  // by field order alone — whether the client sees a committed op's body or its terminal refusal.
+  for (order, arms) in [
+    (
+      "body then too_large",
+      std::vec![body_arm(), too_large_arm()],
+    ),
+    (
+      "too_large then body",
+      std::vec![too_large_arm(), body_arm()],
+    ),
+  ] {
+    assert!(
+      matches!(
+        decode_message(reply_envelope_with_arms(&arms)),
+        Err(CodecError::Malformed {
+          what: "Reply.outcome (repeated)"
+        })
+      ),
+      "a Reply carrying both outcome arms ({order}) must be refused, not resolved by order"
+    );
+  }
+}
+
+#[test]
+fn a_reply_repeating_one_outcome_arm_is_rejected() {
+  // The same rule for a repeated SAME arm: one occurrence, or the frame is not the canonical shape
+  // this build acts on. (A repeated `body` is last-wins; a repeated `too_large` MERGES its fields,
+  // so a second occurrence could rewrite either length.)
+  for (kind, arms) in [
+    ("body", std::vec![body_arm(), body_arm()]),
+    ("too_large", std::vec![too_large_arm(), too_large_arm()]),
+  ] {
+    assert!(
+      matches!(
+        decode_message(reply_envelope_with_arms(&arms)),
+        Err(CodecError::Malformed {
+          what: "Reply.outcome (repeated)"
+        })
+      ),
+      "a Reply repeating its {kind} arm must be refused"
+    );
+  }
+}
+
+#[test]
+fn two_reply_arms_that_merge_into_one_reply_are_counted_together() {
+  // Two `Message.body` reply arms MERGE into a single decoded `Reply`, so a sender could split the
+  // two outcome arms across them and reach the same fork. The scan counts occurrences across every
+  // reply arm the envelope holds, so the split is refused exactly like the adjacent pair.
+  let first = reply_envelope_with_arms(&[body_arm()]);
+  let second = reply_envelope_with_arms(&[too_large_arm()]);
+  let mut split = std::vec::Vec::new();
+  split.extend_from_slice(&first);
+  split.extend_from_slice(&second);
+  assert!(
+    matches!(
+      decode_message(Bytes::from(split)),
+      Err(CodecError::Malformed {
+        what: "Reply.outcome (repeated)"
+      })
+    ),
+    "outcome arms split across two merging reply arms must be refused too"
+  );
+}

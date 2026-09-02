@@ -34,6 +34,15 @@ the SEMANTICS.
   for the same reason: exactly one arm must be present — the reply `body` (an EMPTY body is a
   legitimate result, distinct from an absent outcome) or the `too_large` refusal that replaces a
   reply past the reply bound — and an absent oneof rejects at conversion.
+- **`Reply.outcome` is the one field exempted from the merge rules below: exactly ONE occurrence of
+  field 4 or field 5 is admitted, and a second — a different arm, the same arm again, or the two
+  split across a repeated `Message.body.reply` arm — rejects the frame** (`CodecError::Malformed`,
+  `Reply.outcome (repeated)`), before the envelope is converted. The general rules would make the
+  LAST arm win, which for this field is not redundancy but a semantic fork: the sender could decide
+  by field ORDER alone whether the client observes a committed op's body or its terminal refusal.
+  The check is a single pass over the raw frame's own fields (`src/wire/mod.rs`), since the decoded
+  message has already collapsed the oneof. An independent implementation MUST reject the same
+  frames; a frame it cannot walk under the proto3 wire grammar is likewise rejected.
 - Duplicate fields follow protobuf merge semantics precisely: duplicate singular SCALAR fields are
   last-wins; duplicate singular EMBEDDED-MESSAGE fields MERGE their field sets; a `oneof`
   re-occurrence of the SAME message-typed variant (e.g. two `PreparedEntry.reconfigure` arms in
