@@ -48,6 +48,10 @@
 //! and a materialize can still be running when a view transition abandons it), and
 //! [`vopr_block_fault_sweep_no_violations`] fails durability barriers and faults reconstruct reads,
 //! under the standing oracle that no durable checkpoint root ever names an un-flushed block. A
+//! committed READ-DELAY sweep ([`vopr_read_delay_sweep_no_violations`]) gives WAL reads a latency, so
+//! a recovery read can still be outstanding when its op's retransmission budget runs out — the state
+//! the endpoint's carried-correlation lane exists for, and one a WAL that answers inline can never
+//! produce. A
 //! committed CROSSED sweep ([`vopr_swap_root_rebuild_sweep_no_violations`]) runs the
 //! live-reconfiguration axis and the in-place endpoint rebuild TOGETHER, which no single-axis lane
 //! does, and TARGETS the one window where they meet: a rebuild taken while a committed
@@ -179,10 +183,11 @@
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
   run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
-  run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live,
-  run_vopr_with_restart_in_place, run_vopr_with_sb_reorder, run_vopr_with_slow,
-  run_vopr_with_stale_read, run_vopr_with_swap_root_rebuild, run_vopr_with_torn_headers,
-  run_vopr_with_wipe, run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
+  run_vopr_with_learners, run_vopr_with_read_delay, run_vopr_with_reconfig,
+  run_vopr_with_reconfig_live, run_vopr_with_restart_in_place, run_vopr_with_sb_reorder,
+  run_vopr_with_slow, run_vopr_with_stale_read, run_vopr_with_swap_root_rebuild,
+  run_vopr_with_torn_headers, run_vopr_with_wipe, run_vopr_with_wipe_learners,
+  run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -1143,6 +1148,129 @@ fn vopr_block_delay_sweep_no_violations() {
     "VOPR block-delay sweep OK: delayed={total_delayed} outstanding_ticks={total_outstanding_ticks} \
      commits_while_outstanding={total_commits} heartbeats_while_outstanding={total_heartbeats} \
      materializes_superseded={total_superseded} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed WAL READ-DELAY sweep (same budget rationale as
+/// [`HOLD_SEEDS`]: this lane is ADDITIVE to the default sweep, and every replica's WAL answers its
+/// reads with a latency for the whole run).
+const READ_DELAY_SEEDS: u64 = 16;
+
+/// The committed WAL READ-DELAY sweep: [`run_vopr_with_read_delay`] over `0..READ_DELAY_SEEDS` — the
+/// axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var, so it cannot
+/// race other tests in this process and cannot be forgotten by a runner).
+///
+/// Every other lane's WAL resolves a read in the call that submitted it. That makes a LATE read
+/// structurally impossible: a recovery read can never still be outstanding when its op's
+/// retransmission budget runs out, so an op never resolves from its durable header with a live
+/// correlation, and everything an endpoint does with a completion arriving after that point — the
+/// carried-correlation lane, its placement/identity gates, its current-durability witness, its
+/// `RepairFill` append barrier, and the promoted head's restore — sits unreachable at every seed of
+/// every sweep. This lane gives reads a latency: most slots answer within a fraction of the recover
+/// cadence, and a seeded minority are DEGRADED and answer only past the whole budget — for EVERY read
+/// of them, which is what an op needs to reach its resolution with all nine correlations live.
+///
+/// The EXISTING oracles judge the outcome every tick — committed-loss (durability),
+/// applied-divergence (agreement), append-before-ack, durable-view, boundedness, plus the
+/// liveness/final-quiesce gates — so a panic here is a REAL finding in the late-read lane, reported
+/// with its seed, never masked. The DEFAULT sweep leaves this axis OFF (a latency is a schedule
+/// change, so enabling it would move every pinned seed); delay-enabled runs are their own
+/// deterministic baselines, byte-identical to `VOPR_READ_DELAY=1` runs of the same seeds.
+///
+/// What this lane can assert cross-seed is that the medium genuinely REACHED the state — reads
+/// outliving the budget, with bytes to deliver. That an endpoint then CONSUMED one on its carried
+/// correlation is proved causally instead, by the deterministic `read_delay.rs` lanes: a SOLO voter,
+/// which has no peer to solicit, no donor to sync from, and no escalation available to a
+/// single-voter cluster, is left holding a header-only hole (and, on the head, an unidentifiable
+/// slot) that nothing in the system but its own late read can answer — and it resumes committing,
+/// hundreds of milliseconds after its recovery finished.
+#[test]
+fn vopr_read_delay_sweep_no_violations() {
+  let seeds = axis_sweep_seed_count(READ_DELAY_SEEDS);
+  let mut total_delayed = 0u64;
+  let mut total_drawn = 0u64;
+  let mut total_past_budget = 0u64;
+  let mut total_late_bodies = 0u64;
+  let mut total_discarded = 0u64;
+  let mut seeds_past_budget = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR read-delay sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, read-delay axis \
+     forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_read_delay(seed, DEFAULT_TICKS);
+    total_delayed += r.wal_reads_delayed();
+    total_drawn += r.wal_read_stalls_drawn();
+    total_past_budget += r.wal_reads_past_budget();
+    total_late_bodies += r.wal_late_bodies_delivered();
+    total_discarded += r.wal_reads_discarded();
+    if r.wal_reads_past_budget() > 0 {
+      seeds_past_budget += 1;
+    }
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+    println!(
+      "  seed {seed}: delayed={} drawn={} delivered={} bodies={} discarded={} committed={} \
+       max_view={}",
+      r.wal_reads_delayed(),
+      r.wal_read_stalls_drawn(),
+      r.wal_reads_past_budget(),
+      r.wal_late_bodies_delivered(),
+      r.wal_reads_discarded(),
+      r.max_committed(),
+      r.max_view()
+    );
+  }
+  // Non-vacuity, first half: the axis must genuinely give reads a latency, otherwise it has silently
+  // decayed into the inline default and every witness below is measuring an ordinary run.
+  assert!(
+    total_delayed > 0,
+    "the read-delay axis never delayed a read across the sweep (wal_reads_delayed={total_delayed}) \
+     — the plan is not plumbed through to the media"
+  );
+  // Non-vacuity, second half — the one that matters. A read that OUTLIVES the recovery read budget is
+  // the whole point: it is necessarily still outstanding when its op resolves from its durable
+  // header, so the resolution carries a live correlation into online repair. A sweep where every
+  // delay stayed inside the budget would exercise nothing the synchronous default does not.
+  assert!(
+    total_drawn > 0,
+    "the axis never drew a beyond-budget stall across the sweep \
+     (wal_read_stalls_drawn={total_drawn}) — no recovery ever read a degraded slot, so the budget \
+     was never at risk of running out under a live read"
+  );
+  assert!(
+    total_past_budget > 0,
+    "no read outlived the recovery read budget across the sweep \
+     (wal_read_stalls_drawn={total_drawn}, wal_reads_past_budget={total_past_budget}, \
+     wal_reads_discarded={total_discarded}) — every op still resolved off a read that beat its own \
+     budget, so the carried-correlation lane was never reached"
+  );
+  // And they must carry BYTES: a beyond-budget fault or absent verdict merely spends its correlation,
+  // while only a `ReadOk` can be admitted as a hole's canonical body.
+  assert!(
+    total_late_bodies > 0,
+    "every beyond-budget read delivered a fault or absent verdict \
+     (wal_late_bodies_delivered={total_late_bodies}) — no canonical body ever arrived late, so the \
+     admission gates the lane exists for were never offered anything"
+  );
+  assert!(
+    total_committed > 0,
+    "the read-delay sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no read-delay seed drove a view change — a hole re-identified by a transition since its read \
+     was submitted (the case the identity gate refuses) never arose"
+  );
+  println!(
+    "VOPR read-delay sweep OK: delayed={total_delayed} drawn={total_drawn} \
+     delivered={total_past_budget} bodies={total_late_bodies} discarded={total_discarded} \
+     seeds_delivering={seeds_past_budget}/{seeds} committed={total_committed} \
      view_change_seeds={seeds_with_view_change}"
   );
 }

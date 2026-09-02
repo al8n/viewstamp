@@ -1576,3 +1576,192 @@ fn a_truncated_slot_has_no_holder_for_a_late_landing_to_be_stale_against() {
   assert_eq!(w.stale_landings_fired(), 0);
   assert!(w.take_stale_landing().is_none());
 }
+
+/// The read-delay seed used by the fixtures below. Any seed works — they drive the device clock
+/// directly and assert on the BAND each verdict lands in, not on a particular draw.
+const READ_DELAY_SEED: u64 = 0xD0DE_1A17_5EED_0001;
+
+/// The first op whose slot is DEGRADED under [`READ_DELAY_SEED`], and the first that is not. Read off
+/// the same pure verdict the WAL uses, so the fixtures name real slots of the seeded medium rather
+/// than hard-coding numbers that a mixer change would silently invalidate.
+fn degraded_and_healthy_ops(seed: u64) -> (u64, u64) {
+  let degraded = (1..10_000)
+    .find(|&op| InMemoryWal::slot_degraded(seed, op))
+    .expect("some slot in the first ten thousand is degraded");
+  let healthy = (1..10_000)
+    .find(|&op| !InMemoryWal::slot_degraded(seed, op))
+    .expect("some slot in the first ten thousand is healthy");
+  (degraded, healthy)
+}
+
+/// A virtual clock cursor in milliseconds, carried across the reads of one fixture: the device clock
+/// is monotone, so each read's latency must be measured from where the previous one left it.
+struct DeviceClock(u64);
+
+impl DeviceClock {
+  /// Advance the medium's clock to this cursor.
+  fn feed(&self, w: &mut InMemoryWal) {
+    w.advance_device_clock(Instant::from_nanos(self.0 * 1_000_000));
+  }
+}
+
+/// Append `op` durably, submit a read of it, and return how long the completion took — driving the
+/// device clock forward one millisecond at a time from where `clock` stands, so the measured latency
+/// is the drawn one to within a millisecond.
+fn read_latency(w: &mut InMemoryWal, clock: &mut DeviceClock, op: u64, seq: u64) -> Duration {
+  clock.feed(w);
+  submit(w, seq, op, b"body");
+  while w.poll().is_some() {}
+  w.submit_read(read_id(seq + 1_000), OpNumber::with(op));
+  let submitted_at = clock.0;
+  for _ in 0..10_000u64 {
+    clock.0 += 1;
+    clock.feed(w);
+    if w.poll().is_some() {
+      return Duration::from_millis(clock.0 - submitted_at);
+    }
+  }
+  panic!("the read of op {op} never completed within ten virtual seconds");
+}
+
+#[test]
+fn reads_resolve_inline_with_no_read_delay_plan() {
+  // The default: a read's completion is queued in the call that submitted it, so it is available to
+  // the very next poll with no clock ever advancing. This is the property every existing gate rests
+  // on, and the reason an off-axis schedule cannot move.
+  let mut w = InMemoryWal::new();
+  submit(&mut w, 1, 1, b"x");
+  assert_eq!(w.poll(), Some(WalDone::Appended(write_id(1))));
+  w.submit_read(read_id(2), OpNumber::with(1));
+  assert!(
+    matches!(w.poll(), Some(WalDone::ReadOk(_))),
+    "a read resolves inline without the axis"
+  );
+  assert_eq!(w.reads_delayed(), 0);
+  assert_eq!(w.reads_past_budget(), 0);
+  assert_eq!(w.late_bodies_delivered(), 0);
+}
+
+#[test]
+fn a_degraded_slot_answers_past_the_recovery_read_budget_and_a_healthy_one_well_inside_it() {
+  // The band the whole axis rests on: a degraded slot cannot answer inside the proto's recovery read
+  // budget, so every additive retransmission of its op is outstanding when the op resolves from its
+  // durable header — while a healthy slot always answers inside it, keeping the ordinary in-budget
+  // read path exercised alongside.
+  let (degraded, healthy) = degraded_and_healthy_ops(READ_DELAY_SEED);
+  let mut w = InMemoryWal::new();
+  w.set_read_delay(Some(READ_DELAY_SEED));
+  let mut clock = DeviceClock(0);
+  let slow = read_latency(&mut w, &mut clock, degraded, 1);
+  assert!(
+    slow > RECOVERY_READ_BUDGET,
+    "a degraded slot answered in {slow:?}, inside the {RECOVERY_READ_BUDGET:?} recovery read budget"
+  );
+  assert!(
+    slow < READ_STALL_FLOOR + READ_STALL_SPAN,
+    "a degraded slot answered in {slow:?}, past the top of its band — a stall that outlives the \
+     convergence drain would wedge an armed seed rather than make it late"
+  );
+  let fast = read_latency(&mut w, &mut clock, healthy, 2);
+  assert!(
+    fast < RECOVERY_READ_BUDGET,
+    "a healthy slot answered in {fast:?}, outside the {RECOVERY_READ_BUDGET:?} recovery read budget"
+  );
+  assert_eq!(
+    w.reads_past_budget(),
+    1,
+    "exactly the degraded read was late"
+  );
+  assert_eq!(w.late_bodies_delivered(), 1, "and it delivered bytes");
+}
+
+#[test]
+fn every_read_of_a_degraded_slot_is_late_however_often_it_is_retried() {
+  // The additive retransmissions share the op, so an op whose degradation was re-rolled per attempt
+  // would be resolved by the first attempt that drew a healthy latency and could never reach its
+  // budget with a live correlation. The verdict is a pure function of (seed, op) precisely so that
+  // cannot happen.
+  let (degraded, _) = degraded_and_healthy_ops(READ_DELAY_SEED);
+  let mut w = InMemoryWal::new();
+  w.set_read_delay(Some(READ_DELAY_SEED));
+  let mut clock = DeviceClock(0);
+  for attempt in 0..9 {
+    let latency = read_latency(&mut w, &mut clock, degraded, attempt);
+    assert!(
+      latency > RECOVERY_READ_BUDGET,
+      "retransmission {attempt} of a degraded slot answered in {latency:?}, inside the budget"
+    );
+  }
+  assert_eq!(w.reads_past_budget(), 9);
+}
+
+#[test]
+fn a_held_read_resolves_exactly_once_even_over_a_truncated_slot() {
+  // A delay is a latency model, never a drop: the trait owes every submitted read exactly one
+  // completion, and `truncate`/`prune` report cancelled WRITES only. So a read still in flight when
+  // its slot is trimmed away still delivers the bytes it captured — which is precisely the
+  // "captured before a later write mutated the slot" case an endpoint's carried-body durability
+  // witness exists to judge — and delivers them once.
+  let (degraded, _) = degraded_and_healthy_ops(READ_DELAY_SEED);
+  let mut w = InMemoryWal::new();
+  w.set_read_delay(Some(READ_DELAY_SEED));
+  submit(&mut w, 1, degraded, b"body");
+  while w.poll().is_some() {}
+  w.submit_read(read_id(2), OpNumber::with(degraded));
+  assert!(w.poll().is_none(), "the read is held, not resolved inline");
+  assert!(
+    w.truncate(OpNumber::with(degraded - 1)).is_empty(),
+    "a truncate cancels writes, and there is none in flight"
+  );
+  let mut delivered = 0;
+  for ms in 0..10_000u64 {
+    w.advance_device_clock(Instant::from_nanos(ms * 1_000_000));
+    while let Some(done) = w.poll() {
+      assert!(
+        matches!(done, WalDone::ReadOk(_)),
+        "the trimmed slot's read still delivers the bytes it captured, got {done:?}"
+      );
+      delivered += 1;
+    }
+  }
+  assert_eq!(delivered, 1, "exactly one completion, however long it took");
+}
+
+#[test]
+fn a_crash_discards_the_reads_in_flight() {
+  // In-flight reads are device work the process death takes with it, and the session that submitted
+  // them dies too — a crash opens a fresh one over the surviving media, so nothing is owed those
+  // completions any more. The durable log is untouched, and a later read of the same slot is served.
+  let (degraded, _) = degraded_and_healthy_ops(READ_DELAY_SEED);
+  let mut w = InMemoryWal::new();
+  w.set_read_delay(Some(READ_DELAY_SEED));
+  submit(&mut w, 1, degraded, b"body");
+  while w.poll().is_some() {}
+  w.submit_read(read_id(2), OpNumber::with(degraded));
+  w.discard_inflight();
+  let mut clock = DeviceClock(0);
+  for _ in 0..10_000u64 {
+    clock.0 += 1;
+    clock.feed(&mut w);
+    assert!(w.poll().is_none(), "a discarded read never resurfaces");
+  }
+  assert_eq!(w.status(OpNumber::with(degraded)), SlotStatus::Clean);
+  assert!(read_latency(&mut w, &mut clock, degraded, 3) > RECOVERY_READ_BUDGET);
+}
+
+#[test]
+fn a_held_read_stays_held_while_the_device_clock_stands_still() {
+  // The due instants are stated against the device's own clock, so a medium nobody advances holds
+  // its reads indefinitely — the requirement `set_read_delay` states on its harness.
+  let (_, healthy) = degraded_and_healthy_ops(READ_DELAY_SEED);
+  let mut w = InMemoryWal::new();
+  w.set_read_delay(Some(READ_DELAY_SEED));
+  submit(&mut w, 1, healthy, b"body");
+  while w.poll().is_some() {}
+  w.submit_read(read_id(2), OpNumber::with(healthy));
+  for _ in 0..1_000 {
+    assert!(w.poll().is_none(), "a held read waits on the device clock");
+  }
+  w.advance_device_clock(Instant::from_nanos(RECOVERY_READ_BUDGET.as_nanos() as u64));
+  assert!(matches!(w.poll(), Some(WalDone::ReadOk(_))));
+}
