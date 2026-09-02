@@ -262,6 +262,23 @@ impl Bridge {
     e.class_mut(class).outbound.extend(bytes.iter().copied());
   }
 
+  /// Write raw bytes onto `sid`'s send half from THIS bridge, bypassing the class staging — the
+  /// test-only way to play a peer that writes into the recv half of a stream the other side opened.
+  fn test_write_raw(
+    &mut self,
+    h: ConnectionHandle,
+    sid: StreamId,
+    bytes: &[u8],
+  ) -> Result<usize, WriteError> {
+    let e = self.table.entry(h).expect("entry for a raw write");
+    e.conn.send_stream(sid).write(bytes)
+  }
+
+  /// The Control/Bulk send stream id this bridge opened for `h`, if any.
+  fn test_send_id(&mut self, h: ConnectionHandle, class: StreamClass) -> Option<StreamId> {
+    self.table.entry(h)?.class_mut(class).send
+  }
+
   /// Accept the first peer-opened bidi stream on the first handshook
   /// connection and read all available bytes. Returns `None` if no stream is
   /// pending yet (test-only).
@@ -1099,7 +1116,7 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
 /// A sender whose segmentation is not packet-filling reaches the ceiling on far fewer bytes, and no
 /// window prevents that;
 /// `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` covers that
-/// shape, and `quic::loopback::a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_operation`
+/// shape, and `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
 /// the recovery it gets.
 #[test]
 fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
@@ -1246,7 +1263,7 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
 /// is unbound so nothing is written into a dead connection. Whether the cluster then RECOVERS — both
 /// ends reaping, the link re-established, the in-flight operation completing — is a property of the
 /// coordinator, the consensus layer and the driver's link reconcile, and is proved end to end over
-/// real mTLS by `quic::loopback::a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_operation`.
+/// real mTLS by `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`.
 /// Asserting it here would mean building that state by hand instead of reaching it.
 ///
 /// The flood stages already-framed bytes and flushes them through the production `flush_outbound`
@@ -1348,6 +1365,90 @@ fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_strea
     flooded < MAX_STREAM_RECEIVE_WINDOW,
     "and it must do so on less than a window ({MAX_STREAM_RECEIVE_WINDOW} B) of stream bytes — \
      {flooded} B — since a window that admitted this would have to be smaller than any usable one"
+  );
+}
+
+/// The recv half of a stream WE opened is bounded by flow control and retained by nothing.
+///
+/// Each class opens a BIDI stream and uses only its send half — the peer's frames arrive on the
+/// streams IT opened — so the recv half is never read. A valid-cert peer may still write into it.
+/// What that costs is one `stream_receive_window` per unused half: quinn buffers up to the window
+/// and then the peer is flow-control blocked forever, since nothing ever reads to release credit.
+/// The bridge itself retains none of it — those bytes are not the class's adopted recv stream, so
+/// they never reach the class decoder.
+///
+/// The inbound bound counts these halves for exactly that reason. Refusing them outright with
+/// `STOP_SENDING` would be better, but sending it for a bidi stream the peer has not allocated
+/// underflows `allocated_remote_count` in quinn 0.11.17 (`connection/streams/state.rs`
+/// `stream_freed`), which would corrupt the peer's `MAX_STREAMS` accounting in a release build.
+#[test]
+fn a_peer_writing_into_our_opened_streams_recv_half_is_window_bounded_and_retained_nowhere() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B writes into the OTHER direction of that same bidi stream — the half A never reads — until
+  // flow control refuses more.
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let payload = std::vec![0x5Cu8; 64 * 1024];
+  let mut written = 0usize;
+  let mut blocked = false;
+  for k in 1..2_000u64 {
+    let tick = now + Duration::from_millis(k);
+    match b.test_write_raw(hb, victim, &payload) {
+      Ok(n) => written += n,
+      Err(WriteError::Blocked) => blocked = true,
+      Err(e) => panic!("the unused half must only ever block, got {e:?}"),
+    }
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+    if blocked && written > 0 {
+      break;
+    }
+  }
+  assert!(
+    blocked,
+    "the unused half must run out of flow-control window and STAY blocked — nothing reads it, so \
+     no credit is ever regranted; wrote {written} B"
+  );
+  assert!(
+    written as u64 <= MAX_STREAM_RECEIVE_WINDOW,
+    "and what it absorbs before blocking is one window, not more: {written} B"
+  );
+  // The bridge retains none of it: those bytes are not the class's adopted recv stream.
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "the unused half's bytes must not reach the class decoder"
+  );
+  assert!(
+    a.next_frame(ha, StreamClass::Control).is_none(),
+    "and must not surface as a frame"
   );
 }
 

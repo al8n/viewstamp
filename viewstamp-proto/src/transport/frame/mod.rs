@@ -71,6 +71,16 @@ const RETAINED_PARTIAL_CAP: usize = STAGE_CHUNK;
 /// comfortably holds the handful of frames a steady pass delivers.
 const RETAINED_READY_CAP: usize = 64;
 
+/// Consecutive drains to empty — each one staying inside [`RETAINED_READY_CAP`] — before the ready
+/// queue gives its high-water slots back.
+///
+/// Without the hysteresis, every pass that queues more than the retained capacity would be followed
+/// by a shrink on the next drain, so a peer sending steady bursts would drive a grow/shrink pair per
+/// receive pass: allocator work on the consensus loop, for nothing. Any burst past the retained
+/// capacity restarts the count, so a bursty workload keeps its high-water allocation and only a
+/// genuinely quiet stretch releases it.
+const READY_SHRINK_AFTER_IDLE_DRAINS: u32 = 32;
+
 /// Appends `[u32 len][payload]` to `out`.
 #[cfg_attr(not(tarpaulin), inline)]
 pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
@@ -90,6 +100,9 @@ pub struct FrameDecoder {
   partial: Vec<u8>,
   ready: VecDeque<Vec<u8>>,
   max: u32,
+  /// Drains to empty since the queue last exceeded [`RETAINED_READY_CAP`] — the hysteresis that
+  /// keeps a bursty peer from driving a grow/shrink pair per receive pass.
+  idle_drains: u32,
 }
 
 impl FrameDecoder {
@@ -100,6 +113,7 @@ impl FrameDecoder {
       partial: Vec::new(),
       ready: VecDeque::new(),
       max,
+      idle_drains: 0,
     }
   }
 
@@ -137,7 +151,7 @@ impl FrameDecoder {
       bytes = &bytes[take..];
       if self.partial.len() == total {
         let frame = self.take_completed_frame(total);
-        self.ready.push_back(frame);
+        self.push_ready(frame);
       } else {
         break;
       }
@@ -216,7 +230,7 @@ impl FrameDecoder {
         break;
       }
       let frame = self.take_completed_frame(total);
-      self.ready.push_back(frame);
+      self.push_ready(frame);
     }
     Ok(())
   }
@@ -273,7 +287,7 @@ impl FrameDecoder {
     bytes = &bytes[take..];
     if self.partial.len() == total {
       let frame = self.take_completed_frame(total);
-      self.ready.push_back(frame);
+      self.push_ready(frame);
       // The hello is complete: buffer the pipelined remainder (a peer that already validated us may flush
       // queued consensus Control behind its hello), but gate each tail frame on its length prefix against
       // `MAX_FRAME_LEN` BEFORE retaining its body — the same guard `extend` applies, just under the cap
@@ -338,13 +352,30 @@ impl FrameDecoder {
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn next_frame(&mut self) -> Option<Vec<u8>> {
     let frame = self.ready.pop_front();
-    // Emptying the queue releases the slots a burst grew it to: the capacity is what would otherwise
-    // be retained for the connection's life (see `RETAINED_READY_CAP`). Only on the empty transition,
-    // so draining a burst frame-by-frame does not reallocate per pop.
-    if self.ready.is_empty() && self.ready.capacity() > RETAINED_READY_CAP {
-      self.ready.shrink_to(RETAINED_READY_CAP);
+    // Emptying the queue is what can release the slots a burst grew it to (see
+    // `RETAINED_READY_CAP`), but only after `READY_SHRINK_AFTER_IDLE_DRAINS` quiet drains in a row:
+    // shrinking on every empty transition would pair a grow with a shrink on every receive pass a
+    // peer keeps busy. Counted on the empty transition alone, so draining frame-by-frame costs one
+    // compare per pop.
+    if frame.is_some() && self.ready.is_empty() {
+      self.idle_drains = self.idle_drains.saturating_add(1);
+      if self.idle_drains >= READY_SHRINK_AFTER_IDLE_DRAINS
+        && self.ready.capacity() > RETAINED_READY_CAP
+      {
+        self.ready.shrink_to(RETAINED_READY_CAP);
+        self.idle_drains = 0;
+      }
     }
     frame
+  }
+
+  /// Queue a decoded frame, restarting the shrink hysteresis if the queue has grown past the
+  /// capacity it is willing to carry forward.
+  fn push_ready(&mut self, frame: Vec<u8>) {
+    self.ready.push_back(frame);
+    if self.ready.len() > RETAINED_READY_CAP {
+      self.idle_drains = 0;
+    }
   }
 
   /// Adjusts the per-frame length cap in place, leaving any buffered partial frame and the ready queue

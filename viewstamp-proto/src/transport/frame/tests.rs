@@ -298,7 +298,7 @@ fn extend_first_preserves_a_legitimate_over_hello_cap_tail() {
 /// assembly actually grows to is the one observed.
 #[test]
 fn a_max_sized_frame_retains_no_second_frame_allocation() {
-  let body = vec![0xA5u8; MAX_FRAME_LEN as usize];
+  let body = std::vec![0xA5u8; MAX_FRAME_LEN as usize];
   let mut wire = Vec::new();
   encode_frame(&body, &mut wire);
 
@@ -387,7 +387,7 @@ fn a_burst_of_frames_releases_its_queue_slots_once_drained() {
   }
   dec.extend(&wire).unwrap();
   assert_eq!(
-    dec.ready_len(),
+    dec.ready.len(),
     burst,
     "the whole budget's frames are queued"
   );
@@ -400,9 +400,51 @@ fn a_burst_of_frames_releases_its_queue_slots_once_drained() {
     drained += 1;
   }
   assert_eq!(drained, burst, "every frame is delivered");
+  // A quiet stretch — nothing past the retained capacity — is what releases the slots.
+  let mut small = Vec::new();
+  encode_frame(b"q", &mut small);
+  for _ in 0..READY_SHRINK_AFTER_IDLE_DRAINS {
+    dec.extend(&small).unwrap();
+    assert!(dec.next_frame().is_some());
+  }
   assert!(
     dec.ready.capacity() <= RETAINED_READY_CAP,
-    "and the slots are released once the queue empties, not carried forward: {} slots",
+    "and the slots are released after the quiet stretch, not carried forward: {} slots",
     dec.ready.capacity()
   );
+}
+
+/// Repeated bursts must not pay a grow/shrink pair per pass.
+///
+/// Every receive pass drains the ready queue, so a peer that keeps the queue above the retained
+/// capacity would, under an unconditional shrink-on-empty, make the decoder reallocate twice per
+/// pass — allocator work on the consensus loop whose rate an authenticated peer alone decides. The
+/// hysteresis keeps the high-water allocation while the bursts continue, so after the first burst
+/// warms it the capacity never moves.
+#[test]
+fn repeated_bursts_reuse_one_queue_allocation() {
+  let mut dec = FrameDecoder::new(MAX_FRAME_LEN);
+  let burst = RETAINED_READY_CAP * 4;
+  let mut wire = Vec::new();
+  for _ in 0..burst {
+    encode_frame(b"b", &mut wire);
+  }
+  dec.extend(&wire).unwrap();
+  while dec.next_frame().is_some() {}
+  let warm = dec.ready.capacity();
+  assert!(warm >= burst, "the first burst sized the queue");
+
+  for round in 0..100 {
+    dec.extend(&wire).unwrap();
+    let mut drained = 0usize;
+    while dec.next_frame().is_some() {
+      drained += 1;
+    }
+    assert_eq!(drained, burst, "round {round} delivers its whole burst");
+    assert_eq!(
+      dec.ready.capacity(),
+      warm,
+      "round {round} must reuse the warmed allocation, not grow and shrink it again"
+    );
+  }
 }

@@ -43,33 +43,49 @@
 //! no post-free replay). Dropping `Drained` entirely (the original behaviour) leaked
 //! that endpoint-owned state under reconnect / failed-handshake churn.
 //!
-//! **Inbound memory, per recv stream.** INBOUND ONLY — the send side is separate, below. Two
-//! numbers matter: the PEAK a peer can drive it to, and what stays RETAINED once the traffic passes.
+//! **Inbound memory: an ESTIMATE, not an upper bound.** The figures below are derived from this
+//! implementation and from `quinn-proto` 0.11.17's internals; they are the right order of magnitude
+//! for sizing, and they are NOT a proof. What is enumerated: allocations this crate makes, plus the
+//! ones quinn's reassembler makes that its own constants bound. What is not: allocator overhead and
+//! fragmentation, transient copies inside quinn beyond the one called out, and anything a future
+//! quinn changes — which is part of why the dependency is pinned exactly.
 //!
-//! Peak, with the arithmetic:
+//! Per recv stream, inbound only:
 //!
 //! | | |
 //! |---|---|
 //! | quinn reassembler, payload | `stream_receive_window` = 1 MiB |
-//! | quinn reassembler, allocation ahead of payload — it compacts only once over-allocation passes `max(32 KiB, 1.5 x buffered)` | `1 MiB + max(32 KiB, 1.5 MiB)` = 2.5 MiB |
-//! | quinn span bookkeeping — it holds up to `2 x MAX_CHUNKS` = 2048 spans before compacting, and its heap capacity rounds up | ~4096 x ~48 B = 192 KiB |
+//! | quinn reassembler, allocation ahead of payload — it compacts only once over-allocation passes `max(32 KiB, 1.5 x buffered)` | ~2.5 MiB |
+//! | quinn span bookkeeping — up to `2 x MAX_CHUNKS` = 2048 spans held before a compaction, heap capacity rounding up, `Buffer` at ~56 B | ~4096 x 56 B = 224 KiB |
+//! | quinn compaction, transient — the old heap, its replacement, and the `BytesMut` copy are live together | up to another ~2.5 MiB while it runs |
 //! | read scratch, one pass | [`STAGE_CHUNK`] = 64 KiB |
 //! | decoder, frame being assembled — reserved to its own size, not doubled past it | `LEN_PREFIX + MAX_FRAME_LEN` = 16 MiB |
-//! | decoder, frames one pass completed — the one that was already assembling, plus what a budget can complete | 16 MiB + 64 KiB |
+//! | decoder, frames one pass completed — the one that was already assembling, plus what one budget can complete | 16 MiB + 64 KiB |
 //! | decoder, ready-queue slots — one budget of minimal frames is `STAGE_CHUNK / LEN_PREFIX` = 16384 of them | 16384 x 24 B = 384 KiB |
 //!
-//! That totals under 36 MiB per recv stream, and a connection carries at most two (Control + Bulk).
-//! The last two rows are what one pass can leave queued: `drain_bridge` pops the queue after every
-//! `ingest_recv`, so a second frame-sized buffer does not accumulate behind the first, and the
-//! decoder itself never holds two — a completed frame IS the buffer that assembled it, handed over
-//! rather than copied out of a retained one. Reaching any of this needs a peer actually sending a
-//! maximum-sized frame; [`decoder_max`] holds the frame cap down to the hello size until the
-//! connection validates.
+//! Plus, per CLASS, the recv half of the stream this side OPENED. A class's stream is bidi but only
+//! its send half is ours — the peer's frames arrive on the streams IT opened — so that half is never
+//! read. A peer may still write into it, and what that costs is one more `stream_receive_window`
+//! (1 MiB) plus its reassembler allocation: quinn buffers a window and then the peer is
+//! flow-control blocked for good, because nothing ever reads to release credit. The bridge itself
+//! retains none of it. Refusing it outright with `STOP_SENDING` would be better, but sending that
+//! for a bidi stream the peer has not yet allocated underflows `allocated_remote_count` in
+//! quinn 0.11.17's `stream_freed`, which would corrupt the peer's `MAX_STREAMS` accounting — so it
+//! is accounted for here instead, and pinned by
+//! `a_peer_writing_into_our_opened_streams_recv_half_is_window_bounded_and_retained_nowhere`.
 //!
-//! Retained between frames, which is what a long-lived idle connection costs: the decoder carries
-//! bounded working capacity and nothing frame-sized — the partial buffer is released above the
-//! retained bound as each frame completes, and the ready queue releases its slots as it empties —
-//! while quinn's reassembler keeps its heap allocation for the stream's life.
+//! That is roughly 40 MiB per recv stream at the extreme, and a connection carries at most two
+//! (Control + Bulk). Reaching it needs a peer actually sending a maximum-sized frame; [`decoder_max`]
+//! holds the frame cap down to the hello size until the connection validates. The two frame-sized
+//! decoder rows are what ONE pass can leave: `drain_bridge` pops the ready queue after every
+//! `ingest_recv`, and the decoder never holds two frame-sized buffers itself — a completed frame IS
+//! the buffer that assembled it, handed over rather than copied out of a retained one.
+//!
+//! Retained between frames — what a long-lived idle connection costs — is bounded by code rather
+//! than by estimate: the partial buffer is released above its retained bound as each frame
+//! completes, and the ready queue releases its slots after a quiet stretch (kept through bursts, so
+//! a busy peer cannot drive a grow/shrink pair per pass). quinn's reassembler keeps its heap
+//! allocation for the stream's life.
 //!
 //! **Outbound memory is separate** and separately capped: per class, the staged `outbound` buffer up
 //! to `PER_CLASS_OUTBOUND_CAP` (64 MiB, past which the class resets or the connection is reaped),
@@ -1078,6 +1094,19 @@ impl Bridge {
   /// double-count). Forwarded to the driver through the coordinator's
   /// [`QuicCoordinator::conn_close_count`](super::QuicCoordinator::conn_close_count), mirroring the
   /// stream drivers' per-cause close observability.
+  /// STREAM frames this connection has RECEIVED — quinn's own frame counter, which is one tick per
+  /// span the reassembler was handed. The direct observable for the sender-side segmentation
+  /// contract: a datagram can carry several STREAM frames (retransmit recovery packs disjoint ranges
+  /// into one), so counting datagrams would under-report exactly where it matters.
+  #[cfg(test)]
+  pub(crate) fn rx_stream_frames_total(&mut self) -> u64 {
+    self
+      .table
+      .iter_mut()
+      .map(|(_, e)| e.conn.stats().frame_rx.stream)
+      .sum()
+  }
+
   pub(crate) fn conn_close_count(&self, cause: CloseCause) -> u64 {
     self.close_counts[cause.index()]
   }
