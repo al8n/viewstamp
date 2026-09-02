@@ -192,8 +192,8 @@ impl EpochSwap {
 ///
 /// The shared commit tail (run by [`Endpoint::advance_commit`] / [`Endpoint::try_commit`], and
 /// directly by the quiescent-primary heartbeat) contains one arm —
-/// [`Endpoint::maybe_enter_orphan_repersist_fetch`] — that can tear the whole generation down
-/// into the recovery peer-fetch. A caller that keeps executing after that teardown acts on a
+/// [`Endpoint::maybe_enter_orphan_repersist_recovery`] — that can tear the whole generation down
+/// into the reconciling recovery. A caller that keeps executing after that teardown acts on a
 /// generation that no longer exists: forming a new primary's view would overwrite `Recovering`
 /// with `Normal` and stage a `StartView` for a checkpoint frontier this endpoint never installed.
 /// So the transition is returned as a value every caller must consume and short-circuit on,
@@ -203,13 +203,13 @@ impl EpochSwap {
 pub(crate) enum CommitFlow {
   /// The endpoint is still in the caller's generation — continue.
   Continue,
-  /// The commit tail entered the recovery peer-fetch: the caller's generation is torn down, so
+  /// The commit tail entered the reconciling recovery: the caller's generation is torn down, so
   /// the caller returns without touching status or staging further participation.
   EnteredRecovery,
 }
 
 impl CommitFlow {
-  /// `true` iff the commit tail tore the generation down into the recovery peer-fetch.
+  /// `true` iff the commit tail tore the generation down into the reconciling recovery.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) fn entered_recovery(self) -> bool {
     matches!(self, Self::EnteredRecovery)
@@ -1580,13 +1580,15 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// the staged install, so the state the durable root now names was never installed and no
   /// commit path may ever reach it (the band below the synced point can be pruned cluster-wide).
   ///
-  /// While owed, [`Self::maybe_enter_orphan_repersist_fetch`] flips this endpoint into the
-  /// recovery peer-fetch — reconciliation before further participation — deferring only across
-  /// an in-flight durable-view write or an own-advance window, each of which re-drives it from
-  /// the commit tails or the primary heartbeat. A recovery ALREADY in flight when the debt
-  /// latches satisfies it by doing the work instead: an in-flight peer fetch is retargeted at
-  /// the owed frontier, [`Self::complete_recovery`] refuses every terminal transition while it
-  /// is owed and re-latches the fetch, and the `RecoveringHead` adoption exit enters the fetch
+  /// While owed, [`Self::maybe_enter_orphan_repersist_recovery`] flips this endpoint into the
+  /// reconciling recovery — reconciliation before further participation, restored from the OWN
+  /// medium the landing proved durable, with the peer fetch only as the fault escalation —
+  /// deferring only across an in-flight durable-view write or an own-advance window, each of
+  /// which re-drives it from the commit tails or the primary heartbeat. A recovery ALREADY in
+  /// flight when the debt latches satisfies it by doing the work instead: its local read phase
+  /// verifies against (and so restores) the landed root, an in-flight peer fetch is retargeted
+  /// at the owed frontier, [`Self::complete_recovery`] refuses every terminal transition while
+  /// it is owed and re-arms the reconciliation, and the `RecoveringHead` adoption exit enters it
   /// at its completion — so no recovery can end with the debt behind it. Cleared when
   /// [`Self::advance_checkpoint_op`] reaches the frontier (any reconciling install or restore
   /// satisfies it) or when `commit_min` catches up after all (repair recovered the band; the
@@ -1892,7 +1894,7 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// at the peer-fetch entries, the recovery early-returns) — claims that hold one CALL LAYER
   /// ABOVE the arm, which is why the arm itself stays as a live backstop and why, without this
   /// counter, it fires silently. A non-zero count is information, not corruption (the absorb holds
-  /// the landing's facts and enters the reconciling fetch); the simulation sweeps assert `0` so
+  /// the landing's facts and enters the reconciling recovery); the simulation sweeps assert `0` so
   /// any schedule that reaches the arm surfaces with its seed instead of passing unnoticed. Same
   /// lifecycle as the other observability counters (reset to 0 on `new`/`recover`); exposed only
   /// via `repersist_roots_disowned()`.
@@ -3349,7 +3351,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // exits) because two shields one layer AWAY read the pair as inseparable without re-checking:
     // `advance_quarantine_probe` refuses to disarm — and so to escalate a Recovering node out of a
     // staged re-persist — only because `pending_install.is_some()` stands in for "a root is
-    // staged", and `enter_orphan_repersist_fetch` is deferred on the same reading. Those sites
+    // staged", and `enter_orphan_repersist_recovery` is deferred on the same reading. Those sites
     // enforce; this is the detection that the coupling they lean on holds at every exit.
     debug_assert!(
       !self.sync_repersist_root_staged() || self.pending_install.is_some(),
@@ -6583,7 +6585,7 @@ where
         // generation: the debt-pay and checkpoint cadences below must not run over the teardown.
         self.maybe_adopt_inherited_frontier();
         if !self
-          .maybe_enter_orphan_repersist_fetch(now, storage)
+          .maybe_enter_orphan_repersist_recovery(now, storage)
           .entered_recovery()
         {
           self.maybe_pay_checkpoint_debt(now, storage);
@@ -6711,8 +6713,8 @@ where
     // frontier (`inherited_frontier` — an UNCORRELATED landing advanced the durable pointer past
     // this endpoint's own: a dead incarnation's root across a restart in place, or an own root
     // whose correlation ended without an abandon. The pointer is adopted the moment `commit_min`
-    // reaches it, `maybe_adopt_inherited_frontier`, or delivered by the reconciling fetch an
-    // orphaned re-persist owes, `maybe_enter_orphan_repersist_fetch`).
+    // reaches it, `maybe_adopt_inherited_frontier`, or delivered by the reconciling recovery an
+    // orphaned re-persist owes, `maybe_enter_orphan_repersist_recovery`).
     #[cfg(debug_assertions)]
     if self.pending_checkpoint.is_none()
       && self.sm_reconstruct.is_none()

@@ -1059,6 +1059,31 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
+  /// Arm the LOCAL checkpoint phase of an open recovery: submit a read of the snapshot the
+  /// CURRENT durable root names, latch it outstanding, and seed the ABSOLUTE retry budget —
+  /// exactly the checkpoint-phase seeding cold-start `recover` performs, shared with the
+  /// mid-session reconciliation entries ([`Self::enter_orphan_repersist_recovery`],
+  /// [`Self::complete_recovery`]'s owed-debt refusal). From here the established plumbing owns
+  /// the phase end to end: the completion verifies the bytes against the durable root before
+  /// anything restores ([`Self::on_recover_sb_done`]), `recover_timeouts` re-reads on its
+  /// cadence and escalates to the peer fetch when the budget exhausts (the medium lost what the
+  /// root names — the one case a donor is genuinely required), and a successful reconstruct
+  /// restores the SM/sessions and advances the pointer to the read generation's frontier
+  /// ([`Self::on_recovered_checkpoint_restored`]).
+  pub(crate) fn submit_recover_checkpoint_read<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B, S>,
+  ) {
+    let id = self.mint_read_id();
+    storage.submit_checkpoint_read(id);
+    if let Some(rec) = self.recover.as_mut() {
+      rec.checkpoint = Some(id.seq());
+      rec.checkpoint_retries = RECOVER_READ_RETRIES;
+    }
+    self.arm_timers(now);
+  }
+
   /// Handles a WAL completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). Adopts a
   /// body ONLY after `Header::verify` (the faults-as-data chokepoint: a torn write / bit-rot fails
   /// verify and is treated as a `Fault`). A clean read resolves its op (Verified body, KeepRepairing
@@ -1647,16 +1672,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// just (re-)solicits.
   ///
   /// Three callers, distinguished by `target` + `require_cross_epoch`:
-  /// - the permanently-unreadable own-checkpoint recovery (`target = self.checkpoint_op`,
-  ///   `require_cross_epoch = false`): any peer at/above our corrupt checkpoint subsumes it.
+  /// - the permanently-unreadable own-checkpoint recovery (`recover_timeouts`' budget exhaustion;
+  ///   `target = self.checkpoint_op`, lifted to an owed orphaned-re-persist frontier when one is
+  ///   latched, `require_cross_epoch = false`): any peer at/above the target subsumes what the
+  ///   local medium lost. This is also how the orphaned-re-persist reconciliation
+  ///   ([`Self::maybe_enter_orphan_repersist_recovery`]) reaches a donor — only through its LOCAL
+  ///   read phase faulting out, never directly.
   /// - the cross-epoch crossing fetch ([`Self::enter_cross_epoch_peer_fetch`]) (`target` = the advertised
   ///   cluster checkpoint, `require_cross_epoch = true`): the fetch MUST cross into E+1 — `apply_sync`
   ///   rejects any non-crossing reply (see [`SyncState::require_cross_epoch`]).
-  /// - the orphaned-re-persist reconciliation ([`Self::maybe_enter_orphan_repersist_fetch`])
-  ///   (`target` = the orphaned root's landed frontier, at/above our own checkpoint,
-  ///   `require_cross_epoch = false`): the durable root already names the synced point, so only a
-  ///   reply that subsumes it can install — which `apply_sync`'s timeline admission enforces
-  ///   independently off the effective root.
+  /// - [`Self::complete_recovery`]'s owed-debt refusal on an ALREADY-escalated recovery (`target`
+  ///   = the owed frontier, at/above our own checkpoint, `require_cross_epoch = false`): the
+  ///   durable root already names the synced point, so only a reply that subsumes it can install
+  ///   — which `apply_sync`'s timeline admission enforces independently off the effective root.
   pub(crate) fn escalate_checkpoint_to_peer_fetch(
     &mut self,
     now: Instant,
@@ -1700,11 +1728,33 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///   reply fresh) cannot arm or displace anything.
   ///
   /// Everything else about the handshake is preserved: the nonce (a late reply to the old
-  /// solicitation at/above the new target still admits), the forced assert-relaxation, and a
-  /// crossing requirement (a raise must never weaken it — the stale-crossing downgrade has its
-  /// own trigger machinery). A raise past a pinned chunked transfer invalidates it, exactly as
-  /// the Normal-path target raise does. No-op unless a peer fetch is in flight and the owed
-  /// frontier exceeds its target.
+  /// solicitation at/above the new target still admits), the forced assert-relaxation, and a LIVE
+  /// crossing requirement (a raise must never weaken a crossing that is still owed). A raise past
+  /// a pinned chunked transfer invalidates it, exactly as the Normal-path target raise does.
+  /// No-op unless a peer fetch is in flight and the owed frontier exceeds its target — with one
+  /// exception, below.
+  ///
+  /// # A crossing the landing itself satisfied
+  ///
+  /// The landing that latches the debt ALSO installs any successor configuration its root carries
+  /// (the configuration half of the absorb runs first), and that install retires the persistent
+  /// crossing intent — the same clear the SwapEpoch arm and the sync install perform. A crossing
+  /// fetch that OUTLIVES its intent is therefore one whose goal a landed configuration already
+  /// met: the endpoint now IS at the landed epoch, so every donor of the current configuration
+  /// answers with same-configuration checkpoints that `apply_sync` must reject under
+  /// `require_cross_epoch` (`successor = None`) — forever, because both stale-crossing cleanups
+  /// are scoped OFF this posture at their own layer (`stale_crossing_intent_clearable` requires
+  /// Normal status and excludes `awaiting_peer_checkpoint`, and the trigger-level downgrade runs
+  /// from Normal-only sync triggers). This retarget is the one reconciliation site that observes
+  /// the satisfied crossing while Recovering, so it performs the downgrade: the fetch becomes a
+  /// same-epoch FORCED fetch at the owed frontier itself — discarding a bogus-high crossing hint
+  /// exactly as the trigger-level downgrade does — which the wire (`send_request_sync` advertises
+  /// the non-crossing floor) and the ingress (`on_recover_sync_checkpoint` refuses below-floor
+  /// replies) then enforce. The downgrade fires even when the target does not raise (the hint may
+  /// already sit at/above the frontier), and it clears the quarantine-probe bookkeeping the
+  /// crossing carried (the probe bounds a crossing; none remains). A crossing still genuinely
+  /// owed — a fresh higher-epoch hint above even the landed configuration re-pins the intent
+  /// pre-binding on every message — keeps its requirement untouched.
   pub(crate) fn retarget_recovery_fetch(&mut self, now: Instant, target: OpNumber) {
     if !self.awaiting_peer_checkpoint() {
       return;
@@ -1712,10 +1762,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(s) = self.sync else {
       return;
     };
-    if s.target >= target {
+    let satisfied_crossing = s.require_cross_epoch && self.cross_epoch_intent.is_none();
+    if !satisfied_crossing && s.target >= target {
       return;
     }
-    self.sync = Some(SyncState { target, ..s });
+    self.sync = Some(SyncState {
+      target,
+      require_cross_epoch: s.require_cross_epoch && !satisfied_crossing,
+      ..s
+    });
+    if satisfied_crossing {
+      self.quarantined_donor = None;
+      self.quarantine_probe_deadline = None;
+      self.quarantine_probe_progress_mark = 0;
+    }
     self.drop_transfer_below_forced_target();
     self.send_request_sync(now);
   }
@@ -2146,20 +2206,42 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // still uninstalled: the durable root names state this endpoint does not hold, so NO terminal
     // transition may settle over it — not a Normal resume, not a view-change re-drive, not an
     // abdication (each is participation over a superseded pointer). Refuse the completion and
-    // turn the recovery INTO the reconciliation: keep `Recovering` and re-latch the peer fetch
-    // at/above the owed frontier. The install that satisfies it advances the pointer through the
-    // single pointer-advance choke — which retires the latch — and its completion re-runs this
-    // decision with nothing owed. This is what backs the fetch guard's deferral while already
+    // turn the recovery INTO the reconciliation: keep `Recovering` and read the landed
+    // checkpoint back from this endpoint's OWN medium (the landing is the durability proof —
+    // content lands before the root that names it), escalating to the peer fetch only through
+    // the read budget, exactly as the settle-site entry does. The recovery that just finished
+    // read an OLDER durable generation (its own reads settled at the pre-landing root); the
+    // fresh read serves the landed one. The restore advances the pointer through the single
+    // pointer-advance choke — which retires the latch — and its completion re-runs this decision
+    // with nothing owed. This is what backs the reconciliation guard's deferral while already
     // Recovering: the debt is met by the recovery doing the work, never by the status alone.
     if let Some(owed) = self.repersist_orphan_owed() {
       // Defensive: the refusal normally finds the read-phase `RecoverState` still latched (the
       // staged-install path retires it, but its install also retires the debt before reaching
-      // here). Re-latch a fresh one so the awaiting-peer gate and its ingress hold.
+      // here). Re-latch a fresh one so the recovery gates and their ingress hold.
       if self.recover.is_none() {
         self.recover = Some(RecoverState::default());
       }
-      let target = OpNumber::with(owed.get().max(self.checkpoint_op.get()));
-      self.escalate_checkpoint_to_peer_fetch(now, target, false);
+      let (reading, escalated) = self.recover.as_ref().map_or((false, false), |rec| {
+        (
+          rec.checkpoint.is_some() || rec.reconstruct.is_some() || rec.probe_deferred.is_some(),
+          rec.awaiting_peer_checkpoint,
+        )
+      });
+      if escalated {
+        // The local read phase already exhausted its budget (or the recovery was a peer fetch
+        // from the start): only a donor can supply the frontier now — keep soliciting, with the
+        // wire target lifted to the owed frontier so a donor below it stays silent instead of
+        // drawing replies the timeline admission refuses.
+        let target = OpNumber::with(owed.get().max(self.checkpoint_op.get()));
+        self.escalate_checkpoint_to_peer_fetch(now, target, false);
+      } else if reading {
+        // A local read/reconstruct is already in flight — completing or retrying on the recover
+        // cadence; arming a second would only duplicate a verified result.
+        self.arm_timers(now);
+      } else {
+        self.submit_recover_checkpoint_read(now, storage);
+      }
       return;
     }
     // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
@@ -2391,7 +2473,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       if checkpoint_retries == 0 {
         // Permanently-unreadable OWN checkpoint: any peer at/above it subsumes ours — NOT a cross-epoch
         // crossing (no epoch target to pin), so target our own `checkpoint_op` with the requirement off.
-        self.escalate_checkpoint_to_peer_fetch(now, self.checkpoint_op, false);
+        // An owed orphaned-re-persist frontier lifts the target: the read that just exhausted was
+        // serving the LANDED root's generation (at/above the owed frontier), so the pointer alone
+        // under-states what a donor must supply — a donor below the frontier would answer with a
+        // reply the timeline admission then refuses, soliciting forever.
+        let target = match self.repersist_orphan_owed() {
+          Some(owed) => OpNumber::with(owed.get().max(self.checkpoint_op.get())),
+          None => self.checkpoint_op,
+        };
+        self.escalate_checkpoint_to_peer_fetch(now, target, false);
       } else {
         let new_id = self.mint_read_id();
         if let Some(rec) = self.recover.as_mut() {
@@ -3136,10 +3226,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
     // An owed orphaned-re-persist reconciliation withholds the answer: handing out a canonical
     // head is participation, and the uncorrelated landing that latched the debt also absorbed a
-    // commit frontier that can exceed the held head while the fetch is deferred behind an
-    // own-advance arc — a StartView built then would carry `commit > op` straight into the
+    // commit frontier that can exceed the held head while the reconciliation is deferred behind
+    // an own-advance arc — a StartView built then would carry `commit > op` straight into the
     // adopter's fail-stop. The requester's timer re-solicits; the debt clears through the arc it
-    // deferred to (or the next commit tail's fetch), after which the answer resumes.
+    // deferred to (or the next commit tail's reconciliation), after which the answer resumes.
     if self.repersist_orphan_owed().is_some() {
       return;
     }
@@ -3206,9 +3296,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // An owed orphaned-re-persist reconciliation withholds the whole answer, exactly as
     // `on_get_view` withholds its StartView: answering is participation, and the landing that
     // latched the debt also absorbed a commit frontier that can exceed the held head while the
-    // fetch is deferred behind an own-advance arc — the primary's `(op, commit)` head would then
-    // fail-stop its adopter at the `commit <= op` guard. The requester's `recover_head` timer
-    // re-solicits; the answer resumes once the debt clears.
+    // reconciliation is deferred behind an own-advance arc — the primary's `(op, commit)` head
+    // would then fail-stop its adopter at the `commit <= op` guard. The requester's
+    // `recover_head` timer re-solicits; the answer resumes once the debt clears.
     if self.repersist_orphan_owed().is_some() {
       return;
     }

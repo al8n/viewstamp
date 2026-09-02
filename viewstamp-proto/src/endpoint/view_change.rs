@@ -1281,15 +1281,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Reconcile an owed orphaned-re-persist debt BEFORE building the StartView. The debt can latch
     // in exactly this write's flight window: an uncorrelated checkpoint-role landing absorbs its
-    // frontier into `commit_max` and records the owed reconciliation, and the fetch guard defers to
-    // this completion arm (a durable-view write is never torn down mid-flight). Entering the fetch
-    // ends this generation, so it must run before any participation is staged — deferring it to the
-    // commit tail below would broadcast first and reconcile after, with the prohibited participation
-    // already on the wire. Adopt-then-check mirrors the commit tails: a frontier the applied prefix
-    // already covers is adopted in place and retires the debt instead of fetching.
+    // frontier into `commit_max` and records the owed reconciliation, and the reconciliation guard
+    // defers to this completion arm (a durable-view write is never torn down mid-flight). Entering
+    // the reconciling recovery ends this generation, so it must run before any participation is
+    // staged — deferring it to the commit tail below would broadcast first and reconcile after,
+    // with the prohibited participation already on the wire. Adopt-then-check mirrors the commit
+    // tails: a frontier the applied prefix already covers is adopted in place and retires the debt
+    // instead of tearing the generation down.
     self.maybe_adopt_inherited_frontier();
     if self
-      .maybe_enter_orphan_repersist_fetch(now, storage)
+      .maybe_enter_orphan_repersist_recovery(now, storage)
       .entered_recovery()
     {
       return;
@@ -1306,7 +1307,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (`commit_max` above `op`), so a StartView built now would fail-stop every adopting backup at
     // the `commit <= op` adopt guard — in release, where the emission assert below is compiled
     // out, straight off the wire. Keep the timers armed and stand down: the deferred-to arc
-    // completes, the heartbeat re-drive consumes the debt (entering the reconciling fetch, or
+    // completes, the heartbeat re-drive consumes the debt (entering the reconciling recovery, or
     // retiring it through the applied frontier), and participation resumes through that
     // resolution — the solicitors' retransmits re-drive the withheld handouts meanwhile.
     if self.repersist_orphan_owed().is_some() {
@@ -1657,8 +1658,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //
     // For a ViewChange (or Normal) adopter the tail can enter the owed orphaned-re-persist
     // reconciliation directly: the adopting generation is torn down, so the adoption stops here —
-    // the head/log adoption above is pure data (memory-only), and the fetched install decides the
-    // tail when it completes recovery.
+    // the head/log adoption above is pure data (memory-only), and the reconciling install decides
+    // the tail when it completes recovery.
     if self
       .advance_commit(now, storage, commit.get())
       .entered_recovery()
@@ -1669,15 +1670,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // DEFERRED the reconciliation (a head-recovery is a recovery in flight), and this adoption is
     // that recovery's completion — the one that does not route through `complete_recovery`'s
     // refusal — so the debt is paid here, not stepped over into Normal: a quiescent backup
-    // settled Normal over it would have no commit tail to re-drive the fetch, and its next view
-    // change would cast votes over a superseded pointer. The adopted head/log stay (they are the
-    // data this exit came for, superseding the head-recovery bookkeeping exactly as the Normal
-    // exit below does); the endpoint enters the reconciling fetch instead of Normal, and the
-    // install that completes it re-drives the view (`log_view` stays behind `view`).
-    if self.status.is_recovering_head()
-      && let Some(owed) = self.repersist_orphan_owed()
-    {
-      self.enter_orphan_repersist_fetch(now, storage, owed);
+    // settled Normal over it would have no commit tail to re-drive the reconciliation, and its
+    // next view change would cast votes over a superseded pointer. The adopted head/log stay
+    // (they are the data this exit came for, superseding the head-recovery bookkeeping exactly as
+    // the Normal exit below does); the endpoint enters the reconciling recovery instead of
+    // Normal, and the install that completes it re-drives the view (`log_view` stays behind
+    // `view`).
+    if self.status.is_recovering_head() && self.repersist_orphan_owed().is_some() {
+      self.enter_orphan_repersist_recovery(now, storage);
       return CommitFlow::EnteredRecovery;
     }
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).

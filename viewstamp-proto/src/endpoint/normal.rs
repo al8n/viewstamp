@@ -735,7 +735,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // nothing below runs over the teardown, and the caller short-circuits on the returned flow.
     self.maybe_adopt_inherited_frontier();
     if self
-      .maybe_enter_orphan_repersist_fetch(now, storage)
+      .maybe_enter_orphan_repersist_recovery(now, storage)
       .entered_recovery()
     {
       return CommitFlow::EnteredRecovery;
@@ -1615,7 +1615,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // nothing below runs over the teardown, and the caller short-circuits on the returned flow.
     self.maybe_adopt_inherited_frontier();
     if self
-      .maybe_enter_orphan_repersist_fetch(now, storage)
+      .maybe_enter_orphan_repersist_recovery(now, storage)
       .entered_recovery()
     {
       return CommitFlow::EnteredRecovery;
