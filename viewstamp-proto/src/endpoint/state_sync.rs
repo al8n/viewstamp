@@ -545,9 +545,27 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn send_request_sync(&mut self, now: Instant) {
     let nonce = self.sync.map_or(self.nonce, |s| s.nonce);
     let recovery = self.awaiting_peer_checkpoint() || self.sm_reconstruct_owed();
+    // The advertised checkpoint is the donor-side SERVE FLOOR (`on_request_sync` answers a recovery
+    // solicitation at/above it), and a donor gates on this WIRE value — never on this endpoint's
+    // internal `sync.target`. A recovery peer-fetch's target can be RAISED past the durable
+    // `checkpoint_op` (`retarget_recovery_fetch`, on an orphaned-re-persist landing), and every
+    // install below the raised floor is refused by `apply_sync`'s timeline admission — so the
+    // solicitation must carry the raised floor, or donors in between keep answering with replies
+    // that can never install. A CROSSING keeps advertising the durable checkpoint: its hinted
+    // target is a solicit hint, not a hard bound (the verified successor membership in `apply_sync`
+    // is the crossing authority), and lifting the wire floor to a bogus-high hint would silence
+    // every legitimate below-hint successor donor. The Normal-status solicitations are unchanged:
+    // an ordinary/forced sync is served on the strict `>`, where advertising the target itself
+    // would silence the exact-target donor the trigger chose.
+    let advertised = match self.sync {
+      Some(s) if self.awaiting_peer_checkpoint() && !s.require_cross_epoch => {
+        self.checkpoint_op.max(s.target)
+      }
+      _ => self.checkpoint_op,
+    };
     let request = crate::RequestSync::new(
       self.view,
-      self.checkpoint_op,
+      advertised,
       self.local_slot(),
       nonce,
       recovery,

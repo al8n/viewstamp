@@ -1687,8 +1687,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// checkpoint-role root landing performs on a recovery already fetching below its frontier.
   /// The landing advanced the effective root, and `apply_sync`'s timeline admission floors every
   /// install at it — so a fetch still soliciting the OLD target would only draw replies the
-  /// admission then refuses, soliciting forever. Lifting the wire target makes donors below the
-  /// frontier stay silent and a donor at/above it answer with a reply that can actually install.
+  /// admission then refuses, soliciting forever.
+  ///
+  /// The raised target is internal state; it governs donors only through the two layers that
+  /// carry it outward, and the raise here is effective because both read `sync.target`:
+  /// - the WIRE: the re-solicit below advertises the effective floor
+  ///   (`send_request_sync`), so donors below the frontier stay silent and one at/above it
+  ///   answers with a reply that can actually install;
+  /// - the INGRESS: `on_recover_sync_checkpoint` refuses a below-floor reply before it can touch
+  ///   the transfer — a donor still answering the OLD solicitation (the preserved nonce keeps its
+  ///   reply fresh) cannot arm or displace anything.
   ///
   /// Everything else about the handshake is preserved: the nonce (a late reply to the old
   /// solicitation at/above the new target still admits), the forced assert-relaxation, and a
@@ -2617,6 +2625,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if m.checkpoint_op().get() < self.checkpoint_op.get() {
       return; // does not even reach our (corrupt) checkpoint — cannot subsume it; ignore.
     }
+    // The fetch's EFFECTIVE floor, enforced at the INGRESS — before the integrity hash, the
+    // reconstruct re-pin, any decode, or the transfer — mirroring the Normal ingress
+    // (`handle_sync_checkpoint`). The durable-pointer check above is only the fetch's INITIAL
+    // floor: the TARGET can sit higher (`retarget_recovery_fetch`, on an orphaned-re-persist
+    // landing, keeping the nonce so a late reply to the old solicitation still admits), and every
+    // install below it is refused by `apply_sync`'s timeline admission at the very END of the
+    // transfer — so a below-target reply admitted here could only arm (or wholesale REPLACE) a
+    // transfer whose whole DAG is walked and then refused, displacing the one transfer that can
+    // install, once per delivery. The CROSSING carve-out is the Normal ingress's too: a crossing's
+    // target is a solicit hint, not a hard bound — the verified successor membership in
+    // `apply_sync` is the real admission, and a legitimate below-hint successor reply must reach
+    // it.
+    if m.checkpoint_op().get() < s.target.get() && !s.require_cross_epoch {
+      return;
+    }
     // The load-bearing integrity gate: never restore a snapshot whose bytes do not hash to the
     // advertised id (corrupt / forged / torn). Verified BEFORE any mutation; reject + keep awaiting.
     if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
@@ -2626,7 +2649,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // == M`): a fresh reply AT M re-pulls M's DAG from THIS donor — donor FAILOVER for a dead pinned donor —
     // rather than re-staging. A reply ABOVE M supersedes the obligation forward (it falls through to
     // `begin_recover_block_sync`, which keeps the obligation owed until `install_sync` installs the newer
-    // point). The `< M` reply was already dropped. GATE on `pending_install.is_none()` for the same reason as
+    // point). A reply below M — or below a target raised past M — was already dropped above. GATE on
+    // `pending_install.is_none()` for the same reason as
     // the Normal mirror: a retained newer install (a superseding sync whose flush faulted) subsumes M and is
     // retried locally, so a same-M reconstruct here would orphan it.
     if self.sm_reconstruct_owed()
