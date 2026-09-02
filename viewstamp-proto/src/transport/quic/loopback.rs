@@ -1475,17 +1475,19 @@ fn recover_and_complete(
 /// endpoint, and the close from quinn's own refusal. Removing the redial leaves step 6 with no route
 /// to rebuild and the final request never commits.
 ///
-/// **Scope — what is MODELLED.** The stall itself: production's `handle_udp` feeds quinn and drains
-/// it in the same call, so a driver whose loop is behind leaves datagrams in its socket, not in
-/// quinn, and cannot produce a receiver that ACKs without draining. This test constructs that shape
-/// deliberately, because it is the shortest path to the ceiling and therefore the way to exercise
-/// what happens AFTER it. The redial schedule is likewise modelled here (armed, then dialed when
-/// due) — the real one lives in the drivers.
+/// **Scope — what is MODELLED, and how far the claim reaches.** The stall itself: production's
+/// `handle_udp` feeds quinn and drains it in the same call, so a driver whose loop is behind leaves
+/// datagrams in its socket, not in quinn, and cannot produce a receiver that ACKs without draining.
+/// This test constructs that shape deliberately, because it is the shortest path to the ceiling and
+/// therefore the way to exercise what happens AFTER it. The redial schedule is modelled here too
+/// (armed, then dialed when due); the real one lives in the drivers and is proved by
+/// `viewstamp-compio`'s `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff`.
 ///
-/// So this proves the recovery, not the reachability. The reachability question is answered on real
-/// drivers with real network loss by `viewstamp-compio`'s
-/// `a_lossy_real_link_keeps_the_cluster_committing_and_recovers`, and the redial schedule by that
-/// crate's `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff`.
+/// So this is COMPONENT-level evidence for the recovery path — connection-lost, unbind and reap,
+/// backoff redial, protocol retransmission — and nothing wider. There is no end-to-end real-driver
+/// test of the refusal, because the refusal was not reached through `handle_udp` on the paths
+/// tested; `viewstamp-compio`'s `a_lossy_real_link_keeps_the_cluster_committing_and_recovers` drives
+/// real drivers under real relayed loss and is loss-tolerance evidence, not evidence for this claim.
 #[test]
 fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation() {
   let ca = test_ca();

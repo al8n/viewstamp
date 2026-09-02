@@ -198,26 +198,47 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// pump rate and the receiver's: the receiver drains a 64 KiB budget per pump and re-arms itself
 /// while bytes remain, far outpacing a sub-packet sender.
 ///
-/// **Reachability, stated once.** The refusal's condition is more than 2048 unmerged spans — twice
-/// the reassembler's span ceiling, the count past which it compacts and then refuses — behind a
-/// SINGLE gap within one loss-detection interval: a lost packet stops the ordered reader, and every small-frame packet
-/// that arrives before the retransmit fills that gap lands as its own unmergeable span. The count
-/// reached is therefore the small-frame packets in flight across that interval — roughly
-/// `send rate x (RTT + loss-detection delay)`. On a loopback path that is a handful of packets,
-/// measured, because the interval is microseconds; on a high-RTT path carrying a high small-frame
-/// rate it is plausible. "Not reached" is a measurement of the paths tested, not a property of the
-/// transport. `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
-/// models that condition and proves the RECOVERY from it; `viewstamp-compio`'s
-/// `a_lossy_real_link_keeps_the_cluster_committing_and_recovers` drives the production chain under
-/// real loss and is where the loopback measurement comes from.
+/// **Reachability, stated once.** The pinned reassembler compacts when EITHER its raw heap length
+/// exceeds 2048 spans OR its over-allocation (allocated bytes minus buffered) exceeds
+/// `max(32 KiB, 1.5 x buffered)`, and it refuses the insert only when more than 1024 spans SURVIVE
+/// that compaction. Compaction merges only poorly utilized spans, so what survives is whatever
+/// cannot merge: spans separated by a gap, and spans already well utilized.
 ///
-/// **When a peer exceeds it.** quinn closes the connection; the bridge classifies that loss, unbinds
-/// the peer's routing and queues the connection for reaping, the driver's redial reconciler
-/// re-establishes it on a backoff, and consensus retransmission re-drives whatever was in flight.
-/// The failure mode is a bounded reconnect, not a wedge. The whole chain — a stalled receiver
-/// refused, both ends reaping, the link redialed, and the request that was in flight completing — is
-/// driven over real mTLS by
-/// `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`.
+/// Sufficient scenarios, none of them necessary on its own:
+///
+/// - ONE gap, many small frames. A lost packet stops the ordered reader and every small-frame packet
+///   arriving before the retransmit fills that gap lands as its own unmergeable span. The count
+///   reached is the small-frame packets in flight across that interval — roughly
+///   `send rate x (RTT + loss-detection delay)`.
+/// - MANY gaps. Poorly utilized spans survive compaction too when a gap separates them, so a pattern
+///   of alternating loss reaches the count on far fewer bytes than the single-gap case, and can trip
+///   the over-allocation trigger rather than the length one.
+/// - Repeated loss. Gaps that are re-created faster than they are filled hold spans across several
+///   detection intervals, so the count accumulates instead of resetting each time.
+///
+/// On a loopback path the first is a handful of packets, measured, because the interval is
+/// microseconds; on a high-RTT path carrying a high small-frame rate it is plausible. "Not reached"
+/// is a measurement of the paths tested, not a property of the transport.
+///
+/// **When a peer exceeds it — the claim, exactly.** Recovery is the transport's PRE-EXISTING
+/// connection-lost path, not new machinery: quinn closes the connection, the bridge classifies the
+/// loss, unbinds the peer's routing and queues it for reaping, the driver's link reconcile redials on
+/// a jittered backoff, and consensus retransmission re-drives what was in flight.
+///
+/// That path is proved at COMPONENT level, and the claim is no wider than that evidence:
+///
+/// - `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
+///   drives the refusal and the recovery over real mTLS with real consensus traffic. The stall that
+///   reaches the refusal, and the redial schedule, are MODELLED there; the reaping, the
+///   re-establishment and the in-flight request's completion are real.
+/// - `viewstamp-compio`'s `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff`
+///   proves the redial schedule itself on the real reconcile.
+///
+/// There is NO end-to-end real-driver test of the refusal, because the refusal was not reached
+/// through `handle_udp` on the paths tested — that entrypoint feeds quinn and drains it in the same
+/// call. `viewstamp-compio`'s `a_lossy_real_link_keeps_the_cluster_committing_and_recovers` drives
+/// real drivers under real relayed packet loss and is loss-tolerance evidence, not evidence for this
+/// claim.
 ///
 /// Frame size is not bounded by any of this: a frame spans as many window grants as it needs, so the
 /// transport's frame ceiling ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is
