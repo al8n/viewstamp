@@ -1653,6 +1653,18 @@ pub trait Wal {
   /// already admits (`Fault` is one of the four endings), not a proto requirement: a backend that
   /// never bounds a read is equally conforming, and either way the read resolves exactly once.
   ///
+  /// A synthesized `Fault` IS that read's one completion, so a backend that bounds a read MUST NOT
+  /// also deliver its real ending later under the same [`ReadId`] — a timeout wrapper that leaves
+  /// the underlying I/O running owes the proto one verdict for that id, not two. Recovery is
+  /// defensive about it regardless: the fault retires the id from the read fence, and
+  /// `on_recover_wal_done` drops any completion whose id the fence no longer holds, so a late
+  /// duplicate is ignored by construction — but suppressing it is the backend's obligation, not
+  /// something to rely on the handler for.
+  ///
+  /// This repository ships no [`Wal`] implementation — the drivers are generic over one — so any
+  /// wall-clock bound on a recovery read is the embedder's to supply. Without one there is no
+  /// bound anywhere: a read the backend never answers holds its recovery open indefinitely.
+  ///
   /// Unlike an append's, a read's completion carries no physical-write fact: it frees no slot and
   /// releases no deferred re-append, so what a swallowed one wedges is the waiting recovery, not
   /// the slot. Read completions correlate by [`ReadId`] and MAY be delivered in ANY order relative
