@@ -456,8 +456,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //
     // Only the LOGICAL half is dropped, and it is the only half this reset can reach. The
     // `Materialize` job a `FlushingBlocks` drop orphans is already queued on the lane and executes to
-    // completion regardless — the issue-order contract admits no retraction — and the capture quota
-    // it occupies belongs to the lane, not to this endpoint, so it stays claimed until the lane hands
+    // completion regardless — the issue-order contract admits no retraction — and the capture slot
+    // it occupies belongs to the lane, not to this endpoint, so it stays taken until the lane hands
     // the image back. That is what keeps the capture site closed across the transition rather than
     // re-opening the accumulation the split exists to bound.
     if self.pending_checkpoint.as_ref().is_some_and(|pc| {

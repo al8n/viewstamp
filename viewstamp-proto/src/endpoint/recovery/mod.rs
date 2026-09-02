@@ -550,12 +550,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// value per replica incarnation.)
   ///
   /// **The block lane is not this constructor's concern**, because nothing about it is reborn here.
-  /// Its queue, the admission quotas that bound its depth (one un-consumed checkpoint image
-  /// capture, the outstanding-serve cap, one frontier walk) and the order its completions must
-  /// arrive in all live in the [`Storage`] session, whose lifetime is the store's. So an endpoint
-  /// rebuilt over a lane that never drained polls exactly the jobs its predecessor queued, and each
-  /// completion — refused at the incarnation choke, publishing nothing — still releases the quota
-  /// that admitted it. There is no occupancy to state, and therefore no way to state one that does
+  /// Its queue, the per-kind slots that bound its depth (one cell for each kind but `Serve`, plus
+  /// the outstanding-serve cap) and the order its completions must arrive in all live in the
+  /// [`Storage`] session, whose lifetime is the store's. So an endpoint rebuilt over a lane that
+  /// never drained polls exactly the jobs its predecessor queued, and each completion — refused at
+  /// the incarnation choke, publishing nothing — still releases the slot that admitted it. There is no occupancy to state, and therefore no way to state one that does
   /// not match what the lane will deliver.
   ///
   /// **Fail-fast parameter validation (the WAL-geometry fence).** Before any storage I/O, the live
@@ -1504,13 +1503,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // escalates to a peer block-fetch.
         //
         // Defer while the LANE still owes a walk. The `rec.reconstruct` guard above is this
-        // incarnation's, but the lane's one-walk quota has the SESSION's lifetime: an endpoint
+        // incarnation's, but the lane's walk slot has the SESSION's lifetime: an endpoint
         // rebuilt over a live session inherits a predecessor's queued-or-executing walk (a transfer
         // ARQ's, or this same probe's), and admitting a second one is refused fail-stop at the
         // lane's admission assert. The read is NOT discarded: it already VERIFIED against the
         // durable root, so the deferral RETAINS it as an obligation (`probe_deferred`) that the
         // inherited walk's settle re-drives directly — the completion is refused by the
-        // incarnation choke, but the lane settles it first, and that settle frees the quota this
+        // incarnation choke, but the lane settles it first, and that settle frees the slot this
         // probe needs ([`Endpoint::redrive_deferred_recover_probe`]). While the obligation is
         // held, `recover_timeouts` neither re-reads nor decrements the checkpoint budget: that
         // budget pays for READ faults, and spending it on lane contention would exhaust it into a
@@ -2831,13 +2830,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.arm_timers(now);
   }
 
-  /// Re-drive a deferred cold-start presence probe the moment the lane's walk quota frees.
+  /// Re-drive a deferred cold-start presence probe the moment the lane's walk slot frees.
   ///
   /// Runs on every walk settle (`on_block_done`, BEFORE the incarnation choke): the walk that held
-  /// the quota is typically an inherited one — a dead incarnation's, whose completion the choke
+  /// the slot is typically an inherited one — a dead incarnation's, whose completion the choke
   /// refuses — so the settle is the ONLY event that can resume the deferred local recovery, and it
   /// must fire on refused completions too. A no-op unless a verified obligation is actually held
-  /// (`probe_deferred`), the quota is genuinely free, and no probe/reconstruct of this incarnation
+  /// (`probe_deferred`), the slot is genuinely free, and no probe/reconstruct of this incarnation
   /// is already executing.
   ///
   /// The obligation carries the durable `checkpoint_id` it was verified against, and the re-drive
@@ -2853,7 +2852,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     storage: &mut Storage<W, B, S>,
   ) {
     if storage.walk_owed() {
-      return; // another walk still holds the quota — its settle re-runs this
+      return; // another walk still holds the slot — its settle re-runs this
     }
     let Some(rec) = self.recover.as_mut() else {
       return;
@@ -2915,6 +2914,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
       // A missing block: NOT a bound breach — discard, retry, escalate.
       Ok(Some(_)) => return,
+    }
+    // Defer while the LANE still owes a reconstruct — the same lane-slot gate the synced-checkpoint
+    // reconstruct observes, and for the same reason: an inherited reconstruct still occupies the
+    // lane after the endpoint that issued it is gone, and this incarnation's recovery bookkeeping
+    // cannot see it. The disposition matches the missing-block arm just above — leave the checkpoint
+    // read outstanding so `recover_timeouts` re-drives on its own cadence with the budget intact.
+    // Unreachable in the current tree for the reason stated at the synced-checkpoint site (a
+    // reconstruct only ever follows a frontier walk's delivery, and the walk slot serializes those),
+    // so it is the structural backstop for a future issue site.
+    if storage.restore_owed() {
+      return;
     }
     // Reconstruct OFF the pump, through the VERIFY-ON-READ path: the walk above drained, but a block
     // can bit-rot or be misdirected in the window before the reconstruct runs, so every block read is

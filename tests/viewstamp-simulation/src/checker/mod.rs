@@ -1340,15 +1340,19 @@ impl MembershipMonotonicChecker {
   }
 }
 
-/// Asserts the per-op in-memory maps (`log` cache, `inflight` pipeline) and each replica's durable
-/// WAL stay **bounded** over a run — the guarantee that post-checkpoint GC bounds the structures
-/// that previously grew without bound in op count.
+/// Asserts the per-op in-memory maps (`log` cache, `inflight` pipeline, `deferred_appends` parking
+/// lot) and each replica's durable WAL stay **bounded** over a run — the guarantee that
+/// post-checkpoint GC bounds the structures that previously grew without bound in op count.
 ///
 /// Without GC these grow with the total committed-op count (one `log`/WAL entry per op forever); with
 /// GC they plateau near the un-checkpointed tail (a few `checkpoint_ops` intervals) plus pipeline
 /// headroom. The bounds are generous constants chosen so a real leak (no GC) trips while normal
 /// fluctuation does not. The `clients` table is bounded separately by the active client set (one
 /// session per client), so it is checked against a client-count-derived bound, not the per-op bound.
+/// The endpoint's `deferred_appends` parking lot rides the same per-op bound as the `log` cache and
+/// for the same reason — one waiter per op, trimmed in lockstep with the log tail — and it is the
+/// one enumerated container the session's own arms cannot see, precisely because a parked append is
+/// a write the session refused to take.
 /// The session's durable-root queue is checked against the CONSTANT bound of three (the submitted
 /// front plus the live endpoint's two awaited roots) — independent of ops, views, time, AND the
 /// incarnation count, since a rebuild collapses the dead incarnations' parked roots at endpoint
@@ -1366,20 +1370,20 @@ impl MembershipMonotonicChecker {
 /// This arm bounds the retained set's SIZE only; whether the durable root's generation still
 /// EXISTS in the store is a different property, asked per tick by [`check_medium_integrity`] —
 /// a collector can hold the count constant while deleting the one generation the root names.
-/// The block lane's total depth is checked against the serve cap plus constant headroom, so a
-/// quota that stopped releasing (or an obligation that re-issues without consuming) trips within a
-/// few cycles.
+/// The block lane's total depth is checked against the lane's own compositional constant — one
+/// cell per job kind but `Serve`, plus the outstanding-serve cap — so a slot that stopped releasing
+/// (or a cap entry freed by a completion that never took one) trips within a few cycles.
 #[derive(Debug)]
 pub struct BoundednessChecker {
-  /// Max allowed entries in any per-op map (`log`, `inflight`) and any WAL.
+  /// Max allowed entries in any per-op map (`log`, `inflight`, `deferred_appends`) and any WAL.
   max_per_op: usize,
   /// Max allowed client-session entries on any replica.
   max_clients: usize,
 }
 
 impl BoundednessChecker {
-  /// A checker bounding each per-op map + WAL to `max_per_op` entries and each session table to
-  /// `max_clients` entries.
+  /// A checker bounding each per-op map (`log`, `inflight`, `deferred_appends`) + WAL to
+  /// `max_per_op` entries and each client-session table to `max_clients` entries.
   pub const fn new(max_per_op: usize, max_clients: usize) -> Self {
     Self {
       max_per_op,
@@ -1409,6 +1413,25 @@ impl BoundednessChecker {
       if wal > self.max_per_op {
         return CheckResult::violation(format!(
           "replica {i}: WAL {wal} exceeds bound {} (prune not freeing slots below the checkpoint)",
+          self.max_per_op
+        ));
+      }
+      // The PARKED appends — submissions the session's slot fence or append quota handed back,
+      // waiting for a release trigger. Op-keyed with one waiter per op, on the ENDPOINT rather than
+      // in any session queue, so nothing the session bounds bounds this: it is held down instead by
+      // the trimming paths that clear it in lockstep with the log tail (a view change and a
+      // state-sync install clear it, a nack truncation retains below the gap, post-checkpoint GC
+      // drops the subsumed ops) — the same per-op bound the log cache carries. A release trigger
+      // that stopped firing, or a trimming path that stopped covering it, would grow this map one
+      // entry per refused op while every session-side depth arm stayed green, because a parked
+      // append is precisely a write the session never took. The arm is non-vacuous exactly when
+      // the session refuses something — every refusal parks here — so the sweeps' assertion that
+      // the slot fence FIRES is also this arm's witness that the map is ever occupied.
+      let deferred = cluster.replica_deferred_appends_len(i);
+      if deferred > self.max_per_op {
+        return CheckResult::violation(format!(
+          "replica {i}: {deferred} parked appends exceed bound {} \
+           (a deferred-append release trigger or trim path is not draining the map)",
           self.max_per_op
         ));
       }
@@ -1480,18 +1503,18 @@ impl BoundednessChecker {
            (the superblock collect keeps live + staged-root-named + latest-completed)"
         ));
       }
-      // The block lane's total depth: the serve cap (128 in the proto) plus headroom for the
-      // quota'd kinds (one image capture, one walk) and the single-slot-obligation kinds
-      // (flush/sweep/reconstruct, each serialized by the obligation that issues it and by the
-      // lane's own drain). A leak in ANY kind — a quota that stopped releasing, an obligation
-      // that re-issues without consuming — grows past this within a few cycles, where before
-      // only the per-kind quotas were asserted and the unquota'd kinds were bounded by argument
-      // alone.
+      // The block lane's total depth, against the COMPOSITIONAL constant the lane admits by: one
+      // cell per job kind but `Serve`, plus the outstanding-serve cap. Not headroom over an
+      // estimate — the containers cannot hold more — so a violation here means a slot stopped
+      // releasing, or a cap entry was freed by a completion that never took one. The bound is read
+      // from the session rather than transcribed, so a change to either term moves both sides at
+      // once instead of leaving a stale constant that passes.
       let jobs = cluster.replica_block_jobs_in_flight(i);
-      if jobs > 144 {
+      let bound = cluster.replica_block_jobs_bound(i);
+      if jobs > bound {
         return CheckResult::violation(format!(
           "replica {i}: {jobs} block jobs in flight \
-           (the lane's admission quotas cap the depth at the serve cap plus headroom)"
+           (the lane's per-kind slots and serve cap hold the depth at {bound})"
         ));
       }
     }

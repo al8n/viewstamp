@@ -228,8 +228,19 @@ fn sweep_ticks() -> u64 {
 /// `0..SEEDS` range. All pass with the async-superblock mode on; these guard against any of those
 /// specific divergences/wedges ever returning. The `vsr_headers` recovery fix is also covered
 /// by the contiguous range, but stays pinned here as an explicit named guard against its return.
+///
+/// Seeds **56** and **63** are pinned for a different job: they are the only seeds in the canonical
+/// band that reach the session's SLOT-QUIESCENCE fence (one refusal each), so they are what makes
+/// [`vopr_sweep_no_violations`]'s `appends_slot_fenced > 0` assertion non-vacuous. The window is
+/// narrow because the endpoint's own `appending` set already refuses a second append for an op it
+/// has one in flight for — the session fence is only REACHED where that set does not cover the
+/// blocker, chiefly across a view transition, which clears `appending` and `deferred_appends` while
+/// the physical write deliberately stays with the device. Pinning them keeps the witness alive for
+/// any `VOPR_SEEDS` width: a narrower contiguous band would otherwise drop both and leave the fence
+/// asserted over a schedule that never contends a slot.
 const REGRESSION_SEEDS: &[u64] = &[
-  21, 52, 84, 85, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774, 796, 887,
+  21, 52, 56, 63, 84, 85, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774,
+  796, 887,
 ];
 
 #[test]
@@ -267,6 +278,18 @@ fn vopr_sweep_no_violations() {
   let mut total_repair_batches = 0u64;
   let mut total_prepare_batches = 0u64;
   let mut total_unions_floored = 0u64;
+  // The session's three admission chokes, each read differently: `slot_fenced` must be `> 0` (a
+  // fence that never refuses is dead code), while `quota_refused` and `envelopes_fenced` must stay
+  // `0` — the quota's ceiling sits above every legitimate in-flight window, and the endpoint's
+  // staging gates keep the envelope fence unreachable. See the assertions below.
+  let mut total_slot_fenced = 0u64;
+  let mut total_quota_refused = 0u64;
+  let mut total_envelopes_fenced = 0u64;
+  // The block lane's two sweep-slot absorb outcomes, read like the envelope fence: both must stay
+  // `0`, because every sweep is issued from the completion of a job the same lane already
+  // delivered. See the assertion below.
+  let mut total_sweeps_coalesced = 0u64;
+  let mut total_sweeps_dropped = 0u64;
   let start = sweep_seed_start();
   let contiguous = sweep_seed_count();
   let ticks = sweep_ticks();
@@ -326,6 +349,58 @@ fn vopr_sweep_no_violations() {
     total_repair_batches += r.repair_batches_served();
     total_prepare_batches += r.prepare_batches_sent();
     total_unions_floored += r.unions_floored();
+    total_slot_fenced += r.appends_slot_fenced();
+    total_quota_refused += r.appends_quota_refused();
+    total_envelopes_fenced += r.envelopes_fenced();
+    // The session append quota's ADEQUACY oracle. The ceiling is twice the implied ring, sized so
+    // one full sync handover fits beneath it, so an ordinary schedule must never meet it — and this
+    // is the only thing that says so. Without it a quota narrowed to the point of stalling healthy
+    // appends, or an append ledger that stopped retiring quiesced writes, would leave every
+    // depth arm green (the ledger would sit AT the ceiling, which is `<= quota`) while the replica
+    // deferred work it could have submitted. Per seed, so a failure names the schedule that met it.
+    assert_eq!(
+      r.appends_quota_refused(),
+      0,
+      "seed {seed}: the session append quota refused {} healthy appends — the ceiling has come \
+       down into the live in-flight window (or the append ledger stopped retiring quiesced \
+       writes); an ordinary schedule must never meet it",
+      r.appends_quota_refused()
+    );
+    // The envelope fence's INERTNESS oracle, pinning what the proto's two submit sites already
+    // claim in prose: `force_checkpoint` and `flush_and_stage_install` each defer while the
+    // envelope lane is occupied, and no other envelope can enter it between that gate and the
+    // submission, so the session's fence is a structural backstop for a future caller rather than a
+    // live path. That claim had no witness. It has one now: if a new caller ever reaches the
+    // backstop, this fails with the seed instead of the refusal passing unnoticed. A failure here
+    // is a re-evaluation of the gates, never a reason to drop the assert.
+    assert_eq!(
+      r.envelopes_fenced(),
+      0,
+      "seed {seed}: the session envelope fence refused {} submissions — the endpoint's staging \
+       gates no longer make the fence unreachable, so a second envelope is now genuinely offered \
+       while one is with the medium",
+      r.envelopes_fenced()
+    );
+    total_sweeps_coalesced += r.sweeps_coalesced();
+    total_sweeps_dropped += r.sweeps_dropped();
+    // The BLOCK LANE's sweep-slot INERTNESS oracle, the envelope fence's shape one lane over. Every
+    // sweep is issued from the completion of a job the same lane already delivered (an ordinary
+    // checkpoint's root landing follows its own image capture; a completed state-sync follows its
+    // barrier or its reconstruct), and the lane delivers in issue order — so a sweep offered while
+    // one is still on the lane has no issuer. The slot resolves it safely either way (a queued one
+    // takes the newer live-root list, an executing one is left to finish), which is exactly why it
+    // would pass unnoticed without this: a coalesce leaves the lane's depth where it was and a drop
+    // lowers it, so no depth arm can see either. A failure here re-reads the issue sites; it is
+    // never a reason to drop the assert.
+    assert_eq!(
+      (r.sweeps_coalesced(), r.sweeps_dropped()),
+      (0, 0),
+      "seed {seed}: the block lane absorbed {} coalesced and {} dropped sweeps — a sweep is now \
+       genuinely offered while the lane still owes one, so the issue sites are no longer each \
+       downstream of a delivery of this lane's own",
+      r.sweeps_coalesced(),
+      r.sweeps_dropped()
+    );
     if r.wal_capacity().is_some() {
       bounded_seeds += 1;
       total_wal_stalls += r.wal_stalls();
@@ -455,6 +530,29 @@ fn vopr_sweep_no_violations() {
        (unions_floored={total_unions_floored}) — the floored-union path is vacuous (a schedule change \
        swept away every firing seed in the contiguous range; re-scan and pin one)"
     );
+    // The session's SLOT-QUIESCENCE fence must genuinely REFUSE somewhere. It is the fence the whole
+    // storage session exists around — no new append may take a ring slot an older physical write has
+    // not quiesced, or completion reordering could land the abandoned old bytes over a value this
+    // replica's ack already named — and until now nothing said it ever fires. A depth oracle cannot:
+    // a fence deleted from the admission path refuses nothing, so the ledger never grows and every
+    // bound stays green.
+    //
+    // The count is SMALL by construction, and that is worth stating rather than tuning away. The
+    // endpoint's own `appending` set already refuses a duplicate append for an op it has one in
+    // flight for, so within a single generation the session fence is never reached; it is reached
+    // where that set does not cover the blocker — chiefly a view transition, which clears
+    // `appending`/`deferred_appends` while deliberately leaving the physical write with the device
+    // for this fence to defer around. Seeds 56 and 63 hit exactly that window (one refusal each) and
+    // are pinned in [`REGRESSION_SEEDS`] so the witness survives any band width. EMPIRICAL, like the
+    // durability-bound sums on the axis lanes: a change that moves these schedules must RE-MEASURE
+    // this sum and re-pin a firing seed, never delete the assertion.
+    assert!(
+      total_slot_fenced > 0,
+      "the session's slot-quiescence fence refused nothing across the sweep \
+       (appends_slot_fenced={total_slot_fenced}) — the fence is armed but never fires, so nothing is \
+       testing that a re-append waits for the older write on its ring slot to quiesce (a schedule \
+       change swept away the firing seeds; re-scan the band and pin one)"
+    );
     // Bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
     // - SOME seeds ran the bounded ring (the ~1/3 seed-derived draw — sanity that the axis is wired and
     //   the env mask is off);
@@ -496,7 +594,10 @@ fn vopr_sweep_no_violations() {
      large_bodies={total_large_bodies} oversized_dropped={total_oversized_dropped} \
      header_only_carriers={total_header_only_carriers} repair_batches={total_repair_batches} \
      prepare_batches={total_prepare_batches} \
-     unions_floored={total_unions_floored}"
+     unions_floored={total_unions_floored} \
+     appends_slot_fenced={total_slot_fenced} appends_quota_refused={total_quota_refused} \
+     envelopes_fenced={total_envelopes_fenced} \
+     sweeps_coalesced={total_sweeps_coalesced} sweeps_dropped={total_sweeps_dropped}"
   );
 }
 
@@ -850,6 +951,7 @@ fn vopr_sb_reorder_sweep_no_violations() {
   let mut total_overtakes = 0u64;
   let mut total_committed = 0usize;
   let mut seeds_with_view_change = 0u64;
+  let mut total_envelopes_fenced = 0u64;
   println!(
     "VOPR sb-reorder sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, envelope-lag axis \
      forced on"
@@ -859,6 +961,20 @@ fn vopr_sb_reorder_sweep_no_violations() {
     total_lags += r.sb_envelope_lags();
     total_overtakes += r.sb_envelope_overtakes();
     total_committed += r.max_committed();
+    total_envelopes_fenced += r.envelopes_fenced();
+    // The envelope fence's INERTNESS oracle on the lane that most contends the envelope lane: this
+    // axis lags every envelope write so later roots complete AROUND it, which is the schedule under
+    // which an orphaned envelope actually coexists with a re-opened staging gate. Even here the
+    // session fence must never be reached — `force_checkpoint` and `flush_and_stage_install` both
+    // defer while the lane is occupied — so a refusal is the first evidence that a caller now
+    // offers a second envelope, and this lane would show it before any other.
+    assert_eq!(
+      r.envelopes_fenced(),
+      0,
+      "seed {seed}: the session envelope fence refused {} submissions under the envelope-lag axis \
+       — the endpoint's staging gates no longer keep the fence unreachable",
+      r.envelopes_fenced()
+    );
     if r.max_view() >= 1 {
       seeds_with_view_change += 1;
     }
@@ -891,7 +1007,7 @@ fn vopr_sb_reorder_sweep_no_violations() {
   println!(
     "VOPR sb-reorder sweep OK: sb_envelope_lags={total_lags} \
      sb_envelope_overtakes={total_overtakes} committed={total_committed} \
-     view_change_seeds={seeds_with_view_change}"
+     view_change_seeds={seeds_with_view_change} envelopes_fenced={total_envelopes_fenced}"
   );
 }
 

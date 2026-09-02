@@ -862,7 +862,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the DAG is being written, therefore advances no pointer at all; the cadence / debt-pay /
   /// commit-advance re-forces the checkpoint next time, exactly as a failed inline flush used to.
   ///
-  /// AT MOST ONE IMAGE CAPTURE IS EVER OWED TO THE LANE (the lane front's capture quota). The callers'
+  /// AT MOST ONE IMAGE CAPTURE IS EVER OWED TO THE LANE (the lane front's capture slot). The callers'
   /// shared `pending_checkpoint.is_none()` fence is the LOGICAL guard, and a view transition CLEARS it
   /// while the `Materialize` it named is still queued — the job cannot be retracted (the lane executes
   /// serially in issue order), so the cleared guard would let the cadence capture a second full image

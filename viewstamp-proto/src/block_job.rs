@@ -333,7 +333,7 @@ impl<S: StateMachine> core::fmt::Debug for BlockJobDone<S> {
 /// follow and is unchecked.
 ///
 /// This is the EXECUTING side of the lane's order. Its issuing side — the queue jobs wait in, the
-/// admission quotas that bound the lane's depth, and the order their completions must arrive in —
+/// per-kind slots that bound the lane's depth, and the order their completions must arrive in —
 /// lives in the [`Storage`](crate::Storage) session, whose lifetime is the store's for the same
 /// reason. Both halves therefore cross an endpoint rebuild by being owned by something that
 /// outlives the endpoint, never by being handed across it.

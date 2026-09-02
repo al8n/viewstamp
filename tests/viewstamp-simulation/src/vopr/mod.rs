@@ -392,6 +392,40 @@ pub struct VoprReport {
   /// MECHANISM rather than a violation: what it buys is visibility, since a change that turned a rare
   /// bounded refusal into a frequent one would otherwise show up as nothing at all.
   walk_pins_refused: u64,
+  /// Cumulative append submissions the session's SLOT-QUIESCENCE fence refused, summed over replicas
+  /// and accumulated reset-robustly (the counter lives on the session, which a crash restart rebuilds
+  /// over the same store while an in-place endpoint rebuild inherits it). NOT axis-gated: the fence
+  /// sits on the single append choke, so any schedule that re-appends an op while its older write is
+  /// still with the device reaches it. The refusal is a DEFERRAL — the bytes come back and the slot's
+  /// quiescence re-drives them — so this witnesses the fence ENGAGING, not a fault; its job is to keep
+  /// the fence from decaying into dead code that every depth oracle would still pass.
+  appends_slot_fenced: u64,
+  /// Cumulative append submissions the session's APPEND QUOTA refused, accumulated exactly like
+  /// [`Self::appends_slot_fenced`] but read the opposite way. The quota ceiling sits above every
+  /// legitimate in-flight window (twice the implied ring, so one full sync handover fits under it),
+  /// so an ordinary schedule must leave this at `0`: a non-zero value is a healthy append stalled
+  /// behind a ceiling that has become too tight, or an append ledger that stopped retiring.
+  appends_quota_refused: u64,
+  /// Cumulative checkpoint-envelope submissions the session's one-outstanding fence refused,
+  /// accumulated exactly like [`Self::appends_slot_fenced`]. Expected `0` on every lane: the
+  /// endpoint's two staging gates defer while the envelope lane is occupied and nothing can enter
+  /// it between those gates and the submission, so the session fence is a backstop for a future
+  /// caller rather than a live path. This is what pins that claim — a non-zero value means a caller
+  /// now reaches the backstop.
+  envelopes_fenced: u64,
+  /// Cumulative sweeps the block lane COALESCED into one still queued, accumulated exactly like
+  /// [`Self::appends_slot_fenced`]. Expected `0`, on the envelope fence's reading: every sweep is
+  /// issued from the completion of a job the same lane already delivered, and the lane admits one
+  /// sweep at a time, so the slot a sweep finds is free. A non-zero value means a sweep site now
+  /// genuinely offers a second sweep while one is queued — the coalescing keeps that safe (the
+  /// newer live-root list is the better one to run), but it is a re-reading of the issue sites
+  /// rather than a bound doing its job.
+  sweeps_coalesced: u64,
+  /// Cumulative sweeps the block lane DROPPED behind one the driver had already taken — the window
+  /// in which the queued payload can no longer be replaced. Expected `0` and read exactly like
+  /// [`Self::sweeps_coalesced`]; the two split one claim into its queued and executing halves, so a
+  /// failure names which window a new issue site reached.
+  sweeps_dropped: u64,
   /// How many block jobs the delay lane kept OUTSTANDING for at least one storage step this run. `0`
   /// unless the block-delay axis is enabled (`VOPR_BLOCK_DELAY`, or [`run_vopr_with_block_delay`]);
   /// `> 0` proves the axis genuinely held jobs off the lane rather than drawing zero-length holds —
@@ -797,6 +831,40 @@ impl VoprReport {
     self.walk_pins_refused
   }
 
+  /// The run-cumulative count of append submissions the session's slot-quiescence fence refused.
+  /// Not axis-gated; a bounded, self-releasing deferral made visible so the fence cannot decay into
+  /// a guard that never fires while every depth oracle stays green.
+  pub const fn appends_slot_fenced(&self) -> u64 {
+    self.appends_slot_fenced
+  }
+
+  /// The run-cumulative count of append submissions the session's append quota refused. Expected
+  /// `0` on an ordinary schedule — the ceiling sits above every legitimate in-flight window — so a
+  /// non-zero value means the quota started stalling appends the medium could have taken.
+  pub const fn appends_quota_refused(&self) -> u64 {
+    self.appends_quota_refused
+  }
+
+  /// The run-cumulative count of checkpoint-envelope submissions the session's one-outstanding
+  /// fence refused. Expected `0`: the endpoint's staging gates make the fence unreachable, and the
+  /// sweeps assert that rather than assuming it.
+  pub const fn envelopes_fenced(&self) -> u64 {
+    self.envelopes_fenced
+  }
+
+  /// The run-cumulative count of sweeps the block lane coalesced into one still queued. Expected
+  /// `0`: a sweep is issued only from the completion of a job the same lane already delivered, so
+  /// the sweep slot it finds is free — and the sweeps assert that rather than assuming it.
+  pub const fn sweeps_coalesced(&self) -> u64 {
+    self.sweeps_coalesced
+  }
+
+  /// The run-cumulative count of sweeps the block lane dropped behind one already executing.
+  /// Expected `0`, for the same reason as [`Self::sweeps_coalesced`].
+  pub const fn sweeps_dropped(&self) -> u64 {
+    self.sweeps_dropped
+  }
+
   /// How many block jobs the delay lane kept outstanding for at least one storage step. `0` with the
   /// axis off; the delay lane's non-vacuity witness.
   pub const fn block_jobs_delayed(&self) -> u64 {
@@ -1178,6 +1246,17 @@ struct Vopr {
   /// Per-replica last-observed `walk_pins_refused`, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (the `Endpoint` counter zeroes on `recover`).
   walk_pins_refused_seen: Vec<u64>,
+  /// Per-replica last-observed session refusal counts — `(slot fence, append quota, envelope
+  /// fence)` — accumulated reset-robustly for the same reason as [`Self::walk_pins_refused_seen`],
+  /// one level down: these live on the SESSION, which an in-place endpoint rebuild inherits but a
+  /// crash restart rebuilds over the same store. Re-baselining each tick and folding positive
+  /// deltas therefore counts every refusal in the run, including a burst a later crash erased.
+  session_refusals_seen: Vec<(u64, u64, u64)>,
+  /// Per-replica last-observed `(sweeps coalesced, sweeps dropped)` on the block lane, accumulated
+  /// exactly like [`Self::session_refusals_seen`] and for the same reason — the lane is the
+  /// session's, so an in-place endpoint rebuild inherits these counts and only a crash restart
+  /// zeroes them.
+  sweeps_absorbed_seen: Vec<(u64, u64)>,
   /// Per-replica last-CHECKED durable checkpoint DAG roots, so the flush oracle walks a replica's DAG
   /// only when it has PUBLISHED a new checkpoint. Complete rather than merely cheap: the property can
   /// only break at publication, since a held block never leaves the store's flushed set.
@@ -2011,6 +2090,8 @@ impl Vopr {
       block_fault_axis: env_flag("VOPR_BLOCK_FAULT"),
       block_outstanding_committed: None,
       walk_pins_refused_seen: vec![0; node_count],
+      session_refusals_seen: vec![(0, 0, 0); node_count],
+      sweeps_absorbed_seen: vec![(0, 0); node_count],
       checkpoint_roots_seen: vec![None; node_count],
       report: VoprReport {
         seed,
@@ -3975,6 +4056,39 @@ impl Vopr {
         self.report.walk_pins_refused += refused - self.walk_pins_refused_seen[i];
       }
       self.walk_pins_refused_seen[i] = refused;
+      // The SESSION's three admission chokes — the slot fence, the append quota, the envelope
+      // fence. Same reset-robust positive-delta accumulation, one layer down: these counters ride
+      // the session, so an in-place endpoint rebuild inherits them and only a crash restart (which
+      // builds a fresh session over the same store) zeroes them. Folding them here is what turns
+      // "the bound held" into "the bound was reached and enforced" — a depth arm alone cannot tell
+      // an admission gate that works from one that was deleted.
+      let (slot_seen, quota_seen, envelope_seen) = self.session_refusals_seen[i];
+      let slot = c.replica_appends_slot_fenced(i);
+      if slot > slot_seen {
+        self.report.appends_slot_fenced += slot - slot_seen;
+      }
+      let quota = c.replica_appends_quota_refused(i);
+      if quota > quota_seen {
+        self.report.appends_quota_refused += quota - quota_seen;
+      }
+      let envelope = c.replica_envelopes_fenced(i);
+      if envelope > envelope_seen {
+        self.report.envelopes_fenced += envelope - envelope_seen;
+      }
+      self.session_refusals_seen[i] = (slot, quota, envelope);
+      // The BLOCK LANE's two absorb outcomes, on the same reset-robust footing: the lane rides the
+      // session, so a rebuilt endpoint inherits both counts. They are what says the sweep slot is
+      // never contended — a depth arm cannot, since a coalesce leaves the depth exactly where it
+      // was and a drop lowers it.
+      let (coalesced_seen, dropped_seen) = self.sweeps_absorbed_seen[i];
+      let (coalesced, dropped) = c.replica_sweeps_absorbed(i);
+      if coalesced > coalesced_seen {
+        self.report.sweeps_coalesced += coalesced - coalesced_seen;
+      }
+      if dropped > dropped_seen {
+        self.report.sweeps_dropped += dropped - dropped_seen;
+      }
+      self.sweeps_absorbed_seen[i] = (coalesced, dropped);
       // Session-cap evictions (the churn lane's non-vacuity witness), same reset-robust
       // positive-delta accumulation (the counter zeroes on `recover`).
       let evicted = c.replica_sessions_evicted(i);

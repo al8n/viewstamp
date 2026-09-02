@@ -144,7 +144,7 @@ pub struct Cluster {
   sbs: Vec<Shared<InMemorySuperblock>>,
   /// Per-replica storage SESSIONS — one per store, for the store's whole life. They carry the
   /// slot-quiescence fence, the root timeline, the in-flight envelope ledger, and the block lane's
-  /// front (its queue, its admission quotas, its issue-order witness), so an endpoint rebuilt over
+  /// front (its queue, its per-kind slots, its issue-order witness), so an endpoint rebuilt over
   /// the same session ([`restart_in_place`](Self::restart_in_place)) inherits every fence and every
   /// queued job, while a `crash` opens a FRESH one (the process died; its in-flight work died with
   /// it).
@@ -1392,12 +1392,62 @@ impl Cluster {
     self.storages[i].checkpoints_in_flight()
   }
 
+  /// Replica `i`'s parked-append count — submissions a session refusal handed back, waiting for
+  /// their release trigger (for the boundedness checker). Endpoint-lifetime and op-keyed with one
+  /// waiter per op; every path that trims the log tail trims it in lockstep, so it is bounded by
+  /// the same un-checkpointed tail the log cache is.
+  pub fn replica_deferred_appends_len(&self, i: usize) -> usize {
+    self.replicas[i].deferred_appends_len()
+  }
+
+  /// How many append submissions replica `i`'s session refused at the SLOT-QUIESCENCE fence — a
+  /// deferral, never a loss. The fence's non-vacuity witness: a guard that never refuses across a
+  /// whole sweep is a guard whose removal no oracle would notice. Reset only when the session is
+  /// rebuilt over the store (a crash restart), never by an in-place endpoint rebuild.
+  pub fn replica_appends_slot_fenced(&self, i: usize) -> u64 {
+    self.storages[i].appends_slot_fenced()
+  }
+
+  /// How many append submissions replica `i`'s session refused at the APPEND QUOTA. The mirror
+  /// reading of [`Self::replica_appends_slot_fenced`]: the quota sits above every legitimate
+  /// in-flight window, so a healthy schedule leaves this at `0` and a non-zero value means the
+  /// ceiling started stalling appends the medium could have taken.
+  pub fn replica_appends_quota_refused(&self, i: usize) -> u64 {
+    self.storages[i].appends_quota_refused()
+  }
+
+  /// How many checkpoint-envelope submissions replica `i`'s session refused at the one-outstanding
+  /// fence. Expected `0`: the endpoint's staging gates defer while the lane is occupied, so the
+  /// session fence is a backstop no current caller reaches — the sweeps assert that claim instead
+  /// of leaving it as prose.
+  pub fn replica_envelopes_fenced(&self, i: usize) -> u64 {
+    self.storages[i].envelopes_fenced()
+  }
+
   /// Replica `i`'s block-lane depth — every job the lane owes a completion for, queued or
-  /// executing, whichever incarnation issued it (for the boundedness checker). Capped by the
-  /// lane's per-kind admission quotas plus the single-slot endpoint obligations that issue the
-  /// unquota'd kinds.
+  /// executing, whichever incarnation issued it (for the boundedness checker). Held down by the
+  /// lane's per-kind slots plus its serve cap, so the bound below is a cardinality of the lane's
+  /// containers rather than a claim about the state that issued the jobs.
   pub fn replica_block_jobs_in_flight(&self, i: usize) -> usize {
     self.storages[i].block_jobs_in_flight()
+  }
+
+  /// The constant depth cap replica `i`'s lane admits by — one job of each single-slot kind plus
+  /// the outstanding-serve cap. Read from the session rather than transcribed, so the checker's
+  /// bound and the lane's own admission can never drift apart.
+  pub fn replica_block_jobs_bound(&self, i: usize) -> usize {
+    self.storages[i].block_jobs_bound()
+  }
+
+  /// How many sweeps replica `i`'s lane coalesced into one still queued, and how many it dropped
+  /// behind one already executing. Expected `(0, 0)`: every sweep is issued from the completion of
+  /// a job the same lane already delivered, so the slot a sweep finds is free — the sweeps assert
+  /// that claim instead of leaving it as prose.
+  pub fn replica_sweeps_absorbed(&self, i: usize) -> (u64, u64) {
+    (
+      self.storages[i].sweeps_coalesced(),
+      self.storages[i].sweeps_dropped(),
+    )
   }
 
   /// Replica `i`'s retained checkpoint snapshot-generation count on the simulated superblock (for
@@ -1644,7 +1694,7 @@ impl Cluster {
     // took with it, so carrying them into the restart would fence slots against landings that can
     // never come; a fresh session over the same (now quiet) media is exactly what a new process
     // opens. The same call drops the lane's front — jobs the driver had not yet polled, and the
-    // quotas they claimed — which is right for the same reason: they were queued in memory the
+    // slots they took — which is right for the same reason: they were queued in memory the
     // crash took. This is the one place a session is legitimately replaced over surviving handles,
     // and the discards above are what make the medium quiet enough for it.
     self.storages[i] = Storage::new(self.wals[i].clone(), self.sbs[i].clone());
@@ -1716,8 +1766,8 @@ impl Cluster {
   /// new endpoint ([`OpId`](viewstamp_proto::OpId) is minted per endpoint), so a retained completion
   /// carries an id the successor also mints; where the two meet is the lane this exercises. The block
   /// lane's front survives with the session, so the successor polls the jobs its predecessor queued
-  /// but never handed over, and every retained job keeps occupying the lane's admission quotas until
-  /// its (refused) completion releases them.
+  /// but never handed over, and every retained job keeps occupying the lane slot it took until its
+  /// (refused) completion releases it.
   ///
   /// A restart in place runs over the store the running endpoint just wrote, so recovery always
   /// succeeds; a `Retired` or a recover error here is a harness bug (this is not a path for a parked
