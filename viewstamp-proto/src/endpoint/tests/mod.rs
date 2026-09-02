@@ -828,8 +828,9 @@ struct ScriptedWal {
   /// requires its ending — and `release_deferred(op)` delivers it, completing the OLDEST still-held
   /// submission under its ORIGINAL id, the way a real proactor completes the read that was actually
   /// submitted first long after a retry has minted a newer id. Additive-id retransmission keeps that
-  /// original id live, so the late completion resolves; the old retire-on-retry behavior had retired it
-  /// (the completion would be ignored and the pending set never empty — the wedge this models).
+  /// original id live, so the late completion resolves; retiring an op's ids on retry would have
+  /// retired it (the completion would be ignored and the pending set never empty — the wedge this
+  /// models).
   deferred: std::collections::BTreeSet<u64>,
   /// Per deferred op: the submitted read ids still HELD, oldest-first. Each `submit_read` of a deferred
   /// op pushes its id; `release_deferred` pops the front (the original slow read finally completing).

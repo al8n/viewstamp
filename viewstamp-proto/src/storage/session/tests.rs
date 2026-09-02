@@ -744,10 +744,10 @@ fn collapsing_an_all_parked_or_empty_timeline_is_safe() {
 #[test]
 fn the_timeline_holds_one_front_and_one_parked_root_per_role() {
   // The depth bound, read off the containers: one front cell plus one parked cell per role, so a
-  // fourth concurrent root is UNREPRESENTABLE rather than asserted away. Where a leaked
-  // correlation once met a fail-stop at the fourth entry — a deterministic panic on an otherwise
-  // healthy replica — the same schedule is now absorbed as one supersession, and the depth stays
-  // at the constant the containers embody.
+  // fourth concurrent root is UNREPRESENTABLE rather than asserted away. A leaked correlation
+  // cannot meet a fail-stop at the fourth entry — a deterministic panic on an otherwise healthy
+  // replica — because the schedule that would reach one is absorbed as a supersession, and the
+  // depth stays at the constant the containers embody.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.submit_root(
     RootRole::DurableView,
@@ -1260,7 +1260,7 @@ fn the_lane_holds_one_job_of_every_kind_at_once() {
   // THE DEPTH BOUND, read off the containers. One cell per kind but `Serve`, plus a serve set
   // checked against the cap — so the lane's depth is a cardinality of what it holds, not a claim
   // about the state that issued the jobs. That distinction is the point: the endpoint fields a
-  // barrier, a sweep and a reconstruct used to be "bounded by" are reset when the endpoint is
+  // barrier, a sweep and a reconstruct could be "bounded by" are reset when the endpoint is
   // rebuilt over the store, while these cells are the session's.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.enqueue_block_job(JobId::new(1, 1), capture());
@@ -1306,9 +1306,9 @@ fn one_lane_admits_one_image_capture() {
 #[test]
 #[should_panic(expected = "a second durability barrier was queued")]
 fn one_lane_admits_one_durability_barrier() {
-  // The barrier used to be admitted on the strength of the endpoint's owed install alone, which a
-  // rebuild resets while the queued barrier stays the lane's. The slot is what a rebuild cannot
-  // reset, and the staging site now reads it.
+  // Admitting the barrier on the strength of the endpoint's owed install alone would miss it: a
+  // rebuild resets that flag while the queued barrier stays the lane's. The slot is what a rebuild
+  // cannot reset, and the staging site reads it.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.enqueue_block_job(JobId::new(1, 1), barrier(addr()));
   s.enqueue_block_job(JobId::new(2, 1), barrier(addr()));

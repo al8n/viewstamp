@@ -27,7 +27,7 @@ use viewstamp_simulation::{
 #[test]
 fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
   // The durable-root timeline's CONSTANT bound, driven through the checker at exactly the shape
-  // that once grew the timeline one parked header-bearing state per rebuild cycle: a superblock
+  // that would grow the timeline one parked header-bearing state per rebuild cycle: a superblock
   // so slow the front root write never lands, a view-change escalation that keeps a durable-view
   // root parked behind it, and an endpoint rebuilt in place over the live session faster than
   // the backend services roots. The session's containers hold the bound structurally — one front

@@ -112,10 +112,10 @@ fn solo_cycle(seed: u64, armed: bool) -> Cycle {
 
 #[test]
 fn a_solo_voter_waits_out_slow_interior_reads_and_rejoins_whole() {
-  // Seed 9's degraded slots land on INTERIOR ops of the recovery window. The recovery WAITS on
-  // them: cadence ticks spend nothing on an outstanding read, so no op resolves header-only, no
-  // hole survives into Normal, and the replica rejoins only once every delivered verdict has
-  // landed — carrying the full committed tail it recovered from its own disk.
+  // The degraded slots on this lane's medium land on INTERIOR ops of the recovery window. The
+  // recovery WAITS on them: cadence ticks spend nothing on an outstanding read, so no op resolves
+  // header-only, no hole survives into Normal, and the replica rejoins only once every delivered
+  // verdict has landed — carrying the full committed tail it recovered from its own disk.
   const SEED: u64 = 9;
 
   let control = solo_cycle(SEED, /*armed*/ false);
@@ -187,11 +187,11 @@ fn a_solo_voter_waits_out_slow_interior_reads_and_rejoins_whole() {
 
 #[test]
 fn a_solo_voters_slow_head_read_never_routes_through_recovering_head() {
-  // Seed 2's degraded slot is the HEAD of the recovery window. A head whose read is merely slow is
-  // not an unidentifiable head — its identity is owed by an outstanding read the medium must
-  // answer — so the recovery WAITS instead of promoting it faulty: `RecoveringHead` (a status that
-  // solicits a peer a solo voter does not have) is never entered, and the head resolves from the
-  // delivered verdict.
+  // The degraded slot on this lane's medium is the HEAD of the recovery window. A head whose read
+  // is merely slow is not an unidentifiable head — its identity is owed by an outstanding read the
+  // medium must answer — so the recovery WAITS instead of promoting it faulty: `RecoveringHead` (a
+  // status that solicits a peer a solo voter does not have) is never entered, and the head resolves
+  // from the delivered verdict.
   const SEED: u64 = 2;
 
   let control = solo_cycle(SEED, /*armed*/ false);
