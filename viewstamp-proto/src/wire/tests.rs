@@ -1302,7 +1302,7 @@ fn golden_byte_vectors() {
 
 /// One `Reply.outcome` arm as raw wire bytes: the `body` arm (field 4) carrying `payload`, or the
 /// `too_large` arm (field 5) carrying an encoded `ReplyTooLarge{len, max}`.
-fn outcome_arm_bytes(field: u8, payload: &[u8]) -> Vec<u8> {
+fn outcome_arm_bytes(field: u8, payload: &[u8]) -> std::vec::Vec<u8> {
   let mut out = std::vec![(field << 3) | 2, payload.len() as u8];
   out.extend_from_slice(payload);
   out
@@ -1311,7 +1311,7 @@ fn outcome_arm_bytes(field: u8, payload: &[u8]) -> Vec<u8> {
 /// Builds a raw `Message` envelope carrying a `Reply` whose `outcome` arms are exactly `arms`, in
 /// the given order. A compliant encoder emits exactly one; more than one is the shape the decoder
 /// must refuse, whatever the order or repetition.
-fn reply_envelope_with_arms(arms: &[Vec<u8>]) -> Bytes {
+fn reply_envelope_with_arms(arms: &[std::vec::Vec<u8>]) -> Bytes {
   let mut reply = std::vec![0x08, 0x01]; // view = 1
   reply.push(0x12); // client, length-delimited
   reply.push(16);
@@ -1328,12 +1328,12 @@ fn reply_envelope_with_arms(arms: &[Vec<u8>]) -> Bytes {
 }
 
 /// The `body` arm carrying a short payload.
-fn body_arm() -> Vec<u8> {
+fn body_arm() -> std::vec::Vec<u8> {
   outcome_arm_bytes(4, b"ok")
 }
 
 /// The `too_large` arm carrying `ReplyTooLarge { len: 9, max: 8 }`.
-fn too_large_arm() -> Vec<u8> {
+fn too_large_arm() -> std::vec::Vec<u8> {
   outcome_arm_bytes(5, &[0x08, 0x09, 0x10, 0x08])
 }
 
