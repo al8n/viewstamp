@@ -103,17 +103,13 @@
 //! the window it crosses.
 //!
 //! The window bounds the backlog's BYTES, not the number of spans quinn buffers them as; a peer
-//! whose segmentation drives the span count past what quinn's reassembler holds gets the connection
-//! closed. The condition for that — more than 2048 unmerged spans behind a single gap within one
-//! loss-detection interval, and what it takes to reach it — is stated once at
-//! [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW); the table above sizes
-//! the memory, not the reachability. That path is recoverable, not a wedge: the close arrives as
-//! `Event::ConnectionLost`,
-//! [`Bridge::on_app_event`] classifies it, unbinds the peer's routing and queues the connection on
-//! [`Bridge::lost`] for the coordinator to reap, the driver's redial reconciler re-establishes it on
-//! a backoff, and consensus retransmission re-drives what was in flight. See
-//! [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW) for which senders the
-//! window's sizing covers and which it does not.
+//! whose segmentation drives the span count past what quinn's reassembler will hold gets the
+//! connection closed. The predicate for that, and what it takes to reach it, is stated once — at
+//! [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW), which also scopes which
+//! senders the window's sizing covers and what the recovery claim rests on. The table above sizes
+//! the memory, not the reachability, and does not restate the predicate. The close itself arrives
+//! here as `Event::ConnectionLost`: [`Bridge::on_app_event`] classifies it, unbinds the peer's
+//! routing and queues the connection on [`Bridge::lost`] for the coordinator to reap.
 //!
 //! The `Bridge` works natively in [`std::time::Instant`] — quinn's time
 //! currency. The viewstamp-time adapter lives one layer up (the coordinator).
@@ -877,9 +873,20 @@ impl Bridge {
         //
         // One classification is needed first: this transport's OWN retire protocol resets the unused
         // half ([`retire_local_send`]), and a peer's `RESET_STREAM` surfaces as a `Readable` too. So
-        // peek a single byte — `Err(Reset)` / FIN / nothing is the retire and is ignored, `Ok(Some)`
-        // is data no conforming peer sends. The peek runs only for an id that is one of OUR send
-        // streams, so it is off the conforming hot path.
+        // peek at the half once, and read the outcome as:
+        //
+        // - `Ok(Some)` — bytes at the read offset. Data, and a violation.
+        // - `Err(Blocked)` — the peer wrote, but not at the read offset: bytes are buffered BEHIND A
+        //   GAP (its offset-zero packet lost or reordered). Also a violation, and the case that
+        //   matters most: nothing ever reads this half, so those spans would sit there until the
+        //   reassembler refused the stream — the outcome this policy exists to pre-empt. A
+        //   `Readable` is only emitted for a frame that arrived, so `Blocked` here means buffered,
+        //   not empty.
+        // - `Ok(None)` — the peer FINISHED the half with nothing on it. Not data; ignored.
+        // - `Err(Reset)` — the peer RESET it, which is what our own retirement does. Ignored.
+        //
+        // The peek runs only for an id that is one of OUR send streams, so it is off the conforming
+        // hot path.
         let unsolicited = self.table.entry(h).is_some_and(|e| {
           e.classes.iter().any(|c| c.send == Some(id))
             && e
@@ -887,7 +894,10 @@ impl Bridge {
               .recv_stream(id)
               .read(/*ordered=*/ true)
               .is_ok_and(|mut chunks| {
-                let got = matches!(chunks.next(1), Ok(Some(_)));
+                let got = matches!(
+                  chunks.next(1),
+                  Ok(Some(_)) | Err(quinn_proto::ReadError::Blocked)
+                );
                 let _ = chunks.finalize();
                 got
               })

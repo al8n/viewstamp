@@ -274,6 +274,19 @@ impl Bridge {
     e.conn.send_stream(sid).write(bytes)
   }
 
+  /// RESET `sid`'s send half from THIS bridge — the peer-side action our own retirement performs on
+  /// the reverse direction of a stream the other side opened.
+  fn test_reset_raw(&mut self, h: ConnectionHandle, sid: StreamId) {
+    let e = self.table.entry(h).expect("entry for a raw reset");
+    let _ = e.conn.send_stream(sid).reset(VarInt::from_u32(7));
+  }
+
+  /// FINISH `sid`'s send half from THIS bridge, with nothing written on it.
+  fn test_finish_raw(&mut self, h: ConnectionHandle, sid: StreamId) {
+    let e = self.table.entry(h).expect("entry for a raw finish");
+    let _ = e.conn.send_stream(sid).finish();
+  }
+
   /// The Control/Bulk send stream id this bridge opened for `h`, if any.
   fn test_send_id(&mut self, h: ConnectionHandle, class: StreamClass) -> Option<StreamId> {
     self.table.entry(h)?.class_mut(class).send
@@ -1261,10 +1274,14 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
 /// What the bridge owes at that moment is asserted here and nothing more: the loss is queued for the
 /// coordinator to reap, classified as the QUIC layer rejecting the connection, and the peer's routing
 /// is unbound so nothing is written into a dead connection. Whether the cluster then RECOVERS — both
-/// ends reaping, the link re-established, the in-flight operation completing — is a property of the
-/// coordinator, the consensus layer and the driver's link reconcile, and is proved end to end over
-/// real mTLS by `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`.
-/// Asserting it here would mean building that state by hand instead of reaching it.
+/// ends reaping, the link re-established, the in-flight operation completing — belongs to the
+/// coordinator, the consensus layer and the driver's link reconcile, and the evidence for it is
+/// COMPONENT-level, not end to end:
+/// `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
+/// drives it over real mTLS with the stall and the redial schedule MODELLED, and `viewstamp-compio`'s
+/// `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff` proves the schedule
+/// on the real reconcile. [`MAX_STREAM_RECEIVE_WINDOW`] carries the canonical statement of that
+/// claim. Asserting any of it here would mean building the state by hand instead of reaching it.
 ///
 /// The flood stages already-framed bytes and flushes them through the production `flush_outbound`
 /// write path, which is where the coalescing that shapes the spans lives.
@@ -1454,6 +1471,240 @@ fn sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection() {
     a.next_frame(ha, StreamClass::Control).is_none(),
     "and must not surface as a frame"
   );
+}
+
+/// Reverse-direction data BEHIND A GAP closes the connection too.
+///
+/// The half is never read, so an ordered peek at it returns `Blocked` whenever the peer's
+/// offset-zero packet is lost or reordered: the bytes are buffered, just not at the read offset.
+/// Treating that as "no data" leaves them accumulating spans until the reassembler refuses the
+/// stream — precisely the outcome the close policy exists to pre-empt — so `Blocked` on one of our
+/// own send ids is a violation like any other.
+///
+/// The first datagram carrying the peer's writes is withheld here and later ones delivered, so what
+/// reaches the bridge is a gap with data behind it. The close must land while the gap is still open,
+/// well before the peer's own retransmission would fill it.
+#[test]
+fn gapped_writes_into_our_opened_streams_recv_half_close_the_connection() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  let payload = std::vec![0x3Bu8; 396];
+
+  // Tick 1's write is HELD, not lost: its datagrams are captured and delivered only at the end. So
+  // when tick 2's write arrives, the bridge holds bytes at a non-zero offset with nothing at the
+  // read offset — the gap — and no retransmission has had a chance to fill it.
+  let tick1 = now + Duration::from_millis(1);
+  b.test_write_raw(hb, victim, &payload)
+    .expect("the first write is accepted");
+  while let Some((dst, bytes)) = a.poll_transmit() {
+    assert_eq!(dst, b_addr);
+    b.handle_datagram(tick1, a_addr, None, &bytes);
+  }
+  b.handle_timeout(tick1);
+  let mut held: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    held.push(bytes);
+  }
+  assert!(
+    !held.is_empty(),
+    "the first write must have produced datagrams to hold back"
+  );
+
+  let tick2 = now + Duration::from_millis(2);
+  b.test_write_raw(hb, victim, &payload)
+    .expect("the second write is accepted");
+  while let Some((dst, bytes)) = a.poll_transmit() {
+    assert_eq!(dst, b_addr);
+    b.handle_datagram(tick2, a_addr, None, &bytes);
+  }
+  b.handle_timeout(tick2);
+  let mut delivered = 0usize;
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    delivered += 1;
+    a.handle_datagram(tick2, b_addr, None, &bytes);
+  }
+  assert!(delivered > 0, "the second write must have reached A");
+
+  assert!(
+    a.conn_close_count(CloseCause::UnsolicitedStream) > 0,
+    "data buffered behind a gap on a stream we opened must close the connection WHILE the gap is \
+     open — an ordered peek reporting Blocked is buffered data, not an empty half"
+  );
+  assert!(
+    !a.is_validated(ha),
+    "and the connection must actually be down"
+  );
+  let _ = held;
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "with nothing of it read into the class decoder"
+  );
+}
+
+/// CONTROL: a peer RESET of the reverse half must not close the connection.
+///
+/// This transport's own retirement resets exactly that half ([`retire_local_send`]), and a
+/// `RESET_STREAM` surfaces as readable like data does. A policy that closed on the event alone would
+/// tear down every connection that retired a stream normally.
+#[test]
+fn a_peer_reset_of_our_opened_streams_recv_half_does_not_close() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B must have ADOPTED the stream before it retires its side of it — that is the order the real
+  // retirement runs in, and acting on a stream quinn has not allocated is what trips its own
+  // accounting (see the unsolicited-half policy's note).
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut framed = Vec::new();
+  encode_frame(b"hello", &mut framed);
+  a.test_stage_outbound(ha, StreamClass::Control, &framed);
+  for k in 1..40u64 {
+    let tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+    if b.next_frame(hb, StreamClass::Control).is_some() {
+      break;
+    }
+  }
+  b.test_reset_raw(hb, victim);
+  for k in 40..120u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "a RESET of the unused half is the retirement this transport performs itself, not a violation"
+  );
+  assert!(a.is_validated(ha), "and the connection stays up");
+}
+
+/// CONTROL: a peer FIN of the reverse half, with nothing written on it, must not close the
+/// connection either — a finished empty half carries no data, so there is nothing to refuse.
+#[test]
+fn a_peer_fin_of_our_opened_streams_recv_half_does_not_close() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B must have ADOPTED the stream before it retires its side of it — that is the order the real
+  // retirement runs in, and acting on a stream quinn has not allocated is what trips its own
+  // accounting (see the unsolicited-half policy's note).
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut framed = Vec::new();
+  encode_frame(b"hello", &mut framed);
+  a.test_stage_outbound(ha, StreamClass::Control, &framed);
+  for k in 1..40u64 {
+    let tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+    if b.next_frame(hb, StreamClass::Control).is_some() {
+      break;
+    }
+  }
+  b.test_finish_raw(hb, victim);
+  for k in 40..120u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "an empty FIN on the unused half carries no data, so there is nothing to refuse"
+  );
+  assert!(a.is_validated(ha), "and the connection stays up");
 }
 
 /// The `Single` layout still round-trips one frame on the Control class (the only class it opens).
