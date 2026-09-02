@@ -942,24 +942,31 @@ async fn the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_back
   );
 }
 
-/// TRIPWIRE, not a guarantee: the inbound path reaches `handle_udp` unconditionally, and the known
-/// loss-injection identifiers are absent.
+/// A four-token text tripwire for the loss seam that was removed here. NOT a guarantee that the
+/// inbound path is unconditional.
 ///
-/// A seam gated on this workspace's internal-testkit cfg would still compile into every artifact the
-/// workspace builds, because that cfg is a repo-wide rustflag — putting a datagram-drop branch on the
-/// real driver's inbound hot path. The loss-tolerance test injects its loss from a relay socket it
-/// owns instead, and this keeps it that way by reading the driver's own source.
+/// A seam gated on this workspace's internal-testkit cfg would compile into every artifact the
+/// workspace builds, because that cfg is a repo-wide rustflag — a datagram-drop branch on the real
+/// driver's inbound hot path. The loss-tolerance test injects its loss from a relay socket it owns
+/// instead, and this makes the specific regression loud.
 ///
-/// Two checks, with different strengths. The SHAPE check is structural: the body of
-/// `handle_inbound_datagram` must reach `handle_udp` with no branch in front of it, so a
-/// conditionally-skipped feed fails however it is spelled. The IDENTIFIER check is a blacklist and
-/// only catches the seam that was removed here — a renamed one would pass it. Neither proves the
-/// absence of every possible seam; they make the known regression loud.
+/// It reads the driver's source and checks two things, both text:
+///
+/// - between `fn handle_inbound_datagram(` and the first textual `.handle_udp(`, none of the four
+///   tokens `if `, `match `, `return`, `?` appears;
+/// - the file contains none of the five identifiers the removed seam used.
+///
+/// **What it does NOT catch**, and must not be read as covering: a `#[cfg]` attribute on the feed or
+/// on an early-return statement; a `while`, `for`, `let ... else`, `.then(...)`, `.filter(...)` or
+/// any other conditional spelling; a macro that expands to a branch; a drop performed inside a
+/// helper the feed calls, or after the `.handle_udp(` line; a differently-named or differently-typed
+/// seam; token text appearing in a comment. It is a heuristic on source text, not an analysis of
+/// what the function does.
 #[test]
-fn the_inbound_path_reaches_handle_udp_unconditionally() {
+fn a_text_tripwire_for_the_removed_inbound_loss_seam() {
   const DRIVER_SRC: &str = include_str!("mod.rs");
 
-  // Structural: nothing may stand between the function's opening brace and the `handle_udp` call.
+  // Heuristic 1: the four tokens, between the helper's signature and the first textual feed call.
   let body = DRIVER_SRC
     .split_once("fn handle_inbound_datagram(")
     .expect("the inbound helper exists")
@@ -970,12 +977,12 @@ fn the_inbound_path_reaches_handle_udp_unconditionally() {
   for branch in ["if ", "match ", "return", "?"] {
     assert!(
       !before_feed.contains(branch),
-      "the inbound path must reach handle_udp unconditionally — found `{branch}` before the feed, \
-       which is how a datagram-drop seam would look"
+      "found `{branch}` between the inbound helper and its feed — one of the four shapes a \
+       datagram-drop seam took here"
     );
   }
 
-  // Tripwire: the identifiers the removed seam used.
+  // Heuristic 2: the identifiers the removed seam used.
   for needle in [
     "InboundLoss",
     "inbound_loss",

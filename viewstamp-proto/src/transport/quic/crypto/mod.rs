@@ -11,10 +11,13 @@
 //!   datagram retransmits before a backup view-changes off a not-yet-connected primary.
 //! - `max_concurrent_bidi_streams` = 8 (each side opens up to 2 send streams under
 //!   `ControlBulk`; 8 gives per-side pair headroom across the cluster mesh).
-//! - `stream_receive_window` = 1 MiB: the largest per-stream window whose unread backlog
-//!   still fits `quinn-proto`'s stream reassembly bound (see [`MAX_STREAM_RECEIVE_WINDOW`]).
-//!   A frame larger than the window still flows, across the window updates its reader
-//!   produces as it drains.
+//! - `stream_receive_window` = 1 MiB: the maximum this transport accepts, sized against
+//!   `quinn-proto`'s stream reassembly ceiling for a PACKET-FILLING sender of contiguous
+//!   new data — the shape a backlog produces. Other segmentation (sub-packet writes, frames
+//!   behind a gap) is excluded from that sizing and can reach the ceiling inside this
+//!   window; [`MAX_STREAM_RECEIVE_WINDOW`] states the predicate and what follows. A frame
+//!   larger than the window still flows, across the window updates its reader produces as
+//!   it drains.
 //! - `receive_window` (connection-level) = 17 MiB, clear of the 8 MiB the connection's
 //!   streams can hold unread together, so stream-level flow control is what throttles a
 //!   slow reader and one class can never starve the other of connection window.
@@ -246,13 +249,13 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
   QUINN_REASSEMBLY_MAX_SPANS * MIN_FILLED_STREAM_FRAME_PAYLOAD;
 
-/// Per-stream receive window: the largest window the reassembly ceiling admits
-/// ([`MAX_STREAM_RECEIVE_WINDOW`]). For the supported sender shape — a peer that fills its packets,
-/// which is what a backlog produces — a stalled reader throttles that peer rather than stranding the
-/// connection, and a frame larger than the window still flows across the window updates its reader's
-/// drain produces. It is NOT a promise over all segmentation: sub-packet or gapped frames reach the
-/// reassembler's span ceiling inside this window and close the connection, which then recovers
-/// through the path [`MAX_STREAM_RECEIVE_WINDOW`] documents.
+/// Per-stream receive window: the maximum this transport accepts
+/// ([`MAX_STREAM_RECEIVE_WINDOW`]), sized for a PACKET-FILLING sender of contiguous new data. For
+/// that shape — the one a backlog produces — a stalled reader throttles its peer rather than
+/// stranding the connection, and a frame larger than the window still flows across the window
+/// updates its reader's drain produces. It is NOT a promise over all segmentation: sub-packet or
+/// gapped frames reach the reassembler's span ceiling inside this window and close the connection,
+/// which then recovers through the path [`MAX_STREAM_RECEIVE_WINDOW`] documents.
 pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = MAX_STREAM_RECEIVE_WINDOW;
 
 /// The largest value a QUIC `VarInt` can carry (`2^62 - 1`).  The tuning setters clamp to this so an
@@ -769,10 +772,11 @@ impl QuicOptions {
       VarInt::from_u64(tuning.connection_receive_window())
         .expect("connection window within VarInt range (clamped by the tuning setter)"),
     );
-    // Per-stream window: what bounds the unread backlog a slow reader lets build up, capped by
-    // the tuning setter at MAX_STREAM_RECEIVE_WINDOW so that backlog stays inside quinn's stream
-    // reassembly bound.  A frame larger than the window still flows, across the window updates the
-    // reader's drain produces.
+    // Per-stream window: what bounds the unread backlog's BYTES, capped by the tuning setter at
+    // MAX_STREAM_RECEIVE_WINDOW — the maximum this transport accepts, sized against quinn's stream
+    // reassembly ceiling for a packet-filling sender of contiguous new data. Other segmentation is
+    // excluded from that sizing (see MAX_STREAM_RECEIVE_WINDOW). A frame larger than the window
+    // still flows, across the window updates the reader's drain produces.
     tc.stream_receive_window(
       VarInt::from_u64(tuning.stream_receive_window())
         .expect("stream window within VarInt range (clamped by the tuning setter)"),
