@@ -1453,7 +1453,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if let Some(rec) = self.recover.as_mut() {
       // Exhaustion is judged only with the op's outstanding-completion fence empty (the shared
       // retry discipline), so every id was already retired by the delivered failure it named.
-      debug_assert!(
+      assert!(
         !rec.reads.values().any(|&o| o == op),
         "resolving op {op} with a read still outstanding — the retry discipline waits on it"
       );
@@ -2344,7 +2344,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // owed exactly one completion, and each caller reaches here only once the fence has drained
     // (`recover_progress` gates on `pending`; the peer-checkpoint ingress defers behind the same
     // fence) — asserted so a future completion path cannot silently abandon an outstanding read.
-    debug_assert!(
+    assert!(
       self
         .recover
         .as_ref()
@@ -2513,18 +2513,47 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Snapshot the PENDING ops (the in-flight tail reads) so we can re-borrow `recover` per op while
     // iterating. Faulty ops are NOT re-read (already resolved to a peer-repaired hole).
-    let (ops, want_checkpoint, checkpoint_retries, awaiting_peer, probe_deferred, reconstructing) =
-      match self.recover.as_ref() {
-        Some(rec) => (
-          rec.pending.keys().copied().collect::<std::vec::Vec<u64>>(),
-          rec.checkpoint,
-          rec.checkpoint_retries,
-          rec.awaiting_peer_checkpoint,
-          rec.probe_deferred.is_some(),
-          rec.reconstruct.is_some(),
-        ),
-        None => (std::vec::Vec::new(), None, 0, false, false, false),
-      };
+    //
+    // `outstanding` INVERTS the fence once per tick — `reads` is keyed by read id, so asking it
+    // per-op would rescan the whole map inside the loop, quadratic in the tail window on the first
+    // ticks after boot (where every slot of a checkpoint interval is still unresolved) and paid
+    // inside the Sans-I/O pump. Inverting is safe as a snapshot because an op's fence entries are
+    // mutated ONLY by its own iteration below (the `Retry` arm inserts one id for that op;
+    // exhaustion touches no other op's), and `pending`'s keys are distinct, so no iteration can
+    // stale another's verdict. The budget is still read live from `pending`, which a completion
+    // arriving mid-loop would clear.
+    let (
+      ops,
+      outstanding,
+      want_checkpoint,
+      checkpoint_retries,
+      awaiting_peer,
+      probe_deferred,
+      reconstructing,
+    ) = match self.recover.as_ref() {
+      Some(rec) => (
+        rec.pending.keys().copied().collect::<std::vec::Vec<u64>>(),
+        rec
+          .reads
+          .values()
+          .copied()
+          .collect::<std::collections::BTreeSet<u64>>(),
+        rec.checkpoint,
+        rec.checkpoint_retries,
+        rec.awaiting_peer_checkpoint,
+        rec.probe_deferred.is_some(),
+        rec.reconstruct.is_some(),
+      ),
+      None => (
+        std::vec::Vec::new(),
+        std::collections::BTreeSet::new(),
+        None,
+        0,
+        false,
+        false,
+        false,
+      ),
+    };
     // A submitted checkpoint read whose exactly-once completion has not yet arrived: the wait the
     // checkpoint block below parks on instead of retrying against.
     let checkpoint_read_owed = self
@@ -2546,7 +2575,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // (`resolve_exhausted_tail_read`/`mint_read_id` re-borrow `self`/`self.recover`).
       let verdict = self.recover.as_ref().and_then(|rec| {
         let budget = rec.pending.get(&op).copied()?;
-        Some(retry_verdict(rec.reads.values().any(|&o| o == op), budget))
+        Some(retry_verdict(outstanding.contains(&op), budget))
       });
       match verdict {
         // A submitted read still owes its completion: wait on it. The delivered verdict resolves
@@ -2656,7 +2685,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `faulty`) and must not erase the original verdicts — nothing was re-read, so they stand until
   /// consumed by `complete_state_sync`.
   pub(super) fn retire_recover_for_staged_sync(&mut self) {
-    debug_assert!(
+    assert!(
       self
         .recover
         .as_ref()
@@ -2805,12 +2834,27 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     storage: &mut Storage<W, B, S>,
   ) {
-    // `RecoveringHead` is entered only through `recover_progress`, whose gate requires the read
-    // fence drained — so this escalation can never abandon an outstanding read or a staged fill:
-    // a recovering endpoint stages no append, and every obligation the reformation supersedes
-    // lives in the log/WAL (a `Repairing` hole, a durable header), which the reformed view
-    // re-derives. Asserted so a future entry path cannot silently reopen the window.
-    debug_assert!(
+    // Neither caller can reach here over an open fence, and each for its own reason.
+    //
+    // - `recover_head_timeouts` runs in `RecoveringHead`, and BOTH entries into that status hold a
+    //   read-free state: `recover_progress` returns early while `rec.pending` is non-empty, and
+    //   `complete_state_sync`'s carried-faulty re-arm builds a `RecoverState` carrying only the
+    //   verdicts. Nothing re-opens the fence afterwards — the sole site that submits a tail read
+    //   for a NEW op is the constructor's batch, and `recover_timeouts` re-submits only for an op
+    //   already pending.
+    // - The bounded quarantine-probe disarm in `handle_timeout` fires in `Status::Recovering`, NOT
+    //   `RecoveringHead`, so the tail fence is not drained by its status. It runs only when
+    //   `advance_quarantine_probe` returns true, which requires an armed `require_cross_epoch`
+    //   sync; both sites that arm one on a Normal endpoint are status-gated, so on a non-Normal
+    //   endpoint only `enter_cross_epoch_peer_fetch` can arm one — and it refuses while
+    //   `rec.pending` is non-empty, then installs a read-free `RecoverState` of its own.
+    //
+    // So this escalation can never abandon an outstanding read or a staged fill: a recovering
+    // endpoint stages no append, and every obligation the reformation supersedes lives in the
+    // log/WAL (a `Repairing` hole, a durable header), which the reformed view re-derives. Asserted
+    // so a future entry path — or a relaxation of either gate above — cannot silently reopen the
+    // window.
+    assert!(
       self
         .recover
         .as_ref()
@@ -2971,7 +3015,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // every retained held-tail entry is a faithfully-resolved slot (`Present(body)` or a
     // `Repairing` hole), never an unresolved Phase-1 placeholder, `self.op` is the verified head,
     // and abandoning the local recovery below discards no completion the medium still owes.
-    debug_assert!(
+    assert!(
       self
         .recover
         .as_ref()

@@ -1763,6 +1763,16 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// checkpoint subsumed and routes to `RecoveringHead` — resuming the preempted decision, verdicts
   /// restored — when the head is among the survivors, and to the normal `complete_recovery` otherwise.
   /// Empty means none carried.
+  ///
+  /// These are SETTLED VERDICTS ABOUT THE LOG that MUST reach `complete_state_sync` — not
+  /// disposable cache, and losing them is not safe-side. With the set empty the completion takes
+  /// the `complete_recovery` branch unconditionally: the head `recover_progress` already removed
+  /// from `self.log` is then held by `self.op` with no entry and no identity anywhere (the exact
+  /// state the carry exists to prevent), and the interior verdicts `committed_band_intact` reads
+  /// are gone, so a same-epoch reformation may proceed omitting a committed op this replica cannot
+  /// vouch. What keeps them SAFE to hand-carry is not any property of their loss but that the read
+  /// phase is provably settled at the staging — nothing the medium still owes can invalidate a
+  /// verdict here — which `retire_recover_for_staged_sync` now asserts rather than assumes.
   sync_carried_faulty: std::collections::BTreeSet<u64>,
   /// Peer fault-repair: committed ops whose body read back PERMANENTLY faulty (bit-rot / torn)
   /// from this replica's own durable WAL and must be re-fetched from a peer (`RequestPrepare` →

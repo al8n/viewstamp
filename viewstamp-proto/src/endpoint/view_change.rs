@@ -1722,7 +1722,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (This is the distinguishing reset only the adoption path owns.) Nothing else needs retiring
     // with it: `RecoveringHead` is entered only over a drained read fence, so no read completion
     // remains owed, and any hole the adopted log re-carries `Repairing` is the ordinary peer-repair
-    // lane's to fill.
+    // lane's to fill. Asserted, like every other site that drops the recovery bookkeeping, so no
+    // transition can silently abandon a read obligation the medium still owes.
+    assert!(
+      self
+        .recover
+        .as_ref()
+        .is_none_or(|rec| rec.pending.is_empty() && rec.reads.is_empty()),
+      "adopting a canonical head over an open read fence"
+    );
     self.recover = None;
     // (The pending-repair set was reconciled above — holes the adopted log / applied-prefix held copies
     // now cover were retired; any committed op neither side carries — including the unapplied band
