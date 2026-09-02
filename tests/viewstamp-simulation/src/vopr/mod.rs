@@ -147,6 +147,37 @@ pub struct VoprReport {
   /// sweep's non-vacuity witness, independent of the view-transition coincidence the overtake
   /// counter needs). Deliberately NOT folded into the digest report hash.
   sb_envelope_lags: u64,
+  /// The high-water of WAL reads that drew a non-zero latency across the run, summed over replicas.
+  /// Always `0` off-axis (the read-delay axis is opt-in); `> 0` proves the axis is plumbed through to
+  /// the media end to end. Deliberately NOT folded into the digest report hash (like
+  /// [`Self::wal_write_reorders`]).
+  wal_reads_delayed: u64,
+  /// The high-water of WAL reads answered only AFTER the proto's whole recovery read budget elapsed,
+  /// summed over replicas. A read that outlives that budget is necessarily still outstanding when its
+  /// op's per-op retransmission budget runs out — the budget is counted from the recovery's start,
+  /// which is at or before the read's submission — so the op resolves from its durable header with a
+  /// LIVE correlation, and the completion can only ever arrive on the carried lane. Always `0`
+  /// off-axis, and `0` on every run before this axis existed: a synchronous backend resolves every
+  /// read in the call that submitted it. Deliberately NOT folded into the digest report hash.
+  wal_reads_past_budget: u64,
+  /// The high-water of beyond-budget WAL reads that delivered BYTES — a `ReadOk` carrying a slot's
+  /// canonical content, the only completion an endpoint's carried-correlation lane can ADMIT (every
+  /// other verdict merely spends its correlation). The sharp non-vacuity witness for the late-read
+  /// lane: `> 0` means the medium genuinely handed back canonical bytes for an op long after the
+  /// endpoint's recovery stopped waiting for them. Always `0` off-axis; NOT folded into the digest.
+  wal_late_bodies_delivered: u64,
+  /// The high-water of beyond-budget stalls the axis DREW, summed over replicas — the armed-and-fired
+  /// half of the pair whose delivered half is [`Self::wal_reads_past_budget`]. A drawn stall reaches
+  /// the endpoint only if its replica lives long enough to be handed it, so the two counts differ by
+  /// exactly the reads a crash discarded plus those still held when the run ended. Always `0`
+  /// off-axis; NOT folded into the digest report hash.
+  wal_read_stalls_drawn: u64,
+  /// The high-water of HELD reads a crash discarded across the run, summed over replicas — reads the
+  /// axis delayed that were delivered to nobody, because the process holding their correlations died
+  /// first. Always `0` off-axis. Kept beside the witnesses above so a small beyond-budget count can be
+  /// read for what it is: a schedule that kept killing the waiting replica, not an axis that failed to
+  /// stall. NOT folded into the digest report hash.
+  wal_reads_discarded: u64,
   /// The high-water mark of the recover read-window's HELD TAIL above the durable checkpoint
   /// (`op - checkpoint_op`), folded from [`Cluster::recovered_band_high_water`] — which samples it ONCE
   /// per recovery at recover construction (the held head is fixed there; the committed band above the
@@ -583,6 +614,40 @@ impl VoprReport {
   /// Always `0` off-axis; `> 0` on a reorder run ⇒ the axis is plumbed through end to end.
   pub const fn sb_envelope_lags(&self) -> u64 {
     self.sb_envelope_lags
+  }
+
+  /// The high-water of WAL reads that drew a non-zero latency (summed over replicas). Always `0`
+  /// off-axis; `> 0` on a read-delay run ⇒ the axis reached the media.
+  pub const fn wal_reads_delayed(&self) -> u64 {
+    self.wal_reads_delayed
+  }
+
+  /// The high-water of WAL reads answered only after the proto's whole recovery read budget elapsed
+  /// (summed over replicas). Always `0` off-axis and on every synchronous-read run; `> 0` ⇒ a read
+  /// genuinely OUTLIVED the budget, so its op resolved from its durable header with the read still
+  /// outstanding — the state the carried-correlation lane exists for.
+  pub const fn wal_reads_past_budget(&self) -> u64 {
+    self.wal_reads_past_budget
+  }
+
+  /// The high-water of beyond-budget WAL reads that delivered BYTES (summed over replicas) — the only
+  /// completions an endpoint's carried-correlation lane can admit. The sharp non-vacuity witness for
+  /// the late-read lane; always `0` off-axis.
+  pub const fn wal_late_bodies_delivered(&self) -> u64 {
+    self.wal_late_bodies_delivered
+  }
+
+  /// The high-water of HELD reads a crash discarded across the run (summed over replicas): reads the
+  /// axis delayed that reached nobody, because the process holding their correlations died first.
+  /// Always `0` off-axis; reported beside the witnesses above so their size can be read in context.
+  pub const fn wal_reads_discarded(&self) -> u64 {
+    self.wal_reads_discarded
+  }
+
+  /// The high-water of beyond-budget stalls the axis DREW (summed over replicas) — the armed-and-fired
+  /// half of the pair whose delivered half is [`Self::wal_reads_past_budget`]. Always `0` off-axis.
+  pub const fn wal_read_stalls_drawn(&self) -> u64 {
+    self.wal_read_stalls_drawn
   }
 
   /// The high-water of the recover read-window's HELD TAIL above the durable checkpoint
@@ -1039,6 +1104,14 @@ struct Vopr {
   /// run is its OWN deterministic baseline. No `VOPR_NO_*` shrink mask exists for it: masking would
   /// be identical to simply not enabling the axis.
   sb_reorder_axis: bool,
+  /// Whether the WAL READ-DELAY axis is enabled for this run: the `VOPR_READ_DELAY` env var, or
+  /// force-enabled via [`run_vopr_with_read_delay`] (the committed read-delay sweep). Same discipline
+  /// as [`Self::write_chaos_axis`]: with the axis OFF no delay seed is installed and no PRNG value is
+  /// consumed (the delay base derives from `self.seed` behind a separate magic, never from the action
+  /// stream), so the default per-seed schedule stays byte-identical; a delay-enabled run is its OWN
+  /// deterministic baseline. No `VOPR_NO_*` shrink mask exists for it: masking would be identical to
+  /// simply not enabling the axis.
+  read_delay_axis: bool,
   /// Whether the RESTART-IN-PLACE axis is enabled for this run: the `VOPR_RESTART_IN_PLACE` env var,
   /// or force-enabled via [`run_vopr_with_restart_in_place`] (which forces the write-chaos axis on
   /// with it — see its docs for why the two only bite together). Same discipline as
@@ -1415,6 +1488,35 @@ pub fn run_vopr_with_write_chaos(seed: u64, ticks: u64) -> VoprReport {
 pub fn run_vopr_with_sb_reorder(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.sb_reorder_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the WAL READ-DELAY axis FORCE-ENABLED, independent of the
+/// `VOPR_READ_DELAY` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]).
+/// Every replica's WAL then gives its reads a LATENCY: the verdict is decided at submit exactly as
+/// before — same fault, misdirect and placement decisions — and the completion is held until the
+/// device clock reaches a drawn due instant. Most slots answer within a fraction of the recovery
+/// cadence; a seeded minority are DEGRADED and answer only past the proto's whole recovery read
+/// budget, and a degraded slot answers late for EVERY read of it.
+///
+/// The default sweep's WAL resolves each read in the call that submitted it, which makes a late read
+/// structurally impossible: a recovery read can never still be outstanding when its op's
+/// retransmission budget runs out, so the op never resolves from its durable header with a LIVE
+/// correlation and everything an endpoint does with a completion arriving after that point — the
+/// carried-correlation lane, its identity and durability gates, its append barrier, and the promoted
+/// head's restore — is unreachable at every seed. This axis is what makes that state reachable: with
+/// a degraded slot the Phase-1 read AND all eight additive retransmissions are outstanding at the
+/// resolution, so the correlations are carried live and the eventual `ReadOk` arrives on them.
+///
+/// The EXISTING oracles judge the outcome every tick — committed-loss (durability),
+/// applied-divergence (agreement), append-before-ack, boundedness, plus the liveness/final-quiesce
+/// gates — so a panic here is a REAL finding in the late-read lane, reported with its seed, never
+/// masked. A delay-enabled run is a pure function of `(seed, ticks)` and its own deterministic
+/// baseline (the delay base derives from the run seed behind a separate magic, never from the action
+/// stream, so the default schedule stays byte-identical with the axis off).
+pub fn run_vopr_with_read_delay(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.read_delay_axis = true;
   run_seeded(v, ticks)
 }
 
@@ -2072,6 +2174,7 @@ impl Vopr {
       torn_header_axis: env_flag("VOPR_TORN_HEADER"),
       write_chaos_axis: env_flag("VOPR_WRITE_CHAOS"),
       sb_reorder_axis: env_flag("VOPR_SB_REORDER"),
+      read_delay_axis: env_flag("VOPR_READ_DELAY"),
       restart_in_place_axis: env_flag("VOPR_RESTART_IN_PLACE"),
       swap_rebuild_axis: env_flag("VOPR_SWAP_REBUILD"),
       swap_rebuild_actions: 0,
@@ -2251,6 +2354,16 @@ impl Vopr {
     if self.sb_reorder_axis {
       const SB_REORDER_SEED_MAGIC: u64 = 0xE57E_10FE_5EED_0D0D;
       c.set_sb_envelope_lag(Some(self.seed ^ SB_REORDER_SEED_MAGIC));
+    }
+    // WAL READ-DELAY axis: every replica's WAL answers reads with a seeded latency — short for a
+    // healthy slot, past the whole recovery read budget for a seeded minority of DEGRADED slots — so
+    // a recovery read can be still outstanding when its op's retransmission budget runs out. The
+    // synchronous default makes that structurally impossible. Same discipline as the write-chaos axis
+    // above: the delay base derives from the run seed behind its own magic, NOT the action stream,
+    // and the call is CONDITIONAL, so an off-axis run makes no cluster call and consumes no draw.
+    if self.read_delay_axis {
+      const READ_DELAY_SEED_MAGIC: u64 = 0x2EAD_5104_5EED_0B0B;
+      c.set_wal_read_delay(Some(self.seed ^ READ_DELAY_SEED_MAGIC));
     }
     // BLOCK-JOB DELAY axis: each polled block job waits a few storage steps on its replica's serial
     // lane before executing. Same discipline as the write-chaos axis above — the plan seed derives
@@ -2665,7 +2778,7 @@ impl Vopr {
     // op is drained to convergence rather than mistaken for a wedge at the first replica to catch up.
 
     // Already converged (the common case — nothing was owed)? Then no drain is needed.
-    if dur.check(c).is_ok() && Self::live_reconfig_fully_installed(c) {
+    if dur.check(c).is_ok() && Self::live_reconfig_fully_installed(c) && !self.media_owe_reads(c) {
       return;
     }
 
@@ -2677,7 +2790,8 @@ impl Vopr {
       // is a real bug, and the strict quorum-durability invariant continues to hold every tick. (Tick
       // label `ticks + k` locates a drain-phase violation.)
       self.check_invariants(c, ticks + k, dur, vm, applied_once, staleness, bound);
-      if dur.check(c).is_ok() && Self::live_reconfig_fully_installed(c) {
+      if dur.check(c).is_ok() && Self::live_reconfig_fully_installed(c) && !self.media_owe_reads(c)
+      {
         self.update_report(c);
         return;
       }
@@ -2727,6 +2841,19 @@ impl Vopr {
        {succ_config_id:#x}); the change is wedged short of cluster-wide convergence",
       self.seed
     );
+  }
+
+  /// Whether any replica's medium still OWES a read completion the read-delay axis is holding — the
+  /// third conjunct of the drain's settle condition, beside durability and reconfiguration install.
+  ///
+  /// A replica waiting on its own disk for a body no peer can supply has not settled, however healthy
+  /// the rest of the cluster looks, and a run that stopped there would leave the axis's own lane
+  /// unable to say whether the completion would ever have been delivered. Identically FALSE with the
+  /// axis off — no read is ever held there — so the drain's exit is unchanged on every other lane.
+  /// Bounded by construction: a held read comes due within its band, and only a recovery submits
+  /// more, so this cannot hold the drain open indefinitely.
+  fn media_owe_reads(&self, c: &Cluster) -> bool {
+    (0..self.node_count).any(|i| c.wal_reads_held(i) > 0)
   }
 
   /// Apply this tick's adversarial actions (suppressed during calm windows). Each action rolls
@@ -4012,6 +4139,25 @@ impl Vopr {
       .map(|i| c.sb_envelope_lags_drawn(i))
       .sum();
     self.report.sb_envelope_lags = self.report.sb_envelope_lags.max(el);
+    // READ-DELAY high-waters (same shape): reads given a latency, reads that outlived the whole
+    // recovery read budget, and the subset of those that delivered bytes — summed over the persistent
+    // per-replica WAL counters. Identically 0 off-axis.
+    let rd: u64 = (0..self.node_count).map(|i| c.wal_reads_delayed(i)).sum();
+    self.report.wal_reads_delayed = self.report.wal_reads_delayed.max(rd);
+    let rb: u64 = (0..self.node_count)
+      .map(|i| c.wal_reads_past_budget(i))
+      .sum();
+    self.report.wal_reads_past_budget = self.report.wal_reads_past_budget.max(rb);
+    let lb: u64 = (0..self.node_count)
+      .map(|i| c.wal_late_bodies_delivered(i))
+      .sum();
+    self.report.wal_late_bodies_delivered = self.report.wal_late_bodies_delivered.max(lb);
+    let rx: u64 = (0..self.node_count).map(|i| c.wal_reads_discarded(i)).sum();
+    self.report.wal_reads_discarded = self.report.wal_reads_discarded.max(rx);
+    let sd: u64 = (0..self.node_count)
+      .map(|i| c.wal_read_stalls_drawn(i))
+      .sum();
+    self.report.wal_read_stalls_drawn = self.report.wal_read_stalls_drawn.max(sd);
     // FORCED-sync (peer-fetch escalation) cumulative accumulation. The proto's per-replica counter
     // resets to 0 on `recover` (each restart), so we fold each POSITIVE delta into the running total
     // and always re-baseline `forced_sync_seen` — a reset's downward step then contributes nothing and

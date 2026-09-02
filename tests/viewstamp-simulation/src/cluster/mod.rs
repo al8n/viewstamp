@@ -35,6 +35,11 @@ const WRITE_CHAOS_SEED_MAGIC: u64 = 0xC4A0_50DE_0DD5_EED5;
 /// when a caller passes the cluster's own seed as the lag base.
 const ENVELOPE_LAG_SEED_MAGIC: u64 = 0xE57E_10FE_5EED_1A6A;
 
+/// Mixed into the per-replica READ-DELAY seed (the WAL's read-latency axis) so a replica's latency
+/// stream — and which of its slots read slowly — is independent of its storage-fault, write-chaos,
+/// envelope-lag, and protocol PRNGs, even when a caller passes the cluster's own seed as the base.
+const READ_DELAY_SEED_MAGIC: u64 = 0x2EAD_DE1A_5EED_0B0B;
+
 /// The virtual delay applied to a message the network elects to HOLD ([`Faults::hold_per_mille`]).
 /// Far past the proto's repair-or-truncate grace (5 s) so a held `PrepareOk` can outlive its op's
 /// truncation + re-mint and arrive at the new primary as a STALE-body vote — the op-reuse class the
@@ -359,6 +364,16 @@ pub struct Cluster {
   /// `crash`/`restart` because the superblock struct does. Only meaningful alongside
   /// [`set_async_superblock_delay`] (synchronous writes complete inline — nothing lags).
   sb_envelope_lag: Option<u64>,
+  /// `None` (default) ⇒ every replica's WAL answers a read INLINE, so no read can be late relative to
+  /// the proto's recovery read budget. `Some(base)` ⇒ READ-DELAY mode on every replica's WAL with a
+  /// per-replica seed derived from `base`: each read's verdict is decided as usual and then held for a
+  /// drawn latency, with a seeded minority of slots DEGRADED and answering only past the whole
+  /// recovery read budget. Set via [`set_wal_read_delay`] before running; persists across
+  /// `crash`/`restart` because the WAL struct does (a `crash` discards the reads in flight, which die
+  /// with the process).
+  ///
+  /// [`set_wal_read_delay`]: Self::set_wal_read_delay
+  read_delay_seed: Option<u64>,
   /// How many INTER-REPLICA messages this cluster dropped because their `encoded_len()` exceeded the
   /// transport frame cap [`MAX_FRAME_LEN`] — modelling the real transport's send-path frame guard,
   /// which refuses a peer message larger than one frame. Only `replica → replica` traffic is measured
@@ -564,6 +579,7 @@ impl Cluster {
       None,
       None,
       None,
+      None,
     );
     // GENESIS: commit each replica over its freshly-seeded (virgin) store. `commit` writes the durable
     // genesis root a later restart recovers over — a voter with no durable root fail-stops — and builds
@@ -650,6 +666,7 @@ impl Cluster {
       wal_capacity: None,
       write_chaos_seed: None,
       sb_envelope_lag: None,
+      read_delay_seed: None,
       oversized_dropped: 0,
       holds_fired: 0,
       one_way_dropped: 0,
@@ -679,7 +696,8 @@ impl Cluster {
   /// composed with the fault plan. When `wal_capacity` is `Some(n)`, every WAL is a fixed ring of `n`
   /// slots, composed with the fault/async modes. When `write_chaos` is `Some(base)`, every WAL runs in
   /// write-chaos mode with its own [`Self::write_chaos_storage_seed`]-derived seed, composed with all
-  /// of the above.
+  /// of the above. When `read_delay` is `Some(base)`, every WAL answers reads with a seeded latency
+  /// off its own [`Self::read_delay_storage_seed`]-derived seed, composed with all of the above.
   ///
   /// Every WAL seeded together shares ONE [`PermanentLossBudget`], sized by the `f` this membership's
   /// quorum implies and returned alongside them: fresh media hold no destroyed copy of anything, so a
@@ -698,6 +716,7 @@ impl Cluster {
     wal_capacity: Option<u64>,
     write_chaos: Option<u64>,
     sb_envelope_lag: Option<u64>,
+    read_delay: Option<u64>,
   ) -> (
     Vec<Shared<InMemoryWal>>,
     Vec<Shared<InMemorySuperblock>>,
@@ -723,6 +742,11 @@ impl Cluster {
         // with everything above. Skipped entirely off-axis (the byte-identical default).
         if let Some(base) = write_chaos {
           w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i)));
+        }
+        // Read latency: healthy slots answer within a short band, a seeded minority only past the
+        // recovery read budget. Skipped entirely off-axis (the byte-identical inline default).
+        if let Some(base) = read_delay {
+          w.set_read_delay(Some(Self::read_delay_storage_seed(base, i)));
         }
         // Every replica's permanent body faults are charged against the one shared budget, so the
         // rolls can no longer destroy the same op everywhere at once.
@@ -767,6 +791,14 @@ impl Cluster {
     base ^ (replica as u64).wrapping_mul(ENVELOPE_LAG_SEED_MAGIC) ^ ENVELOPE_LAG_SEED_MAGIC
   }
 
+  /// The per-replica READ-DELAY seed, derived from the delay `base` with its own magic (mirrors
+  /// [`Self::write_chaos_storage_seed`]) so each replica's read-latency stream — and the set of slots
+  /// it holds degraded — is independent of its fault, chaos and lag streams and of every other
+  /// replica's, and one replica's slow sectors are not the whole cluster's.
+  fn read_delay_storage_seed(base: u64, replica: u16) -> u64 {
+    base ^ (replica as u64).wrapping_mul(READ_DELAY_SEED_MAGIC) ^ READ_DELAY_SEED_MAGIC
+  }
+
   /// Replaces the network fault model (call before running).
   pub fn set_faults(&mut self, faults: Faults) {
     self.faults = faults;
@@ -787,6 +819,7 @@ impl Cluster {
       self.wal_capacity,
       self.write_chaos_seed,
       self.sb_envelope_lag,
+      self.read_delay_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -819,6 +852,7 @@ impl Cluster {
       self.wal_capacity,
       self.write_chaos_seed,
       self.sb_envelope_lag,
+      self.read_delay_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -853,6 +887,7 @@ impl Cluster {
       self.wal_capacity,
       self.write_chaos_seed,
       self.sb_envelope_lag,
+      self.read_delay_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -889,6 +924,7 @@ impl Cluster {
       self.wal_capacity,
       seed,
       self.sb_envelope_lag,
+      self.read_delay_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -924,6 +960,7 @@ impl Cluster {
       self.wal_capacity,
       self.write_chaos_seed,
       seed,
+      self.read_delay_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -935,6 +972,107 @@ impl Cluster {
       .collect();
     // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
     self.format_all_stores();
+  }
+
+  /// Enables (or, with `None`, disables) **read-delay mode** on every replica's WAL, each seeded from
+  /// `seed` with a per-replica derivation. In this mode a WAL still decides each read's verdict at
+  /// submit — same faults, same misdirects, same placement — and then HOLDS the completion for a drawn
+  /// latency: a short band for a healthy slot, and, for a seeded minority of DEGRADED slots, a band
+  /// strictly above the proto's whole recovery read budget.
+  ///
+  /// The synchronous default makes a WAL read structurally incapable of being late: every read
+  /// resolves in the call that submitted it, so a recovery read can never still be outstanding when
+  /// its op's retransmission budget runs out, and everything an endpoint does with a completion that
+  /// arrives after its recovery stopped waiting on it is unreachable at every seed. This axis is what
+  /// opens that window — and, because a degraded slot answers late for EVERY read of it, it opens it
+  /// for the additive retransmissions too, which is what the op must exhaust its budget through.
+  ///
+  /// Composes with the current fault/async/ring/chaos modes. Call before running; the mode persists
+  /// across `crash`/`restart` because the WAL struct does (a `crash` discards the reads in flight —
+  /// device work dies with the process). `None` (the default) keeps every read's completion queued
+  /// inline, byte-identical to the pre-axis harness. Rebuilds the (empty) WALs, like
+  /// [`set_async_wal_delay`](Self::set_async_wal_delay).
+  pub fn set_wal_read_delay(&mut self, seed: Option<u64>) {
+    self.read_delay_seed = seed;
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
+      self.seed,
+      self.storage_faults,
+      self.async_wal_delay,
+      self.async_sb_delay,
+      self.wal_capacity,
+      self.write_chaos_seed,
+      self.sb_envelope_lag,
+      seed,
+    );
+    self.wals = wals;
+    self.sbs = sbs;
+    self.loss_budget = loss_budget;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
+    // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
+    self.format_all_stores();
+  }
+
+  /// Feed EVERY medium the cluster's virtual clock — the device-side act the WAL read-delay axis
+  /// needs, through the same second handle the harness injects faults through.
+  ///
+  /// Called wherever virtual time changes or the harness is about to enter an endpoint, so the
+  /// invariant a held read's due instant rests on holds at every submission: **at every point an
+  /// endpoint runs, every medium's clock equals the cluster's**. Applied to CRASHED replicas too — a
+  /// device does not stop keeping time because its host process died, and a medium whose clock froze
+  /// across an outage would answer the restart's first reads out of a stale past, releasing them the
+  /// instant the clock caught up and quietly cancelling the latency the axis exists to impose.
+  ///
+  /// Monotone and inert with the axis off, where no read is ever held and nothing reads the clock.
+  fn advance_device_clocks(&mut self, now: viewstamp_proto::Instant) {
+    for wal in &self.wals {
+      wal.borrow_mut().advance_device_clock(now);
+    }
+  }
+
+  /// How many reads replica `i`'s WAL DELAYED (drew a non-zero latency) since construction. `0` with
+  /// the read-delay axis off; `> 0` proves the axis reached that medium.
+  pub fn wal_reads_delayed(&self, i: usize) -> u64 {
+    self.wals[i].borrow().reads_delayed()
+  }
+
+  /// How many reads replica `i`'s WAL answered only AFTER the proto's whole recovery read budget had
+  /// elapsed since their submission — reads that genuinely outlived the budget, so their op resolved
+  /// from its durable header while they were still outstanding. `0` with the axis off.
+  pub fn wal_reads_past_budget(&self, i: usize) -> u64 {
+    self.wals[i].borrow().reads_past_budget()
+  }
+
+  /// How many HELD reads a crash discarded on replica `i` before they came due — the difference
+  /// between the reads that medium delayed and the reads it ever delivered late. `0` with the axis off.
+  pub fn wal_reads_discarded(&self, i: usize) -> u64 {
+    self.wals[i].borrow().reads_discarded()
+  }
+
+  /// How many reads replica `i`'s WAL drew a beyond-budget stall for, counted at submit — the
+  /// armed-and-fired half of the pair whose delivered half is [`wal_reads_past_budget`]. `0` with the
+  /// axis off.
+  ///
+  /// [`wal_reads_past_budget`]: Self::wal_reads_past_budget
+  pub fn wal_read_stalls_drawn(&self, i: usize) -> u64 {
+    self.wals[i].borrow().read_stalls_drawn()
+  }
+
+  /// How many reads replica `i`'s WAL is holding right now (submitted, not yet due). `0` with the
+  /// axis off.
+  pub fn wal_reads_held(&self, i: usize) -> usize {
+    self.wals[i].borrow().reads_held()
+  }
+
+  /// How many of replica `i`'s beyond-budget reads delivered BYTES (a `ReadOk` carrying the slot's
+  /// canonical content) rather than a fault/absent verdict — the only completions an endpoint's
+  /// carried-correlation lane can admit. `0` with the axis off.
+  pub fn wal_late_bodies_delivered(&self, i: usize) -> u64 {
+    self.wals[i].borrow().late_bodies_delivered()
   }
 
   /// Enables (or, with `None`, disables) **bounded ring mode** on every replica's WAL: each WAL becomes
@@ -1814,6 +1952,11 @@ impl Cluster {
     i: usize,
   ) -> Result<Option<viewstamp_proto::Retired>, viewstamp_proto::RecoverError> {
     self.incarnations[i] += 1;
+    // The rebuild below submits this recovery's whole first batch of tail reads, so the medium's
+    // clock must be current before it runs — a disk that has been sitting out an outage (or, on a
+    // wipe, one that was just installed) would otherwise date those reads from whenever it last saw
+    // the clock and answer them the moment it catches up.
+    self.advance_device_clocks(self.clock.now());
     let cfg = self.replica_config(i as u16);
     // The genesis-fallback membership for a legacy root (a v4 root ignores it). Sized by the CURRENT
     // voting/learner split so a same-epoch legacy bridge still resolves every node.
@@ -1892,6 +2035,12 @@ impl Cluster {
     // per-medium), re-seeded with the same per-replica derivation the initial seeding used.
     if let Some(base) = self.write_chaos_seed {
       w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i as u16)));
+    }
+    // The replaced disk keeps the cluster's read-delay mode (per-DEPLOYMENT, like write chaos),
+    // re-seeded with the same per-replica derivation the initial seeding used — so a swapped disk in
+    // the same enclosure reads at the same speed, and holds the same slots degraded.
+    if let Some(base) = self.read_delay_seed {
+      w.set_read_delay(Some(Self::read_delay_storage_seed(base, i as u16)));
     }
     // The replacement disk joins the same cluster-wide permanent-fault budget, and joining releases
     // every seat the replaced disk held: an empty medium holds no destroyed copy of anything.
@@ -2396,6 +2545,7 @@ impl Cluster {
       self.wal_capacity,
       self.write_chaos_seed,
       self.sb_envelope_lag,
+      self.read_delay_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -3604,6 +3754,7 @@ impl Cluster {
 
   pub fn tick(&mut self) {
     let now = self.clock.now();
+    self.advance_device_clocks(now);
 
     for ci in 0..self.clients.len() {
       if let Some(req) = self.clients[ci].pending(now) {
@@ -3786,6 +3937,7 @@ impl Cluster {
     self.clock.advance_to(target);
 
     let now = self.clock.now();
+    self.advance_device_clocks(now);
     for ri in 0..self.replicas.len() {
       if self.crashed[ri] {
         continue;
