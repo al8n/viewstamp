@@ -262,13 +262,16 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// and runs the whole QUIC suite against whatever it picks.
 ///
 /// An embedder who pins or upgrades `quinn-proto` themselves does not get that for free. The
-/// compatibility check is this crate's QUIC suite (`cargo test -p viewstamp-proto --features
-/// quic,tcp,tls,tls-rustls-ring`). Running only part of it, these are the five that fail when the
-/// private behaviour moves — two for the SIZING, three for the CLASSIFIER:
+/// compatibility check IS this crate's QUIC suite — `cargo test -p viewstamp-proto --features
+/// quic,tcp,tls,tls-rustls-ring` — and the list below is not a shortcut past it. These are the tests
+/// that PIN each private behaviour, named so a failure is legible:
 ///
 /// - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
 /// - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
 ///   assumes, counted from the receiver's own STREAM-frame counter;
+/// - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and
+///   refusal: it drives more than 2048 resident spans through compaction and requires the refusal to
+///   surface as a classified, unbound loss;
 /// - `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
 /// - `gapped_writes_into_our_opened_streams_recv_half_close_the_connection` — `Readable` being raised
 ///   for a frame that arrived, at the read offset and ahead of a gap;
@@ -282,8 +285,11 @@ pub const MAX_STREAM_RECEIVE_WINDOW: u64 =
 /// that shape — the one a backlog produces — a stalled reader throttles its peer rather than
 /// stranding the connection, and a frame larger than the window still flows across the window
 /// updates its reader's drain produces. It is NOT a promise over all segmentation: sub-packet or
-/// gapped frames reach the reassembler's span ceiling inside this window and close the connection,
-/// which then recovers through the path [`MAX_STREAM_RECEIVE_WINDOW`] documents.
+/// gapped frames reach the reassembler's span ceiling inside this window and close the connection.
+/// That close enters the recovery path [`MAX_STREAM_RECEIVE_WINDOW`] documents — whose evidence is
+/// COMPONENT-level and carries three modelled seams (the receiver's stall, the redial schedule, the
+/// client's stale-request rebroadcast), so read the claim there rather than taking a recovery
+/// guarantee from this synopsis.
 pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = MAX_STREAM_RECEIVE_WINDOW;
 
 /// The largest value a QUIC `VarInt` can carry (`2^62 - 1`).  The tuning setters clamp to this so an

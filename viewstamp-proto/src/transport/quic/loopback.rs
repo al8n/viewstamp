@@ -1649,8 +1649,11 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 /// a datagram-length proxy would score a recovery packet as one span when it is several.
 ///
 /// The alternating-loss phase then puts recovery in the sample deliberately: with every other
-/// datagram dropped, the sender is retransmitting continuously, and the receiver's span count must
-/// still stay proportional to the data — bounded recovery, not span multiplication.
+/// datagram dropped the sender is retransmitting continuously, and what is ASSERTED there is only
+/// that the excess is present — the receiver parses more spans than the new-data ratio would give,
+/// which is what makes the scope limit above a measurement rather than a claim. No proportional
+/// upper bound on recovery is asserted, and none is claimed: the worst case for how many disjoint
+/// ranges recovery packs into a packet is not characterised here.
 #[test]
 fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
   /// Below the 1200-byte QUIC path minimum: a datagram this small could not have been packet-filling.
@@ -1749,27 +1752,35 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
   let mut delivered = false;
   for _ in 0..40_000u64 {
     now = now + Duration::from_millis(1);
+    // Drain after EACH coordinator entry, so `worst` is short datagrams per ENTRY — the quantity the
+    // contract is about — and not per ferry iteration, which would fold two entries together.
+    let mut to_r1: Vec<Vec<u8>> = Vec::new();
+    let drain_r0 = |c: &mut QuicCoordinator<CountSm, ProvidedIdentity>,
+                    to_r1: &mut Vec<Vec<u8>>,
+                    worst: &mut usize| {
+      let mut entry_short = 0usize;
+      while let Some((dst, d)) = c.poll_transmit() {
+        if dst == addr1 {
+          if d.len() < SHORT {
+            entry_short += 1;
+          }
+          to_r1.push(d);
+        }
+      }
+      *worst = (*worst).max(entry_short);
+    };
     {
       let (c, w, b) = &mut r0;
       c.handle_storage(now, w, b);
+      drain_r0(c, &mut to_r1, &mut worst);
       c.handle_timeout(now, w);
+      drain_r0(c, &mut to_r1, &mut worst);
     }
     {
       let (c, w, b) = &mut r1;
       c.handle_storage(now, w, b);
       c.handle_timeout(now, w);
     }
-    let mut entry_short = 0usize;
-    let mut to_r1: Vec<Vec<u8>> = Vec::new();
-    while let Some((dst, d)) = r0.0.poll_transmit() {
-      if dst == addr1 {
-        if d.len() < SHORT {
-          entry_short += 1;
-        }
-        to_r1.push(d);
-      }
-    }
-    worst = worst.max(entry_short);
     for d in &to_r1 {
       phase_bytes += d.len();
       let (c, w, _) = &mut r1;
@@ -1794,12 +1805,22 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     delivered,
     "the large op must commit, so the measured sample really did include its blocked-stream retries"
   );
+  // The per-entry bound, asserted rather than merely reported. A packetizing pass emits
+  // packet-filling frames plus at most one short tail, and an entry packetizes a SMALL CONSTANT
+  // number of times — the drain-side flush, the read pass that services to release flow-control
+  // credit, and the pump-end service, across the connections a mutual-dial pair holds. Measured at 3
+  // in this sample, which includes the partial writes and `Writable`-driven retries of a stream
+  // blocked behind a multi-megabyte frame. Servicing per message instead puts this in the tens.
+  assert!(
+    worst <= 3,
+    "a coordinator entry may emit only a small constant of short datagrams for a class — one per \
+     packetizing pass — got {worst}"
+  );
   let phase_spans = r1.0.rx_stream_frames_for_test() - spans_at_phase;
   assert!(
     phase_spans <= (phase_bytes / SHORT) as u64 + 64,
     "carrying a multi-megabyte frame — partial writes and Writable retries included — the receiver's \
-     span count must stay proportional to the bytes: {phase_spans} spans for {phase_bytes} B \
-     ({worst} short datagrams in the worst entry)"
+     span count must stay proportional to the bytes: {phase_spans} spans for {phase_bytes} B"
   );
 
   // Recovery in the sample: every other datagram to r1 is dropped, so the sender is retransmitting

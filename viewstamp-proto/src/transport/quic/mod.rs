@@ -10,13 +10,16 @@
 //! and runs the whole QUIC suite against whatever it picks.
 //!
 //! An embedder who pins or upgrades `quinn-proto` themselves does not get that for free. The
-//! compatibility check is this crate's QUIC suite (`cargo test -p viewstamp-proto --features
-//! quic,tcp,tls,tls-rustls-ring`). Running only part of it, these are the five that fail when the
-//! private behaviour moves — two for the SIZING, three for the CLASSIFIER:
+//! compatibility check IS this crate's QUIC suite — `cargo test -p viewstamp-proto --features
+//! quic,tcp,tls,tls-rustls-ring` — and the list below is not a shortcut past it. These are the tests
+//! that PIN each private behaviour, named so a failure is legible:
 //!
 //! - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
 //! - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
 //!   assumes, counted from the receiver's own STREAM-frame counter;
+//! - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and
+//!   refusal: it drives more than 2048 resident spans through compaction and requires the refusal to
+//!   surface as a classified, unbound loss;
 //! - `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
 //! - `gapped_writes_into_our_opened_streams_recv_half_close_the_connection` — `Readable` being raised
 //!   for a frame that arrived, at the read offset and ahead of a gap;
