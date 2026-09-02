@@ -693,7 +693,12 @@ const QUARANTINE_SERVE_LIMIT: usize = 8;
 /// only against a retransmit storm or a misbehaving peer. A request past the cap is DROPPED (not
 /// answered ABSENT — an absent reply for a block we hold would drive the requester's pruned-front
 /// re-solicit path) and re-sent by the requester's own ARQ.
-const MAX_OUTSTANDING_BLOCK_SERVES: usize = 128;
+///
+/// The lane holds the serve SET this bounds, and checks the cap at its own admission point, so the
+/// cap is a property of the session's container rather than of this endpoint remembering to consult
+/// it. Read here too because dropping the request — rather than queueing it and discovering the cap
+/// later — is what keeps the requester's ARQ, not a refusal path, in charge of the retry.
+pub(crate) const MAX_OUTSTANDING_BLOCK_SERVES: usize = 128;
 /// Forfeit: how long the checkpoint-lag forfeit condition must
 /// hold CONTINUOUSLY before a stuck primary actually steps down (the anti-storm grace timer). Sits
 /// above `PRIMARY_IDLE` (200ms) — so a *silent* primary is failed over first by a backup's idle VC,
@@ -941,7 +946,7 @@ struct RecoverState {
   /// candidate: while it is held `recover_timeouts` neither re-reads nor spends the absolute
   /// checkpoint-read budget (that budget pays for READ faults; the wait here is on a lane
   /// completion the medium owes, exactly like `pending_checkpoint`'s), and the walk settle that
-  /// frees the lane quota re-drives the probe directly
+  /// frees the lane's walk slot re-drives the probe directly
   /// ([`Endpoint::redrive_deferred_recover_probe`]). Discarding the read instead would let lane
   /// contention exhaust the read budget and escalate a replica with a perfectly valid local
   /// checkpoint into a peer fetch no donor may exist to answer — a permanent wedge on a solo
@@ -4044,6 +4049,21 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     self.inflight.len()
   }
 
+  /// The number of appends parked in this replica's `deferred_appends` map — submissions a session
+  /// refusal (the slot fence or the append quota) handed back, waiting for their release trigger.
+  ///
+  /// Exposed for the simulation boundedness checker. Same bound argument as [`Self::log_len`], and
+  /// for the same structural reason: the map is keyed by op with one waiter per op, and every path
+  /// that trims the log tail trims it in lockstep (a view change and a state-sync install clear it,
+  /// a nack truncation retains below the gap, post-checkpoint GC drops the subsumed ops), so a
+  /// parked append is always an op inside the tail the log cache itself holds. Not part of the
+  /// stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn deferred_appends_len(&self) -> usize {
+    self.deferred_appends.len()
+  }
+
   /// The number of entries in this replica's client-session table (`clients`).
   ///
   /// Exposed for the simulation boundedness checker: `clients` is bounded by the active client set
@@ -4828,12 +4848,18 @@ impl<S: StateMachine, R> Endpoint<S, R> {
 
   /// Queue a block-storage job for the driver to execute OFF the pump, returning the `JobId` the
   /// completion will echo. The single place a block job enters the seam: it mints the id and hands
-  /// it to the lane's front, which claims the admission quota its kind occupies, records the
-  /// completion as owed, and queues it — so no job can be issued without being ordered and
-  /// accounted, and no quota can be claimed for a job that is not queued.
+  /// it to the lane's front, which takes the slot its kind occupies, records the completion as
+  /// owed, and queues it — so no job can be issued without being ordered and accounted, and no slot
+  /// can be taken by a job that is not queued.
   ///
   /// The queue is the LANE's, not this endpoint's ([`Storage`]): a job issued here outlives the
-  /// endpoint that issued it, exactly as the image or cap slot it occupies does.
+  /// endpoint that issued it, exactly as the slot or cap entry it occupies does.
+  ///
+  /// Every kind whose completion the endpoint correlates gates on its lane slot at the issue site,
+  /// so the returned id names a queued job. A SWEEP is the one kind that does not — it answers no
+  /// correlation, so a sweep offered while one is already on the lane is absorbed there instead
+  /// (coalesced into the queued one, or dropped behind an executing one) and the id returned for it
+  /// names nothing. Nothing reads it: the sweep's callers hold no token to bind.
   fn issue_block_job<W: Wal, B: Superblock>(
     &mut self,
     storage: &mut Storage<W, B, S>,
@@ -6603,7 +6629,7 @@ where
   ///
   /// The split is the same one the WAL and superblock completions get: the lane fact is settled
   /// unconditionally, the correlation fact is judged per incarnation. A refused completion still
-  /// left the lane, so its quota must free — and it can only ever arrive refused.
+  /// left the lane, so its slot must free — and it can only ever arrive refused.
   ///
   /// Only then does the outcome dispatch, and each arm re-validates its own correlation token: a
   /// completion whose state was superseded while it executed is dropped and counted
@@ -6615,7 +6641,7 @@ where
     done: BlockJobDone<S>,
   ) {
     storage.settle_block_job(&done);
-    // A walk settle frees the lane's one-walk quota, and a deferred cold-start probe waits on
+    // A walk settle frees the lane's one-walk slot, and a deferred cold-start probe waits on
     // exactly that. Run the re-drive BEFORE the incarnation choke: the walk that deferred the
     // probe is typically a dead incarnation's, so its completion arrives foreign and is refused
     // below — but the settle above is the lane's own delivery, and it is the only event that can

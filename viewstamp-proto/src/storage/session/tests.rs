@@ -202,12 +202,18 @@ fn a_second_append_to_a_fenced_slot_is_refused_until_the_slot_quiesces() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let first = WriteId::new(1, 1);
   assert_eq!(submit(&mut s, first, 7), AppendSubmission::Submitted);
+  assert_eq!(s.appends_slot_fenced(), 0, "nothing refused yet");
   assert!(
     matches!(
       submit(&mut s, WriteId::new(1, 2), 7),
       AppendSubmission::SlotFenced { .. }
     ),
     "an un-quiesced older write holds the slot"
+  );
+  assert_eq!(
+    s.appends_slot_fenced(),
+    1,
+    "the refusal is counted, so a fence that stopped firing is observable rather than silent"
   );
 
   s.wal_mut().land(first);
@@ -221,6 +227,11 @@ fn a_second_append_to_a_fenced_slot_is_refused_until_the_slot_quiesces() {
     submit(&mut s, WriteId::new(1, 3), 7),
     AppendSubmission::Submitted,
     "the quiesced slot admits the replacement"
+  );
+  assert_eq!(
+    s.appends_slot_fenced(),
+    1,
+    "an ADMITTED submission never counts — the counter measures refusals, not attempts"
   );
 }
 
@@ -843,6 +854,11 @@ fn a_second_envelope_is_fenced_until_the_outstanding_one_completes() {
     "the fenced envelope never reached the backend"
   );
   assert_eq!(s.checkpoints_in_flight(), 1);
+  assert_eq!(
+    s.envelopes_fenced(),
+    1,
+    "the refusal is counted, so a fence that stopped firing is observable rather than silent"
+  );
 
   // The refusal is deferral: the outstanding write completes, the lane empties, and the deferred
   // checkpoint's re-forced submission is admitted.
@@ -865,6 +881,11 @@ fn a_second_envelope_is_fenced_until_the_outstanding_one_completes() {
   s.sb_mut().land_checkpoint();
   assert!(s.poll_sb().is_some());
   assert!(!s.has_inflight(), "the drained lane quiesces the session");
+  assert_eq!(
+    s.envelopes_fenced(),
+    1,
+    "an ADMITTED submission never counts — the counter measures refusals, not attempts"
+  );
 }
 
 #[test]
@@ -923,15 +944,29 @@ fn into_parts_refuses_while_the_medium_owes_completions() {
   );
 }
 
-/// A `Gc` sweep: the job kind that claims no lane quota.
+/// A `Gc` sweep over an empty live-root set: the one kind with no endpoint correlation, so the lane
+/// resolves a collision on its slot itself rather than fail-stopping.
 fn sweep() -> BlockJobKind<MockSm> {
+  sweep_over(Vec::new())
+}
+
+/// A `Gc` sweep naming `sm_roots` as the live SM roots — what a coalesce replaces.
+fn sweep_over(sm_roots: Vec<BlockAddress>) -> BlockJobKind<MockSm> {
   BlockJobKind::Gc {
-    sm_roots: Vec::new(),
+    sm_roots,
     session_roots: Vec::new(),
   }
 }
 
-/// A `Serve` answer for `addr` — the counted quota.
+/// The live SM roots a queued sweep names, for the coalescing tests.
+fn sweep_roots(job: &crate::BlockJob<MockSm>) -> Vec<BlockAddress> {
+  match &job.kind {
+    BlockJobKind::Gc { sm_roots, .. } => sm_roots.clone(),
+    _ => panic!("not a sweep"),
+  }
+}
+
+/// A `Serve` answer for `addr` — the one kind admitted against the counted cap.
 fn serve(addr: BlockAddress) -> BlockJobKind<MockSm> {
   BlockJobKind::Serve {
     to: crate::Peer::Replica(crate::ReplicaId::new(0)),
@@ -939,7 +974,7 @@ fn serve(addr: BlockAddress) -> BlockJobKind<MockSm> {
   }
 }
 
-/// One frontier step over a two-root DAG — the single-slot walk quota.
+/// One frontier step over a two-root DAG — the walk slot.
 fn walk(addr: BlockAddress) -> BlockJobKind<MockSm> {
   BlockJobKind::Walk {
     walks: BlockWalks::new(addr, addr),
@@ -948,14 +983,50 @@ fn walk(addr: BlockAddress) -> BlockJobKind<MockSm> {
   }
 }
 
+/// An image capture of the empty mock state machine — the materialize slot.
+fn capture() -> BlockJobKind<MockSm> {
+  BlockJobKind::Materialize {
+    image: (),
+    sessions: crate::endpoint::SessionImage(std::collections::BTreeMap::new()),
+  }
+}
+
+/// A durability barrier over `addr`'s two DAG roots — the flush slot.
+fn barrier(addr: BlockAddress) -> BlockJobKind<MockSm> {
+  BlockJobKind::Flush {
+    sm_root: addr,
+    sessions_root: addr,
+  }
+}
+
+/// A reconstruct of a synced checkpoint from `addr`'s two DAG roots — the restore slot.
+fn reconstruct(addr: BlockAddress) -> BlockJobKind<MockSm> {
+  BlockJobKind::Restore {
+    sm_root: addr,
+    sessions_root: addr,
+    seed: MockSm,
+    purpose: crate::block_job::RestorePurpose::SyncedCheckpoint,
+  }
+}
+
 /// The completion of a job whose kind is `tag`, echoing `id`.
 fn done(id: JobId, tag: BlockJobTag, addr: BlockAddress) -> BlockJobDone<MockSm> {
   let output = match tag {
+    BlockJobTag::Materialize => BlockJobOutput::Materialized {
+      sm_root: addr,
+      sessions_root: addr,
+      flush: Ok(()),
+    },
+    BlockJobTag::Flush => BlockJobOutput::Flushed(Ok(())),
     BlockJobTag::Gc => BlockJobOutput::Gced,
     BlockJobTag::Serve => BlockJobOutput::Served {
       to: crate::Peer::Replica(crate::ReplicaId::new(0)),
       addr,
       block: None,
+    },
+    BlockJobTag::Restore => BlockJobOutput::Restored {
+      purpose: crate::block_job::RestorePurpose::SyncedCheckpoint,
+      result: Err(crate::state_machine::RestoreError::new(addr)),
     },
     BlockJobTag::Walk => BlockJobOutput::Walked(crate::block_job::WalkDone {
       walks: BlockWalks::new(addr, addr),
@@ -963,7 +1034,6 @@ fn done(id: JobId, tag: BlockJobTag, addr: BlockAddress) -> BlockJobDone<MockSm>
       next: Ok(None),
       purpose: WalkPurpose::Arq,
     }),
-    other => panic!("no completion fixture for {other}"),
   };
   BlockJobDone { id, output }
 }
@@ -996,9 +1066,9 @@ fn a_job_queued_but_never_polled_outlives_the_endpoint_that_issued_it() {
 }
 
 #[test]
-fn a_quota_releases_on_the_delivery_of_the_job_that_claimed_it() {
-  // The claim is made at QUEUE time and released at DELIVERY, both on the lane's own books — so the
-  // window in which the claim exists is exactly the window in which the job exists.
+fn a_slot_releases_on_the_delivery_of_the_job_that_took_it() {
+  // The slot is taken at QUEUE time and released at DELIVERY, both on the lane's own books — so the
+  // window in which it is held is exactly the window in which the job exists.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let first = JobId::new(1, 1);
   let second = JobId::new(2, 1); // a SUCCESSOR incarnation's id, aliasing the sequence
@@ -1008,20 +1078,157 @@ fn a_quota_releases_on_the_delivery_of_the_job_that_claimed_it() {
   assert!(s.walk_owed(), "one frontier step per lane");
 
   s.settle_block_job(&done(first, BlockJobTag::Serve, addr()));
-  assert_eq!(s.serves_outstanding(), 0, "the serve's cap slot is free");
+  assert_eq!(s.serves_outstanding(), 0, "the serve's cap entry is free");
   assert!(s.walk_owed(), "the walk is still owed");
   s.settle_block_job(&done(second, BlockJobTag::Walk, addr()));
   assert!(!s.walk_owed(), "and its delivery frees the walk slot");
 }
 
 #[test]
+fn the_lane_holds_one_job_of_every_kind_at_once() {
+  // THE DEPTH BOUND, read off the containers. One cell per kind but `Serve`, plus a serve set
+  // checked against the cap — so the lane's depth is a cardinality of what it holds, not a claim
+  // about the state that issued the jobs. That distinction is the point: the endpoint fields a
+  // barrier, a sweep and a reconstruct used to be "bounded by" are reset when the endpoint is
+  // rebuilt over the store, while these cells are the session's.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.enqueue_block_job(JobId::new(1, 1), capture());
+  s.enqueue_block_job(JobId::new(1, 2), barrier(addr()));
+  s.enqueue_block_job(JobId::new(1, 3), sweep());
+  s.enqueue_block_job(JobId::new(1, 4), reconstruct(addr()));
+  s.enqueue_block_job(JobId::new(1, 5), walk(addr()));
+  s.enqueue_block_job(JobId::new(1, 6), serve(addr()));
+  s.enqueue_block_job(JobId::new(1, 7), serve(addr()));
+  assert!(s.materialize_owed());
+  assert!(s.flush_owed());
+  assert!(s.restore_owed());
+  assert!(s.walk_owed());
+  assert_eq!(s.serves_outstanding(), 2);
+  assert_eq!(s.block_jobs_in_flight(), 7);
+  assert_eq!(
+    s.block_jobs_bound(),
+    5 + 128,
+    "one cell per single-slot kind plus the outstanding-serve cap"
+  );
+}
+
+#[test]
 #[should_panic(expected = "a second frontier walk was queued")]
 fn one_lane_admits_one_frontier_walk() {
-  // The walk quota is the lane's, so a transfer abandoned by a rebuild (or a re-pin, or a view
+  // The walk slot is the lane's, so a transfer abandoned by a rebuild (or a re-pin, or a view
   // transition) cannot leave its walk queued and admit another behind it.
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   s.enqueue_block_job(JobId::new(1, 1), walk(addr()));
   s.enqueue_block_job(JobId::new(2, 1), walk(addr()));
+}
+
+#[test]
+#[should_panic(expected = "a second image capture was queued")]
+fn one_lane_admits_one_image_capture() {
+  // A capture carries a full state-machine image, and the checkpoint a view transition abandons
+  // cannot retract the job — so the capture site reads THIS slot before it captures anything.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.enqueue_block_job(JobId::new(1, 1), capture());
+  s.enqueue_block_job(JobId::new(2, 1), capture());
+}
+
+#[test]
+#[should_panic(expected = "a second durability barrier was queued")]
+fn one_lane_admits_one_durability_barrier() {
+  // The barrier used to be admitted on the strength of the endpoint's owed install alone, which a
+  // rebuild resets while the queued barrier stays the lane's. The slot is what a rebuild cannot
+  // reset, and the staging site now reads it.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.enqueue_block_job(JobId::new(1, 1), barrier(addr()));
+  s.enqueue_block_job(JobId::new(2, 1), barrier(addr()));
+}
+
+#[test]
+#[should_panic(expected = "a second reconstruct was queued")]
+fn one_lane_admits_one_reconstruct() {
+  // Same shape as the barrier, on the obligation that owes the SM's content: the two reconstruct
+  // sites (a synced checkpoint's, and cold start's own) issue from different bookkeeping, and only
+  // this slot spans both — and spans the incarnation that issued one of them and then died.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  s.enqueue_block_job(JobId::new(1, 1), reconstruct(addr()));
+  s.enqueue_block_job(JobId::new(2, 1), reconstruct(addr()));
+}
+
+#[test]
+fn the_serve_cap_is_released_by_the_exact_serve_that_completes() {
+  // The cap is the ONE bound here that counts rather than names: a serve's correlatum is an inbound
+  // request, so there is no finite key space to carve. What keeps the count honest is that release
+  // is exact — the completion removes the id it answers, so a cap entry can only be freed by the
+  // completion of a serve the lane genuinely admitted. A bare counter would take any mis-tagged
+  // completion as a release and re-open the cap by one for each one it absorbed.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let cap = crate::endpoint::MAX_OUTSTANDING_BLOCK_SERVES;
+  for seq in 1..=cap {
+    s.enqueue_block_job(JobId::new(1, seq as u64), serve(addr()));
+  }
+  assert_eq!(s.serves_outstanding(), cap, "the lane is at its cap");
+  s.settle_block_job(&done(JobId::new(1, 1), BlockJobTag::Serve, addr()));
+  assert_eq!(s.serves_outstanding(), cap - 1, "exactly one entry freed");
+  s.enqueue_block_job(JobId::new(1, cap as u64 + 1), serve(addr()));
+  assert_eq!(s.serves_outstanding(), cap, "and exactly one refilled it");
+}
+
+#[test]
+#[should_panic(expected = "past the lane's outstanding-serve cap")]
+fn a_serve_past_the_cap_is_refused_by_the_lane() {
+  // The endpoint drops the request before it ever reaches here (a dropped `RequestBlock` is re-sent
+  // by the requester's ARQ, which is what keeps its frontier intact), so this is the backstop that
+  // makes the cap the container's property rather than the caller's discipline.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  for seq in 1..=crate::endpoint::MAX_OUTSTANDING_BLOCK_SERVES as u64 + 1 {
+    s.enqueue_block_job(JobId::new(1, seq), serve(addr()));
+  }
+}
+
+#[test]
+fn a_sweep_offered_over_a_queued_one_takes_the_newer_live_roots() {
+  // The sweep is the one kind with no endpoint correlation, so a second offer cannot be refused
+  // into an obligation and must not fail-stop either. While the queued sweep is still the lane's,
+  // its root list is REPLACED: nothing awaits the absorbed id, and marking from the newer roots is
+  // what the next sweep would have done anyway (over-marking retains, so it is the safe direction).
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let queued = JobId::new(1, 1);
+  let newer = crate::block_address(b"a root the newer sweep list names");
+  s.enqueue_block_job(queued, sweep_over(Vec::new()));
+  s.enqueue_block_job(JobId::new(2, 1), sweep_over(std::vec![newer]));
+  assert_eq!(s.sweeps_coalesced(), 1);
+  assert_eq!(s.block_jobs_in_flight(), 1, "one sweep, not two");
+
+  let job = s.poll_block_job().expect("the queued sweep is still there");
+  assert_eq!(job.id(), queued, "under the id the lane already owes");
+  assert_eq!(sweep_roots(&job), std::vec![newer], "with the newer roots");
+  assert!(s.poll_block_job().is_none(), "and nothing behind it");
+  s.settle_block_job(&done(queued, BlockJobTag::Gc, addr()));
+  assert!(!s.has_inflight());
+}
+
+#[test]
+fn a_sweep_offered_over_an_executing_one_is_dropped() {
+  // Past the poll the payload can no longer be reached, so there is nothing to coalesce into. The
+  // offer is dropped whole rather than queued behind: a sweep leaves no obligation owed, retention
+  // is unaffected by one that does not run, and the next checkpoint's sweep re-drives it.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let executing = JobId::new(1, 1);
+  s.enqueue_block_job(executing, sweep());
+  let taken = s.poll_block_job().expect("the driver takes it");
+  assert_eq!(taken.id(), executing);
+
+  s.enqueue_block_job(JobId::new(2, 1), sweep());
+  assert_eq!(s.sweeps_dropped(), 1);
+  assert_eq!(s.sweeps_coalesced(), 0);
+  assert!(s.poll_block_job().is_none(), "nothing was queued behind it");
+  assert_eq!(s.block_jobs_in_flight(), 1, "the lane still owes only one");
+
+  // The delivery frees the slot, and the next sweep is admitted normally.
+  s.settle_block_job(&done(executing, BlockJobTag::Gc, addr()));
+  s.enqueue_block_job(JobId::new(2, 2), sweep());
+  assert_eq!(s.block_jobs_in_flight(), 1);
+  assert_eq!(s.sweeps_dropped(), 1, "the counter is session-lifetime");
 }
 
 #[test]
@@ -1033,9 +1240,9 @@ fn a_completion_out_of_issue_order_is_refused_by_the_lanes_witness() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
   let dead = JobId::new(1, 1);
   let live = JobId::new(2, 1);
-  s.enqueue_block_job(dead, sweep());
-  s.enqueue_block_job(live, sweep());
-  s.settle_block_job(&done(live, BlockJobTag::Gc, addr()));
+  s.enqueue_block_job(dead, serve(addr()));
+  s.enqueue_block_job(live, serve(addr()));
+  s.settle_block_job(&done(live, BlockJobTag::Serve, addr()));
 }
 
 #[test]
@@ -1075,6 +1282,11 @@ fn a_ring_less_append_backlog_is_refused_at_the_session_quota() {
     );
   }
   assert_eq!(s.wal_appends_in_flight() as u64, quota);
+  assert_eq!(
+    s.appends_quota_refused(),
+    0,
+    "a full window at the ceiling is still a healthy window — nothing refused"
+  );
   assert!(
     matches!(
       submit(&mut s, WriteId::new(1, quota + 1), quota + 1),
@@ -1086,6 +1298,11 @@ fn a_ring_less_append_backlog_is_refused_at_the_session_quota() {
     s.wal_appends_in_flight() as u64,
     quota,
     "a refused submission enters neither the ledger nor the backend"
+  );
+  assert_eq!(
+    s.appends_quota_refused(),
+    1,
+    "the refusal is counted, so the sweeps can assert the ceiling stays clear of healthy windows"
   );
 }
 

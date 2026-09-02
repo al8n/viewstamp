@@ -41,15 +41,48 @@
 //! - **checkpoint envelopes** — the one-outstanding fence: at most one envelope write on the
 //!   medium ([`Storage::submit_checkpoint`] returns [`CheckpointSubmission::EnvelopeFenced`]
 //!   otherwise). Unconditional;
-//! - **block jobs** — the lane front's per-kind admission quotas (one image capture, one frontier
-//!   walk, the serve cap), which cap the lane's total depth at the serve cap plus a small
-//!   per-obligation constant. Unconditional: the quotas are compile-time constants.
+//! - **block jobs** — the lane front's per-kind SLOTS: one cell per job kind but `Serve`, plus a
+//!   serve set checked against the outstanding-serve cap, so the lane's depth is the cardinality
+//!   of those containers ([`Storage::block_jobs_bound`]) rather than a claim about the state that
+//!   issued the jobs. Unconditional, and — the reason the slots exist — independent of the
+//!   endpoint rebuild count: the state an issue site would otherwise be bounded by is reset when
+//!   the endpoint is rebuilt, while the cells belong to the session.
 //!
 //! Each bound is a CONSTANT for a given deployment — independent of ops, views, time, and the
 //! endpoint rebuild count (the append quota scales only with the configured checkpoint interval,
 //! fixed at format time and fenced by recovery) — and each has a per-tick oracle in the
 //! simulation (the backend asserts and the boundedness checker), so a caller change that would
 //! re-open a lane trips a sweep instead of growing quietly.
+//!
+//! # Each choke counts its own refusals
+//!
+//! A depth oracle alone cannot tell a bound that HOLDS from one that is never reached: a fence
+//! removed from an admission path leaves every depth arm green, because nothing was refused and
+//! nothing accumulated. So each choke also counts what it turned away —
+//! [`Storage::appends_slot_fenced`], [`Storage::appends_quota_refused`],
+//! [`Storage::envelopes_fenced`] — and the simulation sweeps assert on those counts. Each choke's
+//! expected reading differs, and the difference is the point:
+//!
+//! - the SLOT fence is asserted to FIRE. Within one endpoint generation it is unreachable (the
+//!   endpoint refuses a duplicate append for an op it already has in flight), so what reaches it is
+//!   the cross-generation case a view transition opens — the endpoint drops its own bookkeeping
+//!   while the physical write stays with the device. That is precisely the case the fence exists
+//!   for, so a sweep in which it never fires is a sweep testing nothing here;
+//! - the APPEND QUOTA is asserted NOT to fire. Its ceiling sits above every legitimate in-flight
+//!   window, so a refusal is a healthy append stalled, not a bound working;
+//! - the ENVELOPE fence is asserted NOT to fire either, for a third reason: the endpoint's staging
+//!   gates defer while the lane is occupied and nothing can enter it between those gates and the
+//!   submission, so this fence is a structural backstop for a future caller rather than a live
+//!   path. The assertion pins that claim — if a new caller ever reaches the backstop, a sweep says
+//!   so instead of the refusal passing unnoticed.
+//!
+//! The block lane reads the same way. Its per-kind slots refuse nothing that a fail-stop does not
+//! already catch, so the only outcomes worth counting are the two the sweep's slot resolves on its
+//! own — [`Storage::sweeps_coalesced`] and [`Storage::sweeps_dropped`] — and both are asserted to
+//! stay `0` for the envelope fence's reason: every sweep is issued from the completion of a job the
+//! same lane already delivered, so the slot it finds is free.
+//!
+//! The counts are session-lifetime, so an endpoint rebuild cannot reset the evidence.
 
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -68,7 +101,7 @@ use super::{Header, ReadId, Superblock, SuperblockDone, VsrState, Wal, WalDone, 
 
 mod lane;
 
-use lane::LaneFront;
+use lane::{LaneFront, MAX_BLOCK_JOBS_IN_FLIGHT};
 
 #[cfg(test)]
 mod tests;
@@ -200,7 +233,7 @@ pub(crate) struct SbPolled {
 /// write fact that outlives an endpoint — the in-flight append ledger (the slot-quiescence fence's
 /// witness set), the in-flight root writes with the exact states they will make durable (the root
 /// timeline), the in-flight checkpoint-envelope writes, and the block lane's front (its job queue,
-/// its admission quotas, and its issue-order witness).
+/// its per-kind slots, and its issue-order witness).
 ///
 /// **One session per store, for the store's whole in-process lifetime.** Construct it once over
 /// quiesced handles — freshly formatted, or freshly opened after a process start — and thread
@@ -216,9 +249,9 @@ pub(crate) struct SbPolled {
 /// the handles to build it with are inside the first session until the first session proves the
 /// store quiet.
 ///
-/// The block lane's front rides here for exactly that reason. Its queue and the quotas that bound
+/// The block lane's front rides here for exactly that reason. Its queue and the slots that bound
 /// its depth are one object with one lifetime, so an endpoint rebuild can neither drop a queued job
-/// while inheriting its weight nor start a fresh quota over a queue that never drained; and because
+/// while inheriting its weight nor free a slot over a queue that never drained; and because
 /// the front is reachable only through this session, "a fresh front over a live lane" is as
 /// unsayable as a fresh append ledger. The lane's own half — the store, the worker, and the
 /// [`BlockJobCursor`](crate::BlockJobCursor) that witnesses EXECUTION order — stays with the
@@ -306,8 +339,32 @@ pub struct Storage<W, B, S: StateMachine> {
   /// one more envelope — each entry retaining its full snapshot bytes — while later durable-view
   /// roots complete around them and re-open the endpoint's own staging gates.
   checkpoints: BTreeMap<SessionKey, u64>,
-  /// The block lane's front: every job issued over this store and not yet completed, the quotas
-  /// they occupy, and the order they must execute in.
+  /// Observability counter: how many append submissions the SLOT-QUIESCENCE fence refused
+  /// ([`AppendSubmission::SlotFenced`]), across every endpoint incarnation that wrote this medium.
+  /// A refusal is a deferral, never a loss — the caller parks the bytes and the slot's quiescence
+  /// re-drives them — so a growing count means the fence is genuinely engaging under contention,
+  /// not that anything is stuck. Its VALUE is the fence's non-vacuity witness: a fence that never
+  /// refuses is a fence whose regression no sweep would notice. Session-lifetime, like every fact
+  /// here: an endpoint rebuild does not reset it, only a fresh session over the store does.
+  /// Exposed via [`Self::appends_slot_fenced`].
+  appends_slot_fenced: u64,
+  /// Observability counter: how many append submissions the session APPEND QUOTA refused
+  /// ([`AppendSubmission::QuotaExhausted`]) — the ledger already at [`Self::append_quota`] when the
+  /// submission arrived. Same lifecycle and same deferral semantics as [`Self::appends_slot_fenced`],
+  /// but the reading is the mirror image: the quota is sized so healthy operation (including one
+  /// full-window sync handover) never meets it, so a NON-ZERO count on an unstressed run says the
+  /// quota is refusing legitimate appends, while a zero count says the ceiling stayed clear of the
+  /// live window. Exposed via [`Self::appends_quota_refused`].
+  appends_quota_refused: u64,
+  /// Observability counter: how many checkpoint-envelope submissions the one-outstanding fence
+  /// refused ([`CheckpointSubmission::EnvelopeFenced`]) — a second envelope offered while one write
+  /// was still with the medium, this endpoint's or an orphan a dead correlation left. Same
+  /// lifecycle and deferral semantics as [`Self::appends_slot_fenced`]: the caller drops its staged
+  /// step and its cadence re-forces one once the outstanding write drains. Exposed via
+  /// [`Self::envelopes_fenced`].
+  envelopes_fenced: u64,
+  /// The block lane's front: every job issued over this store and not yet completed, the per-kind
+  /// slots they occupy, and the order they must execute in.
   lane: LaneFront<S>,
 }
 
@@ -329,6 +386,9 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
       roots: VecDeque::new(),
       roots_submitted: 0,
       checkpoints: BTreeMap::new(),
+      appends_slot_fenced: 0,
+      appends_quota_refused: 0,
+      envelopes_fenced: 0,
       lane: LaneFront::new(),
     }
   }
@@ -372,20 +432,21 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
   ///
   /// Taken from the session rather than from the endpoint because the queue is the LANE's: a job
   /// issued by an endpoint that has since been replaced is still owed by the lane, still executes,
-  /// and still releases the quota it claimed.
+  /// and still releases the slot it took.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn poll_block_job(&mut self) -> Option<BlockJob<S>> {
     self.lane.poll()
   }
 
-  /// Queue a block job the endpoint has issued, claiming the lane quota its kind occupies. The ONLY
-  /// route into the lane's queue.
+  /// Queue a block job the endpoint has issued, taking the lane slot its kind occupies. The ONLY
+  /// route into the lane's queue. See [`LaneFront::enqueue`] for what happens to a kind whose slot
+  /// is already taken — a fail-stop for every kind but the sweep, which the lane absorbs.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) fn enqueue_block_job(&mut self, id: JobId, kind: BlockJobKind<S>) {
     self.lane.enqueue(id, kind);
   }
 
-  /// Settle a block-job completion against the lane's issue-order witness and quotas, before the
+  /// Settle a block-job completion against the lane's issue-order witness and slots, before the
   /// endpoint judges correlation. See [`LaneFront::settle`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) fn settle_block_job(&mut self, done: &BlockJobDone<S>) {
@@ -399,9 +460,21 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
     self.lane.materialize_owed()
   }
 
+  /// Whether the lane already owes a durability barrier — the staging site's admission gate.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn flush_owed(&self) -> bool {
+    self.lane.flush_owed()
+  }
+
+  /// Whether the lane already owes a reconstruct — the two reconstruct sites' admission gate.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn restore_owed(&self) -> bool {
+    self.lane.restore_owed()
+  }
+
   /// How many `Serve` jobs the lane owes completions for — the serve cap's admission count.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) const fn serves_outstanding(&self) -> usize {
+  pub(crate) fn serves_outstanding(&self) -> usize {
     self.lane.serves_outstanding()
   }
 
@@ -466,16 +539,85 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
 
   /// The number of block jobs the lane owes completions for — queued or executing, every kind.
   ///
-  /// Bounded by the per-kind admission quotas plus the obligations that issue the unquota'd
-  /// kinds: at most one image capture and one frontier walk (the lane's own quotas), the serve
-  /// cap, and a small constant of flush/sweep/reconstruct jobs (each issued under a single-slot
-  /// endpoint obligation and serialized by the lane's own drain). Exposed for the simulation
-  /// boundedness checker, which asserts a constant bound per tick — the oracle that the lane's
-  /// depth is genuinely capped rather than argued. Not part of the stable API.
+  /// Never exceeds [`Self::block_jobs_bound`]: every kind but `Serve` takes one of the lane's
+  /// per-kind slots, and the serves are held in a set checked against the outstanding-serve cap.
+  /// Exposed for the simulation boundedness checker, which asserts the bound per tick — the oracle
+  /// that the depth the containers make impossible is genuinely never reached. Not part of the
+  /// stable API.
   #[doc(hidden)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn block_jobs_in_flight(&self) -> usize {
     self.lane.outstanding_len()
+  }
+
+  /// The lane's CONSTANT depth cap: one job of each single-slot kind plus the outstanding-serve
+  /// cap. Independent of ops, views, time, configuration, and the endpoint rebuild count — both
+  /// terms are compile-time constants of the lane's own containers.
+  ///
+  /// Exposed so the simulation boundedness checker asserts [`Self::block_jobs_in_flight`] against
+  /// the SAME constant the lane admits by, rather than a transcribed copy that could drift from
+  /// it. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn block_jobs_bound(&self) -> usize {
+    MAX_BLOCK_JOBS_IN_FLIGHT
+  }
+
+  /// How many sweeps the lane coalesced into one still queued — the newer live-root list replacing
+  /// the older in place. Read as an INERTNESS witness, like [`Self::envelopes_fenced`]: every sweep
+  /// is issued from the completion of a job the same lane already delivered, so the slot a sweep
+  /// finds is free and the sweeps assert this stays `0`. A non-zero value means a sweep site now
+  /// genuinely offers a second sweep while one is queued — the coalescing keeps that safe, but it
+  /// is a re-reading of the issue sites rather than a bound doing its job. Not part of the stable
+  /// API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sweeps_coalesced(&self) -> u64 {
+    self.lane.sweeps_coalesced()
+  }
+
+  /// How many sweeps the lane dropped behind one the driver had already taken — the window in
+  /// which the queued payload can no longer be reached. Read exactly like
+  /// [`Self::sweeps_coalesced`], and unreachable for the same reason. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sweeps_dropped(&self) -> u64 {
+    self.lane.sweeps_dropped()
+  }
+
+  /// How many append submissions the slot-quiescence fence refused (see the field). The fence's
+  /// non-vacuity witness: the simulation sweeps assert it goes `> 0`, so a change that turned the
+  /// fence into dead code — an admission path that stopped consulting it, or a schedule that
+  /// stopped producing same-slot contention — fails loudly instead of staying green on a guard
+  /// that never fires. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn appends_slot_fenced(&self) -> u64 {
+    self.appends_slot_fenced
+  }
+
+  /// How many append submissions the session append quota refused (see the field). Read as the
+  /// quota's ADEQUACY witness rather than a non-vacuity one: the ceiling is sized above every
+  /// legitimate in-flight window, so a healthy run leaves this at `0` and the simulation sweeps
+  /// assert exactly that — a quota that started refusing under an ordinary schedule would be
+  /// stalling appends the medium could have taken. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn appends_quota_refused(&self) -> u64 {
+    self.appends_quota_refused
+  }
+
+  /// How many checkpoint-envelope submissions the one-outstanding fence refused (see the field).
+  /// The witness for what the two submit sites already claim in prose: their staging gates defer
+  /// while the lane is occupied and nothing can enter it in between, so this fence is a structural
+  /// backstop for a future caller, not a live path. The sweeps assert it stays `0` — a non-zero
+  /// value means a caller now genuinely offers a second envelope while one is with the medium, and
+  /// that is a re-evaluation of the gates rather than a bound doing its job. Not part of the stable
+  /// API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn envelopes_fenced(&self) -> u64 {
+    self.envelopes_fenced
   }
 
   /// Test-only escape hatch to the raw WAL handle, for fixture knobs (staging, landing order,
@@ -557,12 +699,14 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     body: Bytes,
   ) -> AppendSubmission {
     if self.slot_write_in_flight(op.get()) {
+      self.appends_slot_fenced += 1;
       return AppendSubmission::SlotFenced { header, body };
     }
     if self.append_quota == 0 {
       self.append_quota = self.append_quota();
     }
     if self.wal_writes.len() as u64 >= self.append_quota {
+      self.appends_quota_refused += 1;
       return AppendSubmission::QuotaExhausted { header, body };
     }
     self.wal.submit_append(id, op, header, body);
@@ -875,6 +1019,7 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     snapshot: Bytes,
   ) -> CheckpointSubmission {
     if !self.checkpoints.is_empty() {
+      self.envelopes_fenced += 1;
       return CheckpointSubmission::EnvelopeFenced;
     }
     self.sb.submit_write_checkpoint(id, op, snapshot);

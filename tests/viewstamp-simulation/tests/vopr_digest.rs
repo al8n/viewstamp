@@ -201,6 +201,23 @@ fn report_digest(r: &VoprReport) -> u64 {
     // which this run may never read back, so the counter can move while nothing observable moves;
     // folding it would make this hash differ between checkouts for a non-behavioural reason. The
     // lanes that assert it non-zero read the counter directly in the vopr sweep instead.
+    // The SESSION-ADMISSION witnesses (appends_slot_fenced / appends_quota_refused /
+    // envelopes_fenced) are NOT folded, for exactly that reason rather than the axis-gated one: the
+    // slot fence is live on the default schedule (seeds 56 and 63 reach it), so these are not
+    // vacuously zero — but each counts a DEFERRAL, and a deferral re-drives the identical bytes the
+    // moment its release trigger fires. How many times a submission was offered and handed back is a
+    // property of the retry cadence, not of what the run produced: an extra harmless re-offer moves
+    // the count while the applied history and every progress counter stay put. Folding them would
+    // therefore make this hash differ between checkouts for a non-behavioural reason, and — since
+    // adding any field rewrites the FNV schema — would move all four pinned baselines on top of
+    // that. The sweeps read these counters directly instead, asserting the slot fence FIRES while
+    // the quota and the envelope fence do NOT.
+    // The BLOCK-LANE sweep-slot witnesses (sweeps_coalesced / sweeps_dropped) are NOT folded
+    // either, on the envelope fence's reading: both are identically zero on every schedule — a
+    // sweep is issued only from the completion of a job the same lane already delivered — so
+    // folding them would rewrite the FNV schema, and move all four pinned baselines, for a field
+    // that cannot move. The sweep asserts them at `0` directly instead, which is where a schedule
+    // that DID reach one would be reported.
   ] {
     fnv1a_u64(&mut h, v);
   }

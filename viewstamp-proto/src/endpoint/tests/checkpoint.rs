@@ -1953,9 +1953,15 @@ fn a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site(
   );
 }
 
-/// Drive a backup to a DURABLE checkpoint, then hand back two freshly issued block jobs (two GC
-/// sweeps over the live roots) plus the parts. Two OUTSTANDING jobs is the precondition every
-/// issue-order falsifier needs, and it is asserted at every use.
+/// Drive a backup to a DURABLE checkpoint, then hand back two freshly issued block jobs — a GC
+/// sweep over the live roots, then a serve for a peer's block — plus the parts. Two OUTSTANDING
+/// jobs is the precondition every issue-order falsifier needs, and it is asserted at every use.
+///
+/// The sweep is deliberately the EARLIER of the pair: the hazard the order contract exists for is a
+/// stale sweep running after a later materialize, so the falsifiers below need the damaging job
+/// first. The second is a serve rather than a second sweep because the lane admits one sweep at a
+/// time — a second offered while the first is still queued is coalesced into it — and a serve is
+/// the kind whose cap admits many, so the pair is genuinely two jobs.
 #[allow(clippy::type_complexity)]
 fn two_outstanding_block_jobs() -> (
   Endpoint<EchoSm>,
@@ -1982,14 +1988,18 @@ fn two_outstanding_block_jobs() -> (
   assert!(
     storage.poll_block_job().is_none(),
     "precondition: the durable-checkpoint drive left no job outstanding, so the only jobs below are \
-     the two sweeps this helper issues"
+     the two this helper issues"
   );
   e.gc_blocks_for_test(&mut storage);
-  e.gc_blocks_for_test(&mut storage);
-  let first = storage.poll_block_job().expect("the first sweep is queued");
+  e.on_request_block(
+    &mut storage,
+    Peer::Replica(ReplicaId::new(2)),
+    crate::block_address(b"a block a laggard peer asked this backup for"),
+  );
+  let first = storage.poll_block_job().expect("the sweep is queued");
   let second = storage
     .poll_block_job()
-    .expect("the second sweep is queued");
+    .expect("the serve is queued behind it");
   assert_ne!(
     first.id(),
     second.id(),

@@ -2089,6 +2089,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if storage.checkpoints_in_flight() > 0 {
       return;
     }
+    // Defer while the LANE still owes a barrier. The gate reads the lane's own slot rather than this
+    // endpoint's bookkeeping, because that is the reading a rebuild cannot reset: an inherited
+    // barrier still owes the lane a completion after the endpoint that issued it is gone, and a
+    // successor's `pending_checkpoint` says nothing about it. Unreachable in the current tree — a
+    // barrier is issued only for an owed `pending_install`, and every path that ends this
+    // barrier's correlation (a view transition, a rebuild) drops that install with it, so a second
+    // barrier needs a fresh transfer whose arming waited on this lane delivering a frontier walk
+    // issued after it. So this is the structural backstop for a future issue site rather than a
+    // live path, and it costs nothing where it does fire: the install stays owed, its DAG stays
+    // GC-rooted, and the same cadences re-drive it.
+    if storage.flush_owed() {
+      return;
+    }
     // Issue the durability barrier over the drained blocks as a block job, NAMING the two roots it is
     // for: the executor holds the store, so it is where "the install's roots are still held when the
     // barrier that will let a durable pointer name them runs" is checked. Only the barrier's CLEAN
@@ -2370,14 +2383,25 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Issue the reconstruct job for the owed [`SmReconstruct`] obligation, recording its token on the
-  /// obligation. A no-op when nothing is owed, or when a reconstruct is ALREADY executing for it —
-  /// two concurrent restores of the same obligation would leave the loser's verdict answering a
-  /// token it no longer holds, and the second seed capture would be wasted work.
+  /// obligation. A no-op when nothing is owed, when a reconstruct is ALREADY executing for it — two
+  /// concurrent restores of the same obligation would leave the loser's verdict answering a token it
+  /// no longer holds, and the second seed capture would be wasted work — or when the LANE still owes
+  /// a reconstruct at all.
+  ///
+  /// The obligation's own token and the lane's slot answer different questions, which is why both
+  /// are consulted. The token says whether THIS obligation has a reconstruct out; the slot says
+  /// whether the lane does, including one a predecessor endpoint issued and this obligation has
+  /// never heard of. Only the second survives a rebuild. It is unreachable in the current tree — a
+  /// reconstruct is issued only from a frontier walk's delivery, and the walk that would carry the
+  /// second one cannot be admitted until the walk that carried the first has left the lane, which
+  /// by delivery order puts the first reconstruct's completion ahead of it — so this is the
+  /// structural backstop for a future issue site. Where it does fire the obligation simply stays
+  /// owed with no token, and the re-solicit cadence re-drives it.
   pub(crate) fn issue_sm_restore<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     let Some(recon) = self.sm_reconstruct.as_ref() else {
       return;
     };
-    if recon.restore.is_some() {
+    if recon.restore.is_some() || storage.restore_owed() {
       return;
     }
     let (sm_root, sessions_root) = (recon.sm_root, recon.sessions_root);
