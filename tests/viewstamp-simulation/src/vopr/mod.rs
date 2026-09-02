@@ -241,6 +241,20 @@ pub struct VoprReport {
   /// the frame, or a bound is incomplete); `run_vopr` asserts it stays `0` every tick, so such a
   /// regression fails fast with its seed + tick.
   oversized_dropped: u64,
+  /// How many CLIENT-LINK messages this run dropped for exceeding the frame cap — a `Request` on
+  /// its way to a replica, or a `Reply` on its way back. This MUST stay `0`: the driver's submit
+  /// check bounds a request and the endpoint's apply-time choke bounds a reply, so an oversized
+  /// message here is one a real client would never have heard about, and any op the sim then acked
+  /// would be an ack no deployment could produce. `run_vopr` asserts it stays `0` every tick.
+  /// Deliberately NOT folded into the digest report hash: it is identically zero on every schedule,
+  /// so folding it would change that hash's schema without any behavioral change.
+  client_link_oversized_dropped: u64,
+  /// How many committed ops this run applied whose state-machine reply exceeded the reply bound and
+  /// was delivered as the terminal refusal, summed over replicas (positive deltas, so a `recover`
+  /// reset does not lose the history). `0` on every schedule whose state machine keeps its replies
+  /// small — which is every VOPR schedule — and driven up only by the focused reply-size lane. NOT
+  /// folded into the digest report hash, for the same reason as the axis-gated witnesses.
+  replies_too_large: u64,
   /// How many messages the virtual network HELD this run ([`Faults::hold_per_mille`] fired — delivery
   /// pushed far into the virtual future, past the proto's repair-or-truncate grace). `0` unless the
   /// hold axis is enabled (`VOPR_HOLD`, or [`run_vopr_with_hold`]). `> 0` proves the axis genuinely
@@ -710,6 +724,20 @@ impl VoprReport {
   /// check in [`run_vopr`] already failed on.
   pub const fn oversized_dropped(&self) -> u64 {
     self.oversized_dropped
+  }
+
+  /// How many CLIENT-LINK messages were dropped for exceeding the frame cap this run. Always `0` —
+  /// a request is bounded at submit and a reply at apply — and the per-tick check in [`run_vopr`]
+  /// has already failed on any other value.
+  pub const fn client_link_oversized_dropped(&self) -> u64 {
+    self.client_link_oversized_dropped
+  }
+
+  /// How many committed ops were answered with the over-bound-reply refusal this run. `0` for a
+  /// state machine that keeps its replies within the bound (every VOPR schedule); the focused
+  /// reply-size lane is what drives it up.
+  pub const fn replies_too_large(&self) -> u64 {
+    self.replies_too_large
   }
 
   /// How many messages the virtual network HELD this run (the unbounded-hold axis fired). `0` with
@@ -1297,6 +1325,9 @@ struct Vopr {
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
+  /// Per-replica last-seen `Endpoint::replies_too_large`, so the run folds positive deltas across a
+  /// `recover` (which resets the endpoint counter) exactly as it does the eviction count.
+  replies_too_large_seen: Vec<u64>,
   /// Replicas wiped since the last invariant check, queued so [`Self::check_invariants`] can tell the
   /// stateful checkers their per-replica baselines are forfeit BEFORE they next observe the cluster.
   wiped_pending: Vec<usize>,
@@ -2204,6 +2235,7 @@ impl Vopr {
       config_lineage: ConfigLineageChecker::new(node_count),
       durable_quorum: DurableQuorumChecker::new(),
       sessions_evicted_seen: vec![0; node_count],
+      replies_too_large_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
       wiped_learner_fetch_base: vec![None; node_count],
       block_delay_axis: env_flag("VOPR_BLOCK_DELAY"),
@@ -3719,6 +3751,20 @@ impl Vopr {
         c.oversized_dropped(),
       );
     }
+    // The same cap on the CLIENT link, and the same verdict: a `Request` is bounded at driver submit
+    // and a `Reply` by the endpoint's apply-time reply choke, so neither direction can legitimately
+    // exceed one frame. A drop here means the sim would have acked a client with a message the real
+    // transport refuses to send — an outcome no deployment could observe — so it is a REAL bug, not
+    // a tolerance to widen.
+    if c.client_link_oversized_dropped() > 0 {
+      panic!(
+        "vopr seed {} tick {tick}: frame-cap: a client-link message exceeded MAX_FRAME_LEN and was \
+         dropped ({} so far) — a request escaped the submit bound, or a reply escaped the \
+         apply-time reply choke, and no real client could have been answered",
+        self.seed,
+        c.client_link_oversized_dropped(),
+      );
+    }
     // Durable-view-before-participate: a StartView / head-bearing RecoveryResponse for a view
     // above the emitter's durable view, observed during the tick + the pending-view-window probe.
     if let Some(why) = c.take_durable_view_violation() {
@@ -4268,6 +4314,13 @@ impl Vopr {
         self.report.sessions_evicted += evicted - self.sessions_evicted_seen[i];
       }
       self.sessions_evicted_seen[i] = evicted;
+      // Over-bound replies refused at apply, on the same reset-robust footing (the endpoint counter
+      // zeroes on `recover`). Zero on every schedule whose state machine stays within the bound.
+      let refused = c.replica_replies_too_large(i);
+      if refused > self.replies_too_large_seen[i] {
+        self.report.replies_too_large += refused - self.replies_too_large_seen[i];
+      }
+      self.replies_too_large_seen[i] = refused;
     }
     // Recovered read-window non-vacuity witness: fold the cluster's held-tail high-water — sampled once
     // per recovery at recover construction (the held head above the checkpoint, the span the read loop
@@ -4381,6 +4434,10 @@ impl Vopr {
       .sum();
     self.report.large_bodies_sent = self.report.large_bodies_sent.max(large);
     self.report.oversized_dropped = self.report.oversized_dropped.max(c.oversized_dropped());
+    self.report.client_link_oversized_dropped = self
+      .report
+      .client_link_oversized_dropped
+      .max(c.client_link_oversized_dropped());
     // Hold-axis witness: how many messages the network has HELD so far. Monotone on the cluster (the
     // cluster struct persists across replica crash/restart and nothing resets it), so `max` is exact.
     // Stays 0 with the axis disabled; the hold sweep asserts the cross-seed sum is `> 0`.

@@ -399,7 +399,7 @@ fn advertises_authoritative_view_is_exactly_the_gated_set() {
       View::with(1),
       ClientId::new(7),
       RequestNumber::with(1),
-      body.clone()
+      ReplyOutcome::from_applied(body.clone())
     )),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -529,7 +529,7 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       View::with(2),
       ClientId::new(8),
       RequestNumber::with(3),
-      Bytes::from_static(b"reply-body"),
+      ReplyOutcome::from_applied(Bytes::from_static(b"reply-body")),
     )),
     Message::Commit(Commit::new(
       View::with(4),
@@ -789,21 +789,47 @@ fn a_reply_with_worst_case_scalars_at_the_body_bound_fits_the_frame_cap() {
   // `max_reply_body_len()` subtracts `REPLY_ENCODE_OVERHEAD` — the protobuf WORST-CASE overhead,
   // every scalar charged its varint-widest — from the frame cap, so a reply body of exactly the
   // bound must fit `MAX_FRAME_LEN` even when every other field genuinely encodes at that widest
-  // (u64::MAX view/request, u128::MAX client). Load-bearing: an already-committed op has no
-  // in-protocol recovery if its cached reply cannot be sent (`StateMachine::apply` carries the
-  // bound as an embedder obligation), so the bound must hold for EVERY field value, not just small
-  // ones whose varints shrink.
+  // (u64::MAX view/request, u128::MAX client). Load-bearing: `ReplyBody` admits a body of exactly
+  // this length, so every value the type can hold must frame — the bound has to hold for EVERY
+  // field value, not just small ones whose varints shrink.
+  let body = ReplyBody::try_new(Bytes::from(std::vec![0u8; max_reply_body_len()]))
+    .expect("a body of exactly the bound is admissible");
   let reply = Message::Reply(Reply::new(
     View::with(u64::MAX),
     ClientId::new(u128::MAX),
     RequestNumber::with(u64::MAX),
-    Bytes::from(std::vec![0u8; max_reply_body_len()]),
+    ReplyOutcome::Ok(body),
   ));
   let encoded = encode_message(&reply).len();
   let cap = MAX_FRAME_LEN as usize;
   assert!(
     encoded <= cap,
     "a worst-case-scalar Reply at the body bound must fit the frame cap: {encoded} > {cap}"
+  );
+}
+
+#[test]
+fn a_refused_reply_frames_far_under_the_cap_with_worst_case_scalars() {
+  // The refusal arm is what an over-bound reply becomes, so it must be deliverable under EVERY
+  // field value — otherwise the outcome that exists to be deliverable would not be. Its modeled
+  // bound charges the two lengths at their varint-widest, so bound >= actual holds there too.
+  let reply = Message::Reply(Reply::new(
+    View::with(u64::MAX),
+    ClientId::new(u128::MAX),
+    RequestNumber::with(u64::MAX),
+    ReplyOutcome::TooLarge(ReplyTooLarge::new(usize::MAX, ReplyBody::max_len())),
+  ));
+  let encoded = encode_message(&reply).len();
+  let bound = reply.wire_size_bound();
+  let cap = MAX_FRAME_LEN as usize;
+  assert!(
+    encoded <= cap && bound <= cap,
+    "a worst-case-scalar refused Reply must frame under the cap: encoded {encoded}, bound \
+     {bound}, cap {cap}"
+  );
+  assert!(
+    bound >= encoded,
+    "wire_size_bound() {bound} must be >= encode_message().len() {encoded} for the refusal arm"
   );
 }
 
@@ -1368,7 +1394,7 @@ fn wire_size_bound_holds_for_a_multi_megabyte_body() {
       View::with(u64::MAX),
       client,
       request,
-      body.clone(),
+      ReplyOutcome::from_applied(body.clone()),
     )),
   ];
   for m in &carriers {
@@ -1387,20 +1413,44 @@ fn wire_size_bound_holds_for_a_multi_megabyte_body() {
 fn wire_size_bound_exceeds_the_frame_cap_for_an_over_cap_body() {
   // Pin the property the transport's send choke points gate admission on: a message whose
   // wire_size_bound() exceeds MAX_FRAME_LEN must be identifiable as refused WITHOUT ever
-  // encoding it. A body a bit over max_reply_body_len()'s bound is cheaply allocatable
-  // (~17 MiB) here — unlike the ~4 GiB wrap hazard wire_size_bound guards against, which cannot
-  // be constructed in a test.
+  // encoding it. A client `Request` carries the body unbounded by its type — the driver's submit
+  // check is what refuses one — so it is the carrier this property is pinned on. A body a bit over
+  // the reply bound is cheaply allocatable (~17 MiB) here, unlike the ~4 GiB wrap hazard
+  // wire_size_bound guards against, which cannot be constructed in a test.
   let over = max_reply_body_len() + 1024 * 1024;
-  let reply = Message::Reply(Reply::new(
-    View::with(1),
+  let request = Message::Request(Request::new(
     ClientId::new(1),
     RequestNumber::with(1),
     Bytes::from(std::vec![0u8; over]),
   ));
   assert!(
-    reply.wire_size_bound() > MAX_FRAME_LEN as usize,
+    request.wire_size_bound() > MAX_FRAME_LEN as usize,
     "a body {over} bytes (max_reply_body_len() + 1 MiB) must push wire_size_bound() past the \
      frame cap"
+  );
+}
+
+#[test]
+fn an_over_bound_reply_is_unrepresentable_as_a_success_and_frames_as_a_refusal() {
+  // The structural half of the same property: the over-cap bytes above can never BE a successful
+  // Reply, so no send path is ever handed one. `ReplyBody` refuses them, the apply-time choke turns
+  // them into the refusal, and that refusal's Reply frames far under the cap.
+  let over = max_reply_body_len() + 1024 * 1024;
+  let bytes = Bytes::from(std::vec![0u8; over]);
+  let err = ReplyBody::try_new(bytes.clone()).expect_err("a body past the bound is refused");
+  assert_eq!(err.reply_len(), over);
+  assert_eq!(err.max_len(), max_reply_body_len());
+  let outcome = ReplyOutcome::from_applied(bytes);
+  assert_eq!(outcome.as_too_large(), Some(&err));
+  let reply = Message::Reply(Reply::new(
+    View::with(1),
+    ClientId::new(1),
+    RequestNumber::with(1),
+    outcome,
+  ));
+  assert!(
+    reply.wire_size_bound() <= MAX_FRAME_LEN as usize,
+    "the refusal that replaces an over-bound reply must stay inside the frame cap"
   );
 }
 

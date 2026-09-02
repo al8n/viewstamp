@@ -962,6 +962,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       prepare_batches_sent: 0,
       header_only_carriers_emitted: 0,
       sessions_evicted: 0,
+      replies_too_large: 0,
       pending_forfeit: false,
       reconfigure_inflight: None,
       pending_swap: None,

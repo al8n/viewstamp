@@ -35,10 +35,9 @@ use std::{
   time::Duration,
 };
 
-use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Config, Endpoint, Epoch, Event, Instant, MemberId, Membership, Recovered, Request,
-  RequestNumber, SingleChange, StateMachine, Storage, Superblock, Wal,
+  ClientId, Config, Endpoint, Epoch, Event, Instant, MemberId, Membership, Recovered, ReplyOutcome,
+  Request, RequestNumber, SingleChange, StateMachine, Storage, Superblock, Wal,
 };
 
 use crate::{Command, DriverError};
@@ -377,7 +376,7 @@ impl Drop for ReservationGuard {
 /// on commit, on cancellation reclaim, or on shutdown drain — releases its budget exactly once with no
 /// explicit release call at any of those sites.
 pub struct Pending {
-  pub reply: futures_channel::oneshot::Sender<Bytes>,
+  pub reply: futures_channel::oneshot::Sender<ReplyOutcome>,
   pub request: Request,
   pub last_sent: Instant,
   /// Owns this entry's budget reservation; its `Drop` releases the slot when the entry is removed.
@@ -578,9 +577,13 @@ pub fn reap_and_collect_retransmits(
 /// deliberate (the proto `Event` is `#[non_exhaustive]`): any future variant forwards as observability
 /// by default rather than being silently swallowed.
 ///
+/// The matching submit is answered with the commit's OUTCOME, not its bytes, so a node-local
+/// caller sees exactly what a remote client would: a refused (over-bound) reply resolves the submit
+/// as an error rather than handing back a payload the wire declares undeliverable.
+///
 /// Two delivery paths with different guarantees:
 /// - The per-`submit` oneshot (`p.reply`) is the RELIABLE path: the matching submit always receives
-///   its committed reply, independent of any pressure on the events channel.
+///   its committed outcome, independent of any pressure on the events channel.
 /// - The events channel (`events`) is BEST-EFFORT observability. It is bounded
 ///   ([`EVENTS_CAP`]), so the `try_send` here DROPS the event when the channel is full — i.e. when an
 ///   application holds a `Handle::events()` receiver but does not drain it fast enough. Dropping
@@ -593,7 +596,7 @@ pub fn deliver_event(pending: &mut PendingMap, events: &flume::Sender<Event>, ev
   let forward = match event {
     Event::Committed(committed) => {
       if let Some(p) = pending.remove(&(committed.client(), committed.request())) {
-        let _ = p.reply.send(committed.reply_bytes());
+        let _ = p.reply.send(committed.outcome().clone());
         // Release this entry's budget slot now its op committed: dropping the guard runs its `Drop`.
         drop(p.reservation);
       }

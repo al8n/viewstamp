@@ -4,12 +4,24 @@ use super::*;
 use crate::block_store::{InMemoryBlockStore, block_address};
 
 /// Builds a session record with the given fields. `reply` is the cached `(request_number, body)` or
-/// `None`.
+/// `None`; the body is classified through the same choke the endpoint uses.
 fn session(request: u64, last_op: u64, reply: Option<(u64, Bytes)>) -> Session {
   Session {
     request: RequestNumber::with(request),
     last_op: crate::OpNumber::with(last_op),
-    reply: reply.map(|(rn, body)| (RequestNumber::with(rn), body)),
+    reply: reply.map(|(rn, body)| (RequestNumber::with(rn), ReplyOutcome::from_applied(body))),
+  }
+}
+
+/// Builds a session record whose cached outcome is the over-bound-reply REFUSAL rather than a body.
+fn refused_session(request: u64, last_op: u64, rn: u64, len: usize) -> Session {
+  Session {
+    request: RequestNumber::with(request),
+    last_op: crate::OpNumber::with(last_op),
+    reply: Some((
+      RequestNumber::with(rn),
+      ReplyOutcome::TooLarge(ReplyTooLarge::new(len, ReplyBody::max_len())),
+    )),
   }
 }
 
@@ -56,6 +68,37 @@ fn small_table_round_trips() {
     session(1, 5, Some((1, Bytes::from_static(b"another cached reply")))),
   );
   assert_round_trip(&table);
+}
+
+#[test]
+fn a_refused_reply_record_round_trips_alongside_body_records() {
+  // The refusal is a cached outcome like any other — the row must survive a checkpoint and restore
+  // so a duplicate request after recovery is answered with the SAME refusal the client already had,
+  // not with silence (no cached reply) and not with a body. Encoded in a table mixing all three
+  // record kinds, so the reader cannot confuse the refusal's fixed layout with a body's.
+  let max = crate::ReplyBody::max_len();
+  let mut table = std::collections::BTreeMap::new();
+  table.insert(
+    1u128,
+    session(3, 10, Some((3, Bytes::from_static(b"body")))),
+  );
+  table.insert(2u128, refused_session(7, 20, 7, max + 1));
+  table.insert(3u128, session(4, 30, None));
+  assert_round_trip(&table);
+
+  // The refusal decoded back carries the offending length and the bound verbatim.
+  let mut store = InMemoryBlockStore::new();
+  let root = encode_sessions(&table, &mut store);
+  let decoded = decode_sessions(root, &store).expect("the whole DAG is present");
+  let outcome = decoded[&2u128]
+    .reply
+    .as_ref()
+    .map(|(_, outcome)| outcome.clone())
+    .expect("the refusal row keeps its cached outcome");
+  assert_eq!(
+    outcome,
+    ReplyOutcome::TooLarge(ReplyTooLarge::new(max + 1, max))
+  );
 }
 
 #[test]

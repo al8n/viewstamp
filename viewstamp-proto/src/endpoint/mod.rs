@@ -5,8 +5,8 @@ use bytes::Bytes;
 use crate::{
   BlockAddress, BlockJobDone, BlockStore, ClientId, Commit, Config, DoViewChange, Epoch, Event,
   Header, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Prepare, PrepareOk,
-  Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus, StateMachine, Status, Superblock,
-  SuperblockDone, View, Wal, WalDone,
+  Prng, Recipient, ReplicaId, Reply, ReplyOutcome, RequestNumber, SlotStatus, StateMachine, Status,
+  Superblock, SuperblockDone, View, Wal, WalDone,
   block_job::{BlockJobKind, BlockJobOutput, RecoveredCheckpoint, RestorePurpose, WalkPurpose},
   storage::{RootRole, Storage},
 };
@@ -1235,8 +1235,9 @@ struct Inflight {
 pub(crate) struct Session {
   /// Highest request number accepted (assigned an op or committed).
   request: RequestNumber,
-  /// Cached `(request_number, reply_body)` of the latest committed request.
-  reply: Option<(RequestNumber, Bytes)>,
+  /// Cached `(request_number, outcome)` of the latest committed request — the SAME terminal
+  /// outcome the client was sent, so a resend after failover reproduces it byte for byte.
+  reply: Option<(RequestNumber, ReplyOutcome)>,
   /// The op number of this client's last APPLIED request — the deterministic last-activity stamp the
   /// session-cap eviction orders victims by ([`crate::MAX_CLIENT_SESSIONS`]). `0` means PROVISIONAL:
   /// the row was minted off the consensus path (a primary's accept-time insert, a new primary's
@@ -2025,6 +2026,14 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// sim lane assert NON-VACUITY (the cap genuinely engaged). Same lifecycle as the other
   /// observability counters (reset to 0 on `new`/`recover`); exposed only via `sessions_evicted()`.
   sessions_evicted: u64,
+  /// How many committed ops this replica applied whose state-machine reply exceeded
+  /// [`crate::max_reply_body_len`] and was therefore replaced by a
+  /// [`ReplyOutcome::TooLarge`](crate::ReplyOutcome) ([`Self::replies_too_large`]). Advanced at the
+  /// single apply-time choke, so it counts identically on every replica across the same applied
+  /// prefix. Non-zero means the embedder's state machine returns replies the protocol cannot
+  /// deliver — the ops committed, but their results did not. Same lifecycle as the other
+  /// observability counters (reset to 0 on `new`/`recover`).
+  replies_too_large: u64,
   /// Deferred-forfeit flag: set when [`Self::maybe_force_sync`] would have force-synced
   /// but we are the PRIMARY — a primary MUST NOT force-sync, as that resets `self.op` to the checkpoint
   /// (below its head) and lets it re-issue new client requests at REUSED op numbers in the same view,
@@ -2403,6 +2412,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       prepare_batches_sent: 0,
       header_only_carriers_emitted: 0,
       sessions_evicted: 0,
+      replies_too_large: 0,
       pending_forfeit: false,
       reconfigure_inflight: None,
       pending_swap: None,
@@ -4779,6 +4789,20 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     self.sessions_evicted
   }
 
+  /// How many committed ops applied on this replica produced a reply past
+  /// [`max_reply_body_len`](crate::max_reply_body_len), delivered as
+  /// [`ReplyOutcome::TooLarge`](crate::ReplyOutcome) instead of a body.
+  ///
+  /// Zero for a state machine that honors the bound. A non-zero value is an embedder defect worth
+  /// alarming on: those operations COMMITTED and mutated the replicated state, but their results
+  /// reached no client. It advances identically on every replica across the same applied prefix
+  /// (the classification is a pure function of the deterministic apply), so it can be compared
+  /// across the cluster.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replies_too_large(&self) -> u64 {
+    self.replies_too_large
+  }
+
   /// Test-only: the client session's request high-water (the at-most-once dedup watermark
   /// `on_request` compares against), or `None` if the client has no session row. Proves the watermark
   /// is NOT seeded for an uncommitted adopted tail op that is later truncated.
@@ -4787,16 +4811,16 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     self.clients.get(&client).map(|s| s.request.get())
   }
 
-  /// Test-only: the cached `(request_number, reply_body)` a client session holds (the at-most-once
+  /// Test-only: the cached `(request_number, outcome)` a client session holds (the at-most-once
   /// reply cache a backup-turned-primary resends on a duplicate request). `None` if no session / no
   /// cached reply.
   #[cfg(test)]
-  fn session_reply_for_test(&self, client: u128) -> Option<(u64, std::vec::Vec<u8>)> {
+  fn session_reply_for_test(&self, client: u128) -> Option<(u64, ReplyOutcome)> {
     self
       .clients
       .get(&client)
       .and_then(|s| s.reply.as_ref())
-      .map(|(rn, body)| (rn.get(), body.to_vec()))
+      .map(|(rn, outcome)| (rn.get(), outcome.clone()))
   }
 
   /// Test-only: the full session table as ordered `(client, watermark, last_op)` rows — the

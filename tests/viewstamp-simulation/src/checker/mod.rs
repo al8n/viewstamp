@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 use smol_str::SmolStr;
-use viewstamp_proto::{Instant, MembershipChanged, OpNumber};
+use viewstamp_proto::{Instant, MembershipChanged, OpNumber, ReplyOutcome};
 
 use crate::cluster::{AppliedEvent, Cluster};
 
@@ -76,11 +76,14 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
   if let v @ CheckResult::Violation(_) = check_agreement(&logs) {
     return v;
   }
+  // Request ordering over the client's WHOLE acknowledgement history, refusals included: a refused
+  // request is answered and consumes its number exactly as a body-bearing one does, so reading only
+  // the bodies would see a gap at every refusal and mis-judge any mixed sequence.
   for i in 0..cluster.client_count() {
-    for (idx, (rn, _)) in cluster.client(i).replies().iter().enumerate() {
+    for (idx, (rn, _, _)) in cluster.client(i).acked().iter().enumerate() {
       if *rn != (idx as u64) + 1 {
         return CheckResult::violation(format!(
-          "client {i}: reply for request {rn} at position {idx} (expected {})",
+          "client {i}: acknowledgement for request {rn} at position {idx} (expected {})",
           idx + 1
         ));
       }
@@ -671,10 +674,12 @@ pub struct AppliedOnceChecker {
   last_op: Vec<Option<u64>>,
   /// Per-replica `(client, request)` pairs applied within the current incarnation.
   seen: Vec<HashSet<(u128, u64)>>,
-  /// The global injective map: `(client, request) → (op, reply)` across every replica and
+  /// The global injective map: `(client, request) → (op, outcome)` across every replica and
   /// incarnation. Agreement makes re-emissions (recovery, wipes, backups) converge on identical
-  /// values; any disagreement is a double-apply/divergence violation.
-  by_key: HashMap<(u128, u64), (u64, Bytes)>,
+  /// values; any disagreement is a double-apply/divergence violation. The OUTCOME, not the body, is
+  /// the compared quantity: a refused (over-bound) reply must be derived identically everywhere too,
+  /// and a replica that answered with a body where another refused is a divergence.
+  by_key: HashMap<(u128, u64), (u64, ReplyOutcome)>,
   /// The reverse direction of injectivity: `op → (client, request)` — one request per op number,
   /// ever.
   by_op: HashMap<u64, (u128, u64)>,
@@ -765,24 +770,24 @@ impl AppliedOnceChecker {
               ));
             }
             self.by_op.insert(op, (client, request));
-            let reply = c.reply_bytes();
+            let outcome = c.outcome().clone();
             match self.by_key.get(&(client, request)) {
-              Some((op2, reply2)) => {
+              Some((op2, outcome2)) => {
                 if *op2 != op {
                   return CheckResult::violation(format!(
                     "client {client} request {request} applied at two different ops ({op2} and \
                      {op}) — a request committed twice"
                   ));
                 }
-                if *reply2 != reply {
+                if *outcome2 != outcome {
                   return CheckResult::violation(format!(
-                    "client {client} request {request} (op {op}): applied replies diverge \
-                     ({reply2:?} vs {reply:?})"
+                    "client {client} request {request} (op {op}): applied outcomes diverge \
+                     ({outcome2:?} vs {outcome:?})"
                   ));
                 }
               }
               None => {
-                self.by_key.insert((client, request), (op, reply));
+                self.by_key.insert((client, request), (op, outcome));
               }
             }
           }
@@ -805,8 +810,13 @@ impl AppliedOnceChecker {
 
   /// Final applied-once assertion (run post-quiesce): folds any not-yet-observed stream entries,
   /// then enforces that the map is non-empty whenever the cluster committed anything, and that
-  /// every client-acked reply is present in the map with a matching reply body. An
+  /// every client-acked request is present in the map with a matching OUTCOME. An
   /// acked-but-never-applied request is a lost committed op — the headline invariant.
+  ///
+  /// Both terminal outcomes are collected: a body the client recorded as a reply, and a refusal it
+  /// recorded as an error. Both are acks of a committed op, so both must match what the replicas
+  /// applied — a client told "refused" for a request the replicas answered with a body (or the
+  /// reverse) is a divergence between what was applied and what was observed.
   pub fn check(&mut self, cluster: &Cluster) -> CheckResult {
     if let v @ CheckResult::Violation(_) = self.observe(cluster) {
       return v;
@@ -816,24 +826,24 @@ impl AppliedOnceChecker {
     let mut acked = Vec::new();
     for i in 0..cluster.client_count() {
       let client = cluster.client(i).id().get();
-      for (request, body) in cluster.client(i).replies() {
-        acked.push((client, *request, body.clone()));
+      for (request, outcome, _) in cluster.client(i).acked() {
+        acked.push((client, *request, outcome.clone()));
       }
     }
     self.check_acked(&acked, committed_any)
   }
 
-  /// The final-check core over the collected acked replies (`(client, request, reply)` triples) and
-  /// whether the cluster committed anything. Pure over its inputs so the no-loss logic is
+  /// The final-check core over the collected acked outcomes (`(client, request, outcome)` triples)
+  /// and whether the cluster committed anything. Pure over its inputs so the no-loss logic is
   /// unit-testable without a live `Cluster`.
-  fn check_acked(&self, acked: &[(u128, u64, Bytes)], committed_any: bool) -> CheckResult {
+  fn check_acked(&self, acked: &[(u128, u64, ReplyOutcome)], committed_any: bool) -> CheckResult {
     if committed_any && self.by_key.is_empty() {
       return CheckResult::violation(
         "the cluster committed ops but the applied-once map is empty — the apply-stream capture \
          recorded nothing",
       );
     }
-    for (client, request, reply) in acked {
+    for (client, request, outcome) in acked {
       match self.by_key.get(&(*client, *request)) {
         None => {
           return CheckResult::violation(format!(
@@ -841,10 +851,10 @@ impl AppliedOnceChecker {
              client-acked committed op was lost"
           ));
         }
-        Some((op, applied)) if applied != reply => {
+        Some((op, applied)) if applied != outcome => {
           return CheckResult::violation(format!(
-            "client {client}: acked request {request} disagrees with the applied reply at op {op} \
-             ({reply:?} acked vs {applied:?} applied)"
+            "client {client}: acked request {request} disagrees with the applied outcome at op \
+             {op} ({outcome:?} acked vs {applied:?} applied)"
           ));
         }
         Some(_) => {}
@@ -854,9 +864,11 @@ impl AppliedOnceChecker {
   }
 }
 
-/// One client's ack-time record entry as the staleness fold consumes it: `(request, reply_body,
-/// ack_instant)` — the shape [`Cluster::client_replies_at`] yields per client.
-type AckRecord = (u64, Bytes, Instant);
+/// One client's ack-time record entry as the staleness fold consumes it: `(request, outcome,
+/// ack_instant)` — the shape [`Cluster::client_acked`] yields per client. BOTH terminal outcomes
+/// appear: a refused reply still acknowledges a committed write, so it belongs in the floor a later
+/// read must reflect.
+type AckRecord = (u64, ReplyOutcome, Instant);
 
 /// Stateful **linearizable-read staleness** oracle: the cluster's write-reply staleness floor over
 /// time, and the enforcement a linearizable-read path must satisfy the moment one exists.
@@ -873,7 +885,8 @@ type AckRecord = (u64, Bytes, Instant);
 ///    of the same no-rewrite invariant [`DurabilityChecker`] enforces: the staleness floor can never
 ///    silently move backwards.
 /// 2. **The acked set** — every client-acked write paired with the instant it was acked. Each ack is
-///    `(client, request, ack_instant)` (drained from [`Cluster::client_replies_at`]); the op it
+///    `(client, request, ack_instant)` (drained from [`Cluster::client_acked`], both terminal
+///    outcomes); the op it
 ///    committed at is resolved by folding the replicas' apply streams into a `(client, request) -> op`
 ///    map (the apply stream is the authority on which op a request committed at). The resolved acked
 ///    set is therefore `(op, ack_instant)` pairs — exactly the writes a later read must not be stale
@@ -905,7 +918,7 @@ pub struct StalenessChecker {
   /// The `(client, request) -> op` map learned from the apply streams — the authority on which op a
   /// request committed at, used to resolve each ack to its committed op.
   op_of: HashMap<(u128, u64), u64>,
-  /// Per-client count of acked replies already drained from [`Cluster::client_replies_at`] (the
+  /// Per-client count of acknowledgements already drained from [`Cluster::client_acked`] (the
   /// per-client ack record is append-only).
   ack_cursor: Vec<usize>,
   /// The acked set: `(client, request, ack_instant)` per client-acked write, in ack order. Resolved
@@ -1013,7 +1026,7 @@ impl StalenessChecker {
       .map(|i| cluster.replica_sm(i).applied().to_vec())
       .collect();
     let acks: Vec<(u128, &[AckRecord])> = (0..cluster.client_count())
-      .map(|i| (cluster.client(i).id().get(), cluster.client_replies_at(i)))
+      .map(|i| (cluster.client(i).id().get(), cluster.client_acked(i)))
       .collect();
     // The client-spawn churn lane can grow the client set mid-run; keep the ack cursor in step so a
     // spawned client's acks are folded rather than panicking on a missing cursor.

@@ -141,18 +141,71 @@ pub fn materialize_sm<S: StateMachine>(sm: &S, store: &mut dyn BlockStore) -> Bl
   S::materialize(&sm.checkpoint_image(), store)
 }
 
+/// How large a reply [`LogSm`] produces — the REPLY-SIZE lever the endpoint's reply ceiling is
+/// walked with. A padded reply still leads with the applied count, so every existing reply check
+/// keeps working; only the length changes, which is what moves a reply across the ceiling without
+/// changing anything else about a run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ReplySize {
+  /// The bare 8-byte applied count (the default) — no schedule moves.
+  #[default]
+  Count,
+  /// Every reply padded to exactly this many bytes.
+  Fixed(usize),
+  /// ALTERNATING by applied position: the bare count on odd applies, this many bytes on even ones.
+  /// Past the reply bound this makes one client's request stream interleave bodies and refusals,
+  /// which is the shape a per-request ordering check has to get right.
+  Alternating(usize),
+}
+
+impl ReplySize {
+  /// The reply length for the `count`-th applied op, or `None` for the bare count.
+  const fn len_at(self, count: u64) -> Option<usize> {
+    match self {
+      Self::Count => None,
+      Self::Fixed(len) => Some(len),
+      Self::Alternating(len) if count.is_multiple_of(2) => Some(len),
+      Self::Alternating(_) => None,
+    }
+  }
+}
+
 /// A deterministic state machine that records the sequence of applied operations.
 /// The reply is the post-apply length encoded as 8 big-endian bytes — enough for
-/// the linearizability checker to verify ordering and uniqueness.
+/// the linearizability checker to verify ordering and uniqueness, and padded to whatever
+/// [`ReplySize`] the cluster configured.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LogSm {
   applied: Vec<(u64, Bytes)>,
+  reply_size: ReplySize,
 }
 
 impl LogSm {
+  /// A recorder whose replies follow `reply_size`.
+  pub const fn with_reply_size(reply_size: ReplySize) -> Self {
+    Self {
+      applied: Vec::new(),
+      reply_size,
+    }
+  }
+
   /// The ordered list of applied `(op, body)` pairs.
   pub fn applied(&self) -> &[(u64, Bytes)] {
     &self.applied
+  }
+
+  /// This SM's reply for its `count`-th applied op: the count as 8 big-endian bytes, padded with
+  /// zeroes to whatever length [`ReplySize`] asks for at that position.
+  fn reply_for(&self, count: u64) -> Bytes {
+    let leading = count.to_be_bytes();
+    match self.reply_size.len_at(count) {
+      None => Bytes::from(leading.to_vec()),
+      Some(len) => {
+        let mut reply = std::vec![0u8; len.max(leading.len())];
+        reply[..leading.len()].copy_from_slice(&leading);
+        Bytes::from(reply)
+      }
+    }
   }
 }
 
@@ -161,7 +214,7 @@ impl StateMachine for LogSm {
 
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), Bytes::copy_from_slice(body)));
-    Bytes::from((self.applied.len() as u64).to_be_bytes().to_vec())
+    self.reply_for(self.applied.len() as u64)
   }
 
   fn checkpoint_image(&self) -> Self::Image {
@@ -178,7 +231,9 @@ impl StateMachine for LogSm {
   }
 
   fn restore_seed(&self) -> Self {
-    LogSm::default()
+    // The reply size is CONFIGURATION, not checkpoint content: the seed carries it forward so a
+    // restored replica keeps producing the same replies as the one it synced from.
+    LogSm::with_reply_size(self.reply_size)
   }
 
   fn restore(&mut self, root: BlockAddress, store: &VerifiedView<'_>) -> Result<(), RestoreError> {

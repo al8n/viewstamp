@@ -494,7 +494,7 @@ fn vsr_state_golden_bytes_pin_the_layout() {
   .unwrap()
   .with_wal_geometry(32, 4096);
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
+    0, 9, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
     0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75, 124,
     48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -631,14 +631,14 @@ fn vsr_state_decode_accepts_exactly_the_current_version() {
     &SUPERBLOCK_VERSION.to_be_bytes(),
     "a new durable root leads with SUPERBLOCK_VERSION"
   );
-  assert_eq!(SUPERBLOCK_VERSION, 2, "the accepted version is exactly 2");
+  assert_eq!(SUPERBLOCK_VERSION, 9, "the accepted version is exactly 9");
   assert_eq!(
     VsrState::decode(&bytes).unwrap(),
     root,
     "the current-version root round-trips (log_floor + WAL geometry included)"
   );
-  // Every other version word in the byte range is refused UNPARSED — 0, and 2..=255, which covers
-  // every number a superseded layout generation ever stamped.
+  // Every other version word in the byte range is refused UNPARSED, which covers every number a
+  // superseded layout generation ever stamped.
   for v in (0u16..=255).filter(|&v| v != SUPERBLOCK_VERSION) {
     let mut tagged = bytes.to_vec();
     tagged[0..2].copy_from_slice(&v.to_be_bytes());
@@ -647,16 +647,16 @@ fn vsr_state_decode_accepts_exactly_the_current_version() {
       "version word {v} is refused as unknown"
     );
   }
-  // The high-water superseded number is pinned by name, so this refusal is a visible witness on its
-  // own — a store written by the last differently-numbered generation can never decode.
-  let mut high_water = bytes.to_vec();
-  high_water[0..2].copy_from_slice(&8u16.to_be_bytes());
+  // The immediately-superseded number is pinned by name, so this refusal is a visible witness on
+  // its own — a store written by the previous generation can never decode.
+  let mut previous = bytes.to_vec();
+  previous[0..2].copy_from_slice(&2u16.to_be_bytes());
   assert!(
     matches!(
-      VsrState::decode(&high_water),
-      Err(CodecError::UnknownVersion(8))
+      VsrState::decode(&previous),
+      Err(CodecError::UnknownVersion(2))
     ),
-    "the superseded high-water version 8 is refused"
+    "the superseded version 2 is refused"
   );
   // Beyond-byte words are refused identically (the version is a full u16).
   for v in [256u16, 0x0800, u16::MAX] {
@@ -671,9 +671,10 @@ fn vsr_state_decode_accepts_exactly_the_current_version() {
 
 #[test]
 fn an_ancient_pre_membership_layout_fails_structurally_under_the_current_version() {
-  // No superseded superblock generation ever stamped the current word `2` (the shared-constant era
-  // stamped `1`, the split numbering ran `3..=8`, and the previous generation reset to `1`), so
-  // the exact-match gate alone already refuses every root an earlier writer produced. This pins
+  // No superseded superblock generation ever stamped the current word `9` (the shared-constant era
+  // stamped `1`, an early split numbering ran `3..=8`, a later generation reset to `1`, and the
+  // previous one stamped `2`), so the exact-match gate alone already refuses every root an earlier
+  // writer produced. This pins
   // the SECOND, structural layer regardless — the defense that holds even if a numbering is ever
   // reused: an ancient pre-membership body (one ending right after the committed-band header set —
   // no epoch, membership, lineage, scalar, or geometry tail) re-tagged with the CURRENT version
@@ -784,10 +785,10 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
   ));
   // Bad leading version → UnknownVersion.
   let mut badver = good.to_vec();
-  badver[1] = 9;
+  badver[1] = 2;
   assert!(matches!(
     VsrState::decode(&badver),
-    Err(CodecError::UnknownVersion(9))
+    Err(CodecError::UnknownVersion(2))
   ));
   // A header-count prefix that overruns the buffer → LengthOverflow (not an OOB slice). The
   // count u32 sits at offset 2+8+8+8+8+16 = 50.

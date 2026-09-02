@@ -9,7 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{pin_mut, task::noop_waker_ref};
-use viewstamp_proto::{BatchView, ReplyBuilder};
+use viewstamp_proto::{BatchView, ReplyBuilder, ReplyOutcome};
 
 use super::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchConfig, BatchError, BatchHandle,
@@ -29,7 +29,13 @@ struct TestDriver {
 
 impl TestDriver {
   /// The next submitted body: its raw bytes, decoded units, and the reply sender to answer.
-  fn next_body(&mut self) -> (Bytes, Vec<Vec<u8>>, futures_channel::oneshot::Sender<Bytes>) {
+  fn next_body(
+    &mut self,
+  ) -> (
+    Bytes,
+    Vec<Vec<u8>>,
+    futures_channel::oneshot::Sender<ReplyOutcome>,
+  ) {
     let cmd = self.commands.try_recv().expect("a body was submitted");
     match cmd {
       Command::Submit {
@@ -84,12 +90,12 @@ fn poll_once<F: Future>(fut: &mut Pin<&mut F>) -> Poll<F::Output> {
 }
 
 /// A committed reply body carrying one result per `units` entry.
-fn reply_for(units: &[&[u8]]) -> Bytes {
+fn reply_for(units: &[&[u8]]) -> ReplyOutcome {
   let mut builder = ReplyBuilder::new(viewstamp_proto::max_reply_body_len(), usize::MAX);
   for unit in units {
     builder.push(unit).expect("test replies fit the budget");
   }
-  builder.finish().expect("non-empty")
+  ReplyOutcome::from_applied(builder.finish().expect("non-empty"))
 }
 
 #[test]
@@ -493,7 +499,7 @@ fn a_malformed_reply_is_committed_reply_lost_for_every_unit() {
   assert!(poll_once(&mut run).is_pending());
   let (_, _, reply) = driver.next_body();
   reply
-    .send(Bytes::from_static(b"\x00\x00"))
+    .send(ReplyOutcome::from_applied(Bytes::from_static(b"\x00\x00")))
     .expect("the submit awaits");
   assert!(poll_once(&mut run).is_pending());
   assert_eq!(
@@ -896,7 +902,9 @@ fn every_wake_fires_outside_the_queue_lock() {
     rb.push(b"ok").expect("reply fits");
   }
   reply
-    .send(rb.finish().expect("a unit was pushed"))
+    .send(ReplyOutcome::from_applied(
+      rb.finish().expect("a unit was pushed"),
+    ))
     .expect("the pump awaits the reply");
   assert!(run.as_mut().poll(&mut cx).is_ready() || run.as_mut().poll(&mut cx).is_pending());
   assert!(s1.as_mut().poll(&mut cx).is_ready());
@@ -1214,5 +1222,22 @@ fn a_retired_submit_is_classified_outcome_unknown() {
       );
     }
     other => panic!("expected OutcomeUnknown for a retired submit, got {other:?}"),
+  }
+}
+
+/// An over-bound reply is classified `CommittedReplyLost`, never `OutcomeUnknown`: the packed body
+/// COMMITTED and every unit in it applied — only the reply batch is gone — so a caller that retried
+/// a non-idempotent unit would apply it a second time. The class is the retry contract, and here
+/// the contract is "do not retry".
+#[test]
+fn an_over_bound_reply_is_classified_committed_reply_lost() {
+  let max = viewstamp_proto::ReplyBody::max_len();
+  let err = DriverError::ReplyTooLarge { len: max + 1, max };
+  match super::submit_failure(&err) {
+    BatchError::CommittedReplyLost { reason } => {
+      assert_eq!(reason, ReplyLostReason::ReplyTooLarge);
+      assert_eq!(reason.as_str(), "reply_too_large");
+    }
+    other => panic!("expected CommittedReplyLost for an over-bound reply, got {other:?}"),
   }
 }

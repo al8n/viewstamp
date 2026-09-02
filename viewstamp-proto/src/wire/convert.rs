@@ -39,6 +39,14 @@ pub(crate) fn u128_from(b: &Bytes, what: &'static str) -> Result<u128, CodecErro
   Ok(u128::from_be_bytes(raw))
 }
 
+/// Narrows a wire byte length to this target's `usize`, rejecting via [`malformed`] a value that
+/// does not fit it. The wire scalar is a `uint64` while the domain counts bytes of an in-memory
+/// buffer, so a length no local allocation could ever describe is a rejection, not a truncation.
+#[cfg_attr(not(tarpaulin), inline)]
+pub(crate) fn usize_from(v: u64, what: &'static str) -> Result<usize, CodecError> {
+  usize::try_from(v).map_err(|_| malformed(what))
+}
+
 /// Narrows a wire replica slot to a [`ReplicaId`], rejecting via [`malformed`] a value above
 /// [`u16::MAX`].
 #[cfg_attr(not(tarpaulin), inline)]

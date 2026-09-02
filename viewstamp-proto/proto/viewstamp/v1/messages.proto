@@ -71,12 +71,28 @@ message PrepareOk {
   bytes config_id = 7;
 }
 
+// A committed operation whose state-machine reply exceeded the largest body a
+// Reply can frame. The operation stays committed; only its reply is refused.
+message ReplyTooLarge {
+  // The length of the reply the state machine returned.
+  uint64 len = 1;
+  // The bound it was refused against.
+  uint64 max = 2;
+}
+
 // Primary to client: the result of a committed operation.
 message Reply {
   uint64 view = 1;
   bytes client = 2;
   uint64 request = 3;
-  bytes body = 4;
+  // Exactly one outcome must be present; an absent oneof rejects at conversion.
+  // An empty body is a legitimate result, distinct from an absent outcome.
+  oneof outcome {
+    // The state machine's reply, within the reply-body bound.
+    bytes body = 4;
+    // The reply exceeded the bound, so no body could be framed.
+    ReplyTooLarge too_large = 5;
+  }
 }
 
 // Primary to backups: commit heartbeat advancing the commit number without a

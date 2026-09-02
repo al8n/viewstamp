@@ -12,7 +12,7 @@ fn alpn_protocols_carries_the_wire_version_from_the_single_source_of_truth() {
   let expected = format!("viewstamp/{}", crate::transport::labeled::wire_version()).into_bytes();
   assert_eq!(alpn_protocols(), vec![expected]);
   // Concretely pins the current version too, so a bump is a deliberate, visible diff here.
-  assert_eq!(alpn_protocols(), vec![b"viewstamp/2".to_vec()]);
+  assert_eq!(alpn_protocols(), vec![b"viewstamp/4".to_vec()]);
 }
 
 #[test]

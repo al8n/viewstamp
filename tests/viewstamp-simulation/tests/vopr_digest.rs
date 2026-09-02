@@ -99,8 +99,12 @@ fn applied_digest(seed: u64) -> u64 {
     }
   }
   for i in 0..c.client_count() {
-    fnv1a_u64(&mut h, c.client(i).replies().len() as u64);
-    for (request, body) in c.client(i).replies() {
+    // The BODY-bearing acknowledgements, in ack order — the same `(request, len, bytes)` fold this
+    // digest has always taken. A refused reply carries no body and contributes nothing, so the
+    // hash's schema is unchanged; this schedule's state machine never produces one anyway.
+    let bodies = c.client(i).reply_bodies();
+    fnv1a_u64(&mut h, bodies.len() as u64);
+    for (request, body) in &bodies {
       fnv1a_u64(&mut h, *request);
       fnv1a_u64(&mut h, body.len() as u64);
       fnv1a_bytes(&mut h, body);

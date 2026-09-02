@@ -867,16 +867,18 @@ fn learner_emission_checker_flags_a_message_minted_while_a_learner_even_if_since
 }
 
 #[test]
-fn network_drops_an_oversized_inter_replica_message_but_not_small_or_client_ones() {
+fn network_drops_an_oversized_message_on_both_the_peer_and_the_client_link() {
   // The CONVERSE that proves the frame cap is REAL: a full-`Present` 8-entry `DoViewChange` of
   // large bodies — the carrier shape header-only carriers exist to avoid — EXCEEDS `MAX_FRAME_LEN`,
-  // and the sim network drops it on the
-  // inter-replica path (counting it), while a header-only carrier of the SAME band, a small message,
-  // and an (oversized) client-bound message all pass. This is the modelled transport send-path frame
-  // guard; it is what makes the VOPR's `oversized_dropped == 0` for legitimate traffic a real oracle.
+  // and the sim network drops it on the inter-replica path (counting it), while a header-only
+  // carrier of the SAME band and a small message pass. The client link is capped the same way, in
+  // both directions, and counted apart: the real transport frames client traffic exactly as it
+  // frames peer traffic, so a message over the cap never arrives there either. This is the modelled
+  // transport send-path frame guard; it is what makes the VOPR's `oversized_dropped == 0` and
+  // `client_link_oversized_dropped == 0` real oracles.
   use viewstamp_proto::{
-    ClientId, DoViewChange, MAX_FRAME_LEN, OpNumber, PreparedEntry, ReplicaId, RequestNumber, View,
-    max_request_body_len,
+    ClientId, DoViewChange, MAX_FRAME_LEN, OpNumber, PreparedEntry, ReplicaId, ReplyBody,
+    ReplyOutcome, Request, RequestNumber, View, max_request_body_len,
   };
 
   let big = max_request_body_len() / 4; // each ~4 MiB; 8 of them full-bodied dwarf the 16 MiB frame
@@ -967,20 +969,54 @@ fn network_drops_an_oversized_inter_replica_message_but_not_small_or_client_ones
     1,
     "a small peer message is never dropped"
   );
-  // An oversized CLIENT-bound message is NOT capped here (only peer traffic is — mirroring what the
-  // real transport drops). Build a Reply that itself exceeds the frame and confirm it is not dropped.
-  let huge_reply = Message::Reply(viewstamp_proto::Reply::new(
-    View::with(1),
+  // CLIENT → REPLICA, oversized: a request body larger than the transport can frame is dropped on
+  // the client link and counted THERE, not against the peer count. (A `Request` carries its body
+  // unbounded by its type — the driver's submit check is what refuses one — so this direction is
+  // where an oversized client-link message can still be built.)
+  let huge_request = Message::Request(Request::new(
     ClientId::new(1),
     RequestNumber::with(1),
     bytes::Bytes::from(std::vec![0u8; MAX_FRAME_LEN as usize + 1024]),
   ));
-  assert!(huge_reply.encoded_len() > MAX_FRAME_LEN as usize);
-  c.schedule(now, from, Target::Client(1), huge_reply);
+  assert!(huge_request.encoded_len() > MAX_FRAME_LEN as usize);
+  c.schedule(
+    now,
+    Peer::Client(ClientId::new(1)),
+    Target::Replica(0),
+    huge_request,
+  );
+  assert_eq!(
+    c.client_link_oversized_dropped(),
+    1,
+    "an oversized client request is dropped by the client link's frame guard and counted there"
+  );
   assert_eq!(
     c.oversized_dropped(),
     1,
-    "a client-bound message is not subject to the inter-replica frame cap (different path)"
+    "a client-link drop is not counted against the inter-replica link"
+  );
+  // REPLICA → CLIENT, at the largest reply the type admits: this is the biggest `Reply` that can
+  // exist, and it must pass. The reply bound is derived from the frame cap precisely so that the
+  // client link's guard can never fire on a legitimate reply — which is what makes the zero count a
+  // fence rather than a tolerance.
+  let widest_reply = Message::Reply(viewstamp_proto::Reply::new(
+    View::with(1),
+    ClientId::new(1),
+    RequestNumber::with(1),
+    ReplyOutcome::Ok(
+      ReplyBody::try_new(bytes::Bytes::from(std::vec![0u8; ReplyBody::max_len()]))
+        .expect("a body of exactly the bound is admissible"),
+    ),
+  ));
+  assert!(
+    widest_reply.encoded_len() <= MAX_FRAME_LEN as usize,
+    "the largest representable reply must fit one frame"
+  );
+  c.schedule(now, from, Target::Client(1), widest_reply);
+  assert_eq!(
+    c.client_link_oversized_dropped(),
+    1,
+    "the largest representable reply is never refused by the client link"
   );
 }
 

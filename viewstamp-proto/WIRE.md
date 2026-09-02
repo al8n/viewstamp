@@ -30,7 +30,19 @@ the SEMANTICS.
   membership — must be PRESENT iff `membership` is non-empty (an explicit `0` names a
   genesis/offline-born producing point and is distinct from absence; either half of the pair
   without the other rejects at conversion, so an omitted producing op can never default to `0`
-  and install a membership under an op no reconfigure committed).
+  and install a membership under an op no reconfigure committed). `Reply.outcome` is a `oneof`
+  for the same reason: exactly one arm must be present — the reply `body` (an EMPTY body is a
+  legitimate result, distinct from an absent outcome) or the `too_large` refusal that replaces a
+  reply past the reply bound — and an absent oneof rejects at conversion.
+- **`Reply.outcome` is the one field exempted from the merge rules below: exactly ONE occurrence of
+  field 4 or field 5 is admitted, and a second — a different arm, the same arm again, or the two
+  split across a repeated `Message.body.reply` arm — rejects the frame** (`CodecError::Malformed`,
+  `Reply.outcome (repeated)`), before the envelope is converted. The general rules would make the
+  LAST arm win, which for this field is not redundancy but a semantic fork: the sender could decide
+  by field ORDER alone whether the client observes a committed op's body or its terminal refusal.
+  The check is a single pass over the raw frame's own fields (`src/wire/mod.rs`), since the decoded
+  message has already collapsed the oneof. An independent implementation MUST reject the same
+  frames; a frame it cannot walk under the proto3 wire grammar is likewise rejected.
 - Duplicate fields follow protobuf merge semantics precisely: duplicate singular SCALAR fields are
   last-wins; duplicate singular EMBEDDED-MESSAGE fields MERGE their field sets; a `oneof`
   re-occurrence of the SAME message-typed variant (e.g. two `PreparedEntry.reconfigure` arms in
@@ -139,11 +151,13 @@ source of truth and does not restate the numbers.
 
 ## 3. The hello + versioning
 
-`HELLO_VERSION` (`src/transport/labeled/mod.rs`, currently `2` — bumped `1` → `2` when
-`SyncCheckpoint.config_install_op` became presence-bearing, a semantic change to an existing field:
-a version-`1` peer's encoder cannot distinguish an omitted producing op from a legitimate `0`, so
-such a peer is refused at the handshake instead of having its membership-bearing sync answers
-misread) is THE wire-version fence for every
+`HELLO_VERSION` (`src/transport/labeled/mod.rs`, currently `4` — bumped `2` → `4` when `Reply.body`
+became the `Reply.outcome` oneof, a structural change to an existing field: a version-`2` peer omits
+the field entirely for an empty reply and has no arm at all for the refusal, so its replies cannot be
+told apart from a truncated envelope. `2` itself had been bumped from `1` when
+`SyncCheckpoint.config_install_op` became presence-bearing, a version-`1` peer's encoder being unable
+to distinguish an omitted producing op from a legitimate `0`. Each such peer is refused at the
+handshake instead of having its messages misread) is THE wire-version fence for every
 transport: the stream `Labeled` hello (the dialer sends eagerly; the acceptor answers only after
 validating the dialer's) and the QUIC control-stream preface written by the `Hello` identity source
 (`src/transport/quic/identity/mod.rs`), which encodes and parses through the IDENTICAL
@@ -173,10 +187,13 @@ dispatch on. Versioning happens exactly once, at the hello, before any consensus
 ## 4. Durable state
 
 The WAL `Header` (`HEADER_VERSION`, currently `1`) and the durable superblock root `VsrState`
-(`SUPERBLOCK_VERSION`, currently `2` — bumped `1` → `2` when `config_install_op` became the
-VERBATIM producing op of the root's membership: a version-`1` root's slot may hold a
-checkpoint-frontier approximation instead, indistinguishable byte-wise, so every version-`1` root
-is refused at decode rather than recovered and re-served as exact) are hand-rolled, fixed-width /
+(`SUPERBLOCK_VERSION`, currently `9` — bumped `2` → `9` when each cached client reply in the
+session DAG the root points at became a terminal OUTCOME rather than a body, so a restored table can
+resend exactly what the client was originally sent; `2` itself had been bumped from `1` when
+`config_install_op` became the VERBATIM producing op of the root's membership, a version-`1` root's
+slot possibly holding a checkpoint-frontier approximation instead, indistinguishable byte-wise. Every
+superseded numbering is refused at decode rather than recovered under a weaker contract) are
+hand-rolled, fixed-width /
 length-prefixed big-endian encodings — UNCHANGED by the protobuf envelope cutover, and NOT
 protobuf. Their layout, per-version
 decode dispatch, and rejection surface (`CodecError::UnknownVersion` / `LengthOverflow` /

@@ -36,7 +36,7 @@
 use bytes::Bytes;
 
 use crate::{
-  RequestNumber,
+  ReplyBody, ReplyOutcome, ReplyTooLarge, RequestNumber,
   block_store::{BlockAddress, BlockStore, read_verified_block},
 };
 
@@ -65,6 +65,16 @@ const TAG_LEAF: u8 = 0x00;
 const TAG_BODY: u8 = 0x01;
 /// Kind tag of an INDEX block (an ordered list of child block addresses).
 const TAG_INDEX: u8 = 0x02;
+
+/// Record `reply_kind`: the session has no cached reply.
+const REPLY_NONE: u8 = 0;
+/// Record `reply_kind`: a cached reply body stored in line in the record.
+const REPLY_INLINE: u8 = 1;
+/// Record `reply_kind`: a cached reply body externalized into body-chunk blocks the record names.
+const REPLY_EXTERNAL: u8 = 2;
+/// Record `reply_kind`: the cached outcome is the over-bound-reply refusal, which carries the two
+/// lengths instead of a body.
+const REPLY_TOO_LARGE: u8 = 3;
 
 /// The kind tag of a session `block`, or `None` if it is not a session block (the magic does not match).
 /// O(1) — the fast reject for the GC union walk over an embedder SM block.
@@ -153,14 +163,15 @@ impl RecordWriter {
     }
   }
 
-  /// Appends one session record. `body_refs` (when present) is the externalized cached-reply body as a
-  /// list of chunk addresses; `inline_reply` is the in-line cached reply (small bodies). At most one of
-  /// the two reply forms is set per record. Layout:
+  /// Appends one session record. `reply_external` (when non-empty) is the externalized cached-reply
+  /// body as a list of chunk addresses; otherwise the outcome is written in line. Layout:
   ///
   /// `client:u128 | request:u64 | last_op:u64 | reply_kind:u8 | …reply…`
   ///
-  /// where `reply_kind` is `0` (none), `1` (inline: `rn:u64 | len:u32 | bytes`), or `2` (external:
-  /// `rn:u64 | chunk_count:u32 | chunk_count × addr:16`).
+  /// where `reply_kind` is [`REPLY_NONE`] (nothing follows), [`REPLY_INLINE`]
+  /// (`rn:u64 | len:u32 | bytes`), [`REPLY_EXTERNAL`] (`rn:u64 | chunk_count:u32 |
+  /// chunk_count × addr:16`), or [`REPLY_TOO_LARGE`] (`rn:u64 | len:u64 | max:u64` — the refusal
+  /// the client was sent in place of an over-bound body).
   fn push_record(&mut self, client: u128, session: &Session, reply_external: &[BlockAddress]) {
     self.buf.extend_from_slice(&client.to_be_bytes());
     self
@@ -170,19 +181,28 @@ impl RecordWriter {
       .buf
       .extend_from_slice(&session.last_op.get().to_be_bytes());
     match &session.reply {
-      None => self.buf.push(0),
-      Some((rn, body)) => {
+      None => self.buf.push(REPLY_NONE),
+      Some((rn, ReplyOutcome::TooLarge(err))) => {
+        self.buf.push(REPLY_TOO_LARGE);
+        self.buf.extend_from_slice(&rn.get().to_be_bytes());
+        self
+          .buf
+          .extend_from_slice(&(err.reply_len() as u64).to_be_bytes());
+        self
+          .buf
+          .extend_from_slice(&(err.max_len() as u64).to_be_bytes());
+      }
+      Some((rn, ReplyOutcome::Ok(body))) => {
         if reply_external.is_empty() {
-          // INLINE reply.
-          self.buf.push(1);
+          self.buf.push(REPLY_INLINE);
           self.buf.extend_from_slice(&rn.get().to_be_bytes());
           self
             .buf
             .extend_from_slice(&(body.len() as u32).to_be_bytes());
-          self.buf.extend_from_slice(body);
+          self.buf.extend_from_slice(body.as_bytes());
         } else {
           // EXTERNAL reply: the body lives in `reply_external` body-chunk blocks.
-          self.buf.push(2);
+          self.buf.push(REPLY_EXTERNAL);
           self.buf.extend_from_slice(&rn.get().to_be_bytes());
           self
             .buf
@@ -273,11 +293,13 @@ pub(crate) fn encode_sessions(
     } else {
       // The inline record overflows a whole leaf — externalize its reply body into chunks and re-encode
       // with the chunk addresses. The re-encoded record is always small (a fixed header plus 16 bytes
-      // per chunk), so it fits the budget for any realistic chunk count.
+      // per chunk), so it fits the budget for any realistic chunk count. Only a cached BODY can
+      // overflow: a refusal record is a fixed few dozen bytes, so this reads the `Ok` arm alone.
       let body = session
         .reply
         .as_ref()
-        .map(|(_, b)| b.clone())
+        .and_then(|(_, outcome)| outcome.as_ok())
+        .map(|body| body.clone().into_bytes())
         .unwrap_or_default();
       let chunks = write_body_chunks(&body, store);
       encode_record(client, session, &chunks)
@@ -383,18 +405,23 @@ impl<'a> Decoder<'a> {
     self.u64()?; // last_op
     let kind = *self.take(1)?.first()?;
     match kind {
-      0 => {}
-      1 => {
+      REPLY_NONE => {}
+      REPLY_INLINE => {
         self.u64()?; // reply request number
         let len = self.u32()? as usize;
         self.take(len)?; // reply body bytes
       }
-      2 => {
+      REPLY_EXTERNAL => {
         self.u64()?; // reply request number
         let count = self.u32()? as usize;
         for _ in 0..count {
           out.push(self.addr()?);
         }
+      }
+      REPLY_TOO_LARGE => {
+        self.u64()?; // reply request number
+        self.u64()?; // the refused reply length
+        self.u64()?; // the bound it was refused against
       }
       _ => return None,
     }
@@ -412,14 +439,14 @@ fn decode_record(d: &mut Decoder<'_>, store: &dyn BlockStore) -> Option<(u128, S
   let last_op = crate::OpNumber::with(d.u64()?);
   let kind = *d.take(1)?.first()?;
   let reply = match kind {
-    0 => None,
-    1 => {
+    REPLY_NONE => None,
+    REPLY_INLINE => {
       let rn = RequestNumber::with(d.u64()?);
       let len = d.u32()? as usize;
-      let body = Bytes::copy_from_slice(d.take(len)?);
-      Some((rn, body))
+      let body = ReplyBody::try_new(Bytes::copy_from_slice(d.take(len)?)).ok()?;
+      Some((rn, ReplyOutcome::Ok(body)))
     }
-    2 => {
+    REPLY_EXTERNAL => {
       let rn = RequestNumber::with(d.u64()?);
       let count = d.u32()? as usize;
       let mut body = std::vec::Vec::new();
@@ -433,7 +460,16 @@ fn decode_record(d: &mut Decoder<'_>, store: &dyn BlockStore) -> Option<(u128, S
         let payload = chunk.get(HEADER_LEN..)?;
         body.extend_from_slice(payload);
       }
-      Some((rn, Bytes::from(body)))
+      // A reassembled body past the reply bound is not a reply this build can cache or resend — the
+      // encoder never produces one, so it reads as a decode fault and the caller re-fetches.
+      let body = ReplyBody::try_new(Bytes::from(body)).ok()?;
+      Some((rn, ReplyOutcome::Ok(body)))
+    }
+    REPLY_TOO_LARGE => {
+      let rn = RequestNumber::with(d.u64()?);
+      let len = usize::try_from(d.u64()?).ok()?;
+      let max = usize::try_from(d.u64()?).ok()?;
+      Some((rn, ReplyOutcome::TooLarge(ReplyTooLarge::new(len, max))))
     }
     _ => return None,
   };

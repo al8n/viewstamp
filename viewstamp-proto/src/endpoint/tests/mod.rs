@@ -196,6 +196,73 @@ impl StateMachine for EchoSm {
   }
 }
 
+/// A state machine whose every reply is exactly `reply_len` bytes, whatever the op body — the
+/// reply-size lever the apply-time choke is exercised with. Sized at `max_reply_body_len()` minus
+/// one, exactly, and plus one, it walks the boundary from "delivered as a body" to "delivered as a
+/// refusal" with nothing else about the run changing.
+struct FixedReplySm {
+  reply_len: usize,
+}
+
+impl FixedReplySm {
+  const fn new(reply_len: usize) -> Self {
+    Self { reply_len }
+  }
+}
+
+impl StateMachine for FixedReplySm {
+  type Image = ();
+
+  fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
+    Bytes::from(std::vec![0xA5u8; self.reply_len])
+  }
+
+  fn checkpoint_image(&self) -> Self::Image {}
+
+  fn materialize(_image: &Self::Image, store: &mut dyn BlockStore) -> BlockAddress {
+    store.put(Bytes::new())
+  }
+
+  fn restore_seed(&self) -> Self {
+    Self::new(self.reply_len)
+  }
+
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &crate::VerifiedView<'_>,
+  ) -> Result<(), crate::RestoreError> {
+    store
+      .read_block(root)
+      .map(|_| ())
+      .ok_or(crate::RestoreError::new(root))
+  }
+}
+
+/// A single-replica PRIMARY (quorum 1, so an op commits as soon as its append is durable) whose
+/// state machine replies with exactly `reply_len` bytes.
+fn primary_replying(reply_len: usize) -> Endpoint<FixedReplySm> {
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).expect("valid cluster config"),
+    genesis(1),
+    0,
+    FixedReplySm::new(reply_len),
+    u64::MAX,
+  )
+}
+
+/// A BACKUP (slot 1 of three) whose state machine replies with exactly `reply_len` bytes — the
+/// other side of the shared apply-time choke.
+fn backup_replying(reply_len: usize) -> Endpoint<FixedReplySm> {
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
+    genesis(3),
+    0,
+    FixedReplySm::new(reply_len),
+    u64::MAX,
+  )
+}
+
 /// Records every applied `(op, body)` and round-trips them through a single-block `checkpoint` /
 /// `restore` (mirrors the sim's `LogSm`). Used to prove `recover` restores the SM from the durable
 /// checkpoint (a fresh SM has 0 applied; a restored one reflects the checkpoint). The inherent

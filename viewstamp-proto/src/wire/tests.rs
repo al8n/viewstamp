@@ -9,9 +9,9 @@ use crate::{
   BlockAddress, BlockResponse, ClientId, CodecError, Commit, DoViewChange, Epoch, EpochAhead,
   GetView, HealthProof, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare,
   PrepareBatch, PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse,
-  RepairBatch, ReplicaId, Reply, Request, RequestHealthProof, RequestLearnerProof, RequestNumber,
-  RequestPrepare, RequestPrepareRange, RequestSync, StartView, StartViewChange, SyncCheckpoint,
-  View,
+  RepairBatch, ReplicaId, Reply, ReplyBody, ReplyOutcome, ReplyTooLarge, Request,
+  RequestHealthProof, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange,
+  RequestSync, StartView, StartViewChange, SyncCheckpoint, View,
 };
 use buffa::Message as _;
 
@@ -309,10 +309,79 @@ fn reply_round_trips() {
     View::with(301),
     ClientId::new(0xEEEE_1111_2222_3333_4444_5555_6666_7777),
     RequestNumber::with(302),
-    Bytes::from_static(b"reply-body"),
+    ReplyOutcome::from_applied(Bytes::from_static(b"reply-body")),
   );
   let back = messages_a::reply_from(messages_a::pb_reply(&m)).expect("round-trip");
   assert_eq!(back, m);
+}
+
+#[test]
+fn an_empty_reply_body_survives_the_wire_as_a_present_outcome() {
+  // Presence is the reason the outcome is a oneof: an EMPTY body is a real result, and must not
+  // decode back as "no outcome" (which the conversion rejects).
+  let m = Reply::new(
+    View::with(1),
+    ClientId::new(2),
+    RequestNumber::with(3),
+    ReplyOutcome::Ok(ReplyBody::empty()),
+  );
+  let back = messages_a::reply_from(messages_a::pb_reply(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert_eq!(back.outcome().as_ok().map(ReplyBody::len), Some(0));
+}
+
+#[test]
+fn a_refused_reply_round_trips_with_both_lengths() {
+  let err = ReplyTooLarge::new(ReplyBody::max_len() + 7, ReplyBody::max_len());
+  let m = Reply::new(
+    View::with(4),
+    ClientId::new(5),
+    RequestNumber::with(6),
+    ReplyOutcome::TooLarge(err),
+  );
+  let back = messages_a::reply_from(messages_a::pb_reply(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert_eq!(back.outcome().as_too_large(), Some(&err));
+}
+
+#[test]
+fn a_reply_with_no_outcome_is_rejected() {
+  // A wire reply whose oneof is absent names no outcome this build can deliver — a peer from a
+  // pre-outcome era, or a corrupt envelope. It is refused at the conversion, never defaulted to an
+  // empty body.
+  let w = pb::Reply {
+    view: 1,
+    client: convert::u128_bytes(2),
+    request: 3,
+    outcome: None,
+    ..Default::default()
+  };
+  assert!(matches!(
+    messages_a::reply_from(w),
+    Err(CodecError::Malformed {
+      what: "Reply.outcome"
+    })
+  ));
+}
+
+#[test]
+fn a_reply_body_past_the_bound_is_rejected_at_the_conversion() {
+  // No compliant peer emits one — its own choke would have produced a refusal instead — so an
+  // over-bound body on the wire is malformed, not a success to admit.
+  let w = pb::Reply {
+    view: 1,
+    client: convert::u128_bytes(2),
+    request: 3,
+    outcome: Some(pb::reply::Outcome::Body(Bytes::from(std::vec![
+      0u8;
+      ReplyBody::max_len() + 1
+    ]))),
+    ..Default::default()
+  };
+  assert!(matches!(
+    messages_a::reply_from(w),
+    Err(CodecError::Malformed { what: "Reply.body" })
+  ));
 }
 
 #[test]
@@ -833,7 +902,7 @@ fn one_of_each_message() -> std::vec::Vec<Message> {
       View::with(10),
       client,
       RequestNumber::with(80),
-      body.clone(),
+      ReplyOutcome::from_applied(body.clone()),
     )),
     Message::Commit(Commit::new(
       View::with(10),
@@ -1229,4 +1298,135 @@ fn golden_byte_vectors() {
       m.kind_str()
     );
   }
+}
+
+/// One `Reply.outcome` arm as raw wire bytes: the `body` arm (field 4) carrying `payload`, or the
+/// `too_large` arm (field 5) carrying an encoded `ReplyTooLarge{len, max}`.
+fn outcome_arm_bytes(field: u8, payload: &[u8]) -> std::vec::Vec<u8> {
+  let mut out = std::vec![(field << 3) | 2, payload.len() as u8];
+  out.extend_from_slice(payload);
+  out
+}
+
+/// Builds a raw `Message` envelope carrying a `Reply` whose `outcome` arms are exactly `arms`, in
+/// the given order. A compliant encoder emits exactly one; more than one is the shape the decoder
+/// must refuse, whatever the order or repetition.
+fn reply_envelope_with_arms(arms: &[std::vec::Vec<u8>]) -> Bytes {
+  let mut reply = std::vec![0x08, 0x01]; // view = 1
+  reply.push(0x12); // client, length-delimited
+  reply.push(16);
+  reply.extend_from_slice(&[0u8; 16]);
+  reply.extend_from_slice(&[0x18, 0x01]); // request = 1
+  for arm in arms {
+    reply.extend_from_slice(arm);
+  }
+  // `Message.body`'s `reply` arm is field 4, length-delimited.
+  let mut envelope = std::vec![0x22];
+  envelope.push(reply.len() as u8);
+  envelope.extend_from_slice(&reply);
+  Bytes::from(envelope)
+}
+
+/// The `body` arm carrying a short payload.
+fn body_arm() -> std::vec::Vec<u8> {
+  outcome_arm_bytes(4, b"ok")
+}
+
+/// The `too_large` arm carrying `ReplyTooLarge { len: 9, max: 8 }`.
+fn too_large_arm() -> std::vec::Vec<u8> {
+  outcome_arm_bytes(5, &[0x08, 0x09, 0x10, 0x08])
+}
+
+#[test]
+fn a_single_outcome_arm_decodes_in_either_form() {
+  // The control for the rejection tests below: each arm ALONE is a well-formed reply, so a
+  // rejection there is about the repetition and nothing else.
+  let with_body = decode_message(reply_envelope_with_arms(&[body_arm()])).expect("one body arm");
+  assert_eq!(
+    with_body
+      .try_unwrap_reply_ref()
+      .expect("a Reply")
+      .outcome()
+      .as_ok()
+      .map(ReplyBody::as_bytes),
+    Some(&b"ok"[..])
+  );
+  let with_refusal =
+    decode_message(reply_envelope_with_arms(&[too_large_arm()])).expect("one too_large arm");
+  assert_eq!(
+    with_refusal
+      .try_unwrap_reply_ref()
+      .expect("a Reply")
+      .outcome()
+      .as_too_large(),
+    Some(&ReplyTooLarge::new(9, 8))
+  );
+}
+
+#[test]
+fn a_reply_carrying_two_outcome_arms_is_rejected_in_either_order() {
+  // Protobuf's merge rule makes the LAST arm win, so accepting this would let the sender decide —
+  // by field order alone — whether the client sees a committed op's body or its terminal refusal.
+  for (order, arms) in [
+    (
+      "body then too_large",
+      std::vec![body_arm(), too_large_arm()],
+    ),
+    (
+      "too_large then body",
+      std::vec![too_large_arm(), body_arm()],
+    ),
+  ] {
+    assert!(
+      matches!(
+        decode_message(reply_envelope_with_arms(&arms)),
+        Err(CodecError::Malformed {
+          what: "Reply.outcome (repeated)"
+        })
+      ),
+      "a Reply carrying both outcome arms ({order}) must be refused, not resolved by order"
+    );
+  }
+}
+
+#[test]
+fn a_reply_repeating_one_outcome_arm_is_rejected() {
+  // The same rule for a repeated SAME arm: one occurrence, or the frame is not the canonical shape
+  // this build acts on. (A repeated `body` is last-wins; a repeated `too_large` MERGES its fields,
+  // so a second occurrence could rewrite either length.)
+  for (kind, arms) in [
+    ("body", std::vec![body_arm(), body_arm()]),
+    ("too_large", std::vec![too_large_arm(), too_large_arm()]),
+  ] {
+    assert!(
+      matches!(
+        decode_message(reply_envelope_with_arms(&arms)),
+        Err(CodecError::Malformed {
+          what: "Reply.outcome (repeated)"
+        })
+      ),
+      "a Reply repeating its {kind} arm must be refused"
+    );
+  }
+}
+
+#[test]
+fn two_reply_arms_that_merge_into_one_reply_are_counted_together() {
+  // Two `Message.body` reply arms MERGE into a single decoded `Reply`, so a sender could split the
+  // two outcome arms across them and reach the same fork. The scan counts occurrences across every
+  // reply arm the envelope holds, so the split is refused exactly like the adjacent pair.
+  let first = reply_envelope_with_arms(&[body_arm()]);
+  let second = reply_envelope_with_arms(&[too_large_arm()]);
+  let mut split = std::vec::Vec::new();
+  split.extend_from_slice(&first);
+  split.extend_from_slice(&second);
+  assert!(
+    matches!(
+      decode_message(Bytes::from(split)),
+      Err(CodecError::Malformed {
+        what: "Reply.outcome (repeated)"
+      })
+    ),
+    "outcome arms split across two merging reply arms must be refused too"
+  );
 }

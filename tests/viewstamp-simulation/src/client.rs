@@ -3,7 +3,7 @@ use core::time::Duration;
 use bytes::Bytes;
 use viewstamp_proto::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, ClientId, Instant, Message, Prng,
-  Request, RequestNumber, max_request_body_len,
+  ReplyOutcome, Request, RequestNumber, max_request_body_len,
 };
 
 use crate::batching::{BatchingClient, BatchingConfig, SubmittedBody};
@@ -49,13 +49,16 @@ pub struct ClientModel {
   id: ClientId,
   total: u64,
   next_request: u64,
-  replies: Vec<(u64, Bytes)>,
-  /// Parallel to [`Self::replies`], one entry per recorded reply in the SAME order, each carrying the
-  /// virtual instant the matching `Reply` was delivered to the client — i.e. when the request was
-  /// ACKED at real (sim) time. The staleness oracle folds these to learn each acked op's
-  /// ack-instant; the plain [`Self::replies`] record is kept untouched so the other checkers and the
-  /// digest harness read it unchanged.
-  replies_at: Vec<(u64, Bytes, Instant)>,
+  /// The ONE append-only acknowledgement history: `(request, outcome, ack_instant)` per request
+  /// that reached a TERMINAL outcome, in ack order, stamped with the virtual instant the matching
+  /// `Reply` was delivered.
+  ///
+  /// Both arms live here. A refusal is as much an acknowledgement of a COMMITTED op as a body is —
+  /// the mutation happened either way — so every oracle that reasons about what a client observed
+  /// (request ordering, the staleness floor, the applied-once map) reads this one record and sees
+  /// both. Splitting bodies from refusals is what let a committed-but-refused write vanish from the
+  /// floor a later read must reflect.
+  acked: Vec<(u64, ReplyOutcome, Instant)>,
   inflight: Option<Request>,
   /// Last instant at which the inflight request was transmitted; `None` means
   /// "not yet sent this cycle" so the next `pending` call must transmit.
@@ -91,8 +94,7 @@ impl ClientModel {
       id: ClientId::new(id),
       total,
       next_request: 1,
-      replies: Vec::new(),
-      replies_at: Vec::new(),
+      acked: Vec::new(),
       inflight: None,
       last_sent: None,
       seed,
@@ -173,16 +175,21 @@ impl ClientModel {
     self.id
   }
 
-  /// The replies received so far.
-  pub fn replies(&self) -> &[(u64, Bytes)] {
-    &self.replies
+  /// Every request that reached a terminal outcome, in ack order: `(request, outcome, ack_instant)`.
+  /// The single acknowledgement history every oracle reads (see [`Self::acked`] the field).
+  pub fn acked(&self) -> &[(u64, ReplyOutcome, Instant)] {
+    &self.acked
   }
 
-  /// The replies received so far, each STAMPED with the virtual instant it was acked (the `Reply`
-  /// delivery instant) — `(request, reply_body, ack_instant)`, in the same order as [`Self::replies`].
-  /// The staleness oracle reads this to learn when each committed op was acked to a client.
-  pub fn replies_at(&self) -> &[(u64, Bytes, Instant)] {
-    &self.replies_at
+  /// The BODY-bearing acknowledgements alone, `(request, body)` in ack order — the projection the
+  /// reply-content checks and the digest fold read. A refused request contributes nothing here (it
+  /// produced no body), so it is visible only through [`Self::acked`].
+  pub fn reply_bodies(&self) -> Vec<(u64, Bytes)> {
+    self
+      .acked
+      .iter()
+      .filter_map(|(rn, outcome, _)| outcome.as_ok().map(|body| (*rn, body.clone().into_bytes())))
+      .collect()
   }
 
   /// How many LARGE-bodied requests this client has minted (the non-vacuity witness for the frame-cap
@@ -196,7 +203,7 @@ impl ClientModel {
   pub fn is_done(&self) -> bool {
     match &self.batching {
       Some(b) => b.is_drained() && self.inflight.is_none(),
-      None => self.replies.len() as u64 == self.total,
+      None => self.acked.len() as u64 == self.total,
     }
   }
 
@@ -205,7 +212,7 @@ impl ClientModel {
   /// client leaving the system — its session row on the replicas goes idle and ages toward the
   /// deterministic cap eviction, while a freshly-spawned client takes over the load.
   pub fn retire(&mut self) {
-    self.total = self.replies.len() as u64;
+    self.total = self.acked.len() as u64;
     self.inflight = None;
     self.last_sent = None;
     if let Some(b) = self.batching.as_mut() {
@@ -305,20 +312,25 @@ impl ClientModel {
   }
 
   /// Handles a reply delivered at virtual instant `now`: if it matches the in-flight request, record
-  /// it (stamping the parallel ack-instant record at `now`) and advance. A batching client first
-  /// demultiplexes the reply body per unit (count + per-unit reply assertions, and the oracle's
-  /// bookkeeping) through the model.
+  /// its outcome and advance. A body is recorded as before (stamping the parallel ack-instant
+  /// record at `now`), and a batching client first demultiplexes it per unit (count + per-unit reply
+  /// assertions, and the oracle's bookkeeping) through the model.
+  ///
+  /// A REFUSAL is equally terminal: the op committed, its result is an error, and the client moves
+  /// on to its next request. Only the batching demux is skipped (there is no reply batch to split);
+  /// the acknowledgement itself is recorded exactly like a body's, in the same one history, so no
+  /// oracle can miss a committed write merely because its result was refused.
   pub fn handle(&mut self, now: Instant, msg: Message) {
     if let Message::Reply(r) = msg
       && let Some(req) = &self.inflight
       && req.request() == r.request()
     {
-      let body = r.body_bytes();
-      if let Some(b) = self.batching.as_mut() {
-        b.on_ack(r.request().get(), &body);
+      let request = r.request().get();
+      let outcome = r.into_outcome();
+      if let (Some(b), Some(body)) = (self.batching.as_mut(), outcome.as_ok()) {
+        b.on_ack(request, &body.clone().into_bytes());
       }
-      self.replies.push((r.request().get(), body.clone()));
-      self.replies_at.push((r.request().get(), body, now));
+      self.acked.push((request, outcome, now));
       self.inflight = None;
       self.last_sent = None;
       self.next_request += 1;

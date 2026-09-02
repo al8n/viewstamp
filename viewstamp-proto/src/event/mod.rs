@@ -1,6 +1,4 @@
-use bytes::Bytes;
-
-use crate::{ClientId, Epoch, OpNumber, RequestNumber, Status, View};
+use crate::{ClientId, Epoch, OpNumber, ReplyOutcome, RequestNumber, Status, View};
 
 /// A committed operation that was applied to the state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,18 +6,23 @@ pub struct Committed {
   op: OpNumber,
   client: ClientId,
   request: RequestNumber,
-  reply: Bytes,
+  outcome: ReplyOutcome,
 }
 
 impl Committed {
   /// Creates a committed-op record.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(op: OpNumber, client: ClientId, request: RequestNumber, reply: Bytes) -> Self {
+  pub const fn new(
+    op: OpNumber,
+    client: ClientId,
+    request: RequestNumber,
+    outcome: ReplyOutcome,
+  ) -> Self {
     Self {
       op,
       client,
       request,
-      reply,
+      outcome,
     }
   }
 
@@ -41,16 +44,18 @@ impl Committed {
     self.request
   }
 
-  /// The reply payload produced by the state machine.
+  /// The operation's terminal outcome — the state machine's reply, or the refusal that replaces an
+  /// over-bound one. The SAME value the client receives over the wire, so a node-local consumer
+  /// can never observe a success the transport would refuse to deliver.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn reply(&self) -> &[u8] {
-    self.reply.as_ref()
+  pub const fn outcome(&self) -> &ReplyOutcome {
+    &self.outcome
   }
 
-  /// The reply payload as a cheap-clone `Bytes`.
+  /// Consumes the record, yielding its outcome.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn reply_bytes(&self) -> Bytes {
-    self.reply.clone()
+  pub fn into_outcome(self) -> ReplyOutcome {
+    self.outcome
   }
 }
 

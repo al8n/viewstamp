@@ -8,14 +8,16 @@
 //! value or rejects it — through [`super::convert`]'s shared helpers — for a wrong-length
 //! id/checksum, an out-of-range replica slot, or a malformed log entry.
 
+use std::boxed::Box;
+
 use super::{
-  convert::{log_from, pb_log, replica_from, u128_bytes, u128_from},
+  convert::{log_from, malformed, pb_log, replica_from, u128_bytes, u128_from, usize_from},
   pb,
 };
 use crate::{
   ClientId, Commit, DoViewChange, Epoch, GetView, OpNumber, Prepare, PrepareOk, Recovery,
-  RecoveryResponse, Reply, Request, RequestNumber, RequestPrepare, StartView, StartViewChange,
-  View, codec::CodecError,
+  RecoveryResponse, Reply, ReplyBody, ReplyOutcome, ReplyTooLarge, Request, RequestNumber,
+  RequestPrepare, StartView, StartViewChange, View, codec::CodecError,
 };
 
 /// Converts a borrowed [`Request`] into its wire form: the client id as 16 big-endian bytes, the
@@ -104,25 +106,47 @@ pub(crate) fn prepare_ok_from(w: pb::PrepareOk) -> Result<PrepareOk, CodecError>
 }
 
 /// Converts a borrowed [`Reply`] into its wire form: the view and request number carried as-is,
-/// the client id as 16 big-endian bytes, and the body carried as-is.
+/// the client id as 16 big-endian bytes, and the outcome filled into the `outcome` oneof — the body
+/// bytes as-is, or the refusal's two lengths widened to the wire scalar.
 pub(crate) fn pb_reply(m: &Reply) -> pb::Reply {
+  let outcome = match m.outcome() {
+    ReplyOutcome::Ok(body) => pb::reply::Outcome::Body(body.clone().into_bytes()),
+    ReplyOutcome::TooLarge(err) => pb::reply::Outcome::TooLarge(Box::new(pb::ReplyTooLarge {
+      len: err.reply_len() as u64,
+      max: err.max_len() as u64,
+      ..Default::default()
+    })),
+  };
   pb::Reply {
     view: m.view().get(),
     client: u128_bytes(m.client().get()),
     request: m.request().get(),
-    body: m.body_bytes(),
+    outcome: Some(outcome),
     ..Default::default()
   }
 }
 
 /// Converts a wire [`pb::Reply`] into the domain [`Reply`], moving the body `Bytes` out rather than
-/// copying it. Rejects a wrong-length client id.
+/// copying it. Rejects a wrong-length client id, an absent `outcome` (every reply carries exactly
+/// one outcome on the wire), a body past [`ReplyBody::max_len`] (unrepresentable as a successful
+/// outcome — no compliant peer emits one, since the sender's own choke would have refused it), or a
+/// refusal whose lengths do not fit this target's `usize`.
 pub(crate) fn reply_from(w: pb::Reply) -> Result<Reply, CodecError> {
+  let outcome = match w.outcome {
+    Some(pb::reply::Outcome::Body(body)) => {
+      ReplyOutcome::Ok(ReplyBody::try_new(body).map_err(|_| malformed("Reply.body"))?)
+    }
+    Some(pb::reply::Outcome::TooLarge(err)) => ReplyOutcome::TooLarge(ReplyTooLarge::new(
+      usize_from(err.len, "Reply.too_large.len")?,
+      usize_from(err.max, "Reply.too_large.max")?,
+    )),
+    None => return Err(malformed("Reply.outcome")),
+  };
   Ok(Reply::new(
     View::with(w.view),
     ClientId::new(u128_from(&w.client, "Reply.client")?),
     RequestNumber::with(w.request),
-    w.body,
+    outcome,
   ))
 }
 

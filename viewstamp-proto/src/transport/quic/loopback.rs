@@ -28,7 +28,7 @@ use bytes::Bytes;
 
 use crate::{
   ClientId, Commit, Config, Endpoint, Event, Instant, MemberId, Message, OpNumber, Peer, ReplicaId,
-  RequestNumber, SingleChange, View, encode_message,
+  ReplyBody, RequestNumber, SingleChange, View, encode_message,
   message::Request,
   transport::{
     frame::{LEN_PREFIX, STAGE_CHUNK, encode_frame},
@@ -1145,8 +1145,8 @@ fn commits_are_drained_through_the_public_poll_event() {
       "{who}'s drained event is the commit of the converged op 1"
     );
     assert_eq!(
-      committed.reply(),
-      b"x",
+      committed.outcome().as_ok().map(ReplyBody::as_bytes),
+      Some(&b"x"[..]),
       "{who}'s committed reply carries the applied op body"
     );
     assert!(
@@ -1215,8 +1215,8 @@ fn public_submit_client_request_converges() {
     "the drained event is the commit of the submitted op 1"
   );
   assert_eq!(
-    committed.reply(),
-    b"x",
+    committed.outcome().as_ok().map(ReplyBody::as_bytes),
+    Some(&b"x"[..]),
     "the committed reply carries the submitted op body"
   );
 }

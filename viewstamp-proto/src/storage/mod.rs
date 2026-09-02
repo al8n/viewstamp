@@ -194,19 +194,23 @@ pub const HEADER_VERSION: u16 = 1;
 /// A contract change — a layout change OR a strengthening of the writer-enforced invariants — bumps
 /// this constant, atomically invalidating every store written under the previous contract.
 ///
-/// Version `2` strengthens the `config_install_op` invariant: a v2 writer records the VERBATIM
-/// producing op of the root's membership (the committed reconfigure op, or the donor-carried op a
-/// crossing validated — never a checkpoint-frontier approximation), so a recovered v2 root's value
-/// can be re-served as exact. A version-`1` root's slot may instead hold the crossing checkpoint
-/// frontier its writer approximated with — byte-wise indistinguishable from a real producing op —
-/// so every version-`1` root is refused at decode (`UnknownVersion(1)`) rather than recovered and
-/// re-served as exact; the one supported path for such a store is a re-format. No earlier writer
-/// generation ever stamped a leading `2` (the shared-constant era stamped `1`; the split numbering
-/// ran `3..=8`; the previous generation reset to `1`), so the current word collides with no
-/// ancient root at all — and any superseded numbering that ever reused a current word is refused
-/// structurally anyway: parsed as the current layout, a shorter-era body runs out of bytes at the
-/// mandatory epoch/membership/lineage/scalar/geometry tail such a root never wrote.
-pub const SUPERBLOCK_VERSION: u16 = 2;
+/// Version `9` names the CLIENT-SESSION contract: a v9 writer's session DAG (reached through the
+/// root's `checkpoint_sessions_root`) records each cached reply as a terminal OUTCOME — a bounded
+/// body, or the refusal that replaces an over-bound one — so a recovered table can resend exactly
+/// what the client was originally sent. Earlier roots' session records can only express a body, so
+/// a table restored from one could not distinguish "no reply cached" from "the reply was refused",
+/// and a resend after recovery would answer a request differently than the pre-crash primary did.
+/// Version `2` additionally strengthened the `config_install_op` invariant: a writer from `2`
+/// onward records the VERBATIM producing op of the root's membership (the committed reconfigure op,
+/// or the donor-carried op a crossing validated — never a checkpoint-frontier approximation), so a
+/// recovered root's value can be re-served as exact, where a version-`1` root's slot may instead
+/// hold the crossing checkpoint frontier its writer approximated with. Decode refuses every
+/// superseded numbering (`UnknownVersion`) rather than recovering a store written under a weaker
+/// contract; the one supported path for such a store is a re-format. The superseded words are
+/// `1..=8`: the shared-constant era stamped `1`, an early split numbering ran `3..=8`, a later
+/// generation reset to `1`, and the `config_install_op` era stamped `2` — so `9` collides with no
+/// writer generation at all.
+pub const SUPERBLOCK_VERSION: u16 = 9;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are

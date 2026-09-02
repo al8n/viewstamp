@@ -1970,3 +1970,167 @@ fn membership_accessor_returns_live_snapshot() {
     "genesis slot 1 holds MemberId 1"
   );
 }
+
+/// Drives a single-replica primary through one client request and returns the emitted `Reply`'s
+/// outcome alongside the `Committed` event's — the two public faces of the same applied op.
+fn primary_outcomes(reply_len: usize) -> (crate::ReplyOutcome, crate::ReplyOutcome, u64) {
+  let mut e = primary_replying(reply_len);
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Client(ClientId::new(7)),
+    client_request(1),
+  );
+  e.storage_step(now, &mut storage, &mut blocks); // append durable → quorum of one → commit + apply
+  assert_eq!(e.commit(), OpNumber::with(1), "the op committed");
+  let mut sent = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::Reply(r) = out.into_msg() {
+      sent = Some(r);
+    }
+  }
+  let sent = sent.expect("the primary emits a Reply for the committed request");
+  let mut delivered = None;
+  while let Some(ev) = e.poll_event() {
+    if let Ok(c) = ev.try_unwrap_committed() {
+      delivered = Some(c);
+    }
+  }
+  let delivered = delivered.expect("the primary emits a Committed event for the applied op");
+  // The cached outcome is the one that was sent: a duplicate request must resend it byte for byte.
+  let cached = e
+    .session_reply_for_test(7)
+    .expect("the apply caches the committed outcome");
+  assert_eq!(
+    cached,
+    (1, sent.outcome().clone()),
+    "the cache holds what was sent"
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Client(ClientId::new(7)),
+    client_request(1),
+  );
+  let mut resent = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::Reply(r) = out.into_msg() {
+      resent = Some(r);
+    }
+  }
+  assert_eq!(
+    resent
+      .expect("a duplicate request is answered from the cache")
+      .outcome(),
+    sent.outcome(),
+    "the duplicate resend reproduces the original outcome"
+  );
+  (
+    sent.outcome().clone(),
+    delivered.outcome().clone(),
+    e.replies_too_large(),
+  )
+}
+
+/// Drives a backup through one prepared+committed op and returns the `Committed` event's outcome
+/// with the count of refusals it recorded.
+fn backup_outcome(reply_len: usize) -> (crate::ReplyOutcome, crate::ReplyOutcome, u64) {
+  let mut e = backup_replying(reply_len);
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.handle_message(
+    now,
+    &mut storage,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.commit(), OpNumber::with(1), "the backup applied op 1");
+  let mut delivered = None;
+  while let Some(ev) = e.poll_event() {
+    if let Ok(c) = ev.try_unwrap_committed() {
+      delivered = Some(c);
+    }
+  }
+  let delivered = delivered.expect("the backup emits a Committed event for the applied op");
+  let (_, cached) = e
+    .session_reply_for_test(7)
+    .expect("the backup caches the committed outcome");
+  (cached, delivered.outcome().clone(), e.replies_too_large())
+}
+
+#[test]
+fn a_reply_at_or_below_the_bound_is_delivered_as_a_body() {
+  // The two admissible sizes either side of the ceiling: one byte under, and exactly at it. Both
+  // reach the client as bodies, on both apply paths, and neither counts as a refusal.
+  let max = crate::max_reply_body_len();
+  for len in [max - 1, max] {
+    let (sent, delivered, refused) = primary_outcomes(len);
+    assert_eq!(
+      sent.as_ok().map(crate::ReplyBody::len),
+      Some(len),
+      "a {len}-byte reply (bound {max}) ships as a body"
+    );
+    assert_eq!(
+      delivered, sent,
+      "the local event carries what the wire carries"
+    );
+    assert_eq!(refused, 0, "a within-bound reply is not a refusal");
+
+    let (cached, delivered, refused) = backup_outcome(len);
+    assert_eq!(
+      cached.as_ok().map(crate::ReplyBody::len),
+      Some(len),
+      "the backup caches a {len}-byte reply as a body"
+    );
+    assert_eq!(delivered, cached, "the backup's event matches its cache");
+    assert_eq!(refused, 0, "a within-bound reply is not a refusal");
+  }
+}
+
+#[test]
+fn a_reply_one_byte_over_the_bound_becomes_a_deliverable_refusal_on_both_apply_paths() {
+  // ONE byte past the ceiling flips the outcome. What must hold: the op still commits, the client
+  // still gets an answer, that answer is small enough to frame, both apply paths produce the
+  // IDENTICAL value (so a failover resend and a checkpointed cache agree), and the refusal is
+  // counted. Before the choke this reply was cached and emitted whole, and every transport then
+  // refused to frame it — the client heard nothing at all, on every retry, forever.
+  let max = crate::max_reply_body_len();
+  let expected = crate::ReplyOutcome::TooLarge(crate::ReplyTooLarge::new(max + 1, max));
+
+  let (sent, delivered, refused) = primary_outcomes(max + 1);
+  assert_eq!(sent, expected, "the primary sends the refusal, not a body");
+  assert_eq!(delivered, expected, "the local event agrees with the wire");
+  assert_eq!(refused, 1, "the primary counted one refused reply");
+
+  let (cached, delivered, refused) = backup_outcome(max + 1);
+  assert_eq!(cached, expected, "the backup caches the identical refusal");
+  assert_eq!(
+    delivered, expected,
+    "the backup's event agrees with its cache"
+  );
+  assert_eq!(refused, 1, "the backup counted one refused reply");
+
+  // Deliverability is the point of the refusal: the message it rides must fit one frame.
+  let framed = Message::Reply(crate::Reply::new(
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(1),
+    expected,
+  ));
+  assert!(
+    framed.wire_size_bound() <= crate::message::MAX_FRAME_LEN as usize,
+    "the refusal must be framable — otherwise the outcome that exists to be delivered is not"
+  );
+}

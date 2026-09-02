@@ -138,6 +138,108 @@ fn message_from(wire: pb::Message) -> Result<Message, CodecError> {
   })
 }
 
+// ── The reply-outcome uniqueness scan ──
+//
+// `Reply.outcome` is a oneof, and protobuf's merge rules make a REPEATED occurrence meaningful: a
+// later arm replaces an earlier different one, and a later same arm replaces (scalars) or merges
+// into (messages) the earlier value. A decoder that only reads the collapsed result therefore
+// cannot tell a single-outcome reply from one carrying both — and an encoder could then choose,
+// purely by field ORDER, whether the client observes a body or a terminal refusal for the same
+// committed op. The outcome is the one field in this schema where that choice is a semantic fork
+// rather than a redundancy, so exactly one occurrence is admitted and any second is refused before
+// the envelope is converted.
+//
+// The scan walks the raw frame's own fields once — it does not re-decode. Every length-delimited
+// field is skipped by its length, and the envelope carries a single top-level field, so this costs
+// a couple of varint reads regardless of body size.
+
+/// The `Message.body` oneof arm that carries a [`Reply`] (`reply = 4` in the schema).
+const MESSAGE_BODY_REPLY_FIELD: u64 = 4;
+
+/// The two `Reply.outcome` oneof arms (`body = 4`, `too_large = 5`), of which a well-formed reply
+/// carries exactly one.
+const REPLY_OUTCOME_FIELDS: [u64; 2] = [4, 5];
+
+/// The protobuf LENGTH-DELIMITED wire type — the only one whose payload this scan descends into.
+const WIRE_TYPE_LEN: u64 = 2;
+
+/// Reads one protobuf varint, returning its value and the bytes after it. `None` on a truncated or
+/// overlong (`> 10`-byte) varint. The shift is wrapping because the tenth byte's high bits fall off
+/// a `u64` by definition; only the field number and lengths this scan reads matter, and both are
+/// far below that width.
+fn scan_varint(bytes: &[u8]) -> Option<(u64, &[u8])> {
+  let mut value = 0u64;
+  for (i, &b) in bytes.iter().take(10).enumerate() {
+    value |= u64::from(b & 0x7F).wrapping_shl((i * 7) as u32);
+    if b & 0x80 == 0 {
+      return Some((value, &bytes[i + 1..]));
+    }
+  }
+  None
+}
+
+/// Reads one protobuf field header plus its value, returning `(field_number, wire_type, payload,
+/// tail)`. `payload` is the field's bytes for a length-delimited field and empty otherwise.
+///
+/// `None` for anything the proto3 wire grammar does not admit here — a truncated field, or the
+/// group wire types (`3`/`4`), which no proto3 encoder emits. A frame the scan cannot walk is
+/// refused rather than waved through: buffa has already accepted its grammar, so a disagreement
+/// here means the bytes are not the canonical shape this build is willing to act on.
+fn scan_field(bytes: &[u8]) -> Option<(u64, u64, &[u8], &[u8])> {
+  let (tag, rest) = scan_varint(bytes)?;
+  let (field, wire_type) = (tag >> 3, tag & 0x7);
+  match wire_type {
+    0 => scan_varint(rest).map(|(_, tail)| (field, wire_type, &[][..], tail)),
+    1 => rest.get(8..).map(|tail| (field, wire_type, &[][..], tail)),
+    WIRE_TYPE_LEN => {
+      let (len, rest) = scan_varint(rest)?;
+      let len = usize::try_from(len).ok()?;
+      let payload = rest.get(..len)?;
+      Some((field, wire_type, payload, &rest[len..]))
+    }
+    5 => rest.get(4..).map(|tail| (field, wire_type, &[][..], tail)),
+    _ => None,
+  }
+}
+
+/// Counts every `Reply.outcome` field occurrence in `frame`, across ALL of the envelope's `reply`
+/// arms (two `Message.body` reply arms MERGE into one decoded `Reply`, so both must be counted).
+/// `None` if the frame cannot be walked.
+fn count_reply_outcome_fields(frame: &[u8]) -> Option<usize> {
+  let mut count = 0usize;
+  let mut rest = frame;
+  while !rest.is_empty() {
+    let (field, wire_type, payload, tail) = scan_field(rest)?;
+    if field == MESSAGE_BODY_REPLY_FIELD && wire_type == WIRE_TYPE_LEN {
+      let mut inner = payload;
+      while !inner.is_empty() {
+        let (inner_field, _, _, inner_tail) = scan_field(inner)?;
+        if REPLY_OUTCOME_FIELDS.contains(&inner_field) {
+          count += 1;
+        }
+        inner = inner_tail;
+      }
+    }
+    rest = tail;
+  }
+  Some(count)
+}
+
+/// Refuses a frame whose `Reply` carries more than one `outcome` field, or that cannot be walked.
+/// A no-op for every envelope that is not a `Reply` (the walk finds no `reply` arm and counts none).
+///
+/// # Errors
+///
+/// [`CodecError::Malformed`] naming `Reply.outcome (repeated)`.
+fn reject_repeated_reply_outcome(frame: &[u8]) -> Result<(), CodecError> {
+  match count_reply_outcome_fields(frame) {
+    Some(0 | 1) => Ok(()),
+    _ => Err(CodecError::Malformed {
+      what: "Reply.outcome (repeated)",
+    }),
+  }
+}
+
 /// Maps a buffa structural decode failure onto the crate's [`CodecError`] surface.
 ///
 /// A caller only ever needs to distinguish two outcomes: the frame ended before a complete
@@ -228,18 +330,26 @@ pub fn encode_message(msg: &Message) -> Bytes {
 /// - [`CodecError::Malformed`] if `frame` violates the protobuf wire grammar (an invalid wire type,
 ///   an overlong varint, an unknown-field FLOOD past the allowance), decodes to a value the domain
 ///   type cannot represent (a wrong-length id/checksum, an out-of-range count, an absent required
-///   oneof), or exceeds a bound described above.
+///   oneof), carries more than one `Reply.outcome` arm (exactly ONE occurrence of the oneof's
+///   field 4 or field 5 is admitted, counted across every `Message.body` reply arm the envelope
+///   holds), or exceeds a bound described above.
 /// - [`CodecError::UnknownMessage`] if `frame` decodes cleanly and within every bound but names no
 ///   `Message.body` this build recognizes — a FORWARD-COMPATIBLE message from a newer peer, or the
 ///   degenerate zero-field envelope. This is NOT a corruption signal: a transport DROPS such a frame
 ///   and keeps the connection live (the stream skips it; QUIC drops the datagram), never terminating
 ///   the peer for speaking a newer additive schema.
 pub fn decode_message(mut frame: Bytes) -> Result<Message, CodecError> {
+  // The decode ADVANCES `frame`; keep the whole envelope for the uniqueness scan below (an O(1)
+  // refcount clone, no copy).
+  let envelope = frame.clone();
   let wire = buffa::DecodeOptions::new()
     .with_max_message_size(crate::message::MAX_FRAME_LEN as usize)
     .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
     .decode::<pb::Message>(&mut frame)
     .map_err(map_decode_err)?;
+  // BEFORE conversion: the decoded `pb::Reply` has already collapsed its outcome oneof, so the
+  // duplicate can only be seen in the bytes.
+  reject_repeated_reply_outcome(&envelope)?;
   message_from(wire)
 }
 

@@ -1184,7 +1184,7 @@ async fn submit_budget_bounds_pending_and_releases_on_commit_stream() {
       viewstamp_proto::OpNumber::with(request.get()),
       client,
       request,
-      Bytes::from_static(b"R"),
+      viewstamp_proto::ReplyOutcome::from_applied(Bytes::from_static(b"R")),
     ));
     viewstamp_driver::deliver_event(&mut driver.pending, &events_tx, event);
   }

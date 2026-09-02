@@ -1,7 +1,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use viewstamp_proto::Event;
+use viewstamp_proto::{Event, ReplyOutcome};
 
 use crate::{
   DriverError,
@@ -10,17 +10,22 @@ use crate::{
 };
 
 /// A committed reply body returned by [`Handle::submit`].
+///
+/// Only the bounded outcome reaches a caller as bytes: a committed op whose reply exceeded
+/// [`viewstamp_proto::max_reply_body_len()`](viewstamp_proto::max_reply_body_len) resolves the
+/// submit as [`DriverError::ReplyTooLarge`] instead, the same terminal answer a remote client
+/// decodes off the wire.
 pub type Reply = Bytes;
 
 /// A control message from a [`Handle`] to the driver task.
 #[derive(Debug)]
 pub enum Command {
-  /// Submit a client request; answer `reply` with the committed reply body.
+  /// Submit a client request; answer `reply` with the committed op's outcome.
   Submit {
     /// The request payload.
     body: Bytes,
     /// The one-shot channel the driver answers when the op commits.
-    reply: futures_channel::oneshot::Sender<Reply>,
+    reply: futures_channel::oneshot::Sender<ReplyOutcome>,
     /// The owning `InflightBudget` reservation for this submit. Carried with the queued command so
     /// the reservation is released by its `Drop` wherever the command finally dies: the driver MOVES
     /// it into the `Pending` entry on drain, or the teardown's close-then-drain of the command
@@ -154,7 +159,10 @@ impl Handle {
   /// hang nor pin the shared submit budget; [`DriverError::Busy`] if the in-flight submit budget (count
   /// or bytes) is full or the command channel refuses the send — shed load and retry later;
   /// [`DriverError::DriverGone`] if the driver task has stopped; [`DriverError::ReplyDropped`] if the
-  /// driver dropped the reply channel without answering (e.g. shutdown mid-flight).
+  /// driver dropped the reply channel without answering (e.g. shutdown mid-flight);
+  /// [`DriverError::ReplyTooLarge`] if the op COMMITTED but the state machine's reply exceeded the
+  /// reply bound, so no body could be delivered — the mutation happened and cannot be undone, and
+  /// resubmitting a non-idempotent request would apply it twice.
   pub async fn submit(&self, body: impl Into<Bytes>) -> Result<Reply, DriverError> {
     // A node that removed itself from the configuration is terminally retired: it emits no further
     // commits, so reject the submit up front — before reserving budget or touching the command
@@ -202,8 +210,16 @@ impl Handle {
       });
     }
     // A dropped reply channel is `ReplyDropped` normally, but the terminal `Retired` when the run loop
-    // drained this submit on self-removal (the latch is read on the woken poll).
-    rx.await.map_err(|_| self.reply_dropped_reason())
+    // drained this submit on self-removal (the latch is read on the woken poll). A resolved submit
+    // yields the committed OUTCOME: the bounded body, or the refusal a state machine that overran
+    // the reply bound earned — surfaced as an error, never as bytes the wire could not have carried.
+    match rx.await.map_err(|_| self.reply_dropped_reason())? {
+      ReplyOutcome::Ok(body) => Ok(body.into_bytes()),
+      ReplyOutcome::TooLarge(err) => Err(DriverError::ReplyTooLarge {
+        len: err.reply_len(),
+        max: err.max_len(),
+      }),
+    }
   }
 
   /// The largest body a single [`Self::submit`] on this handle can ever carry to a commit: the

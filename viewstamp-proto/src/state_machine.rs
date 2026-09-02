@@ -72,14 +72,22 @@ pub trait StateMachine: Sized {
 
   /// Applies a committed operation and returns the reply payload.
   ///
-  /// **Reply-size bound (embedder obligation):** the returned reply must be at most
-  /// [`max_reply_body_len`](crate::max_reply_body_len) bytes. The reply ships to the client as ONE
-  /// `Reply` message, and a reply whose encoding exceeds the transport's frame cap is refused on the
-  /// send path — with no in-protocol recovery, because the op is ALREADY COMMITTED by the time the
-  /// reply exists (the request cannot be re-executed, and every resend of the cached reply re-fails
-  /// the same way). The endpoint `debug_assert`s the bound at both apply sites, so a violation fails
-  /// loudly in tests/sims; in release the over-bound reply is the embedder's bug to prevent, exactly
-  /// as the driver-side `max_request_body_len()` bounds the request body at submit.
+  /// **Reply-size bound:** a reply of at most
+  /// [`max_reply_body_len`](crate::max_reply_body_len) bytes reaches the client as its body. The
+  /// bound is ENFORCED by the endpoint, not asked of the implementation: both apply sites classify
+  /// these bytes through [`ReplyOutcome::from_applied`](crate::ReplyOutcome), which turns an
+  /// over-bound reply into the deterministic
+  /// [`ReplyOutcome::TooLarge`](crate::ReplyOutcome) refusal — a small message every transport can
+  /// frame — so the client always receives a terminal outcome and the reply cache never holds
+  /// something undeliverable.
+  ///
+  /// The OPERATION ITSELF STAYS COMMITTED and applied when that happens: a refused reply loses the
+  /// result, not the mutation, and there is no in-protocol recovery for it (the request cannot be
+  /// re-executed). `apply` is deterministic, so every replica classifies the same bytes the same
+  /// way and the cluster agrees on the outcome; the endpoint counts these in
+  /// [`Endpoint::replies_too_large`](crate::Endpoint), where a non-zero value is the signal to fix
+  /// the state machine — a reply must be bounded to be useful, exactly as the driver-side
+  /// `max_request_body_len()` bounds the request body at submit.
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes;
 
   /// Captures a consistent image of the SM's applied state, to be written into the block store by a
