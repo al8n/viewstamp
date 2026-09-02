@@ -42,7 +42,7 @@
 //! seed. Under the axis each read's verdict is decided exactly as before and then HELD until the
 //! device's clock reaches its due instant: a healthy slot answers within [`READ_DELAY_SPAN`], while
 //! a seeded minority of slots are DEGRADED and answer only past the whole per-op retry allowance
-//! ([`RECOVERY_READ_BUDGET`]), so a recovery genuinely waits out many cadence ticks before the
+//! ([`READ_GIVE_UP_HORIZON`]), so a recovery genuinely waits out many cadence ticks before the
 //! verdict that resolves the op arrives. A delay is a latency model, never a drop — every submitted
 //! read still resolves exactly once, per the [`Wal`] completion contract.
 
@@ -55,28 +55,33 @@ use viewstamp_proto::{
   Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId, checkpoint_id,
 };
 
-/// The proto recovery's FULL per-op retry allowance in virtual time: the per-op failure budget
-/// (`RECOVER_READ_RETRIES`, eight) spent on the recover cadence (`RECOVER_READ_RETRANSMIT`,
-/// 100 ms), across the nine cadence ticks that bound it — the longest span the failure-driven
-/// retry discipline can cover for an op whose every attempt fails the instant it is submitted.
+/// The wall-clock horizon a TICK-METERED recovery would have given up on a read at: the per-op
+/// failure budget (eight) spent once per 100 ms recover-cadence tick, the longest a give-up driven
+/// by elapsed time could have waited before abandoning the read and escalating past it.
 ///
-/// Stated here rather than read from the proto because both constants are private to it. It is the
-/// threshold the read-delay axis is built around: the proto spends that budget only on DELIVERED
-/// failure verdicts and holds no clock against an outstanding read, so a read delivered later than
-/// this span was certainly WAITED ON across cadence ticks that spent nothing — no failure-driven
-/// re-read can explain its consumption, only the wait.
-pub const RECOVERY_READ_BUDGET: Duration = Duration::from_millis(900);
+/// **Nothing in the proto corresponds to this value.** The proto holds no clock against a read and
+/// spends its budget only on DELIVERED failure verdicts, so there is no wall-clock recovery bound
+/// for this to mirror and no constant on either side that the other is derived from — this is a
+/// fixed duration this harness owns, and a change to the proto's cadence or budget neither moves it
+/// nor should.
+///
+/// What it still buys is the read-delay pins' threshold. A read this harness delivers only after
+/// the horizon, and a recovery that reaches Normal only after it, are each past the point where any
+/// time-metered give-up would already have escalated — so the wait is the ONLY thing that can
+/// explain their consumption, and the degraded band is placed above the horizon for exactly that
+/// reason.
+pub const READ_GIVE_UP_HORIZON: Duration = Duration::from_millis(900);
 
 /// The latency band a HEALTHY slot answers a read within under the read-delay axis (`0 ..= span-1`).
 ///
 /// Deliberately spans several recover-cadence ticks: an op whose read takes longer than one
 /// `RECOVER_READ_RETRANSMIT` is genuinely outstanding when ticks fire — the waited-on shape a
-/// synchronous backend cannot produce. It stays well under [`RECOVERY_READ_BUDGET`], so a healthy
+/// synchronous backend cannot produce. It stays well under [`READ_GIVE_UP_HORIZON`], so a healthy
 /// slot always resolves its op inside a short wait.
 pub const READ_DELAY_SPAN: Duration = Duration::from_millis(250);
 
 /// The floor of the latency band a DEGRADED slot answers within — strictly above
-/// [`RECOVERY_READ_BUDGET`], so a read of such a slot outlives every cadence tick the whole
+/// [`READ_GIVE_UP_HORIZON`], so a read of such a slot outlives every cadence tick the whole
 /// failure-driven retry allowance spans: the recovery provably WAITS it out.
 ///
 /// Only JUST above it, deliberately. What the axis has to deliver is a completion whose consumption
@@ -476,7 +481,7 @@ pub struct InMemoryWal {
   /// relative to any deadline the caller keeps. `Some(plan)` ⇒ **READ-DELAY mode**
   /// ([`set_read_delay`](InMemoryWal::set_read_delay)): each read's verdict is decided at submit
   /// exactly as before and then held in `staged_reads` for a drawn latency — short for a healthy slot,
-  /// past the whole [`RECOVERY_READ_BUDGET`] for a degraded one. Persists across `restart` because the
+  /// past the whole [`READ_GIVE_UP_HORIZON`] for a degraded one. Persists across `restart` because the
   /// WAL struct does; a `crash` discards the reads in flight with the process.
   read_delay: Option<ReadDelayPlan>,
   /// Read-delay mode: verdicts decided but not yet delivered, in submission order. Empty by default
@@ -493,7 +498,7 @@ pub struct InMemoryWal {
   /// Observability: how many reads this WAL has DELAYED (drew a non-zero latency) since construction.
   /// Always `0` off-axis; `> 0` proves the read-delay axis is plumbed through to this medium.
   reads_delayed: u64,
-  /// Observability: how many reads this WAL answered only AFTER [`RECOVERY_READ_BUDGET`] had elapsed
+  /// Observability: how many reads this WAL answered only AFTER [`READ_GIVE_UP_HORIZON`] had elapsed
   /// on the device clock since their submission — measured across the wait actually served, at the
   /// release. Such a read outlived every cadence tick the proto's whole failure-driven retry
   /// allowance spans, so its consumption is explainable only by the recovery WAITING it out — this
@@ -637,7 +642,7 @@ impl InMemoryWal {
   /// inline — the same fault, misdirect and placement decisions off the same fault stream — but the
   /// completion is HELD until the device clock reaches a drawn due instant instead of being queued in
   /// the same call. A seeded minority of slots are DEGRADED
-  /// ([`READ_STALL_PER_MILLE`]) and answer only past [`RECOVERY_READ_BUDGET`]; every other slot
+  /// ([`READ_STALL_PER_MILLE`]) and answer only past [`READ_GIVE_UP_HORIZON`]; every other slot
   /// answers within [`READ_DELAY_SPAN`].
   ///
   /// A medium in this mode requires its harness to feed it virtual time
@@ -674,7 +679,7 @@ impl InMemoryWal {
     self.reads_delayed
   }
 
-  /// Test-only: how many reads this WAL answered only after [`RECOVERY_READ_BUDGET`] had elapsed
+  /// Test-only: how many reads this WAL answered only after [`READ_GIVE_UP_HORIZON`] had elapsed
   /// since their submission — reads that outlived the proto's whole failure-driven retry allowance,
   /// so the recovery provably WAITED them out. `0` off-axis.
   #[doc(hidden)]
@@ -712,8 +717,23 @@ impl InMemoryWal {
     self.staged_reads.len()
   }
 
+  /// Test-only: whether reads of `op`'s slot are DEGRADED on THIS medium — every read of it answers
+  /// only past [`READ_GIVE_UP_HORIZON`]. `false` off-axis, where no read is ever held.
+  ///
+  /// A lane that means to exercise a particular slot's stall (the recovery head, say) can only say
+  /// so in a comment otherwise: the delivery counters carry no slot identity, so a shift in the
+  /// warm-up, the checkpoint geometry, or the client schedule would silently move the degraded slot
+  /// elsewhere and leave the lane passing while testing something else. Asking here pins it.
+  #[doc(hidden)]
+  pub fn slot_read_degraded(&self, op: u64) -> bool {
+    self
+      .read_delay
+      .as_ref()
+      .is_some_and(|plan| Self::slot_degraded(plan.seed, op))
+  }
+
   /// Whether reads of the slot holding `op` are DEGRADED on a medium whose read-delay plan carries
-  /// `seed`: every read of such a slot answers past [`RECOVERY_READ_BUDGET`].
+  /// `seed`: every read of such a slot answers past [`READ_GIVE_UP_HORIZON`].
   ///
   /// A PURE function of `(seed, op)` rather than a draw off the plan's stream, because the verdict
   /// must be the same for every read of the slot: a slot whose reads were re-rolled per attempt
@@ -777,7 +797,7 @@ impl InMemoryWal {
     while i < self.staged_reads.len() {
       if self.staged_reads[i].due <= self.device_now {
         let read = self.staged_reads.remove(i).expect("the index is in range");
-        if Duration::from_nanos(self.device_now - read.submitted_at) > RECOVERY_READ_BUDGET {
+        if Duration::from_nanos(self.device_now - read.submitted_at) > READ_GIVE_UP_HORIZON {
           self.reads_past_budget += 1;
           if matches!(read.done, WalDone::ReadOk(_)) {
             self.late_bodies_delivered += 1;

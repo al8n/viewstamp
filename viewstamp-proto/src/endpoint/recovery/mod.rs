@@ -2843,11 +2843,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //   for a NEW op is the constructor's batch, and `recover_timeouts` re-submits only for an op
     //   already pending.
     // - The bounded quarantine-probe disarm in `handle_timeout` fires in `Status::Recovering`, NOT
-    //   `RecoveringHead`, so the tail fence is not drained by its status. It runs only when
+    //   `RecoveringHead`, so its status alone does not drain the tail fence. It runs only when
     //   `advance_quarantine_probe` returns true, which requires an armed `require_cross_epoch`
-    //   sync; both sites that arm one on a Normal endpoint are status-gated, so on a non-Normal
-    //   endpoint only `enter_cross_epoch_peer_fetch` can arm one — and it refuses while
-    //   `rec.pending` is non-empty, then installs a read-free `RecoverState` of its own.
+    //   sync — and no such sync can coexist with an open fence, whether it was armed here or
+    //   carried in. Every site that pins the crossing outside recovery is gated on `Status::Normal`,
+    //   where `recover` is structurally `None`. The one recovery site,
+    //   `enter_cross_epoch_peer_fetch`, refuses to arm while `rec.pending` is non-empty and then
+    //   installs a read-free `RecoverState`; the other mid-session entry into `Recovering`
+    //   (`enter_orphan_repersist_recovery`, which may carry a Normal-armed sync across) installs a
+    //   read-free state too, opening only the checkpoint phase. A boot recovery is the one holder
+    //   of an open tail fence, and it starts with no sync at all.
     //
     // So this escalation can never abandon an outstanding read or a staged fill: a recovering
     // endpoint stages no append, and every obligation the reformation supersedes lives in the
