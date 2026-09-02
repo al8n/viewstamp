@@ -152,19 +152,18 @@ pub struct VoprReport {
   /// the media end to end. Deliberately NOT folded into the digest report hash (like
   /// [`Self::wal_write_reorders`]).
   wal_reads_delayed: u64,
-  /// The high-water of WAL reads answered only AFTER the proto's whole recovery read budget elapsed,
-  /// summed over replicas. A read that outlives that budget is necessarily still outstanding when its
-  /// op's per-op retransmission budget runs out — the budget is counted from the recovery's start,
-  /// which is at or before the read's submission — so the op resolves from its durable header with a
-  /// LIVE correlation, and the completion can only ever arrive on the carried lane. Always `0`
-  /// off-axis, and `0` on every run before this axis existed: a synchronous backend resolves every
-  /// read in the call that submitted it. Deliberately NOT folded into the digest report hash.
+  /// The high-water of WAL reads answered only AFTER the proto's whole failure-driven retry
+  /// allowance elapsed, summed over replicas. Such a read outlived every cadence tick that
+  /// allowance spans, so its consumption is explainable only by the recovery WAITING it out —
+  /// elapsed ticks spend nothing on an outstanding read. Always `0` off-axis: a synchronous
+  /// backend resolves every read in the call that submitted it. Deliberately NOT folded into the
+  /// digest report hash.
   wal_reads_past_budget: u64,
   /// The high-water of beyond-budget WAL reads that delivered BYTES — a `ReadOk` carrying a slot's
-  /// canonical content, the only completion an endpoint's carried-correlation lane can ADMIT (every
-  /// other verdict merely spends its correlation). The sharp non-vacuity witness for the late-read
-  /// lane: `> 0` means the medium genuinely handed back canonical bytes for an op long after the
-  /// endpoint's recovery stopped waiting for them. Always `0` off-axis; NOT folded into the digest.
+  /// canonical content, the verdict that resolves a waited-out op with its body. The sharp
+  /// non-vacuity witness for the wait path: `> 0` means the medium genuinely handed back canonical
+  /// bytes for an op long after any failure-driven re-read could have elicited them — only the
+  /// wait consumed them. Always `0` off-axis; NOT folded into the digest.
   wal_late_bodies_delivered: u64,
   /// The high-water of beyond-budget stalls the axis DREW, summed over replicas — the armed-and-fired
   /// half of the pair whose delivered half is [`Self::wal_reads_past_budget`]. A drawn stall reaches
@@ -622,17 +621,17 @@ impl VoprReport {
     self.wal_reads_delayed
   }
 
-  /// The high-water of WAL reads answered only after the proto's whole recovery read budget elapsed
-  /// (summed over replicas). Always `0` off-axis and on every synchronous-read run; `> 0` ⇒ a read
-  /// genuinely OUTLIVED the budget, so its op resolved from its durable header with the read still
-  /// outstanding — the state the carried-correlation lane exists for.
+  /// The high-water of WAL reads answered only after the proto's whole failure-driven retry
+  /// allowance elapsed (summed over replicas). Always `0` off-axis and on every synchronous-read
+  /// run; `> 0` ⇒ a read outlived every cadence tick that allowance spans — the recovery provably
+  /// WAITED it out.
   pub const fn wal_reads_past_budget(&self) -> u64 {
     self.wal_reads_past_budget
   }
 
-  /// The high-water of beyond-budget WAL reads that delivered BYTES (summed over replicas) — the only
-  /// completions an endpoint's carried-correlation lane can admit. The sharp non-vacuity witness for
-  /// the late-read lane; always `0` off-axis.
+  /// The high-water of beyond-budget WAL reads that delivered BYTES (summed over replicas) — the
+  /// waited-out completions that resolve their op with its body. The sharp non-vacuity witness for
+  /// the wait path; always `0` off-axis.
   pub const fn wal_late_bodies_delivered(&self) -> u64 {
     self.wal_late_bodies_delivered
   }
@@ -1496,17 +1495,16 @@ pub fn run_vopr_with_sb_reorder(seed: u64, ticks: u64) -> VoprReport {
 /// Every replica's WAL then gives its reads a LATENCY: the verdict is decided at submit exactly as
 /// before — same fault, misdirect and placement decisions — and the completion is held until the
 /// device clock reaches a drawn due instant. Most slots answer within a fraction of the recovery
-/// cadence; a seeded minority are DEGRADED and answer only past the proto's whole recovery read
-/// budget, and a degraded slot answers late for EVERY read of it.
+/// cadence; a seeded minority are DEGRADED and answer only past the proto's whole per-op retry
+/// allowance, and a degraded slot answers late for EVERY read of it.
 ///
 /// The default sweep's WAL resolves each read in the call that submitted it, which makes a late read
-/// structurally impossible: a recovery read can never still be outstanding when its op's
-/// retransmission budget runs out, so the op never resolves from its durable header with a LIVE
-/// correlation and everything an endpoint does with a completion arriving after that point — the
-/// carried-correlation lane, its identity and durability gates, its append barrier, and the promoted
-/// head's restore — is unreachable at every seed. This axis is what makes that state reachable: with
-/// a degraded slot the Phase-1 read AND all eight additive retransmissions are outstanding at the
-/// resolution, so the correlations are carried live and the eventual `ReadOk` arrives on them.
+/// structurally impossible: a recovery read is never outstanding when a cadence tick fires, so the
+/// WAIT the proto's recovery runs on — an outstanding read spends no budget, resolves to nothing,
+/// and is waited out until its verdict delivers — is vacuous at every seed. This axis is what makes
+/// the wait real: a degraded slot answers only past the whole failure-driven retry allowance, so a
+/// recovery over one holds its read phase open across many ticks and consumes the eventual verdict
+/// exactly where a prompt one would have been consumed.
 ///
 /// The EXISTING oracles judge the outcome every tick — committed-loss (durability),
 /// applied-divergence (agreement), append-before-ack, boundedness, plus the liveness/final-quiesce

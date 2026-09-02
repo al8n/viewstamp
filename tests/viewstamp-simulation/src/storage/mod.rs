@@ -36,14 +36,14 @@
 //! with the ring (a bounded slot can still be torn / bit-rotted / misdirected / staged in flight).
 //!
 //! The OPT-IN **read-delay** mode ([`InMemoryWal::set_read_delay`]) gives reads a LATENCY. By default a
-//! `submit_read` decides its verdict and queues the completion in the same call, so a read can never be
-//! late relative to the proto's recovery read budget ([`RECOVERY_READ_BUDGET`]) and the whole
-//! carried-correlation lane — what an endpoint does with a completion that arrives after its recovery
-//! stopped waiting on it — is unreachable at every seed. Under the axis each read's verdict is decided
-//! exactly as before and then HELD until the device's clock reaches its due instant: a healthy slot
-//! answers within [`READ_DELAY_SPAN`], while a seeded minority of slots are DEGRADED and answer only
-//! past the whole recovery budget, so every additive retransmission of such an op is outstanding when
-//! the op resolves from its durable header. A delay is a latency model, never a drop — every submitted
+//! `submit_read` decides its verdict and queues the completion in the same call, so a recovery read
+//! is never genuinely outstanding at a cadence tick and the WAIT the proto's recovery runs on — a
+//! read that has not completed is outstanding, not failed, and is waited on — is vacuous at every
+//! seed. Under the axis each read's verdict is decided exactly as before and then HELD until the
+//! device's clock reaches its due instant: a healthy slot answers within [`READ_DELAY_SPAN`], while
+//! a seeded minority of slots are DEGRADED and answer only past the whole per-op retry allowance
+//! ([`RECOVERY_READ_BUDGET`]), so a recovery genuinely waits out many cadence ticks before the
+//! verdict that resolves the op arrives. A delay is a latency model, never a drop — every submitted
 //! read still resolves exactly once, per the [`Wal`] completion contract.
 
 use core::time::Duration;
@@ -55,36 +55,33 @@ use viewstamp_proto::{
   Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId, checkpoint_id,
 };
 
-/// The virtual time the proto's recovery read loop spends on ONE tail op before resolving it from its
-/// durable header: the per-op retransmission budget (`RECOVER_READ_RETRIES`, eight) spent on the
-/// recover cadence (`RECOVER_READ_RETRANSMIT`, 100 ms), across the nine cadence ticks that bound it.
-///
-/// Where the resolution actually lands depends on where the FIRST cadence tick falls — a recovery
-/// whose retry timer is already due at its first `handle_timeout` spends the budget over eight
-/// intervals, one that arms a fresh tick over nine. This states the LATER bound, so a read whose
-/// latency exceeds it was still outstanding at the resolution either way.
+/// The proto recovery's FULL per-op retry allowance in virtual time: the per-op failure budget
+/// (`RECOVER_READ_RETRIES`, eight) spent on the recover cadence (`RECOVER_READ_RETRANSMIT`,
+/// 100 ms), across the nine cadence ticks that bound it — the longest span the failure-driven
+/// retry discipline can cover for an op whose every attempt fails the instant it is submitted.
 ///
 /// Stated here rather than read from the proto because both constants are private to it. It is the
-/// threshold the read-delay axis is built around: a read whose latency exceeds this was still
-/// outstanding when its op's budget ran out, so its completion can only ever arrive on the CARRIED
-/// correlation the resolution hands to online repair.
+/// threshold the read-delay axis is built around: the proto spends that budget only on DELIVERED
+/// failure verdicts and holds no clock against an outstanding read, so a read delivered later than
+/// this span was certainly WAITED ON across cadence ticks that spent nothing — no failure-driven
+/// re-read can explain its consumption, only the wait.
 pub const RECOVERY_READ_BUDGET: Duration = Duration::from_millis(900);
 
 /// The latency band a HEALTHY slot answers a read within under the read-delay axis (`0 ..= span-1`).
 ///
 /// Deliberately spans several recover-cadence ticks: an op whose read takes longer than one
-/// `RECOVER_READ_RETRANSMIT` has additive retransmissions outstanding when its first completion
-/// lands, which is the ordinary in-budget shape a synchronous backend also cannot produce. It stays
-/// well under [`RECOVERY_READ_BUDGET`], so a healthy slot always resolves its op inside the budget.
+/// `RECOVER_READ_RETRANSMIT` is genuinely outstanding when ticks fire — the waited-on shape a
+/// synchronous backend cannot produce. It stays well under [`RECOVERY_READ_BUDGET`], so a healthy
+/// slot always resolves its op inside a short wait.
 pub const READ_DELAY_SPAN: Duration = Duration::from_millis(250);
 
 /// The floor of the latency band a DEGRADED slot answers within — strictly above
-/// [`RECOVERY_READ_BUDGET`], so EVERY read of such a slot (the Phase-1 read and all eight additive
-/// retransmissions) is still outstanding when the op's budget runs out.
+/// [`RECOVERY_READ_BUDGET`], so a read of such a slot outlives every cadence tick the whole
+/// failure-driven retry allowance spans: the recovery provably WAITS it out.
 ///
-/// Only JUST above it, deliberately. What the axis has to deliver is a completion arriving after the
-/// resolution, and the read that delivers it is the FIRST one submitted — so the wait the replica
-/// must survive to see it is this floor, not the budget. A band far above the budget makes that wait
+/// Only JUST above it, deliberately. What the axis has to deliver is a completion whose consumption
+/// only the wait can explain, and the read that delivers it is the FIRST one submitted — so the
+/// wait the replica must survive to see it is this floor. A band far above it makes that wait
 /// longer than the adversarial schedule leaves a replica alive: measured against a chaos loop whose
 /// crash cadence is a few hundred milliseconds of virtual time, a 1–2.5 s band had the stalled reads
 /// discarded with the process on most seeds instead of delivered.
@@ -96,9 +93,9 @@ pub const READ_STALL_FLOOR: Duration = Duration::from_millis(950);
 pub const READ_STALL_SPAN: Duration = Duration::from_millis(300);
 
 /// How many slots in a thousand are DEGRADED on a medium running the read-delay axis: every read of
-/// such a slot answers past the whole recovery read budget. Adversarially high for a real device, and
-/// deliberately so — the axis exists to make the beyond-budget completion a routine event rather than
-/// a coincidence — while leaving the large majority of slots answering inside the budget, so the
+/// such a slot answers past the whole per-op retry allowance. Adversarially high for a real device,
+/// and deliberately so — the axis exists to make the waited-out completion a routine event rather
+/// than a coincidence — while leaving the large majority of slots answering promptly, so the
 /// ordinary recovery read path keeps being exercised alongside it.
 pub const READ_STALL_PER_MILLE: u32 = 100;
 
@@ -357,8 +354,8 @@ struct ReadDelayPlan {
 /// `due`. Held completions are never dropped by a trim — the [`Wal`] contract owes every submitted
 /// read exactly one completion, and `truncate`/`prune` report cancelled WRITES only — so a read of a
 /// slot that is truncated, pruned or ring-evicted while it is in flight still delivers the bytes it
-/// captured, which is precisely the "captured before a later write mutated the slot" case the
-/// endpoint's carried-body durability witness exists to judge.
+/// captured — the "captured before a later write mutated the slot" schedule the [`Wal`] read
+/// contract permits, which recovery re-classifies off the delivered verdict.
 #[derive(Debug)]
 struct StagedRead {
   /// The device clock, in nanoseconds, when the read was submitted. Kept so the LATENCY witnesses are
@@ -498,15 +495,14 @@ pub struct InMemoryWal {
   reads_delayed: u64,
   /// Observability: how many reads this WAL answered only AFTER [`RECOVERY_READ_BUDGET`] had elapsed
   /// on the device clock since their submission — measured across the wait actually served, at the
-  /// release. Such a read is necessarily still outstanding when its op's recovery budget runs out
-  /// (the budget is counted from the recovery's start, which is at or before the read's submission),
-  /// so this counts reads that genuinely OUTLIVED the proto's recovery read budget rather than
-  /// merely drawing a long latency. Always `0` off-axis.
+  /// release. Such a read outlived every cadence tick the proto's whole failure-driven retry
+  /// allowance spans, so its consumption is explainable only by the recovery WAITING it out — this
+  /// counts reads genuinely waited on rather than merely drawing a long latency. Always `0` off-axis.
   reads_past_budget: u64,
   /// Observability: the subset of [`reads_past_budget`](Self::reads_past_budget) that delivered
-  /// BYTES — a `ReadOk` carrying a slot's canonical content, the only completion an endpoint's
-  /// carried-correlation lane can admit (every other verdict merely spends its correlation). Always
-  /// `0` off-axis.
+  /// BYTES — a `ReadOk` carrying a slot's canonical content, the verdict that resolves a waited-out
+  /// op with its body (every other verdict spends a failure or settles a phantom). Always `0`
+  /// off-axis.
   late_bodies_delivered: u64,
   /// Observability: how many HELD reads a crash discarded before they came due. A held read that
   /// dies with the process is delivered to nobody, so it appears in
@@ -679,16 +675,16 @@ impl InMemoryWal {
   }
 
   /// Test-only: how many reads this WAL answered only after [`RECOVERY_READ_BUDGET`] had elapsed
-  /// since their submission — reads that genuinely OUTLIVED the proto's whole recovery read budget,
-  /// so their op resolved from its durable header while they were still outstanding. `0` off-axis.
+  /// since their submission — reads that outlived the proto's whole failure-driven retry allowance,
+  /// so the recovery provably WAITED them out. `0` off-axis.
   #[doc(hidden)]
   pub fn reads_past_budget(&self) -> u64 {
     self.reads_past_budget
   }
 
   /// Test-only: how many of the [`reads_past_budget`](Self::reads_past_budget) delivered BYTES (a
-  /// `ReadOk` carrying a slot's canonical content) rather than a fault/absent verdict — the only
-  /// completions an endpoint's carried-correlation lane can admit. `0` off-axis.
+  /// `ReadOk` carrying a slot's canonical content) rather than a fault/absent verdict — the
+  /// waited-out completions that resolve their op with its body. `0` off-axis.
   #[doc(hidden)]
   pub fn late_bodies_delivered(&self) -> u64 {
     self.late_bodies_delivered
@@ -720,11 +716,11 @@ impl InMemoryWal {
   /// `seed`: every read of such a slot answers past [`RECOVERY_READ_BUDGET`].
   ///
   /// A PURE function of `(seed, op)` rather than a draw off the plan's stream, because the verdict
-  /// must be the same for every read of the slot: the recovery loop retransmits ADDITIVELY, so an op
-  /// whose reads were re-rolled per attempt would be resolved by the first attempt that happened to
-  /// draw a healthy latency and could never reach its budget with a live correlation. A degraded
-  /// sector is also degraded across restarts and rewrites, which this gives for free — the verdict
-  /// holds nothing that a crash or a re-append could reset.
+  /// must be the same for every read of the slot: a slot whose reads were re-rolled per attempt
+  /// could resolve off whichever re-read happened to draw a healthy latency, and the wait the axis
+  /// exists to force would never span its full band. A degraded sector is also degraded across
+  /// restarts and rewrites, which this gives for free — the verdict holds nothing that a crash or a
+  /// re-append could reset.
   fn slot_degraded(seed: u64, op: u64) -> bool {
     Prng::new(seed ^ op.wrapping_mul(READ_STALL_SLOT_MAGIC) ^ READ_STALL_SLOT_MAGIC)
       .chance(READ_STALL_PER_MILLE, 1000)

@@ -364,11 +364,11 @@ pub struct Cluster {
   /// `crash`/`restart` because the superblock struct does. Only meaningful alongside
   /// [`set_async_superblock_delay`] (synchronous writes complete inline — nothing lags).
   sb_envelope_lag: Option<u64>,
-  /// `None` (default) ⇒ every replica's WAL answers a read INLINE, so no read can be late relative to
-  /// the proto's recovery read budget. `Some(base)` ⇒ READ-DELAY mode on every replica's WAL with a
-  /// per-replica seed derived from `base`: each read's verdict is decided as usual and then held for a
-  /// drawn latency, with a seeded minority of slots DEGRADED and answering only past the whole
-  /// recovery read budget. Set via [`set_wal_read_delay`] before running; persists across
+  /// `None` (default) ⇒ every replica's WAL answers a read INLINE, so a recovery read is never
+  /// genuinely outstanding at a cadence tick. `Some(base)` ⇒ READ-DELAY mode on every replica's WAL
+  /// with a per-replica seed derived from `base`: each read's verdict is decided as usual and then
+  /// held for a drawn latency, with a seeded minority of slots DEGRADED and answering only past the
+  /// proto's whole per-op retry allowance. Set via [`set_wal_read_delay`] before running; persists across
   /// `crash`/`restart` because the WAL struct does (a `crash` discards the reads in flight, which die
   /// with the process).
   ///
@@ -978,14 +978,13 @@ impl Cluster {
   /// `seed` with a per-replica derivation. In this mode a WAL still decides each read's verdict at
   /// submit — same faults, same misdirects, same placement — and then HOLDS the completion for a drawn
   /// latency: a short band for a healthy slot, and, for a seeded minority of DEGRADED slots, a band
-  /// strictly above the proto's whole recovery read budget.
+  /// strictly above the proto's whole per-op retry allowance.
   ///
   /// The synchronous default makes a WAL read structurally incapable of being late: every read
-  /// resolves in the call that submitted it, so a recovery read can never still be outstanding when
-  /// its op's retransmission budget runs out, and everything an endpoint does with a completion that
-  /// arrives after its recovery stopped waiting on it is unreachable at every seed. This axis is what
-  /// opens that window — and, because a degraded slot answers late for EVERY read of it, it opens it
-  /// for the additive retransmissions too, which is what the op must exhaust its budget through.
+  /// resolves in the call that submitted it, so a recovery read is never outstanding when a cadence
+  /// tick fires and the WAIT the proto's recovery runs on is vacuous at every seed. This axis is
+  /// what makes the wait real — a degraded slot answers late for EVERY read of it, so a recovery
+  /// over one provably waits out many ticks before the resolving verdict arrives.
   ///
   /// Composes with the current fault/async/ring/chaos modes. Call before running; the mode persists
   /// across `crash`/`restart` because the WAL struct does (a `crash` discards the reads in flight —
@@ -1040,9 +1039,9 @@ impl Cluster {
     self.wals[i].borrow().reads_delayed()
   }
 
-  /// How many reads replica `i`'s WAL answered only AFTER the proto's whole recovery read budget had
-  /// elapsed since their submission — reads that genuinely outlived the budget, so their op resolved
-  /// from its durable header while they were still outstanding. `0` with the axis off.
+  /// How many reads replica `i`'s WAL answered only AFTER the proto's whole failure-driven retry
+  /// allowance had elapsed since their submission — reads the recovery provably WAITED out. `0`
+  /// with the axis off.
   pub fn wal_reads_past_budget(&self, i: usize) -> u64 {
     self.wals[i].borrow().reads_past_budget()
   }
@@ -1069,8 +1068,8 @@ impl Cluster {
   }
 
   /// How many of replica `i`'s beyond-budget reads delivered BYTES (a `ReadOk` carrying the slot's
-  /// canonical content) rather than a fault/absent verdict — the only completions an endpoint's
-  /// carried-correlation lane can admit. `0` with the axis off.
+  /// canonical content) rather than a fault/absent verdict — the waited-out completions that
+  /// resolve their op with its body. `0` with the axis off.
   pub fn wal_late_bodies_delivered(&self, i: usize) -> u64 {
     self.wals[i].borrow().late_bodies_delivered()
   }
