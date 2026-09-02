@@ -1905,7 +1905,7 @@ fn no_old_generation_state_survives_a_view_transition() {
   // adoption neither rewinds nor needs to advance the commit. catching_up must end FALSE.
   let mut e = backup();
   e.seed_old_generation_state_for_test();
-  e.adopt_canonical_head(
+  let flow = e.adopt_canonical_head(
     now,
     &mut storage,
     View::with(1),
@@ -1919,6 +1919,7 @@ fn no_old_generation_state_survives_a_view_transition() {
       bytes::Bytes::from_static(b"a"),
     )],
   );
+  assert!(!flow.entered_recovery(), "no reconciliation is owed here");
   assert_eq!(e.status(), Status::Normal);
   assert_eq!(e.view(), View::with(1));
   assert!(

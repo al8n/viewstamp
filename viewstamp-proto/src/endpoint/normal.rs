@@ -632,11 +632,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
+  ///
+  /// Returns the commit tail's status outcome: [`CommitFlow::EnteredRecovery`] when the tail tore
+  /// the generation down into the recovery peer-fetch, on which every caller must short-circuit
+  /// (see [`CommitFlow`]).
   pub(crate) fn try_commit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
     storage: &mut Storage<W, B, S>,
-  ) {
+  ) -> CommitFlow {
     // Tallying votes into a commit — and advertising it — is the PRIMARY's authority, judged
     // against the membership in force NOW, not when the triggering action was staged. Every
     // legitimate caller is the primary of the current view (the own-append and repair-fill
@@ -647,7 +651,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // commit, apply, or emit `Commit`. Non-primaries advance only through externally-proven
     // commits (`advance_commit`).
     if !self.is_primary() {
-      return;
+      return CommitFlow::Continue;
     }
     // Do NOT apply ops while the SM is mid-replacement or does not yet hold its checkpoint — the SAME gate
     // `advance_commit` takes. A node owing a post-root SM-reconstruct (`self.checkpoint_op == M`, SM still
@@ -658,7 +662,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `pending_install` on a primary is unreachable — a primary abdicates rather than stage a sync — but
     // the gate stays symmetric with `advance_commit`.)
     if self.pending_install.is_some() || self.sm_reconstruct_owed() {
-      return;
+      return CommitFlow::Continue;
     }
     let quorum = self.membership.quorum() as u32;
     // Count only CURRENT-VOTER slots toward the quorum. `on_prepare_ok` bounds every ingress bit
@@ -727,9 +731,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Adopt an owed INHERITED checkpoint frontier first (commit_min may have just reached it), so
     // the cadence below computes its boundary off the adopted pointer in the same tail — then
     // re-drive an owed orphaned-re-persist reconciliation the settle site had to defer (its
-    // deferral conditions clear on events this tail observes).
+    // deferral conditions clear on events this tail observes). Entering it ends the generation:
+    // nothing below runs over the teardown, and the caller short-circuits on the returned flow.
     self.maybe_adopt_inherited_frontier();
-    self.maybe_enter_orphan_repersist_fetch(now, storage);
+    if self
+      .maybe_enter_orphan_repersist_fetch(now, storage)
+      .entered_recovery()
+    {
+      return CommitFlow::EnteredRecovery;
+    }
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(storage);
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
@@ -742,6 +752,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // unless a swap is staged AND the superblock is free (the same exclusion `maybe_checkpoint` enforces;
     // a checkpoint queued just above keeps the swap waiting its turn, re-submitted from `on_sb_done`).
     self.maybe_swap_epoch(storage);
+    CommitFlow::Continue
   }
 
   /// Applies op `op` on the primary, caches + sends the reply, emits the event. Returns `true` if it
@@ -1023,8 +1034,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.pending_durable_view() {
       return;
     }
-    // Learn the primary's commit (apply anything we already have).
-    self.advance_commit(now, storage, p.commit().get());
+    // Learn the primary's commit (apply anything we already have). The commit tail can enter the
+    // owed orphaned-re-persist reconciliation — the generation this prepare addressed is then
+    // gone, so drop it (a Recovering node acks nothing; the primary retransmits).
+    if self
+      .advance_commit(now, storage, p.commit().get())
+      .entered_recovery()
+    {
+      return;
+    }
 
     let pop = p.op().get();
     if pop <= self.op.get() {
@@ -1145,9 +1163,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           .expect("just peeked");
         self.append_prepare(storage, next);
       }
-      // After appending, apply any ops now available up to the learned commit.
+      // After appending, apply any ops now available up to the learned commit. Nothing follows in
+      // this arm, so a teardown in the tail has nothing left to short-circuit; discard the flow.
       let target = self.commit_max.get();
-      self.advance_commit(now, storage, target);
+      let _ = self.advance_commit(now, storage, target);
     } else {
       // Future op: buffer it, and solicit the committed band between our head and it that the primary's
       // retransmit (only `commit_min+1..=op`) will never re-send (those ops are `<= commit_min`). This
@@ -1498,18 +1517,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Applies committed ops we hold, up to `min(target, op)`, strictly in order. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
+  ///
+  /// Returns the commit tail's status outcome: [`CommitFlow::EnteredRecovery`] when the tail tore
+  /// the generation down into the recovery peer-fetch, on which every caller must short-circuit
+  /// (see [`CommitFlow`]).
   pub(crate) fn advance_commit<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
     storage: &mut Storage<W, B, S>,
     target: u64,
-  ) {
+  ) -> CommitFlow {
     // A PRE-ROOT staged install (`pending_install`) is about to wholesale-REPLACE the SM at the synced
     // point (`install_sync`), and keeps `commit_min`/`commit_max`/`self.op` FROZEN across the STAGE→install
     // window so the install is the single atomic mutation point (the captured held-tail decision + the
     // monotonic advances stay exactly as at STAGE, no commit_max rewind). Return BEFORE learning the commit.
     if self.pending_install.is_some() {
-      return;
+      return CommitFlow::Continue;
     }
     // Record the learned commit regardless of whether we hold — or can yet apply — the ops: `commit_max` is
     // a re-learnable HINT, not an apply effect. An SM-reconstruct-owed node MUST still raise it, unlike the
@@ -1524,7 +1547,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // above but must NOT apply here; the retry reconstructs the SM under the fixed M pointer and ops
     // re-apply via the next Commit/Prepare once the obligation clears.
     if self.sm_reconstruct_owed() {
-      return;
+      return CommitFlow::Continue;
     }
     while self.commit_min.get() < target && self.commit_min.get() < self.op.get() {
       let op = self.commit_min.get() + 1;
@@ -1588,9 +1611,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Adopt an owed INHERITED checkpoint frontier first (commit_min may have just reached it), so
     // the cadence below computes its boundary off the adopted pointer in the same tail — then
     // re-drive an owed orphaned-re-persist reconciliation the settle site had to defer (its
-    // deferral conditions clear on events this tail observes).
+    // deferral conditions clear on events this tail observes). Entering it ends the generation:
+    // nothing below runs over the teardown, and the caller short-circuits on the returned flow.
     self.maybe_adopt_inherited_frontier();
-    self.maybe_enter_orphan_repersist_fetch(now, storage);
+    if self
+      .maybe_enter_orphan_repersist_fetch(now, storage)
+      .entered_recovery()
+    {
+      return CommitFlow::EnteredRecovery;
+    }
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(storage);
     // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
@@ -1602,6 +1631,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // chiefly a `pending_swap` that survived a `catch_up_to_view` view change (no durable-view write, so
     // no `on_sb_done` re-trigger). No-op unless a swap is staged and the superblock is free.
     self.maybe_swap_epoch(storage);
+    CommitFlow::Continue
   }
 
   /// The SINGLE apply-time client-session update, shared by the primary's [`Self::commit_op`] and the
@@ -1984,8 +2014,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // checkpoint is the same trust `maybe_force_sync` already extends. The commit-side complement of
     // `maybe_request_sync` below, which covers the same evidence ABOVE our head (no bodies held → sync).
     let peer_checkpoint = self.max_peer_checkpoint_op();
-    if peer_checkpoint.get() > self.commit_max.get() {
-      self.advance_commit(now, storage, peer_checkpoint.get());
+    if peer_checkpoint.get() > self.commit_max.get()
+      && self
+        .advance_commit(now, storage, peer_checkpoint.get())
+        .entered_recovery()
+    {
+      // The commit tail entered the owed reconciliation: this ack's generation is gone — no
+      // sync trigger, no vote tally, no commit attempt over the teardown.
+      return;
     }
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
@@ -2005,7 +2041,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     {
       inflight.oks |= 1u64 << ok.replica().get();
     }
-    self.try_commit(now, storage);
+    // Nothing follows: a teardown in the tail has nothing left to short-circuit; discard the flow.
+    let _ = self.try_commit(now, storage);
   }
 
   pub(crate) fn on_commit<W: Wal, B: Superblock>(
@@ -2035,7 +2072,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Force-sync escalation: the primary's just-recorded checkpoint may have crossed a `repair`
     // hole we hold below it (pruned everywhere on the quorum) → escalate to a forced `RequestSync`.
     self.maybe_force_sync(now);
-    self.advance_commit(now, storage, c.commit().get());
+    // The commit tail can enter the owed orphaned-re-persist reconciliation: the generation this
+    // heartbeat addressed is then gone — solicit no tail gap and report no checkpoint over it.
+    if self
+      .advance_commit(now, storage, c.commit().get())
+      .entered_recovery()
+    {
+      return;
+    }
     // Tail-gap repair: if the primary's commit is ABOVE our head (committed ops we are missing, above
     // the cluster checkpoint), solicit them via `RequestPrepare` — the primary's retransmit (only
     // `commit_min+1..=op`) never re-sends a committed op below its own commit_min, so a backup that fell

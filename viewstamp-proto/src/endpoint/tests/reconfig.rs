@@ -1765,7 +1765,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
     Some(1u64 << 0),
     "the swap dropped the demotee's slot-3 bit — only the primary's own vote remains"
   );
-  e.try_commit(now, &mut storage);
+  let _ = e.try_commit(now, &mut storage);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
