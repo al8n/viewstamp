@@ -942,6 +942,31 @@ async fn the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_back
   );
 }
 
+/// The shipped driver carries no loss-injection seam.
+///
+/// A seam gated on this workspace's internal-testkit cfg would still compile into every artifact the
+/// workspace builds, because that cfg is a repo-wide rustflag — putting a datagram-drop branch on the
+/// inbound hot path of the real driver. The loss-tolerance test injects its loss from a relay socket
+/// it owns instead, so no such branch exists here; this reads the driver's own source to keep it
+/// that way, since a reintroduction would otherwise be invisible until someone audits the hot path.
+#[test]
+fn the_driver_carries_no_loss_injection_seam() {
+  const DRIVER_SRC: &str = include_str!("mod.rs");
+  for needle in [
+    "InboundLoss",
+    "inbound_loss",
+    "arm_inbound_loss",
+    "drop_one_in",
+    "drop_next",
+  ] {
+    assert!(
+      !DRIVER_SRC.contains(needle),
+      "the driver must carry no loss-injection seam, found `{needle}`: inject loss from a relay in \
+       the test instead"
+    );
+  }
+}
+
 #[test]
 fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
   // The referenceable defaults exist so an embedder can compute RELATIVE overrides (e.g. a

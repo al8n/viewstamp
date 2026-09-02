@@ -89,58 +89,6 @@ struct PeerLink {
   next_dial: Option<Instant>,
 }
 
-/// Inbound packet-loss seam for tests, applied BELOW `QuicCoordinator::handle_udp`: an armed
-/// datagram is dropped at the socket layer, exactly as the network would drop it, so quinn never
-/// sees it and its loss recovery runs for real.
-///
-/// Gated behind the workspace-only `vsrr_internal_testkit` cfg (set by this repository's
-/// `.cargo/config.toml`), so it does not exist in a consumer build: there is no way to arm loss on a
-/// published driver, and the check compiles out entirely.
-#[cfg(any(test, vsrr_internal_testkit))]
-#[derive(Debug, Default)]
-pub struct InboundLoss {
-  /// Drop one datagram in every `every` that arrives; 0 disables the seam.
-  every: std::sync::atomic::AtomicU64,
-  seen: std::sync::atomic::AtomicU64,
-  dropped: std::sync::atomic::AtomicU64,
-}
-
-#[cfg(any(test, vsrr_internal_testkit))]
-impl InboundLoss {
-  /// A disarmed seam, shareable with the driver it is armed on.
-  #[must_use]
-  pub fn new() -> std::sync::Arc<Self> {
-    std::sync::Arc::new(Self::default())
-  }
-
-  /// Drop one datagram in every `every` from now on; `0` stops dropping.
-  pub fn drop_one_in(&self, every: u64) {
-    self
-      .every
-      .store(every, std::sync::atomic::Ordering::Relaxed);
-  }
-
-  /// How many datagrams the seam has dropped.
-  #[must_use]
-  pub fn dropped(&self) -> u64 {
-    self.dropped.load(std::sync::atomic::Ordering::Relaxed)
-  }
-
-  fn takes(&self) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let every = self.every.load(Relaxed);
-    if every == 0 {
-      return false;
-    }
-    let n = self.seen.fetch_add(1, Relaxed);
-    if n.is_multiple_of(every) {
-      self.dropped.fetch_add(1, Relaxed);
-      return true;
-    }
-    false
-  }
-}
-
 /// The compio (proactor) QUIC driver. Owns the coordinator + storage + socket on one task; a
 /// persistent same-thread recv task (holding a clone of the socket, owned via its `JoinHandle` by
 /// `run()`) feeds it inbound datagrams.
@@ -167,9 +115,6 @@ pub struct CompioQuicDriver<S: StateMachine, W, B, I> {
   client: ClientId,
   next_request: u64,
   pending: PendingMap,
-  /// The test-only inbound loss seam, when one has been armed (see [`InboundLoss`]).
-  #[cfg(any(test, vsrr_internal_testkit))]
-  inbound_loss: Option<std::sync::Arc<InboundLoss>>,
   /// When the next in-flight `pending` scan (cancellation reclaim + retransmit collection) may
   /// run — the deadline gate on [`Self::retransmit_stale`]'s O(in-flight) walk. Starts at zero so
   /// a fresh driver's first scan is never deferred; each scan re-arms it one
@@ -409,8 +354,6 @@ where
       client,
       next_request: first_request,
       pending: PendingMap::new(),
-      #[cfg(any(test, vsrr_internal_testkit))]
-      inbound_loss: None,
       next_pending_scan: Instant::ZERO,
       peers: peer_links,
       peer_book,
@@ -932,12 +875,6 @@ where
   /// stale map. `rekey_if_needed` is config_id-gated, so a datagram that does not change the
   /// membership costs only a scalar compare.
   fn handle_inbound_datagram(&mut self, now: Instant, datagram: &[u8], from: SocketAddr) {
-    #[cfg(any(test, vsrr_internal_testkit))]
-    if let Some(loss) = &self.inbound_loss
-      && loss.takes()
-    {
-      return;
-    }
     self
       .coord
       .handle_udp(now, from, None, datagram, &mut self.storage);
@@ -958,12 +895,6 @@ where
   /// (e.g. the connection cap) retries on the same schedule. `QuicCoordinator::connect` is
   /// synchronous — it queues the handshake Initial for the next transmit pump — so unlike the
   /// stream driver's `dial_peer` there is no dial task to own, cancel, or leak.
-  /// Arm the test-only inbound loss seam before this driver is run (see [`InboundLoss`]).
-  #[cfg(any(test, vsrr_internal_testkit))]
-  pub fn arm_inbound_loss(&mut self, loss: std::sync::Arc<InboundLoss>) {
-    self.inbound_loss = Some(loss);
-  }
-
   fn reconcile_peer_links(&mut self, now: Instant) {
     for link in &mut self.peers {
       if self.coord.has_bound_conn(Peer::Replica(link.id)) {

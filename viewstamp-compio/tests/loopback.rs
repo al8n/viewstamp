@@ -704,47 +704,110 @@ async fn a_parked_checkpoint_materialize_does_not_stop_the_node_committing() {
   }
 }
 
-/// REAL loss on a REAL driver: the production-reachable version of the reassembly-ceiling shape.
+/// A test-side UDP relay between two nodes: one socket, forwarding by source address, dropping one
+/// datagram in `drop_one_in` on the way toward `b`.
+///
+/// The loss lives entirely in the test — no seam, no branch, nothing in the driver. Both nodes are
+/// configured with the relay's address as the other's, so each sees a stable peer address and the
+/// relay can tell the two directions apart by source alone. `drop_one_in` is read per datagram so a
+/// test can arm and disarm the loss while the cluster runs; `0` forwards everything.
+async fn lossy_relay(
+  bind: SocketAddr,
+  a: SocketAddr,
+  b: SocketAddr,
+  drop_one_in: std::sync::Arc<std::sync::atomic::AtomicU64>,
+  dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+  use std::sync::atomic::Ordering::Relaxed;
+  let sock = compio::net::UdpSocket::bind(bind)
+    .await
+    .expect("the relay binds its socket");
+  let mut buf = std::vec![0u8; 2048];
+  let mut toward_b = 0u64;
+  loop {
+    let compio::buf::BufResult(res, returned) = sock.recv_from(buf).await;
+    buf = returned;
+    let Ok((n, from)) = res else {
+      continue;
+    };
+    let dst = if from == a { b } else { a };
+    if dst == b {
+      let every = drop_one_in.load(Relaxed);
+      toward_b = toward_b.wrapping_add(1);
+      if every > 0 && toward_b.is_multiple_of(every) {
+        dropped.fetch_add(1, Relaxed);
+        continue;
+      }
+    }
+    let payload = buf[..n].to_vec();
+    let _ = sock.send_to(payload, dst).await;
+  }
+}
+
+/// REAL loss on REAL drivers, injected by the network and not by the driver.
 ///
 /// The transport's stream receive window bounds an unread backlog's bytes, not the number of spans a
 /// peer segments them into, and a receiver that cannot drain past a gap accumulates one unmergeable
-/// span per arriving packet. The question this answers is whether a real driver can be walked to
-/// quinn's per-stream span ceiling that way, because the production receive entrypoint
-/// (`handle_udp`) feeds quinn AND drains it in the same call — a driver whose loop is behind leaves
-/// datagrams in the socket, not in quinn.
+/// span per arriving packet. Whether a real driver can be walked to quinn's span ceiling that way is
+/// the question, because the production receive entrypoint (`handle_udp`) feeds quinn AND drains it
+/// in the same call.
 ///
-/// So the loss is injected where the network would inject it: BELOW `handle_udp`, at the receiving
-/// driver's socket layer, through a seam that exists only under this workspace's internal-testkit
-/// cfg. One node drops one inbound datagram in two for the whole run while the cluster commits a
-/// stream of small requests — the loss-plus-small-frames shape, at the real driver's real rate, with
-/// quinn's own loss recovery running.
+/// The loss is therefore injected where the network injects it: a relay socket owned by this test
+/// sits between node 2 and each of its peers and drops one inbound datagram in two, with quinn's own
+/// loss recovery running underneath. No driver code participates — there is no loss seam in the
+/// shipped driver to arm.
 ///
-/// What it pins: the cluster keeps committing through sustained 50% loss on one link, and the lossy
-/// node is caught up and serving again once the loss stops. What it MEASURES (and reports through
-/// the seam's own counter) is that this shape does not reach the ceiling: every datagram that
-/// arrives is drained in the same call, so the gap a lost packet leaves is closed by retransmission
-/// long before a span backlog can build.
+/// What it pins: the cluster keeps committing through sustained 50% loss on one node's links, and
+/// that node is caught up and relaying again once the loss stops. What it does NOT do is reach the
+/// reassembly ceiling — every datagram that arrives is drained in the same call, so the gap a lost
+/// packet leaves is closed by retransmission long before a span backlog can build. It is
+/// loss-tolerance evidence, not recovery-from-refusal evidence; the refusal's own recovery is proved
+/// at component level (see the report and the window contract's reachability note).
 #[compio::test]
 async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
   let ca = TestCa::new();
   let base_port = 41100u16;
-  let addrs: Vec<SocketAddr> = (0..3)
+  // Nodes 0..2 at base..base+2; the two relays for node 2's links at base+3 and base+4.
+  let node: Vec<SocketAddr> = (0..3)
     .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
     .collect();
+  let relay02: SocketAddr = format!("127.0.0.1:{}", base_port + 3).parse().unwrap();
+  let relay12: SocketAddr = format!("127.0.0.1:{}", base_port + 4).parse().unwrap();
   let rid = |i: u8| viewstamp_proto::ReplicaId::new(i as u16);
-  let loss = viewstamp_compio::InboundLoss::new();
 
+  let drop_one_in = Arc::new(AtomicU64::new(0));
+  let dropped = Arc::new(AtomicU64::new(0));
+  compio::runtime::spawn(lossy_relay(
+    relay02,
+    node[0],
+    node[2],
+    drop_one_in.clone(),
+    dropped.clone(),
+  ))
+  .detach();
+  compio::runtime::spawn(lossy_relay(
+    relay12,
+    node[1],
+    node[2],
+    drop_one_in.clone(),
+    dropped.clone(),
+  ))
+  .detach();
+
+  // Every path to or from node 2 goes through its relay; nodes 0 and 1 talk directly.
+  let peers_of = |id: u8| -> Vec<(viewstamp_proto::ReplicaId, SocketAddr)> {
+    match id {
+      0 => std::vec![(rid(1), node[1]), (rid(2), relay02)],
+      1 => std::vec![(rid(0), node[0]), (rid(2), relay12)],
+      _ => std::vec![(rid(0), relay02), (rid(1), relay12)],
+    }
+  };
   let mut handles = Vec::new();
   for id in 0u8..3 {
-    let peers: Vec<_> = (0u8..3)
-      .filter(|&p| p != id)
-      .map(|p| (rid(p), addrs[p as usize]))
-      .collect();
-    let (mut driver, handle) = build_driver(&ca, id, addrs[id as usize], peers).await;
-    // Node 2 is the one the network mistreats.
-    if id == 2 {
-      driver.arm_inbound_loss(loss.clone());
-    }
+    let (driver, handle) = build_driver(&ca, id, node[id as usize], peers_of(id)).await;
     compio::runtime::spawn(driver.run()).detach();
     handles.push(handle);
   }
@@ -760,11 +823,10 @@ async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
   assert_eq!(&reply[..], &1u64.to_be_bytes());
 
   // Half of everything arriving at node 2 is now dropped, for the rest of the run.
-  loss.drop_one_in(2);
+  drop_one_in.store(2, Relaxed);
 
-  // A stream of small requests: each one is a sub-packet `Prepare`, and each lost packet leaves a
-  // gap the following ones land behind. The cluster must keep committing — quorum is 2 of 3, and
-  // node 2 must not be torn down by anything other than its own losses.
+  // A stream of small requests: each is a sub-packet `Prepare`, and each lost packet leaves a gap
+  // the following ones land behind. The cluster must keep committing — quorum is 2 of 3.
   for i in 0..40u64 {
     let reply = compio::time::timeout(
       std::time::Duration::from_secs(10),
@@ -776,13 +838,13 @@ async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
     assert_eq!(&reply[..], &(i + 2).to_be_bytes());
   }
   assert!(
-    loss.dropped() > 0,
-    "the seam must actually have dropped inbound datagrams"
+    dropped.load(Relaxed) > 0,
+    "the relay must actually have dropped datagrams"
   );
 
-  // Loss stops: the lossy node has to be caught up and serving again, which a submit relayed
-  // through it proves end to end.
-  loss.drop_one_in(0);
+  // Loss stops: node 2 has to be caught up and serving again, which a submit relayed through it
+  // proves end to end.
+  drop_one_in.store(0, Relaxed);
   let reply = compio::time::timeout(
     std::time::Duration::from_secs(15),
     handles[2].submit(Bytes::from_static(b"healed")),
