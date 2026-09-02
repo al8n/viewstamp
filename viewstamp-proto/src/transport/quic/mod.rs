@@ -1144,6 +1144,13 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
 
   /// The number of live entries in the bridge's connection table (test observable for the dial-cap
   /// boundary test and the membership-range loopback: a rejected candidate must not pin a slot).
+  /// STREAM frames the connection bound to `peer` has RECEIVED — the receiver-side span count the
+  /// sender-segmentation regression measures (see [`Bridge::rx_stream_frames`]).
+  #[cfg(test)]
+  pub(crate) fn rx_stream_frames_for_test(&mut self) -> u64 {
+    self.bridge.rx_stream_frames_total()
+  }
+
   #[cfg(test)]
   pub(crate) fn bridge_table_len(&self) -> usize {
     self.bridge.table_len()

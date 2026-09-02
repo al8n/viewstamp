@@ -879,9 +879,15 @@ async fn the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_back
   let armed = driver.peers[0]
     .next_dial
     .expect("the first pass arms a deadline");
+  // The first delay must be a JITTERED base, never immediate: `jittered` schedules in
+  // `[base, base + base/4]`, so the arm lands inside that window and nowhere else.
+  let base = driver.cfg.redial_backoff_base();
+  let delay = armed.saturating_duration_since(t0);
   assert!(
-    armed > t0,
-    "the deadline is ahead of now, so no dial is due yet"
+    delay >= base && delay <= base + base / 4,
+    "the first redial must be armed a jittered base ahead ({base:?}..={:?}), not immediate; got \
+     {delay:?}",
+    base + base / 4
   );
   assert!(
     driver.coord.poll_transmit().is_none(),

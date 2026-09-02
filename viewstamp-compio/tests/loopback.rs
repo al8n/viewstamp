@@ -703,3 +703,96 @@ async fn a_parked_checkpoint_materialize_does_not_stop_the_node_committing() {
     let _ = h.shutdown().await;
   }
 }
+
+/// REAL loss on a REAL driver: the production-reachable version of the reassembly-ceiling shape.
+///
+/// The transport's stream receive window bounds an unread backlog's bytes, not the number of spans a
+/// peer segments them into, and a receiver that cannot drain past a gap accumulates one unmergeable
+/// span per arriving packet. The question this answers is whether a real driver can be walked to
+/// quinn's per-stream span ceiling that way, because the production receive entrypoint
+/// (`handle_udp`) feeds quinn AND drains it in the same call — a driver whose loop is behind leaves
+/// datagrams in the socket, not in quinn.
+///
+/// So the loss is injected where the network would inject it: BELOW `handle_udp`, at the receiving
+/// driver's socket layer, through a seam that exists only under this workspace's internal-testkit
+/// cfg. One node drops one inbound datagram in two for the whole run while the cluster commits a
+/// stream of small requests — the loss-plus-small-frames shape, at the real driver's real rate, with
+/// quinn's own loss recovery running.
+///
+/// What it pins: the cluster keeps committing through sustained 50% loss on one link, and the lossy
+/// node is caught up and serving again once the loss stops. What it MEASURES (and reports through
+/// the seam's own counter) is that this shape does not reach the ceiling: every datagram that
+/// arrives is drained in the same call, so the gap a lost packet leaves is closed by retransmission
+/// long before a span backlog can build.
+#[compio::test]
+async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
+  let ca = TestCa::new();
+  let base_port = 41100u16;
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+    .collect();
+  let rid = |i: u8| viewstamp_proto::ReplicaId::new(i as u16);
+  let loss = viewstamp_compio::InboundLoss::new();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (rid(p), addrs[p as usize]))
+      .collect();
+    let (mut driver, handle) = build_driver(&ca, id, addrs[id as usize], peers).await;
+    // Node 2 is the one the network mistreats.
+    if id == 2 {
+      driver.arm_inbound_loss(loss.clone());
+    }
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+
+  // Converge cleanly first, so the fault lands on a working cluster.
+  let reply = compio::time::timeout(
+    std::time::Duration::from_secs(10),
+    handles[0].submit(Bytes::from_static(b"warm")),
+  )
+  .await
+  .expect("initial commit within 10s")
+  .expect("a reply");
+  assert_eq!(&reply[..], &1u64.to_be_bytes());
+
+  // Half of everything arriving at node 2 is now dropped, for the rest of the run.
+  loss.drop_one_in(2);
+
+  // A stream of small requests: each one is a sub-packet `Prepare`, and each lost packet leaves a
+  // gap the following ones land behind. The cluster must keep committing — quorum is 2 of 3, and
+  // node 2 must not be torn down by anything other than its own losses.
+  for i in 0..40u64 {
+    let reply = compio::time::timeout(
+      std::time::Duration::from_secs(10),
+      handles[0].submit(Bytes::from_static(b"x")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("commit {i} under 50% loss within 10s"))
+    .expect("a reply");
+    assert_eq!(&reply[..], &(i + 2).to_be_bytes());
+  }
+  assert!(
+    loss.dropped() > 0,
+    "the seam must actually have dropped inbound datagrams"
+  );
+
+  // Loss stops: the lossy node has to be caught up and serving again, which a submit relayed
+  // through it proves end to end.
+  loss.drop_one_in(0);
+  let reply = compio::time::timeout(
+    std::time::Duration::from_secs(15),
+    handles[2].submit(Bytes::from_static(b"healed")),
+  )
+  .await
+  .expect("the healed node relays and commits within 15s")
+  .expect("a reply");
+  assert_eq!(&reply[..], &42u64.to_be_bytes());
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}

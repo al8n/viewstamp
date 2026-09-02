@@ -206,7 +206,7 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// The failure mode is a bounded reconnect, not a wedge. The whole chain — a stalled receiver
 /// refused, both ends reaping, the link redialed, and the request that was in flight completing — is
 /// driven over real mTLS by
-/// `quic::loopback::a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_operation`.
+/// `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`.
 ///
 /// Frame size is not bounded by any of this: a frame spans as many window grants as it needs, so the
 /// transport's frame ceiling ([`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), 16 MiB) is

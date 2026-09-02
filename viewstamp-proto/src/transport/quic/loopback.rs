@@ -1471,11 +1471,23 @@ fn recover_and_complete(
 /// 6. the overload is repeated from whichever replica the intervening view change left as primary,
 ///    and a further request commits after that too.
 ///
-/// Nothing here is constructed: every connection comes from a real dial and mTLS handshake, every
-/// frame from the consensus endpoint, and the close from quinn's own refusal. Removing the redial
-/// leaves step 6 with no route to rebuild and the final request never commits.
+/// Every connection here comes from a real dial and mTLS handshake, every frame from the consensus
+/// endpoint, and the close from quinn's own refusal. Removing the redial leaves step 6 with no route
+/// to rebuild and the final request never commits.
+///
+/// **Scope — what is MODELLED.** The stall itself: production's `handle_udp` feeds quinn and drains
+/// it in the same call, so a driver whose loop is behind leaves datagrams in its socket, not in
+/// quinn, and cannot produce a receiver that ACKs without draining. This test constructs that shape
+/// deliberately, because it is the shortest path to the ceiling and therefore the way to exercise
+/// what happens AFTER it. The redial schedule is likewise modelled here (armed, then dialed when
+/// due) — the real one lives in the drivers.
+///
+/// So this proves the recovery, not the reachability. The reachability question is answered on real
+/// drivers with real network loss by `viewstamp-compio`'s
+/// `a_lossy_real_link_keeps_the_cluster_committing_and_recovers`, and the redial schedule by that
+/// crate's `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff`.
 #[test]
-fn a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_operation() {
+fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation() {
   let ca = test_ca();
   let addr0 = addr(41);
   let addr1 = addr(42);
@@ -1623,9 +1635,15 @@ fn a_stalled_receiver_refused_by_the_reassembler_recovers_and_completes_its_oper
 ///   `Writable`-driven retries of a blocked stream are in the sample — no coordinator entry emits
 ///   more than a couple of short datagrams.
 ///
-/// A datagram shorter than the 1200-byte path minimum is the observable for "quinn had less than a
-/// packet's worth for this stream", which is exactly the span shape that walks a stalled receiver
-/// toward the ceiling.
+/// **Scope: newly written contiguous data.** Retransmissions are excluded — loss recovery packs
+/// disjoint ranges of already-sent data into whatever packet is going out, so one datagram can carry
+/// several short STREAM frames and the guarantee says nothing about them. The spans are therefore
+/// counted at the RECEIVER, from quinn's own `frame_rx.stream`, not inferred from datagram lengths:
+/// a datagram-length proxy would score a recovery packet as one span when it is several.
+///
+/// The alternating-loss phase then puts recovery in the sample deliberately: with every other
+/// datagram dropped, the sender is retransmitting continuously, and the receiver's span count must
+/// still stay proportional to the data — bounded recovery, not span multiplication.
 #[test]
 fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
   /// Below the 1200-byte QUIC path minimum: a datagram this small could not have been packet-filling.
@@ -1674,17 +1692,33 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     let (c, w, _) = &mut r0;
     c.handle_timeout(now, w);
   }
+  let spans_before = r1.0.rx_stream_frames_for_test();
   let (mut datagrams, mut short) = (0usize, 0usize);
-  while let Some((_, d)) = r0.0.poll_transmit() {
+  let mut batch_out: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, d)) = r0.0.poll_transmit() {
     datagrams += 1;
     if d.len() < SHORT {
       short += 1;
     }
+    if dst == addr1 {
+      batch_out.push(d);
+    }
   }
+  now = now + Duration::from_millis(1);
+  for d in &batch_out {
+    let (c, w, _) = &mut r1;
+    c.handle_udp(now, addr0, None, d, w);
+  }
+  // The direct count: STREAM frames the receiver's quinn actually parsed out of that batch.
+  let spans = r1.0.rx_stream_frames_for_test() - spans_before;
+  assert!(
+    spans <= 2,
+    "{BATCH} messages staged for one class must reach the peer as packet-filling frames plus at \
+     most one short tail; its quinn counted {spans} STREAM frames"
+  );
   assert!(
     short <= 1,
-    "{BATCH} messages staged for one class must coalesce into packet-filling frames plus at most \
-     ONE short tail; got {short} short of {datagrams} datagrams"
+    "and at most one datagram may be short: {short} of {datagrams}"
   );
   assert!(
     datagrams < BATCH / 8,
@@ -1703,6 +1737,8 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     ),
   );
   let mut worst = 0usize;
+  let mut phase_bytes = 0usize;
+  let spans_at_phase = r1.0.rx_stream_frames_for_test();
   let mut delivered = false;
   for _ in 0..40_000u64 {
     now = now + Duration::from_millis(1);
@@ -1728,6 +1764,7 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     }
     worst = worst.max(entry_short);
     for d in &to_r1 {
+      phase_bytes += d.len();
       let (c, w, _) = &mut r1;
       c.handle_udp(now, addr0, None, d, w);
     }
@@ -1750,8 +1787,82 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     delivered,
     "the large op must commit, so the measured sample really did include its blocked-stream retries"
   );
+  let phase_spans = r1.0.rx_stream_frames_for_test() - spans_at_phase;
   assert!(
-    worst <= 2,
-    "no coordinator entry may emit more than a couple of sub-packet spans for a class, got {worst}"
+    phase_spans <= (phase_bytes / SHORT) as u64 + 64,
+    "carrying a multi-megabyte frame — partial writes and Writable retries included — the receiver's \
+     span count must stay proportional to the bytes: {phase_spans} spans for {phase_bytes} B \
+     ({worst} short datagrams in the worst entry)"
+  );
+
+  // Recovery in the sample: every other datagram to r1 is dropped, so the sender is retransmitting
+  // continuously and packing disjoint ranges into single packets. The receiver's span count must
+  // stay proportional to the data it actually took, and the link must survive.
+  let spans_before = r1.0.rx_stream_frames_for_test();
+  let refusals_before = r1
+    .0
+    .conn_close_count(crate::transport::CloseCause::RecordRejected);
+  let mut delivered_bytes = 0usize;
+  let mut drop_next = false;
+  for k in 0..3_000u64 {
+    now = now + Duration::from_millis(1);
+    {
+      let (c, w, b) = &mut r0;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+      if k % 2 == 0 {
+        c.route_message_for_test(now, crate::Recipient::To(p1), &heartbeat);
+      }
+    }
+    {
+      let (c, w, b) = &mut r1;
+      c.handle_storage(now, w, b);
+      c.handle_timeout(now, w);
+    }
+    let mut to_r1: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, d)) = r0.0.poll_transmit() {
+      if dst == addr1 {
+        drop_next = !drop_next;
+        if drop_next {
+          continue;
+        }
+        to_r1.push(d);
+      }
+    }
+    for d in &to_r1 {
+      delivered_bytes += d.len();
+      let (c, w, _) = &mut r1;
+      c.handle_udp(now, addr0, None, d, w);
+    }
+    let mut to_r0: Vec<Vec<u8>> = Vec::new();
+    while let Some((dst, d)) = r1.0.poll_transmit() {
+      if dst == addr0 {
+        to_r0.push(d);
+      }
+    }
+    for d in &to_r0 {
+      let (c, w, _) = &mut r0;
+      c.handle_udp(now, addr1, None, d, w);
+    }
+  }
+  let spans = r1.0.rx_stream_frames_for_test() - spans_before;
+  assert_eq!(
+    r1.0
+      .conn_close_count(crate::transport::CloseCause::RecordRejected),
+    refusals_before,
+    "50% loss must not walk the receiver into the reassembly ceiling"
+  );
+  assert!(
+    spans > 0 && delivered_bytes > 0,
+    "the loss phase must actually have carried traffic: {spans} spans, {delivered_bytes} B"
+  );
+  // The scope limit, measured rather than asserted: recovery packs disjoint retransmit ranges into
+  // whatever packet is going out, so the receiver parses far MORE spans than the new-data ratio
+  // would give — which is exactly why the guarantee above is scoped to newly written contiguous
+  // data, and why counting datagram lengths would have shown nothing here.
+  assert!(
+    spans > (delivered_bytes / SHORT) as u64,
+    "retransmission recovery must be visible as extra spans — {spans} for {delivered_bytes} B — or \
+     this phase is not exercising the case the guarantee excludes"
   );
 }
