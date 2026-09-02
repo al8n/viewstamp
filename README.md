@@ -241,10 +241,11 @@ message-format change can never invalidate data already on disk:
   field needs no bump; a semantic break to the wire bumps `HELLO_VERSION`.
 - **Durable formats** carry their own versions
   ([`viewstamp-proto/src/storage/mod.rs`](viewstamp-proto/src/storage/mod.rs)): the
-  superblock root leads with `SUPERBLOCK_VERSION` and decodes by
-  **compatibility range** — the whole layout-compatible range
-  `1..=SUPERBLOCK_VERSION` is accepted, so a wire-only bump never strands a
-  persisted root — and each WAL slot header leads with its own `HEADER_VERSION`.
+  superblock root leads with `SUPERBLOCK_VERSION` and decodes by **exact match**
+  — the version names the durable-format contract, so a root written under any
+  superseded one is refused rather than reinterpreted — and each WAL slot header
+  leads with its own `HEADER_VERSION`. The two version lines are independent, so
+  a wire-only bump never strands a persisted root.
 
 Pre-1.0 the cluster upgrade story is **flag-day**: stop all replicas, upgrade all
 of them, restart — mixed-version clusters are rejected at connect time by the

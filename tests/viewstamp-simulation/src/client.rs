@@ -3,7 +3,7 @@ use core::time::Duration;
 use bytes::Bytes;
 use viewstamp_proto::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, ClientId, Instant, Message, Prng,
-  Request, RequestNumber, max_request_body_len,
+  ReplyOutcome, ReplyTooLarge, Request, RequestNumber, max_request_body_len,
 };
 
 use crate::batching::{BatchingClient, BatchingConfig, SubmittedBody};
@@ -56,6 +56,12 @@ pub struct ClientModel {
   /// ack-instant; the plain [`Self::replies`] record is kept untouched so the other checkers and the
   /// digest harness read it unchanged.
   replies_at: Vec<(u64, Bytes, Instant)>,
+  /// Requests answered with the terminal REFUSAL outcome instead of a body: `(request, refusal)` in
+  /// ack order. A refused request is ANSWERED — the client advances exactly as it does on a body,
+  /// and it counts toward [`Self::is_done`] — but the result is an ERROR, so it is never appended to
+  /// [`Self::replies`] where a checker or the digest would read it as a payload. Empty on every run
+  /// whose state machine keeps its replies within the bound.
+  refused: Vec<(u64, ReplyTooLarge)>,
   inflight: Option<Request>,
   /// Last instant at which the inflight request was transmitted; `None` means
   /// "not yet sent this cycle" so the next `pending` call must transmit.
@@ -93,6 +99,7 @@ impl ClientModel {
       next_request: 1,
       replies: Vec::new(),
       replies_at: Vec::new(),
+      refused: Vec::new(),
       inflight: None,
       last_sent: None,
       seed,
@@ -173,9 +180,14 @@ impl ClientModel {
     self.id
   }
 
-  /// The replies received so far.
+  /// The replies received so far, bodies only — a refused request is in [`Self::refused`].
   pub fn replies(&self) -> &[(u64, Bytes)] {
     &self.replies
+  }
+
+  /// The requests answered with the over-bound-reply REFUSAL, in ack order.
+  pub fn refused(&self) -> &[(u64, ReplyTooLarge)] {
+    &self.refused
   }
 
   /// The replies received so far, each STAMPED with the virtual instant it was acked (the `Reply`
@@ -196,8 +208,14 @@ impl ClientModel {
   pub fn is_done(&self) -> bool {
     match &self.batching {
       Some(b) => b.is_drained() && self.inflight.is_none(),
-      None => self.replies.len() as u64 == self.total,
+      None => self.answered() == self.total,
     }
+  }
+
+  /// How many of this client's requests have reached a TERMINAL outcome — a body or a refusal.
+  /// Both end the request: the op committed either way, so the client never retries it.
+  fn answered(&self) -> u64 {
+    (self.replies.len() + self.refused.len()) as u64
   }
 
   /// RETIRE this client: it permanently stops issuing/retransmitting (any in-flight request is
@@ -205,7 +223,7 @@ impl ClientModel {
   /// client leaving the system — its session row on the replicas goes idle and ages toward the
   /// deterministic cap eviction, while a freshly-spawned client takes over the load.
   pub fn retire(&mut self) {
-    self.total = self.replies.len() as u64;
+    self.total = self.answered();
     self.inflight = None;
     self.last_sent = None;
     if let Some(b) = self.batching.as_mut() {
@@ -305,20 +323,31 @@ impl ClientModel {
   }
 
   /// Handles a reply delivered at virtual instant `now`: if it matches the in-flight request, record
-  /// it (stamping the parallel ack-instant record at `now`) and advance. A batching client first
-  /// demultiplexes the reply body per unit (count + per-unit reply assertions, and the oracle's
-  /// bookkeeping) through the model.
+  /// its outcome and advance. A body is recorded as before (stamping the parallel ack-instant
+  /// record at `now`), and a batching client first demultiplexes it per unit (count + per-unit reply
+  /// assertions, and the oracle's bookkeeping) through the model.
+  ///
+  /// A REFUSAL is equally terminal: the op committed, its result is an error, and the client moves
+  /// on to its next request. It is recorded as an error outcome — never appended to the reply
+  /// history, where the reply and staleness oracles would read it as a payload the state machine
+  /// produced — and the batching demux is skipped, there being no reply batch to split.
   pub fn handle(&mut self, now: Instant, msg: Message) {
     if let Message::Reply(r) = msg
       && let Some(req) = &self.inflight
       && req.request() == r.request()
     {
-      let body = r.body_bytes();
-      if let Some(b) = self.batching.as_mut() {
-        b.on_ack(r.request().get(), &body);
+      let request = r.request().get();
+      match r.into_outcome() {
+        ReplyOutcome::Ok(body) => {
+          let body = body.into_bytes();
+          if let Some(b) = self.batching.as_mut() {
+            b.on_ack(request, &body);
+          }
+          self.replies.push((request, body.clone()));
+          self.replies_at.push((request, body, now));
+        }
+        ReplyOutcome::TooLarge(err) => self.refused.push((request, err)),
       }
-      self.replies.push((r.request().get(), body.clone()));
-      self.replies_at.push((r.request().get(), body, now));
       self.inflight = None;
       self.last_sent = None;
       self.next_request += 1;

@@ -1148,7 +1148,15 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
   compio::time::timeout(Duration::from_secs(20), async {
     loop {
       match learner_events.recv_async().await {
-        Ok(Event::Committed(c)) if c.reply() == 3u64.to_be_bytes() => break,
+        Ok(Event::Committed(c))
+          if c
+            .outcome()
+            .as_ok()
+            .map(viewstamp_proto::ReplyBody::as_bytes)
+            == Some(&3u64.to_be_bytes()[..]) =>
+        {
+          break;
+        }
         Ok(_) => {}
         Err(_) => panic!("the learner's event channel closed before it caught up"),
       }

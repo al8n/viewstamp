@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Committed, Epoch, Event, Instant, MemberId, OpNumber, Request, RequestNumber, Status,
+  ClientId, Committed, Epoch, Event, Instant, MemberId, OpNumber, ReplyOutcome, Request,
+  RequestNumber, Status,
 };
 
 use super::{InflightBudget, Pending};
@@ -19,7 +20,7 @@ fn pending_entry(
   budget: &InflightBudget,
   request: u64,
   body: Bytes,
-) -> (Pending, futures_channel::oneshot::Receiver<Bytes>) {
+) -> (Pending, futures_channel::oneshot::Receiver<ReplyOutcome>) {
   let reservation = budget
     .try_acquire(body.len())
     .expect("a fresh budget has room for one reservation");
@@ -61,11 +62,14 @@ fn deliver_completes_a_matching_pending_reply() {
     OpNumber::with(1),
     ClientId::new(1),
     RequestNumber::with(1),
-    Bytes::from_static(b"R"),
+    ReplyOutcome::from_applied(Bytes::from_static(b"R")),
   ));
   super::deliver_event(&mut pending, &events_tx, event);
 
-  assert_eq!(reply_rx.try_recv().unwrap(), Some(Bytes::from_static(b"R")));
+  assert_eq!(
+    reply_rx.try_recv().unwrap(),
+    Some(ReplyOutcome::from_applied(Bytes::from_static(b"R")))
+  );
   assert!(pending.is_empty());
   assert_eq!(
     budget.count(),
@@ -98,7 +102,7 @@ fn deliver_releases_budget_when_the_reply_receiver_is_gone() {
       OpNumber::with(1),
       ClientId::new(1),
       RequestNumber::with(1),
-      Bytes::from_static(b"R"),
+      ReplyOutcome::from_applied(Bytes::from_static(b"R")),
     )),
   );
 
@@ -246,7 +250,7 @@ fn committed(op: u64) -> Event {
     OpNumber::with(op),
     ClientId::new(1),
     RequestNumber::with(op),
-    Bytes::from_static(b"R"),
+    ReplyOutcome::from_applied(Bytes::from_static(b"R")),
   ))
 }
 
@@ -410,7 +414,7 @@ fn status_changed_retired_still_forwards_after_retire() {
 fn gate_command_on_retirement_drops_a_queued_submit() {
   let budget = default_budget();
   let reservation = budget.try_acquire(4).expect("a fresh budget has room");
-  let (reply, mut reply_rx) = futures_channel::oneshot::channel::<Bytes>();
+  let (reply, mut reply_rx) = futures_channel::oneshot::channel::<ReplyOutcome>();
   let cmd = crate::Command::Submit {
     body: Bytes::from_static(b"body"),
     reply,
@@ -495,7 +499,7 @@ fn gate_command_on_retirement_passes_non_waiting_kinds_through() {
   // Not retired: a Submit passes straight through, still owning its reservation.
   let unlatched = super::Retirement::new();
   let reservation = budget.try_acquire(1).expect("a fresh budget has room");
-  let (reply, _reply_rx) = futures_channel::oneshot::channel::<Bytes>();
+  let (reply, _reply_rx) = futures_channel::oneshot::channel::<ReplyOutcome>();
   let passed = super::gate_command_on_retirement(
     &unlatched,
     crate::Command::Submit {
@@ -545,4 +549,38 @@ fn gate_command_on_retirement_passes_non_waiting_kinds_through() {
     ),
     "AddPeer passes through even when retired (it waits on no commit)"
   );
+}
+
+/// A commit whose reply overran the bound resolves the pending submit with the REFUSAL — the same
+/// terminal outcome the wire carries — and releases its budget exactly as a body-bearing commit
+/// does. The submit is answered, not left hanging, and it is answered with an error rather than a
+/// payload the transport could not have delivered.
+#[test]
+fn deliver_answers_a_pending_submit_with_an_over_bound_refusal() {
+  let (events_tx, _events_rx) = flume::unbounded();
+  let budget = default_budget();
+  let mut pending = std::collections::HashMap::new();
+  let (entry, mut reply_rx) = pending_entry(&budget, 1, Bytes::from_static(b"q"));
+  pending.insert((ClientId::new(1), RequestNumber::with(1)), entry);
+  let max = viewstamp_proto::ReplyBody::max_len();
+  let refusal = ReplyOutcome::TooLarge(viewstamp_proto::ReplyTooLarge::new(max + 1, max));
+
+  super::deliver_event(
+    &mut pending,
+    &events_tx,
+    Event::Committed(Committed::new(
+      OpNumber::with(1),
+      ClientId::new(1),
+      RequestNumber::with(1),
+      refusal.clone(),
+    )),
+  );
+
+  assert_eq!(reply_rx.try_recv().unwrap(), Some(refusal));
+  assert!(
+    pending.is_empty(),
+    "the refused commit still drains the entry"
+  );
+  assert_eq!(budget.count(), 0, "and still releases its budget slot");
+  assert_eq!(budget.bytes(), 0);
 }

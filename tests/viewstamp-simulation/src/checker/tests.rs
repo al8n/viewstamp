@@ -466,14 +466,14 @@ fn applied(
   request: u64,
   reply: &'static [u8],
 ) -> (u64, AppliedEvent) {
-  use viewstamp_proto::{ClientId, Committed, OpNumber, RequestNumber};
+  use viewstamp_proto::{ClientId, Committed, OpNumber, ReplyOutcome, RequestNumber};
   (
     inc,
     AppliedEvent::Committed(Committed::new(
       OpNumber::with(op),
       ClientId::new(client),
       RequestNumber::with(request),
-      Bytes::from_static(reply),
+      ReplyOutcome::from_applied(Bytes::from_static(reply)),
     )),
   )
 }
@@ -554,26 +554,32 @@ fn applied_once_checker_flags_a_divergent_reply() {
 fn applied_once_checker_flags_a_lost_acked_reply() {
   // A client holds an acked reply for a request NO replica's apply stream ever carried — a
   // client-acked committed op was lost. The matching acked reply passes; a divergent one trips.
+  let ok =
+    |body: &'static [u8]| viewstamp_proto::ReplyOutcome::from_applied(Bytes::from_static(body));
   let mut once = AppliedOnceChecker::new(1);
   let s0 = vec![applied(0, 1, 7, 1, b"a")];
   assert!(once.fold(&[&s0], &HashSet::new()).is_ok());
   assert!(
-    once
-      .check_acked(&[(7, 2, Bytes::from_static(b"b"))], true)
-      .is_violation(),
+    once.check_acked(&[(7, 2, ok(b"b"))], true).is_violation(),
     "an acked-but-never-applied request must be flagged"
   );
   assert!(
-    once
-      .check_acked(&[(7, 1, Bytes::from_static(b"a"))], true)
-      .is_ok(),
+    once.check_acked(&[(7, 1, ok(b"a"))], true).is_ok(),
     "an acked reply matching the applied reply passes"
   );
   assert!(
-    once
-      .check_acked(&[(7, 1, Bytes::from_static(b"X"))], true)
-      .is_violation(),
+    once.check_acked(&[(7, 1, ok(b"X"))], true).is_violation(),
     "an acked reply disagreeing with the applied reply must be flagged"
+  );
+  // The refusal is compared as an outcome too: a client told its request was refused, where the
+  // replicas applied it to a body, is the same class of divergence as two different bodies.
+  let refused = viewstamp_proto::ReplyOutcome::TooLarge(viewstamp_proto::ReplyTooLarge::new(
+    viewstamp_proto::ReplyBody::max_len() + 1,
+    viewstamp_proto::ReplyBody::max_len(),
+  ));
+  assert!(
+    once.check_acked(&[(7, 1, refused)], true).is_violation(),
+    "an acked refusal disagreeing with the applied body must be flagged"
   );
 }
 

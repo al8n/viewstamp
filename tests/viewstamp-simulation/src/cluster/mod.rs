@@ -251,6 +251,14 @@ pub struct Cluster {
   /// `restart`/`wipe_and_restart` rebuild a replica with the same state-machine variant (the mode
   /// is cluster configuration, identical on every replica).
   batch_mode: bool,
+  /// `None` (default) ⇒ every replica's [`LogSm`] replies with the bare 8-byte applied count, so
+  /// per-seed schedules stay byte-identical. `Some(len)` ⇒ every reply is padded to exactly `len`
+  /// bytes — the reply-size lever the endpoint's reply ceiling is walked with. Set via
+  /// [`set_fixed_reply_len`](Self::set_fixed_reply_len) BEFORE running; retained so
+  /// `restart`/`wipe_and_restart` rebuild a replica with the same state machine (the reply size is
+  /// cluster configuration, identical on every replica — which is what makes the outcome every
+  /// replica derives identical too).
+  fixed_reply_len: Option<usize>,
   crashed: Vec<bool>,
   /// Per-replica RETIRED flag: `true` once this node has resolved [`Recovered::Retired`] on recover
   /// (absent from its durable membership) and is parked. A retired node stays in the vectors (so
@@ -383,6 +391,12 @@ pub struct Cluster {
   /// for legitimate traffic; the VOPR harness asserts exactly that while large bodies are exercised, so
   /// a regression that let a carrier overflow the frame would trip.
   oversized_dropped: u64,
+  /// How many messages the CLIENT link refused for exceeding one frame, counted separately from the
+  /// inter-replica [`Self::oversized_dropped`] because the two links carry different traffic and are
+  /// bounded by different mechanisms: a client `Request` by the driver's submit check, a `Reply` by
+  /// the endpoint's apply-time reply choke. With both in force this count is a FENCE, not a
+  /// tolerance — the liveness runs assert it stays zero.
+  client_link_oversized_dropped: u64,
   /// How many messages the network elected to HOLD ([`Faults::hold_per_mille`] fired) — delivery
   /// pushed [`HOLD_DELAY`] into the virtual future instead of `latency + jitter`. Monotone over the
   /// cluster's lifetime (the cluster struct persists across replica crash/restart, and nothing resets
@@ -651,6 +665,7 @@ impl Cluster {
       checkpoint_ops,
       max_client_sessions: None,
       batch_mode: false,
+      fixed_reply_len: None,
       crashed: vec![false; n],
       retired: vec![false; n],
       wiped_storage: vec![false; n],
@@ -668,6 +683,7 @@ impl Cluster {
       sb_envelope_lag: None,
       read_delay_seed: None,
       oversized_dropped: 0,
+      client_link_oversized_dropped: 0,
       holds_fired: 0,
       one_way_dropped: 0,
       slow_delays_applied: 0,
@@ -1787,6 +1803,16 @@ impl Cluster {
     self.oversized_dropped
   }
 
+  /// How many CLIENT-LINK messages were dropped for exceeding the frame cap — a `Request` on its way
+  /// to a replica, or a `Reply` on its way back. Counted apart from the inter-replica
+  /// [`Self::oversized_dropped`] because the two links are bounded by different mechanisms, and a
+  /// liveness run asserts this one stays ZERO: the driver's submit check bounds a request and the
+  /// endpoint's apply-time choke bounds a reply, so a drop here would be a message a real client
+  /// could never have heard — an ack the sim counts that no deployment could produce.
+  pub fn client_link_oversized_dropped(&self) -> u64 {
+    self.client_link_oversized_dropped
+  }
+
   /// How many messages the network has HELD so far ([`Faults::hold_per_mille`] fired: delivery pushed
   /// `HOLD_DELAY` into the virtual future). Monotone; `0` unless a fault plan with a non-zero hold
   /// rate is installed. The VOPR hold sweep asserts this fired across its seeds, so the hold lane can
@@ -2531,13 +2557,27 @@ impl Cluster {
     self.rebuild_endpoints();
   }
 
-  /// The state machine a (re)built replica runs: the variant matching the cluster's mode.
+  /// The state machine a (re)built replica runs: the variant matching the cluster's mode, carrying
+  /// the configured reply size (the batch variant seals its replies with the batch codec instead,
+  /// so the lever applies to the plain one).
   fn make_sm(&self) -> SimSm {
     if self.batch_mode {
       SimSm::Batch(BatchSm::default())
     } else {
-      SimSm::Plain(LogSm::default())
+      SimSm::Plain(match self.fixed_reply_len {
+        None => LogSm::default(),
+        Some(len) => LogSm::with_reply_len(len),
+      })
     }
+  }
+
+  /// Pad every replica's reply to exactly `len` bytes (`None` restores the bare count). Call BEFORE
+  /// running: like [`Cluster::set_batch_mode`], this REBUILDS each replica's endpoint fresh, and the
+  /// retained value makes every later `restart`/`wipe_and_restart` rebuild the same state machine —
+  /// the reply size is cluster configuration, so every replica applies to the same outcome.
+  pub fn set_fixed_reply_len(&mut self, len: Option<usize>) {
+    self.fixed_reply_len = len;
+    self.rebuild_endpoints();
   }
 
   /// Rebuilds every replica's endpoint fresh with the current cluster configuration (warm
@@ -3241,6 +3281,16 @@ impl Cluster {
   #[doc(hidden)]
   pub fn replica_sessions_evicted(&self, i: usize) -> u64 {
     self.replicas[i].sessions_evicted()
+  }
+
+  /// Test-only: how many committed ops replica `i` applied whose reply exceeded the reply bound and
+  /// was therefore delivered as the refusal. `0` on every run whose state machine keeps its replies
+  /// small; the reply-size lane drives it up on EVERY replica identically, which is the witness that
+  /// the classification is a function of the applied op and not of the replica. Mirrors the proto's
+  /// `Endpoint::replies_too_large`.
+  #[doc(hidden)]
+  pub fn replica_replies_too_large(&self, i: usize) -> u64 {
+    self.replicas[i].replies_too_large()
   }
 
   /// Test-only: how many NON-EMPTY `RepairBatch`es replica `i` served answering peers'
@@ -4194,12 +4244,26 @@ impl Cluster {
       // inter-replica wire enforces the SAME cap the real transport does (the message-VOPR runs
       // without the transport). Header-only view-change carriers + the byte-bounded `RepairBatch` keep
       // every legitimate peer message at/below the cap, so a drop here is a REAL bug — a carrier
-      // overflowed the frame. Only `replica → replica`
-      // traffic is capped (client↔replica is a different path, not dropped — what the transport drops).
+      // overflowed the frame.
       if msg.encoded_len() > viewstamp_proto::MAX_FRAME_LEN as usize {
         self.oversized_dropped += 1;
         return;
       }
+    }
+    // The SAME guard on the CLIENT link, both directions — a `Request` to a replica and a `Reply`
+    // back. The real transport frames client traffic exactly as it frames peer traffic, so a message
+    // over the cap never arrives; modelling only the peer link let the sim ack a client with a reply
+    // no deployment could have delivered. Counted separately (the two links are bounded by different
+    // mechanisms: the driver's submit check for a request, the endpoint's apply-time reply choke for
+    // a reply) and asserted ZERO by the liveness runs — with both bounds in force this is a fence,
+    // not a tolerance. Pure observation: no PRNG draw, so every schedule stays byte-identical.
+    if matches!(
+      (from, target),
+      (Peer::Client(_), Target::Replica(_)) | (Peer::Replica(_), Target::Client(_))
+    ) && msg.encoded_len() > viewstamp_proto::MAX_FRAME_LEN as usize
+    {
+      self.client_link_oversized_dropped += 1;
+      return;
     }
     if self.faults.drop_per_mille > 0 && self.prng.chance(self.faults.drop_per_mille, 1000) {
       return;

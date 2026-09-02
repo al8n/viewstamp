@@ -46,7 +46,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use viewstamp_proto::{BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, ReplyView};
+use viewstamp_proto::{
+  BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, ReplyBody, ReplyView,
+};
 
 use crate::{
   DriverError, Handle,
@@ -255,6 +257,11 @@ pub enum ReplyLostReason {
   /// positional pairing of results to units is trustworthy.
   #[error("the committed reply's unit count does not match the request batch")]
   ReplyCountMismatch,
+  /// The state machine's reply for the committed body exceeded the reply bound, so the endpoint
+  /// delivered a refusal in its place and there is no reply batch to demultiplex. Every replica
+  /// derives the same refusal, so no retry recovers the results.
+  #[error("the committed reply exceeded the largest deliverable reply body")]
+  ReplyTooLarge,
 }
 
 impl ReplyLostReason {
@@ -264,6 +271,7 @@ impl ReplyLostReason {
     match self {
       Self::MalformedReply => "malformed_reply",
       Self::ReplyCountMismatch => "reply_count_mismatch",
+      Self::ReplyTooLarge => "reply_too_large",
     }
   }
 }
@@ -340,11 +348,12 @@ fn encoded_request_len(lens: impl Iterator<Item = usize>) -> Option<usize> {
 
 /// The most units one body may carry under the reply budget: admitting `n` units prices the
 /// worst-case reply at `BATCH_COUNT_OVERHEAD + n * (BATCH_UNIT_OVERHEAD + max_unit_reply_len)`,
-/// which must fit `max_reply_body_len()`. Zero when even one ceiling-priced reply cannot fit —
+/// which must fit [`ReplyBody::max_len`] — the one definition of the reply ceiling, the same one
+/// the endpoint's apply-time choke enforces. Zero when even one ceiling-priced reply cannot fit —
 /// every submit then refuses at the handle.
 fn max_units_per_body(max_unit_reply_len: usize) -> usize {
   let per_unit = max_unit_reply_len.saturating_add(BATCH_UNIT_OVERHEAD);
-  viewstamp_proto::max_reply_body_len().saturating_sub(BATCH_COUNT_OVERHEAD) / per_unit
+  ReplyBody::max_len().saturating_sub(BATCH_COUNT_OVERHEAD) / per_unit
 }
 
 /// The per-body limits snapshotted at construction, shared verbatim by the [`BatchHandle`]s
@@ -859,6 +868,12 @@ fn submit_failure(err: &DriverError) -> BatchError {
     // would license a double-apply.
     DriverError::Retired { .. } => BatchError::OutcomeUnknown {
       reason: OutcomeUnknownReason::Driver,
+    },
+    // The body COMMITTED and applied; only its reply was refused for exceeding the reply bound. The
+    // class is therefore committed-reply-lost, not unknown: every unit in the packed body ran, so
+    // resubmitting a non-idempotent one double-applies it.
+    DriverError::ReplyTooLarge { .. } => BatchError::CommittedReplyLost {
+      reason: ReplyLostReason::ReplyTooLarge,
     },
     // A submit error this aggregator does not know cannot prove the body stayed out of
     // consensus; the conservative class is unknown, never a false `Refused`.

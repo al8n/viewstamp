@@ -275,6 +275,8 @@ fn vopr_sweep_no_violations() {
   // summary too).
   let mut total_large_bodies = 0u64;
   let mut total_oversized_dropped = 0u64;
+  let mut total_client_link_oversized_dropped = 0u64;
+  let mut total_replies_too_large = 0u64;
   // Non-vacuity witnesses: the header-only view-change/recovery carriers, the byte-bounded
   // `RepairBatch` serve, and the floored canonical union must all genuinely FIRE somewhere across the
   // sweep — otherwise those consensus paths are green only because they were never reached.
@@ -352,6 +354,8 @@ fn vopr_sweep_no_violations() {
     total_misdirects += r.misdirects_fired();
     total_large_bodies += r.large_bodies_sent();
     total_oversized_dropped += r.oversized_dropped();
+    total_client_link_oversized_dropped += r.client_link_oversized_dropped();
+    total_replies_too_large += r.replies_too_large();
     total_header_only_carriers += r.header_only_carriers_emitted();
     total_repair_batches += r.repair_batches_served();
     total_prepare_batches += r.prepare_batches_sent();
@@ -516,6 +520,25 @@ fn vopr_sweep_no_violations() {
        overflowed the frame (the old full-body view-change bug, or an incomplete bound); this is a REAL \
        bug to fix, NOT to mask by loosening the cap"
     );
+    // The CLIENT link's half of the same cap, with the same verdict. Both directions are bounded by
+    // construction — a request at driver submit, a reply by the endpoint's apply-time choke — so this
+    // is a FENCE, not a tolerance: a drop means the sim acked a client with a message the transport
+    // would refuse, which is an outcome no deployment can produce.
+    assert_eq!(
+      total_client_link_oversized_dropped, 0,
+      "a client-link message exceeded MAX_FRAME_LEN and was dropped \
+       ({total_client_link_oversized_dropped} across the sweep) — a request escaped the submit bound \
+       or a reply escaped the apply-time reply choke, so the sweep acked clients with messages no \
+       real transport would carry"
+    );
+    // The choke's own inertness on this lane: the sweep's state machine replies with the 8-byte
+    // applied count, far inside the bound, so no reply may ever be refused. A non-zero count means
+    // the classification fired where it should not — the ceiling moved, or a reply grew unbounded.
+    assert_eq!(
+      total_replies_too_large, 0,
+      "the sweep refused {total_replies_too_large} replies as over-bound, but its state machine \
+       replies with 8 bytes — the reply ceiling or the applied reply has changed"
+    );
     // These consensus paths must genuinely FIRE under the combined-fault schedule (sweep-level
     // evidence, not just focused unit gates):
     // - HEADER-ONLY CARRIERS: every `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows
@@ -616,6 +639,8 @@ fn vopr_sweep_no_violations() {
      bounded_seeds={bounded_seeds} wal_stalls={total_wal_stalls} misdirects={total_misdirects} \
      forced_syncs={total_forced_syncs} max_recovered_band={max_recovered_band} \
      large_bodies={total_large_bodies} oversized_dropped={total_oversized_dropped} \
+     client_link_oversized_dropped={total_client_link_oversized_dropped} \
+     replies_too_large={total_replies_too_large} \
      header_only_carriers={total_header_only_carriers} repair_batches={total_repair_batches} \
      prepare_batches={total_prepare_batches} \
      unions_floored={total_unions_floored} \
@@ -2183,7 +2208,8 @@ fn replay_single_seed() {
     "vopr seed {} OK: ticks={} replicas={} clients={} max_committed={} crashes={} restarts={} \
      partitions={} heals={} calm_windows={} max_view={} all_clients_done={} \
      wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} \
-     bounded_seed_wrapped={} large_bodies={} oversized_dropped={} permanent_faults_refused={}",
+     bounded_seed_wrapped={} large_bodies={} oversized_dropped={} \
+     client_link_oversized_dropped={} replies_too_large={} permanent_faults_refused={}",
     r.seed(),
     r.ticks(),
     r.replicas(),
@@ -2202,6 +2228,8 @@ fn replay_single_seed() {
     r.bounded_seed_wrapped(),
     r.large_bodies_sent(),
     r.oversized_dropped(),
+    r.client_link_oversized_dropped(),
+    r.replies_too_large(),
     r.permanent_faults_refused(),
   );
 }

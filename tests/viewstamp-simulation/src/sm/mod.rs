@@ -144,15 +144,43 @@ pub fn materialize_sm<S: StateMachine>(sm: &S, store: &mut dyn BlockStore) -> Bl
 /// A deterministic state machine that records the sequence of applied operations.
 /// The reply is the post-apply length encoded as 8 big-endian bytes — enough for
 /// the linearizability checker to verify ordering and uniqueness.
+///
+/// [`reply_len`](Self::with_reply_len) is the REPLY-SIZE lever: with it set, every reply is padded
+/// to exactly that many bytes (the count still leading), which walks the endpoint's reply ceiling
+/// from a body that ships to one the endpoint refuses without changing anything else about the run.
+/// Unset (the default) the reply is the bare 8-byte count, so no schedule moves.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LogSm {
   applied: Vec<(u64, Bytes)>,
+  reply_len: Option<usize>,
 }
 
 impl LogSm {
+  /// A recorder whose every reply is padded to exactly `reply_len` bytes.
+  pub const fn with_reply_len(reply_len: usize) -> Self {
+    Self {
+      applied: Vec::new(),
+      reply_len: Some(reply_len),
+    }
+  }
+
   /// The ordered list of applied `(op, body)` pairs.
   pub fn applied(&self) -> &[(u64, Bytes)] {
     &self.applied
+  }
+
+  /// This SM's reply for its `count`-th applied op: the count as 8 big-endian bytes, padded with
+  /// zeroes to the configured length when one is set.
+  fn reply_for(&self, count: u64) -> Bytes {
+    let leading = count.to_be_bytes();
+    match self.reply_len {
+      None => Bytes::from(leading.to_vec()),
+      Some(len) => {
+        let mut reply = std::vec![0u8; len.max(leading.len())];
+        reply[..leading.len()].copy_from_slice(&leading);
+        Bytes::from(reply)
+      }
+    }
   }
 }
 
@@ -161,7 +189,7 @@ impl StateMachine for LogSm {
 
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), Bytes::copy_from_slice(body)));
-    Bytes::from((self.applied.len() as u64).to_be_bytes().to_vec())
+    self.reply_for(self.applied.len() as u64)
   }
 
   fn checkpoint_image(&self) -> Self::Image {
@@ -178,7 +206,12 @@ impl StateMachine for LogSm {
   }
 
   fn restore_seed(&self) -> Self {
-    LogSm::default()
+    // The reply length is CONFIGURATION, not checkpoint content: the seed carries it forward so a
+    // restored replica keeps producing the same replies as the one it synced from.
+    LogSm {
+      applied: Vec::new(),
+      reply_len: self.reply_len,
+    }
   }
 
   fn restore(&mut self, root: BlockAddress, store: &VerifiedView<'_>) -> Result<(), RestoreError> {

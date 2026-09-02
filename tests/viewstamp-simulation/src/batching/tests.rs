@@ -146,14 +146,14 @@ fn seeded_emission_is_deterministic_and_spends_the_budget() {
 
 /// One fabricated apply-stream entry: op `op` committed `(client, request)`.
 fn committed(op: u64, client: u128, request: u64) -> (u64, AppliedEvent) {
-  use viewstamp_proto::{ClientId, Committed, OpNumber, RequestNumber};
+  use viewstamp_proto::{ClientId, Committed, OpNumber, ReplyOutcome, RequestNumber};
   (
     0,
     AppliedEvent::Committed(Committed::new(
       OpNumber::with(op),
       ClientId::new(client),
       RequestNumber::with(request),
-      Bytes::new(),
+      ReplyOutcome::from_applied(Bytes::new()),
     )),
   )
 }

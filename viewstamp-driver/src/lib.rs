@@ -71,6 +71,20 @@ pub enum DriverError {
     "request body exceeds the largest deliverable size (frame limit minus protocol overhead)"
   )]
   RequestTooLarge,
+  /// The request COMMITTED and was applied, but the state machine's reply exceeded
+  /// [`viewstamp_proto::max_reply_body_len()`](viewstamp_proto::max_reply_body_len) — the largest
+  /// body a single `Reply` can frame — so the endpoint delivered the terminal refusal in its place.
+  /// The mutation happened and cannot be undone; the RESULT is what was lost. Resubmitting a
+  /// non-idempotent request would apply it a second time, so the remedy is to read the result out of
+  /// band and to bound the state machine's replies. Every replica derives this identically, so no
+  /// retry against another node returns a body either.
+  #[error("request committed but its {len}-byte reply exceeds the {max}-byte reply bound")]
+  ReplyTooLarge {
+    /// The length of the reply the state machine returned.
+    len: usize,
+    /// The bound it was refused against.
+    max: usize,
+  },
   /// Binding the UDP socket failed.
   #[error("binding the UDP socket failed: {0}")]
   Bind(#[source] std::io::Error),

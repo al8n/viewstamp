@@ -4,6 +4,7 @@ use crate::{
   session::{InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES, Retirement},
 };
 use bytes::Bytes;
+use viewstamp_proto::ReplyOutcome;
 
 /// `Handle` must stay `Send + Sync`: it is the one object meant to cross threads (any thread may
 /// `submit` to any group), so the command-sender wrapping may not cost it either auto trait.
@@ -76,9 +77,51 @@ fn submit_sends_a_command_carrying_its_reply_channel() {
       // The submit carries its budget reservation guard with the command (released on drop).
       drop(reservation);
       // Completing the reply channel is what `submit` awaits.
-      let _ = reply.send(Bytes::from_static(b"world"));
+      let _ = reply.send(ReplyOutcome::from_applied(Bytes::from_static(b"world")));
     }
     other => panic!("expected Submit, got {other:?}"),
+  }
+}
+
+/// A committed op whose reply overran the reply bound resolves the submit as a typed ERROR, not as
+/// bytes. This is the local/remote parity the wire already declares: a remote client decoding the
+/// same `Reply` sees the same refusal, so a node-local caller must never be handed a payload the
+/// transport would have refused to carry.
+#[test]
+fn submit_maps_an_over_bound_reply_to_a_typed_error() {
+  let (tx, mut rx) = futures_channel::mpsc::channel::<Command>(8);
+  let (_events_tx, events_rx) = flume::unbounded();
+  let handle = Handle::new(
+    tx,
+    events_rx,
+    InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES),
+    Retirement::new(),
+  );
+  let max = viewstamp_proto::ReplyBody::max_len();
+
+  let fut = handle.submit(Bytes::from_static(b"hello"));
+  futures_util::pin_mut!(fut);
+  let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+  assert!(std::future::Future::poll(fut.as_mut(), &mut cx).is_pending());
+
+  match rx.try_recv().expect("a command was enqueued") {
+    Command::Submit {
+      reply, reservation, ..
+    } => {
+      drop(reservation);
+      let _ = reply.send(ReplyOutcome::TooLarge(viewstamp_proto::ReplyTooLarge::new(
+        max + 1,
+        max,
+      )));
+    }
+    other => panic!("expected Submit, got {other:?}"),
+  }
+
+  match std::future::Future::poll(fut, &mut cx) {
+    std::task::Poll::Ready(Err(DriverError::ReplyTooLarge { len, max: bound })) => {
+      assert_eq!((len, bound), (max + 1, max));
+    }
+    other => panic!("expected ReplyTooLarge, got {other:?}"),
   }
 }
 
