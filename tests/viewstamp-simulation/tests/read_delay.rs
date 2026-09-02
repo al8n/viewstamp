@@ -1,26 +1,26 @@
 //! The WAL read-delay axis, driven to the state it exists to reach: a recovery read still
-//! outstanding when its op's retransmission budget runs out.
+//! outstanding long after every cadence tick the retry discipline could ever spend.
 //!
-//! The synchronous in-memory WAL resolves every read in the call that submitted it. A recovery read
-//! therefore always beats the proto's read budget, an op never resolves from its durable header with
-//! a live correlation, and everything an endpoint does with a completion arriving after that point is
-//! unreachable — the carried-correlation lane, its identity and durability gates, its append barrier,
-//! and the promoted head's restore. [`Cluster::set_wal_read_delay`] gives reads a latency, with a
-//! seeded minority of slots answering only past the whole budget.
+//! The synchronous in-memory WAL resolves every read in the call that submitted it, so the WAIT the
+//! proto's recovery runs on — a read that has not completed is outstanding, not failed; no cadence
+//! tick spends the failure budget on it; the recovery stays open until its verdict delivers — is
+//! vacuous at every seed. [`Cluster::set_wal_read_delay`] gives reads a latency, with a seeded
+//! minority of slots answering only past the whole per-op retry allowance, so the wait becomes the
+//! load-bearing path.
 //!
-//! The subject here is a SOLO voter, because it makes the argument causal rather than circumstantial.
-//! A solo voter has no peer to solicit, cannot state-sync, and (being alone) cannot escalate a
-//! `RecoveringHead` wedge into a view change — so an op its recovery kept as a header-only hole, or a
-//! head its recovery could not identify, has exactly ONE possible source for its body anywhere in the
-//! system: the medium's own late read. If that lane did not execute, the replica would sit below the
-//! hole forever. The control run with the axis off is included in the same test, so what the axis
-//! changes is visible rather than asserted.
+//! The subject here is a SOLO voter, because it makes the argument causal rather than
+//! circumstantial. A solo voter has no peer to solicit, cannot state-sync, and (being alone) cannot
+//! escalate into a view change — so an op whose read is slow has exactly ONE possible resolution
+//! anywhere in the system: the medium's own delivered verdict. If the recovery gave up on the wait,
+//! the replica would either strand the op behind peer repair no donor answers or distrust a head
+//! its own disk still holds; waiting is what lets it resume whole. The control run with the axis
+//! off is included in the same test, so what the axis changes is visible rather than asserted.
 
 use core::time::Duration;
 
 use viewstamp_simulation::{
   Cluster,
-  storage::{READ_DELAY_SPAN, READ_STALL_FLOOR, RECOVERY_READ_BUDGET},
+  storage::{READ_STALL_FLOOR, RECOVERY_READ_BUDGET},
 };
 
 /// The read-delay base for these lanes. Per-replica derivation happens inside the cluster, so this is
@@ -43,7 +43,7 @@ struct Cycle {
   before_commit: u64,
   /// The commit frontier it reached by the end of the run.
   after_commit: u64,
-  /// Beyond-budget reads that delivered BYTES — the only completions a carried correlation can admit.
+  /// Beyond-allowance reads that delivered BYTES — completions only the wait can have consumed.
   late_bodies: u64,
   /// The distinct statuses the replica entered after the restart, in order.
   statuses: Vec<String>,
@@ -100,11 +100,11 @@ fn solo_cycle(seed: u64, armed: bool) -> Cycle {
 }
 
 #[test]
-fn a_solo_voter_recovers_a_hole_only_its_own_late_read_can_fill() {
-  // Seed 9's degraded slots land on INTERIOR ops of the recovery window: the reads exhaust their
-  // budget, the ops are kept as header-only holes, recovery completes, and the replica returns to
-  // Normal — but with holes below its commit frontier that it can fill from nowhere but its own
-  // still-outstanding reads.
+fn a_solo_voter_waits_out_slow_interior_reads_and_rejoins_whole() {
+  // Seed 9's degraded slots land on INTERIOR ops of the recovery window. The recovery WAITS on
+  // them: cadence ticks spend nothing on an outstanding read, so no op resolves header-only, no
+  // hole survives into Normal, and the replica rejoins only once every delivered verdict has
+  // landed — carrying the full committed tail it recovered from its own disk.
   const SEED: u64 = 9;
 
   let control = solo_cycle(SEED, /*armed*/ false);
@@ -122,93 +122,87 @@ fn a_solo_voter_recovers_a_hole_only_its_own_late_read_can_fill() {
     .expect("the control run resumes committing");
   assert!(
     control_resumed < RECOVERY_READ_BUDGET,
-    "the control resumed after {control_resumed:?}, past the recovery read budget — the fixture is \
-     not measuring what the axis changes"
+    "the control resumed after {control_resumed:?}, past the whole retry allowance — the fixture \
+     is not measuring what the axis changes"
   );
 
   let armed = solo_cycle(SEED, /*armed*/ true);
   assert!(
     armed.late_bodies > 0,
-    "seed {SEED}: no read outlived the recovery read budget with bytes to deliver — the axis is \
+    "seed {SEED}: no read outlived the retry allowance with bytes to deliver — the axis is \
      vacuous here and this lane proves nothing"
   );
+  assert_eq!(
+    armed.statuses,
+    vec!["recovering".to_string(), "normal".to_string()],
+    "seed {SEED}: the replica waits in Recovering until every verdict lands, then rejoins whole — \
+     it neither rejoins early over open holes nor distrusts a head its own reads still owe"
+  );
   let normal_at = armed.normal_at.expect("the armed run reaches Normal");
+  // The whole argument: recovery could not have finished before the earliest instant a stalled
+  // read comes due, because finishing REQUIRES that read's verdict — the wait is load-bearing.
+  assert!(
+    normal_at >= READ_STALL_FLOOR,
+    "seed {SEED}: recovery finished after {normal_at:?}, before the earliest instant a stalled \
+     read can come due ({READ_STALL_FLOOR:?}) — it cannot have waited for the stalled verdicts"
+  );
   let resumed_at = armed.resumed_at.expect("the armed run resumes committing");
-  // The whole argument: the replica was BACK IN SERVICE (`Normal`, its recovery finished, its read
-  // budget spent) and STILL could not advance its commit frontier until well past the point any
-  // in-budget read could have answered. On a cluster with no second node, the body that unblocked it
-  // came from its own medium, arriving after the recovery loop stopped waiting for it.
   assert!(
-    normal_at > READ_DELAY_SPAN,
-    "seed {SEED}: recovery finished after {normal_at:?}, within the healthy read band \
-     {READ_DELAY_SPAN:?} — every op resolved off a prompt read, so none reached its resolution with \
-     a read still outstanding"
-  );
-  assert!(
-    resumed_at > normal_at,
-    "seed {SEED}: the commit frontier advanced at {resumed_at:?}, at or before recovery finished at \
-     {normal_at:?} — nothing was ever held below a hole"
-  );
-  assert!(
-    resumed_at >= READ_STALL_FLOOR,
-    "seed {SEED}: the commit frontier advanced at {resumed_at:?}, before the earliest instant a \
-     stalled read can come due ({READ_STALL_FLOOR:?}) — the hole was filled by a prompt read, not a \
-     late one"
+    resumed_at >= normal_at,
+    "seed {SEED}: the commit frontier advanced at {resumed_at:?}, before recovery finished at \
+     {normal_at:?} — a recovering replica must not commit"
   );
   assert!(
     armed.after_commit > armed.before_commit,
-    "seed {SEED}: the solo voter never committed past {} after the restart — the hole was never \
-     filled, so the late-read lane did not run",
+    "seed {SEED}: the solo voter never committed past {} after the restart — the wait did not \
+     resume service",
     armed.before_commit
   );
   println!(
-    "solo interior hole: control resumed at {control_resumed:?}; armed reached Normal at \
+    "solo interior stalls: control resumed at {control_resumed:?}; armed reached Normal at \
      {normal_at:?} and resumed at {resumed_at:?} with {} late bodies, commit {} -> {}",
     armed.late_bodies, armed.before_commit, armed.after_commit
   );
 }
 
 #[test]
-fn a_solo_voters_unidentifiable_head_is_restored_by_its_own_late_read() {
-  // Seed 2's degraded slot is the HEAD of the recovery window. Its reads exhaust their budget too,
-  // but a head whose identity recovery could not establish is not kept as a log entry — it is
-  // promoted out of the log and the replica enters `RecoveringHead`, where it solicits a peer to
-  // re-establish the head. A SOLO voter has no peer to answer, and the re-formation escalation
-  // refuses a single-voter cluster outright (there is no quorum to re-form among), so the status is
-  // terminal for every source but one: the medium's own outstanding read of that very slot.
+fn a_solo_voters_slow_head_read_never_routes_through_recovering_head() {
+  // Seed 2's degraded slot is the HEAD of the recovery window. A head whose read is merely slow is
+  // not an unidentifiable head — its identity is owed by an outstanding read the medium must
+  // answer — so the recovery WAITS instead of promoting it faulty: `RecoveringHead` (a status that
+  // solicits a peer a solo voter does not have) is never entered, and the head resolves from the
+  // delivered verdict.
   const SEED: u64 = 2;
 
   let control = solo_cycle(SEED, /*armed*/ false);
   assert_eq!(
     control.statuses,
     vec!["normal".to_string()],
-    "with reads resolving inline the head is always identified inside the budget"
+    "with reads resolving inline the head is always identified in the first drain"
   );
 
   let armed = solo_cycle(SEED, /*armed*/ true);
   assert!(
-    armed.statuses.iter().any(|s| s == "recovering_head"),
-    "seed {SEED}: the restart never entered RecoveringHead (statuses {:?}) — the head slot's reads \
-     did not outlive the budget, so the restore lane was not reached",
+    !armed.statuses.iter().any(|s| s == "recovering_head"),
+    "seed {SEED}: the restart entered RecoveringHead (statuses {:?}) — a merely-slow head read \
+     was treated as an unidentifiable head instead of being waited on",
     armed.statuses
   );
   assert_eq!(
-    armed.statuses.last().map(String::as_str),
-    Some("normal"),
-    "seed {SEED}: the solo voter never left RecoveringHead (statuses {:?}) — with no peer to \
-     re-establish the head and no escalation available to a single voter, only its own late read \
-     could have, and it did not",
-    armed.statuses
+    armed.statuses,
+    vec!["recovering".to_string(), "normal".to_string()],
+    "seed {SEED}: the replica waits in Recovering until the head's verdict lands, then rejoins"
   );
   assert!(
     armed.late_bodies > 0,
-    "seed {SEED}: the replica left RecoveringHead without any beyond-budget read delivering bytes"
+    "seed {SEED}: no beyond-allowance read delivered bytes — the head's read never genuinely \
+     outlived the retry allowance, so this lane proves nothing"
   );
   let normal_at = armed.normal_at.expect("the armed run reaches Normal");
   assert!(
     normal_at > RECOVERY_READ_BUDGET,
-    "seed {SEED}: RecoveringHead ended after {normal_at:?}, inside the {RECOVERY_READ_BUDGET:?} \
-     read budget"
+    "seed {SEED}: recovery finished after {normal_at:?}, inside the {RECOVERY_READ_BUDGET:?} \
+     retry allowance — the head cannot have been waited out past it"
   );
   assert!(
     armed.after_commit > armed.before_commit,
@@ -216,7 +210,7 @@ fn a_solo_voters_unidentifiable_head_is_restored_by_its_own_late_read() {
     armed.before_commit
   );
   println!(
-    "solo promoted head: statuses {:?}, back to Normal at {normal_at:?} with {} late bodies, \
+    "solo slow head: statuses {:?}, back to Normal at {normal_at:?} with {} late bodies, \
      commit {} -> {}",
     armed.statuses, armed.late_bodies, armed.before_commit, armed.after_commit
   );

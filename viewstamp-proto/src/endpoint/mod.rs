@@ -6980,9 +6980,9 @@ where
         self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
         self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
       }
-      // Recovering: re-submit any still-outstanding/faulty WAL-tail (+ checkpoint) reads on a cadence,
-      // so the loop terminates however late a real async driver's completions arrive, and a
-      // transient fault gets the later read that clears it.
+      // Recovering: re-observe the read phase on a cadence — re-reading any op (or the checkpoint)
+      // whose prior attempt completed and failed, so a transient fault gets the later read that
+      // clears it; an outstanding read is waited on, never re-submitted over.
       Status::Recovering => {
         let recover_retry = now + RECOVER_READ_RETRANSMIT;
         self.timers.recover_retry =

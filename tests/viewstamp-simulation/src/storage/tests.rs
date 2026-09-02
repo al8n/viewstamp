@@ -1699,9 +1699,9 @@ fn every_read_of_a_degraded_slot_is_late_however_often_it_is_retried() {
 fn a_held_read_resolves_exactly_once_even_over_a_truncated_slot() {
   // A delay is a latency model, never a drop: the trait owes every submitted read exactly one
   // completion, and `truncate`/`prune` report cancelled WRITES only. So a read still in flight when
-  // its slot is trimmed away still delivers the bytes it captured — which is precisely the
-  // "captured before a later write mutated the slot" case an endpoint's carried-body durability
-  // witness exists to judge — and delivers them once.
+  // its slot is trimmed away still delivers the bytes it captured — the capture-before-mutation
+  // schedule the `Wal` read contract permits, re-classified by whoever consumes the verdict — and
+  // delivers them once.
   let (degraded, _) = degraded_and_healthy_ops(READ_DELAY_SEED);
   let mut w = InMemoryWal::new();
   w.set_read_delay(Some(READ_DELAY_SEED));

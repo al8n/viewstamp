@@ -49,9 +49,8 @@
 //! [`vopr_block_fault_sweep_no_violations`] fails durability barriers and faults reconstruct reads,
 //! under the standing oracle that no durable checkpoint root ever names an un-flushed block. A
 //! committed READ-DELAY sweep ([`vopr_read_delay_sweep_no_violations`]) gives WAL reads a latency, so
-//! a recovery read can still be outstanding when its op's retransmission budget runs out — the state
-//! the endpoint's carried-correlation lane exists for, and one a WAL that answers inline can never
-//! produce. A
+//! a recovery read is genuinely outstanding across cadence ticks — the state the recovery WAIT
+//! exists for, and one a WAL that answers inline can never produce. A
 //! committed CROSSED sweep ([`vopr_swap_root_rebuild_sweep_no_violations`]) runs the
 //! live-reconfiguration axis and the in-place endpoint rebuild TOGETHER, which no single-axis lane
 //! does, and TARGETS the one window where they meet: a rebuild taken while a committed
@@ -1162,29 +1161,27 @@ const READ_DELAY_SEEDS: u64 = 16;
 /// race other tests in this process and cannot be forgotten by a runner).
 ///
 /// Every other lane's WAL resolves a read in the call that submitted it. That makes a LATE read
-/// structurally impossible: a recovery read can never still be outstanding when its op's
-/// retransmission budget runs out, so an op never resolves from its durable header with a live
-/// correlation, and everything an endpoint does with a completion arriving after that point — the
-/// carried-correlation lane, its placement/identity gates, its current-durability witness, its
-/// `RepairFill` append barrier, and the promoted head's restore — sits unreachable at every seed of
-/// every sweep. This lane gives reads a latency: most slots answer within a fraction of the recover
-/// cadence, and a seeded minority are DEGRADED and answer only past the whole budget — for EVERY read
-/// of them, which is what an op needs to reach its resolution with all nine correlations live.
+/// structurally impossible: a recovery read is never outstanding when a cadence tick fires, so the
+/// WAIT the proto's recovery runs on — an outstanding read spends no budget and is waited out
+/// until its verdict delivers — sits vacuous at every seed of every sweep. This lane gives reads a
+/// latency: most slots answer within a fraction of the recover cadence, and a seeded minority are
+/// DEGRADED and answer only past the whole failure-driven retry allowance — for EVERY read of
+/// them, so a recovery over one provably holds its read phase open across many ticks and consumes
+/// the eventual verdict where a prompt one would have been consumed.
 ///
 /// The EXISTING oracles judge the outcome every tick — committed-loss (durability),
 /// applied-divergence (agreement), append-before-ack, durable-view, boundedness, plus the
-/// liveness/final-quiesce gates — so a panic here is a REAL finding in the late-read lane, reported
+/// liveness/final-quiesce gates — so a panic here is a REAL finding in the wait path, reported
 /// with its seed, never masked. The DEFAULT sweep leaves this axis OFF (a latency is a schedule
 /// change, so enabling it would move every pinned seed); delay-enabled runs are their own
 /// deterministic baselines, byte-identical to `VOPR_READ_DELAY=1` runs of the same seeds.
 ///
 /// What this lane can assert cross-seed is that the medium genuinely REACHED the state — reads
-/// outliving the budget, with bytes to deliver. That an endpoint then CONSUMED one on its carried
-/// correlation is proved causally instead, by the deterministic `read_delay.rs` lanes: a SOLO voter,
-/// which has no peer to solicit, no donor to sync from, and no escalation available to a
-/// single-voter cluster, is left holding a header-only hole (and, on the head, an unidentifiable
-/// slot) that nothing in the system but its own late read can answer — and it resumes committing,
-/// hundreds of milliseconds after its recovery finished.
+/// outliving the whole retry allowance, with bytes to deliver. That an endpoint then CONSUMED one
+/// through the wait is proved causally instead, by the deterministic `read_delay.rs` lanes: a SOLO
+/// voter, which has no peer to solicit, no donor to sync from, and no escalation available to a
+/// single-voter cluster, waits out its own slow reads — interior and head alike — and rejoins
+/// whole, resuming commits only after the last stalled verdict landed.
 #[test]
 fn vopr_read_delay_sweep_no_violations() {
   let seeds = axis_sweep_seed_count(READ_DELAY_SEEDS);
@@ -1233,30 +1230,30 @@ fn vopr_read_delay_sweep_no_violations() {
     "the read-delay axis never delayed a read across the sweep (wal_reads_delayed={total_delayed}) \
      — the plan is not plumbed through to the media"
   );
-  // Non-vacuity, second half — the one that matters. A read that OUTLIVES the recovery read budget is
-  // the whole point: it is necessarily still outstanding when its op resolves from its durable
-  // header, so the resolution carries a live correlation into online repair. A sweep where every
-  // delay stayed inside the budget would exercise nothing the synchronous default does not.
+  // Non-vacuity, second half — the one that matters. A read that OUTLIVES the whole retry
+  // allowance is the point: no failure-driven re-read can explain its consumption, so a recovery
+  // that consumed it provably WAITED across every cadence tick the allowance spans. A sweep where
+  // every delay stayed inside the allowance would exercise nothing the synchronous default does not.
   assert!(
     total_drawn > 0,
-    "the axis never drew a beyond-budget stall across the sweep \
-     (wal_read_stalls_drawn={total_drawn}) — no recovery ever read a degraded slot, so the budget \
-     was never at risk of running out under a live read"
+    "the axis never drew a beyond-allowance stall across the sweep \
+     (wal_read_stalls_drawn={total_drawn}) — no recovery ever read a degraded slot, so no wait \
+     ever genuinely outlasted the retry allowance"
   );
   assert!(
     total_past_budget > 0,
-    "no read outlived the recovery read budget across the sweep \
+    "no read outlived the retry allowance across the sweep \
      (wal_read_stalls_drawn={total_drawn}, wal_reads_past_budget={total_past_budget}, \
-     wal_reads_discarded={total_discarded}) — every op still resolved off a read that beat its own \
-     budget, so the carried-correlation lane was never reached"
+     wal_reads_discarded={total_discarded}) — every read beat the allowance on its own, so the \
+     wait path was never load-bearing"
   );
-  // And they must carry BYTES: a beyond-budget fault or absent verdict merely spends its correlation,
-  // while only a `ReadOk` can be admitted as a hole's canonical body.
+  // And they must carry BYTES: a beyond-allowance fault or absent verdict spends a failure or
+  // settles a phantom, while only a `ReadOk` resolves a waited-out op with its body.
   assert!(
     total_late_bodies > 0,
-    "every beyond-budget read delivered a fault or absent verdict \
-     (wal_late_bodies_delivered={total_late_bodies}) — no canonical body ever arrived late, so the \
-     admission gates the lane exists for were never offered anything"
+    "every beyond-allowance read delivered a fault or absent verdict \
+     (wal_late_bodies_delivered={total_late_bodies}) — no canonical body was ever consumed through \
+     the wait, so the path this sweep exists to exercise was never genuinely reached"
   );
   assert!(
     total_committed > 0,
