@@ -330,8 +330,9 @@ pub fn encode_message(msg: &Message) -> Bytes {
 /// - [`CodecError::Malformed`] if `frame` violates the protobuf wire grammar (an invalid wire type,
 ///   an overlong varint, an unknown-field FLOOD past the allowance), decodes to a value the domain
 ///   type cannot represent (a wrong-length id/checksum, an out-of-range count, an absent required
-///   oneof), carries more than one `Reply.outcome` arm (see
-///   [`reject_repeated_reply_outcome`]), or exceeds a bound described above.
+///   oneof), carries more than one `Reply.outcome` arm (exactly ONE occurrence of the oneof's
+///   field 4 or field 5 is admitted, counted across every `Message.body` reply arm the envelope
+///   holds), or exceeds a bound described above.
 /// - [`CodecError::UnknownMessage`] if `frame` decodes cleanly and within every bound but names no
 ///   `Message.body` this build recognizes — a FORWARD-COMPATIBLE message from a newer peer, or the
 ///   degenerate zero-field envelope. This is NOT a corruption signal: a transport DROPS such a frame

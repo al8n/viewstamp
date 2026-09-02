@@ -71,10 +71,11 @@ pub const PREPARE_ENCODE_OVERHEAD: usize =
 /// `ENVELOPE_ARM_OVERHEAD` (7) plus 2 × `WORST_UINT64_FIELD` (22) plus `WORST_ID_FIELD` (18) plus
 /// the arm's `LEN_FIELD_OVERHEAD` (6) = 53. Both outcome arms are length-delimited under a
 /// single-byte tag (fields 4 and 5), so the SAME framing bounds either; what the arm then carries
-/// is [`ReplyOutcome::wire_payload_bound`]. The `Reply` is the ONLY carrier of a reply body on the
-/// wire (the checkpoint envelope also embeds cached reply bodies, but that envelope is
-/// chunk-transferable and so unbounded by any single frame), so this is the binding overhead behind
-/// [`max_reply_body_len`].
+/// is the outcome's own payload — the body bytes for [`ReplyOutcome::Ok`], and the two widest
+/// `uint64`s of the refusal for [`ReplyOutcome::TooLarge`]. The `Reply` is the ONLY carrier of a
+/// reply body on the wire (the checkpoint envelope also embeds cached reply bodies, but that
+/// envelope is chunk-transferable and so unbounded by any single frame), so this is the binding
+/// overhead behind [`max_reply_body_len`].
 pub const REPLY_ENCODE_OVERHEAD: usize =
   ENVELOPE_ARM_OVERHEAD + 2 * WORST_UINT64_FIELD + WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
