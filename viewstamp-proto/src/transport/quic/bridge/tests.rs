@@ -1473,17 +1473,17 @@ fn sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection() {
   );
 }
 
-/// Reverse-direction data BEHIND A GAP closes the connection too.
+/// A frame that arrives AHEAD OF A GAP closes the connection too.
 ///
 /// The half is never read, so an ordered peek at it returns `Blocked` whenever the peer's
-/// offset-zero packet is lost or reordered: the bytes are buffered, just not at the read offset.
-/// Treating that as "no data" leaves them accumulating spans until the reassembler refuses the
-/// stream — precisely the outcome the close policy exists to pre-empt — so `Blocked` on one of our
-/// own send ids is a violation like any other.
+/// offset-zero packet is lost or reordered — a frame arrived (that is what raised the `Readable`)
+/// but not at the read offset. Treating that as "nothing arrived" would leave the half unrefused in
+/// exactly the case that matters, so `Blocked` on one of our own send ids is a violation like bytes
+/// at the offset are.
 ///
-/// The first datagram carrying the peer's writes is withheld here and later ones delivered, so what
-/// reaches the bridge is a gap with data behind it. The close must land while the gap is still open,
-/// well before the peer's own retransmission would fill it.
+/// The first datagram carrying the peer's writes is withheld here and later ones delivered, so the
+/// classifier sees a frame it cannot read at the offset. The close must land while the gap is still
+/// open, before the peer's own retransmission could fill it.
 #[test]
 fn gapped_writes_into_our_opened_streams_recv_half_close_the_connection() {
   let Linked {
@@ -1547,8 +1547,8 @@ fn gapped_writes_into_our_opened_streams_recv_half_close_the_connection() {
 
   assert!(
     a.conn_close_count(CloseCause::UnsolicitedStream) > 0,
-    "data buffered behind a gap on a stream we opened must close the connection WHILE the gap is \
-     open — an ordered peek reporting Blocked is buffered data, not an empty half"
+    "a frame that arrived AHEAD OF A GAP on a stream we opened must close the connection while the \
+     gap is open — an ordered peek reporting Blocked still saw a frame arrive"
   );
   assert!(
     !a.is_validated(ha),
@@ -1705,6 +1705,160 @@ fn a_peer_fin_of_our_opened_streams_recv_half_does_not_close() {
     "an empty FIN on the unused half carries no data, so there is nothing to refuse"
   );
   assert!(a.is_validated(ha), "and the connection stays up");
+}
+
+/// DOCUMENTED GAP: data followed by a RESET in the same batch is not classified as data.
+///
+/// Pinned quinn processes a datagram's frames before the bridge drains application events, and
+/// `received_reset` clears the stream's assembler. So when a peer writes into the half and resets it
+/// close enough together, the peek that follows sees `Reset` — the classifier's inputs no longer
+/// contain the write — and the connection stays open.
+///
+/// That is an enforcement and observability gap, not a memory exposure: the RESET is precisely what
+/// released those bytes, so nothing is retained either way. This pins the behaviour so the gap stays
+/// visible and cannot be mistaken for a classifier that saw the data and chose to allow it.
+#[test]
+fn data_then_reset_of_our_opened_streams_recv_half_leaves_the_connection_open() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B adopts the stream first, the order the real retirement runs in.
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut framed = Vec::new();
+  encode_frame(b"hello", &mut framed);
+  a.test_stage_outbound(ha, StreamClass::Control, &framed);
+  for k in 1..40u64 {
+    let tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+    if b.next_frame(hb, StreamClass::Control).is_some() {
+      break;
+    }
+  }
+
+  // Write into the reverse half and reset it before anything is delivered, so both reach A together.
+  let batch = now + Duration::from_millis(40);
+  let _ = b.test_write_raw(hb, victim, &std::vec![0x6Du8; 396]);
+  b.test_reset_raw(hb, victim);
+  for k in 40..120u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  let _ = batch;
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "the classifier sees the RESET, not the write it released — the documented gap"
+  );
+  assert!(
+    a.is_validated(ha),
+    "so the connection stays up; the reset already freed what the write had buffered"
+  );
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "and nothing of it is retained by the bridge either way"
+  );
+}
+
+/// A zero-length, non-FIN frame on the reverse half closes the connection too.
+///
+/// The classifier's `Blocked` arm is "a frame arrived that is not at the read offset", and a
+/// zero-length non-FIN STREAM frame is exactly that: the `Readable` says a frame arrived, the peek
+/// finds nothing at the offset. It carries no bytes, so it is no memory exposure — it is refused
+/// because a frame on a half no conforming peer writes to is the violation, whatever its length.
+///
+/// This pins the outcome rather than assuming it: an empty write through quinn's own API does put a
+/// frame on the wire, so the case is reachable and its result is the close.
+#[test]
+fn a_zero_length_write_into_our_opened_streams_recv_half_closes_the_connection() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  let written = b
+    .test_write_raw(hb, victim, &[])
+    .expect("an empty write is accepted");
+  assert_eq!(written, 0, "and writes nothing");
+
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  for k in 1..80u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  assert!(
+    a.conn_close_count(CloseCause::UnsolicitedStream) > 0,
+    "a zero-length non-FIN frame is still a frame on a half no conforming peer writes to, and the \
+     classifier refuses it like any other"
+  );
+  assert!(!a.is_validated(ha), "so the connection is down");
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "with nothing retained — the frame carried no bytes to begin with"
+  );
 }
 
 /// The `Single` layout still round-trips one frame on the Control class (the only class it opens).

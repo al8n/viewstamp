@@ -875,15 +875,19 @@ impl Bridge {
         // half ([`retire_local_send`]), and a peer's `RESET_STREAM` surfaces as a `Readable` too. So
         // peek at the half once, and read the outcome as:
         //
-        // - `Ok(Some)` — bytes at the read offset. Data, and a violation.
-        // - `Err(Blocked)` — the peer wrote, but not at the read offset: bytes are buffered BEHIND A
-        //   GAP (its offset-zero packet lost or reordered). Also a violation, and the case that
-        //   matters most: nothing ever reads this half, so those spans would sit there until the
-        //   reassembler refused the stream — the outcome this policy exists to pre-empt. A
-        //   `Readable` is only emitted for a frame that arrived, so `Blocked` here means buffered,
-        //   not empty.
-        // - `Ok(None)` — the peer FINISHED the half with nothing on it. Not data; ignored.
-        // - `Err(Reset)` — the peer RESET it, which is what our own retirement does. Ignored.
+        // - `Ok(Some)` — bytes at the read offset. A frame is observable; close.
+        // - `Err(Blocked)` — a frame arrived (that is what raised the `Readable`) but is not at the
+        //   read offset: ahead of a gap, or zero-length. Still a frame on a half no conforming peer
+        //   writes to; close. This says nothing about how many bytes are buffered.
+        // - `Ok(None)` — the half was FINISHED with nothing on it. Not a frame to refuse; ignored.
+        // - `Err(Reset)` — the half was RESET, which is what our own retirement does. Ignored.
+        //
+        // CONTRACT, and its limit: this closes when a STREAM frame is CURRENTLY OBSERVABLE on a half
+        // this side never reads. It does not claim to see data a `RESET_STREAM` already released —
+        // pinned quinn processes frames before the bridge drains application events, and
+        // `received_reset` clears the assembler, so data followed by a reset in one batch reads as
+        // `Reset` and the connection stays open. That is an enforcement and observability gap, not a
+        // memory exposure: the reset is what frees those bytes.
         //
         // The peek runs only for an id that is one of OUR send streams, so it is off the conforming
         // hot path.
