@@ -1638,7 +1638,8 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 ///   message instead (or staging per message without coalescing) turns that into 64 and fails this
 ///   by a wide margin;
 /// - across a converged run that includes a multi-megabyte Bulk frame — so partial writes and the
-///   `Writable`-driven retries of a blocked stream are in the sample — no coordinator entry puts
+///   flow-control retries a 3 MiB frame needs to cross a 1 MiB window are in the sample — no
+///   coordinator entry puts
 ///   more than two short datagrams on the wire to the peer, and exactly two is what this sample
 ///   measures. That is an aggregate count by destination: it does not separate packetizing passes
 ///   and does not attribute a datagram to a class.
@@ -1649,12 +1650,12 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 /// counted at the RECEIVER, from quinn's own `frame_rx.stream`, not inferred from datagram lengths:
 /// a datagram-length proxy would score a recovery packet as one span when it is several.
 ///
-/// The alternating-loss phase then puts recovery in the sample deliberately: with every other
-/// datagram dropped the sender is retransmitting continuously, and what is ASSERTED there is only
-/// that the excess is present — the receiver parses more spans than the new-data ratio would give,
-/// which is what makes the scope limit above a measurement rather than a claim. No proportional
-/// upper bound on recovery is asserted, and none is claimed: the worst case for how many disjoint
-/// ranges recovery packs into a packet is not characterised here.
+/// The alternating-loss phase then puts recovery in the sample deliberately, and what is ASSERTED
+/// there is the recovery itself: with every other datagram to the peer thrown away, the ops
+/// submitted during the phase must still APPLY on the receiving replica — which needs each
+/// `Prepare` in and its `PrepareOk` back, so the gaps the drops left were refilled in both
+/// directions. The span count for that phase is reported alongside it and carries no claim; nothing
+/// here characterises how many disjoint ranges recovery packs into a packet.
 #[test]
 fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
   /// Below the 1200-byte QUIC path minimum: a datagram this small could not have been packet-filling.
@@ -1756,7 +1757,7 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
   );
 
   // A converged run whose traffic includes a frame far larger than the stream window, so the sample
-  // contains partial writes and the `Writable` retries that drain a blocked stream's tail.
+  // contains the partial writes and flow-control retries a frame that size necessarily needs.
   //
   // Counting starts BEFORE the submit: `submit_client_request` pumps the coordinator and can emit
   // transmits of its own, and folding those into the first `handle_storage` bucket would put two
@@ -1766,8 +1767,8 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
   let spans_at_phase = r1.0.rx_stream_frames_for_test();
   let mut delivered = false;
   let bulk_peer = Peer::Replica(ReplicaId::new(1));
-  let mut saw_blocked = false;
-  let mut saw_drain_after_block = false;
+  let mut saw_staged = false;
+  let mut saw_staged_then_absent = false;
   let mut submit_out: Vec<Vec<u8>> = Vec::new();
   r0.0.submit_client_request(
     now,
@@ -1826,17 +1827,16 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
       c.handle_timeout(now, w);
     }
     drain_r0!();
-    // The blocked-write observable, on the connection currently ROUTED to the peer: staged bytes
-    // remain while that peer's window refuses more, and their later disappearance is consistent with
-    // the `Writable`-driven retry draining the tail — but the route can also change under a
-    // mutual-dial pair, so a transition to zero does not by itself identify which.
+    // Staged-then-absent, on whatever connection is ROUTED to the peer at each call. That is all
+    // this observes: bytes staged at one moment, and none staged at a later one. It does not say why
+    // they were staged, nor why they are gone (see the accessor's contract).
     let staged = r0
       .0
       .staged_outbound_for_test(bulk_peer, super::layout::StreamClass::Bulk);
     if staged > 0 {
-      saw_blocked = true;
-    } else if saw_blocked {
-      saw_drain_after_block = true;
+      saw_staged = true;
+    } else if saw_staged {
+      saw_staged_then_absent = true;
     }
     {
       let (c, w, b) = &mut r1;
@@ -1883,16 +1883,22 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
       break;
     }
   }
+  // THIS is what puts flow-control retries in the sample, and it is structural rather than
+  // observed: a 3 MiB frame cannot cross a 1 MiB receive window in one go, so its delivery required
+  // the peer to reopen the window repeatedly and the sender to resume against each reopening.
   assert!(
     delivered,
-    "the large op must commit, so the measured sample really did include its blocked-stream retries"
+    "the 3 MiB op must commit — it cannot cross the 1 MiB window without repeated flow-control \
+     retries, so its delivery is what places them in the measured sample"
   );
+  // A weaker, purely observational companion: bytes were staged at some point and later were not.
+  // It does not establish WHY either way — staging can also mean stream-slot exhaustion, and the
+  // later absence can equally be a reset, a close, a reap, or the mutual-dial sibling being promoted
+  // into the route.
   assert!(
-    saw_blocked && saw_drain_after_block,
-    "the sample must contain a blocked write — staged bytes on the routed handle — and those bytes \
-     later gone, so the partial writes the bound is claimed over are in it (blocked={saw_blocked}, \
-     drained={saw_drain_after_block}). Promotion of the mutual-dial sibling into the route is not \
-     excluded as the cause of the second observation"
+    saw_staged && saw_staged_then_absent,
+    "the sample must contain bytes staged on the routed handle and, later, none staged \
+     (staged={saw_staged}, then_absent={saw_staged_then_absent})"
   );
   // An AGGREGATE per-entry count: short datagrams to the peer from any one public coordinator
   // entry, exactly two here and deterministic. It counts datagrams by destination — it does not
@@ -1911,15 +1917,21 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
   let phase_spans = r1.0.rx_stream_frames_for_test() - spans_at_phase;
   assert!(
     phase_spans <= (phase_bytes / SHORT) as u64 + 64,
-    "carrying a multi-megabyte frame — partial writes and Writable retries included — the receiver's \
-     span count must stay proportional to the bytes: {phase_spans} spans for {phase_bytes} B"
+    "carrying a multi-megabyte frame — partial writes and flow-control retries included — the \
+     receiver's span count must stay proportional to the bytes: {phase_spans} spans for \
+     {phase_bytes} B"
   );
 
-  // Recovery in the sample: every other datagram to r1 is dropped, so the sender is retransmitting
-  // continuously and packing disjoint ranges into single packets. What is asserted below is that
-  // the retransmission EXCESS is present — more spans than the new-data ratio would give — and that
-  // the link survives. No upper bound on that excess is asserted.
+  // Recovery in the sample: every other datagram to r1 is dropped, so bytes the sender put on the
+  // wire are lost and can only arrive again by retransmission. What is asserted below is the
+  // RECOVERY itself — every frame sent during the phase is decoded and delivered on the receiving
+  // side, which cannot happen unless the dropped gaps were refilled — and that the link survives.
+  /// Client requests the loss phase submits. Bounded well under the iteration budget so the loop has
+  /// room to carry every one of them across a link dropping half its datagrams.
+  const LOSS_OPS: u64 = 20;
   let spans_before = r1.0.rx_stream_frames_for_test();
+  let applied_before = r1.0.endpoint().state_machine_ref().applied().len();
+  let mut submitted = 0u64;
   let refusals_before = r1
     .0
     .conn_close_count(crate::transport::CloseCause::RecordRejected);
@@ -1931,8 +1943,20 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
       let (c, w, b) = &mut r0;
       c.handle_storage(now, w, b);
       c.handle_timeout(now, w);
-      if k % 2 == 0 {
-        c.route_message_for_test(now, crate::Recipient::To(p1), &heartbeat);
+      // Real client requests, not injected heartbeats: an op only APPLIES on the receiver once its
+      // `Prepare` arrived and its `PrepareOk` came back, so counting applications is a witness that
+      // both directions recovered from the drops.
+      if k % 32 == 0 && submitted < LOSS_OPS {
+        submitted += 1;
+        c.submit_client_request(
+          now,
+          w,
+          Request::new(
+            ClientId::new(2_000 + submitted as u128),
+            RequestNumber::with(1),
+            Bytes::from_static(b"L"),
+          ),
+        );
       }
     }
     {
@@ -1967,6 +1991,7 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
     }
   }
   let spans = r1.0.rx_stream_frames_for_test() - spans_before;
+  let applied = r1.0.endpoint().state_machine_ref().applied().len() - applied_before;
   assert_eq!(
     r1.0
       .conn_close_count(crate::transport::CloseCause::RecordRejected),
@@ -1977,13 +2002,14 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
     spans > 0 && delivered_bytes > 0,
     "the loss phase must actually have carried traffic: {spans} spans, {delivered_bytes} B"
   );
-  // The scope limit, measured rather than asserted: recovery packs disjoint retransmit ranges into
-  // whatever packet is going out, so the receiver parses far MORE spans than the new-data ratio
-  // would give — which is exactly why the guarantee above is scoped to newly written contiguous
-  // data, and why counting datagram lengths would have shown nothing here.
-  assert!(
-    spans > (delivered_bytes / SHORT) as u64,
-    "retransmission recovery must be visible as extra spans — {spans} for {delivered_bytes} B — or \
-     this phase is not exercising the case the guarantee excludes"
+  assert_eq!(submitted, LOSS_OPS, "the phase must submit its whole batch");
+  // The recovery witness: half of what the sender put on the wire was thrown away, so an op that
+  // APPLIES on the receiver is proof the gaps those drops left were refilled — in both directions,
+  // since applying needs the `Prepare` in and its `PrepareOk` back. `spans` is reported for context
+  // and carries no claim.
+  assert_eq!(
+    applied as u64, LOSS_OPS,
+    "every op submitted under 50% loss must still apply on the receiving replica — the dropped gaps \
+     have to be recovered for that: {applied} of {LOSS_OPS} ({spans} spans for {delivered_bytes} B)"
   );
 }
