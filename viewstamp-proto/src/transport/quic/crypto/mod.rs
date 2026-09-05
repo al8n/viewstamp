@@ -195,11 +195,13 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 ///
 /// **Supported sender.** This transport's own bridge stages a class's frames in one buffer and
 /// writes that whole buffer to quinn in a single call, and the coordinator defers PACKETIZING to one
-/// service pass rather than running one per message. So per packetizing pass a class emits
-/// packet-filling frames plus at most one short tail — one sub-packet span, however many messages
-/// went into it. It is NOT one per coordinator entry: an entry can packetize more than once (the
-/// read pass services to release flow-control credit, the pump services at the end), which makes the
-/// per-entry count a small constant rather than one.
+/// service pass rather than running one per message — so a batch of messages leaves as
+/// packet-filling frames plus a short tail, not as a short packet apiece. That is a statement about
+/// the code, and the evidence for it is narrower than the statement: what
+/// `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` measures is a batch of 64
+/// messages arriving as a handful of receiver-side STREAM frames rather than 64, and an aggregate
+/// ceiling of three short datagrams from any one coordinator entry. Neither counts packetizing
+/// passes, and neither attributes a datagram to a class.
 ///
 /// Nothing bounds how many such spans ACCUMULATE at a peer. That is the ratio between the sender's
 /// pump rate and the receiver's: the receiver drains a 64 KiB budget per pump and re-arms itself

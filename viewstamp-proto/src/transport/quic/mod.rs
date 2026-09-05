@@ -1172,8 +1172,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// boundary test and the membership-range loopback: a rejected candidate must not pin a slot).
   /// STREAM frames the connection bound to `peer` has RECEIVED — the receiver-side span count the
   /// sender-segmentation regression measures (see [`Bridge::rx_stream_frames`]).
-  /// Bytes still staged for `peer`'s `class` stream — the blocked-write observable (see
-  /// [`Bridge::staged_outbound_len`]).
+  /// Bytes still staged for `class` on the connection CURRENTLY ROUTED to `peer` (see
+  /// [`Bridge::staged_outbound_len`]). It re-resolves the route on every call and returns 0 when
+  /// there is none, so a transition to zero means "nothing staged on the routed handle now" — which
+  /// a drain produces, but so would a reset, a close, or the mutual-dial sibling being promoted into
+  /// the route. A caller that needs to tell those apart has to pin the handle itself.
   #[cfg(test)]
   pub(crate) fn staged_outbound_for_test(&mut self, peer: Peer, class: StreamClass) -> usize {
     match self.bridge.handle_for(peer) {

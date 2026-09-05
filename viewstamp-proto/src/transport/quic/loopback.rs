@@ -1625,22 +1625,23 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 /// What the sender actually guarantees about sub-packet spans, measured on the production call path.
 ///
 /// A receiver's reassembler refuses a stream once it holds too many spans, and a span is one STREAM
-/// frame, so how the sender segments matters. The guarantee is per PACKETIZING PASS: every message
-/// staged for a class since the last pass is written to quinn as one contiguous run, so the pass
-/// emits packet-filling frames plus at most one short tail — one sub-packet span, however many
-/// messages went into it. It is NOT one per coordinator entry: an entry can packetize more than once
-/// (the read pass services to release flow-control credit, the pump services at the end), so the
-/// per-entry count is a small constant.
+/// frame, so how the sender segments matters. What the CODE does is stage a class's messages in one
+/// buffer, write that buffer to quinn in a single call, and let one service pass packetize it — so a
+/// batch leaves as packet-filling frames plus a short tail, not as a short packet apiece.
 ///
-/// Both halves are measured here on the real path — `route` per message exactly as `pump` does, then
-/// the real pump-end service:
+/// What is MEASURED here is narrower than that sentence, and these two claims are all this test
+/// makes. Both are taken on the real path — `route` per message exactly as `pump` does, then the
+/// real pump-end service:
 ///
-/// - a batch of 64 small Control messages leaves as a couple of datagrams with ONE short one, not 64
-///   short ones. Servicing per message instead (or staging per message without coalescing) turns
-///   that into 64 sub-packet spans and fails this by a wide margin;
+/// - a batch of 64 small Control messages leaves as a handful of datagrams with at most ONE short
+///   one, and reaches the peer as at most two receiver-side STREAM frames, not 64. Servicing per
+///   message instead (or staging per message without coalescing) turns that into 64 and fails this
+///   by a wide margin;
 /// - across a converged run that includes a multi-megabyte Bulk frame — so partial writes and the
-///   `Writable`-driven retries of a blocked stream are in the sample — no coordinator entry emits
-///   more than a couple of short datagrams.
+///   `Writable`-driven retries of a blocked stream are in the sample — no coordinator entry puts
+///   more than three short datagrams on the wire to the peer. That is an aggregate count by
+///   destination: it does not separate packetizing passes and does not attribute a datagram to a
+///   class.
 ///
 /// **Scope: newly written contiguous data.** Retransmissions are excluded — loss recovery packs
 /// disjoint ranges of already-sent data into whatever packet is going out, so one datagram can carry
@@ -1737,6 +1738,18 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
 
   // A converged run whose traffic includes a frame far larger than the stream window, so the sample
   // contains partial writes and the `Writable` retries that drain a blocked stream's tail.
+  //
+  // Counting starts BEFORE the submit: `submit_client_request` pumps the coordinator and can emit
+  // transmits of its own, and folding those into the first `handle_storage` bucket would put two
+  // entries' output in one count.
+  let mut worst = 0usize;
+  let mut phase_bytes = 0usize;
+  let spans_at_phase = r1.0.rx_stream_frames_for_test();
+  let mut delivered = false;
+  let bulk_peer = Peer::Replica(ReplicaId::new(1));
+  let mut saw_blocked = false;
+  let mut saw_drain_after_block = false;
+  let mut submit_out: Vec<Vec<u8>> = Vec::new();
   r0.0.submit_client_request(
     now,
     &mut r0.1,
@@ -1746,13 +1759,23 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
       Bytes::from(std::vec![0x5Au8; 3 * 1024 * 1024]),
     ),
   );
-  let mut worst = 0usize;
-  let mut phase_bytes = 0usize;
-  let spans_at_phase = r1.0.rx_stream_frames_for_test();
-  let mut delivered = false;
-  let bulk_peer = Peer::Replica(ReplicaId::new(1));
-  let mut saw_blocked = false;
-  let mut saw_drain_after_block = false;
+  {
+    let mut entry_short = 0usize;
+    while let Some((dst, d)) = r0.0.poll_transmit() {
+      if dst == addr1 {
+        if d.len() < SHORT {
+          entry_short += 1;
+        }
+        submit_out.push(d);
+      }
+    }
+    worst = worst.max(entry_short);
+  }
+  for d in &submit_out {
+    phase_bytes += d.len();
+    let (c, w, _) = &mut r1;
+    c.handle_udp(now, addr0, None, d, w);
+  }
   for _ in 0..40_000u64 {
     now = now + Duration::from_millis(1);
     // Drain and count after EVERY public coordinator entry on r0 — `handle_storage`,
@@ -1784,8 +1807,10 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
       c.handle_timeout(now, w);
     }
     drain_r0!();
-    // The blocked-write observable: staged bytes remain exactly while the peer's window refuses
-    // more, and their later disappearance is the `Writable`-driven retry draining the tail.
+    // The blocked-write observable, on the connection currently ROUTED to the peer: staged bytes
+    // remain while that peer's window refuses more, and their later disappearance is consistent with
+    // the `Writable`-driven retry draining the tail — but the route can also change under a
+    // mutual-dial pair, so a transition to zero does not by itself identify which.
     let staged = r0
       .0
       .staged_outbound_for_test(bulk_peer, super::layout::StreamClass::Bulk);
@@ -1845,26 +1870,24 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
   );
   assert!(
     saw_blocked && saw_drain_after_block,
-    "the sample must contain a stream BLOCKED behind the peer's window and its later drain — the \
-     partial writes and `Writable` retries the bound is claimed over (blocked={saw_blocked}, \
-     drained={saw_drain_after_block})"
+    "the sample must contain a blocked write — staged bytes on the routed handle — and those bytes \
+     later gone, so the partial writes the bound is claimed over are in it (blocked={saw_blocked}, \
+     drained={saw_drain_after_block}). Promotion of the mutual-dial sibling into the route is not \
+     excluded as the cause of the second observation"
   );
-  // The per-entry bound, asserted rather than merely reported. The structural invariant is per
-  // PACKETIZING PASS: one short tail each, however many messages the pass coalesced. An entry can
-  // run up to four such passes — the leading service its own entry performs, the writable-driven
-  // flush, the read pass that services to release flow-control credit, and the pump-end service —
-  // across the connections a mutual-dial pair holds. This sample measures 3, and the bound is
-  // pinned there rather than at the structural four, so a regression that adds a pass fails here.
+  // An AGGREGATE per-entry ceiling: three short datagrams to the peer from any one public
+  // coordinator entry, measured at three in this sample. It counts datagrams by destination — it
+  // does not separate packetizing passes and does not attribute a datagram to a stream class, so it
+  // says nothing about how many passes ran or how a class's frames were laid out.
   //
-  // What this does NOT detect is coalescing itself: chunking the writes into `flush_outbound`, or
-  // adding a service that emits nothing new, both leave it at 3 — quinn coalesces at packetization
-  // however many write calls fed the send buffer, which is the property the contract states. The
-  // sharp coalescing detector is the batch phase above, where servicing per message turns 64
-  // messages into 64 receiver-side STREAM frames.
+  // It is not a coalescing detector either: chunking the writes into `flush_outbound`, or adding a
+  // service that emits nothing new, both leave it at three — quinn coalesces at packetization
+  // however many write calls fed the send buffer. The coalescing detector is the batch phase above,
+  // where servicing per message turns 64 messages into 64 receiver-side STREAM frames.
   assert!(
     worst <= 3,
-    "a coordinator entry may emit at most one short datagram per packetizing pass for a class, \
-     three in this sample — got {worst}"
+    "one coordinator entry may put at most three short datagrams on the wire to the peer — got \
+     {worst}"
   );
   let phase_spans = r1.0.rx_stream_frames_for_test() - spans_at_phase;
   assert!(

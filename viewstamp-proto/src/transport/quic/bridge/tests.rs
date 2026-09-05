@@ -1378,17 +1378,18 @@ fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_strea
   // reassembler rather than writes that were staged: each is its own non-mergeable span (a
   // sub-packet frame quinn packetized alone), and the count has to pass the compaction threshold of
   // `2 x QUINN_REASSEMBLY_MAX_SPANS` for compaction to have run and still left too many.
+  // Deterministic in this harness: one write per pump, each packetized alone, so one non-mergeable
+  // span per write, and the refusal lands on the first insert past the compaction threshold.
   let spans = b.rx_stream_frames_total() - spans_before;
-  assert!(
-    spans > 2 * QUINN_REASSEMBLY_MAX_SPANS,
-    "the flood must drive more than {} spans into the receiver's reassembler — past the compaction \
-     threshold — before the refusal; its quinn counted {spans} STREAM frames over {writes} writes",
-    2 * QUINN_REASSEMBLY_MAX_SPANS
+  let expected = 2 * QUINN_REASSEMBLY_MAX_SPANS + 1;
+  assert_eq!(
+    spans, expected,
+    "the refusal must land on the first span past the compaction threshold: {spans} STREAM frames \
+     reached the receiver's reassembler, expected {expected}"
   );
-  assert!(
-    writes > QUINN_REASSEMBLY_MAX_SPANS,
-    "the flood must actually cross the span ceiling ({QUINN_REASSEMBLY_MAX_SPANS}), took {writes} \
-     writes"
+  assert_eq!(
+    writes, expected,
+    "and every write must have produced exactly one of them: {writes} writes for {spans} spans"
   );
   let flooded = writes * framed.len() as u64;
   assert!(
