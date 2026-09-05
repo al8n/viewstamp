@@ -268,7 +268,9 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// quic,tcp,tls,tls-rustls-ring` — and the list below is not a shortcut past it. These are the tests
 /// that PIN each private behaviour, named so a failure is legible:
 ///
-/// - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
+/// - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling: it
+///   fills a whole receive window unread and pins the spans the reassembler holds, counted at the
+///   RECEIVER from quinn's own STREAM-frame counter;
 /// - `a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams` — the segmentation the sizing
 ///   assumes, counted from the receiver's own STREAM-frame counter;
 /// - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and

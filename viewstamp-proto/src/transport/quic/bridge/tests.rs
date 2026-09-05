@@ -1117,15 +1117,14 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
 /// is fewer spans than the ceiling.
 ///
 /// This test drives the worst case directly: a frame several windows long, ferried to B with B
-/// reading NOTHING, so B's reassembler holds a whole window unread. What is COUNTED is datagrams,
-/// not spans: the count is an upper bound on the spans only under the assumption that a datagram
-/// carries at most one STREAM frame per stream, which nothing here checks — the flood test counts
-/// receiver-side spans directly. Then B drains and the frame must arrive in FULL — a stream quinn
-/// had errored would deliver nothing.
+/// reading NOTHING, so B's reassembler holds a whole window unread. The spans are COUNTED AT THE
+/// RECEIVER, from quinn's own STREAM-frame counter, and pinned against the ceiling directly; the
+/// datagrams B absorbed are kept alongside as a coarser bound on what the wire carried. Then B
+/// drains and the frame must arrive in FULL — a stream quinn had errored would deliver nothing.
 ///
-/// It fails both ways the end-to-end tests only fail indirectly: raising the window (or
-/// shrinking the packets a window holds) drives the span count over the ceiling, and a quinn release
-/// that lowers its own bound errors this stream while the count assertion still passes.
+/// It fails both ways the end-to-end tests only fail indirectly: raising the window (or shrinking
+/// the packets a window holds) drives the receiver's span count over the ceiling, and a quinn
+/// release that lowers its own bound errors this stream while the count assertions still pass.
 ///
 /// Scope: this is the FILLED-PACKET case the sizing covers — the shape a bulk transfer produces.
 /// A sender whose segmentation is not packet-filling reaches the ceiling on far fewer bytes, and no
@@ -1164,6 +1163,7 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
   // more onto the wire (B's window is full and A still holds a staged tail).
   let mut pipe_to_a = PacketPipe::default();
   let mut pipe_to_b = PacketPipe::default();
+  let spans_before = b.rx_stream_frames_total();
   let mut unread_datagrams = 0usize;
   let mut unread_bytes = 0usize;
   let mut idle = 0u64;
@@ -1214,14 +1214,21 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
     "A must still hold a staged tail: the frame ({total} B) is several windows long, so B's window \
      is the only thing that can have stopped it"
   );
-  // The pin: a full window of real packets is fewer DATAGRAMS than the reassembler's span ceiling.
-  // Spans are not counted here; the count also includes B's control-stream and pure-ACK datagrams,
-  // so it is an over-count of anything Bulk.
+  // The pin, counted at the RECEIVER from quinn's own STREAM-frame counter: a full window's worth of
+  // real packets is fewer SPANS than the reassembler will hold.
+  let unread_spans = b.rx_stream_frames_total() - spans_before;
+  assert!(
+    unread_spans <= QUINN_REASSEMBLY_MAX_SPANS,
+    "a window's worth of unread data must stay within the {QUINN_REASSEMBLY_MAX_SPANS}-span \
+     reassembly ceiling — B's quinn counted {unread_spans} STREAM frames (over {unread_datagrams} \
+     datagrams); the window is sized as {MAX_STREAM_RECEIVE_WINDOW} B / \
+     {MIN_FILLED_STREAM_FRAME_PAYLOAD} B per full packet"
+  );
+  // The datagram count is kept as the coarser companion: it also covers B's control-stream and
+  // pure-ACK traffic, so it bounds what the wire carried rather than what the reassembler held.
   assert!(
     unread_datagrams as u64 <= QUINN_REASSEMBLY_MAX_SPANS,
-    "a window's worth of unread datagrams ({unread_datagrams}) must stay within the \
-     {QUINN_REASSEMBLY_MAX_SPANS}-span reassembly ceiling — the window is sized as \
-     {MAX_STREAM_RECEIVE_WINDOW} B / {MIN_FILLED_STREAM_FRAME_PAYLOAD} B per full packet"
+    "and the datagrams that carried it ({unread_datagrams}) must stay within it too"
   );
 
   // ...and the count is a full window's worth rather than an early-ended fill: a stream quinn has
