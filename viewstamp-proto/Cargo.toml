@@ -33,6 +33,20 @@ buffa = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+# The QUIC bridge sizes its stream receive window against `MAX_CHUNKS`, a private constant in
+# quinn-proto's `connection/assembler.rs` that no API exposes, so a release is free to move that
+# ceiling. Drift is caught by tests rather than held off by a version pin:
+# `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` (receiver-side span
+# count against the ceiling) and
+# `a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams` pin the sizing,
+# `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` pins compaction and
+# refusal (receiver-side span count, past the compaction threshold), and the three unsolicited-half
+# tests (`sub_packet_writes_...`, `gapped_writes_...`,
+# `data_whose_reset_lands_in_the_same_batch_...`) pin the classifier that rests on the same private
+# behaviour. This crate's CI resolves fresh and runs the whole QUIC suite against each new 0.11.x; an
+# embedder who pins or upgrades quinn-proto themselves should run that suite as the compatibility
+# check — the named tests say what a failure means, they are not a subset to run instead (both the
+# sizing and the classifier were verified against 0.11.17).
 quinn-proto = { version = "0.11", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 

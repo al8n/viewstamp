@@ -1,5 +1,33 @@
 //! Sans-I/O QUIC transport over `quinn_proto`: the driver pumps UDP datagrams; the
 //! consensus `Endpoint` and the deterministic oracle stay I/O-free. Std-only.
+//!
+//! **Compatibility with `quinn-proto`.** The bridge's reassembly sizing and its unsolicited-half
+//! classifier were verified against `quinn-proto` 0.11.17, and both rest on behaviour that crate keeps
+//! private: the per-stream span ceiling the window is sized against, the compaction rule that merges
+//! only spans under 5/6 utilization, `Readable` being raised for a frame that arrived, and a reset
+//! clearing the assembler before the application drains the event. The dependency is a plain `0.11`
+//! range, so a newer patch release resolves without ceremony — this repository's own CI resolves fresh
+//! and runs the whole QUIC suite against whatever it picks.
+//!
+//! An embedder who pins or upgrades `quinn-proto` themselves does not get that for free. The
+//! compatibility check IS this crate's QUIC suite — `cargo test -p viewstamp-proto --features
+//! quic,tcp,tls,tls-rustls-ring` — and the list below is not a shortcut past it. These are the tests
+//! that PIN each private behaviour, named so a failure is legible:
+//!
+//! - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling: it
+//!   fills a whole receive window unread and pins the spans the reassembler holds, counted at the
+//!   RECEIVER from quinn's own STREAM-frame counter;
+//! - `a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams` — the segmentation the sizing
+//!   assumes, counted from the receiver's own STREAM-frame counter;
+//! - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and
+//!   refusal: it drives non-mergeable sub-packet frames past the compaction threshold, counted at the
+//!   RECEIVER from quinn's own STREAM-frame counter (2049 spans over 2049 writes, one past `2 x` the
+//!   span ceiling), and requires the refusal to surface as a classified, unbound loss;
+//! - `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
+//! - `gapped_writes_into_our_opened_streams_recv_half_close_the_connection` — `Readable` being raised
+//!   for a frame that arrived, at the read offset and ahead of a gap;
+//! - `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open` — a reset clearing the
+//!   assembler before the event is drained.
 
 mod bridge;
 mod conn;
@@ -17,7 +45,8 @@ mod testutil;
 pub use bridge::DialError;
 pub use crypto::{
   ClusterTls, DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_IDLE_TIMEOUT_MILLIS,
-  DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, QuicOptions, QuicTuning,
+  DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, MAX_STREAM_RECEIVE_WINDOW,
+  QuicOptions, QuicTuning, StreamWindowTooLarge,
 };
 pub use identity::{
   AttestedId, CertOid, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
@@ -1143,6 +1172,29 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
 
   /// The number of live entries in the bridge's connection table (test observable for the dial-cap
   /// boundary test and the membership-range loopback: a rejected candidate must not pin a slot).
+  /// STREAM frames the connection bound to `peer` has RECEIVED — the receiver-side span count the
+  /// sender-segmentation regression measures (see [`Bridge::rx_stream_frames`]).
+  /// Bytes currently staged for `class` on the connection ROUTED to `peer` at the moment of the
+  /// call, or 0 when no connection is routed (see [`Bridge::staged_outbound_len`], whose contract
+  /// this inherits: staged bytes may equally be flow-control blocked or waiting on stream-slot
+  /// exhaustion, and zero may equally be a drain, a class reset, a close, or a reaped entry).
+  ///
+  /// This wrapper re-resolves the route on EVERY call, so it adds one more way to read zero: the
+  /// mutual-dial sibling being promoted into the route. A caller that needs to tell these apart has
+  /// to pin the handle itself.
+  #[cfg(test)]
+  pub(crate) fn staged_outbound_for_test(&mut self, peer: Peer, class: StreamClass) -> usize {
+    match self.bridge.handle_for(peer) {
+      Some(h) => self.bridge.staged_outbound_len(h, class),
+      None => 0,
+    }
+  }
+
+  #[cfg(test)]
+  pub(crate) fn rx_stream_frames_for_test(&mut self) -> u64 {
+    self.bridge.rx_stream_frames_total()
+  }
+
   #[cfg(test)]
   pub(crate) fn bridge_table_len(&self) -> usize {
     self.bridge.table_len()

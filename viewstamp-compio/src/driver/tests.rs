@@ -848,6 +848,156 @@ async fn inbound_datagram_rekeys_so_the_dial_pass_drops_a_removed_slot() {
   );
 }
 
+/// The link reconcile is what re-establishes a mesh edge that died — including one quinn closed
+/// because a stalled reader let its reassembler fill. It must ARM before it dials (a dial and its
+/// handshake are in flight while `has_bound_conn` is still false, so dialing on every observation
+/// would stack dials), then dial when the backoff is due, doubling it toward the cap so a peer that
+/// stays down is probed at a bounded rate.
+///
+/// A dial is observable as the handshake datagram the coordinator queues for the peer's address: the
+/// pass that only ARMS must queue nothing, and the pass that is DUE must queue one. Removing the
+/// reconcile's dial leaves the second half with no datagram — the state a lost connection would sit
+/// in forever.
+#[compio::test]
+async fn the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff() {
+  let (mut driver, _handle) = test_quic_driver_with_handle().await;
+  let peer_addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+  let slot = viewstamp_proto::ReplicaId::new(1);
+  driver.peers.clear();
+  driver.peers.push(super::PeerLink {
+    id: slot,
+    member_id: MemberId::new(1),
+    addr: peer_addr,
+    backoff: viewstamp_driver::REDIAL_BACKOFF_BASE,
+    next_dial: None,
+  });
+  while driver.coord.poll_transmit().is_some() {}
+
+  // First observation of an unbound peer: arm a deadline, dial nothing yet.
+  let t0 = viewstamp_proto::Instant::ZERO;
+  driver.reconcile_peer_links(t0);
+  let armed = driver.peers[0]
+    .next_dial
+    .expect("the first pass arms a deadline");
+  // The first delay must be a JITTERED base, never immediate: `jittered` schedules in
+  // `[base, base + base/4]`, so the arm lands inside that window and nowhere else.
+  let base = driver.cfg.redial_backoff_base();
+  let delay = armed.saturating_duration_since(t0);
+  assert!(
+    delay >= base && delay <= base + base / 4,
+    "the first redial must be armed a jittered base ahead ({base:?}..={:?}), not immediate; got \
+     {delay:?}",
+    base + base / 4
+  );
+  assert!(
+    driver.coord.poll_transmit().is_none(),
+    "the arming pass must not dial: a dial already in flight would be stacked on"
+  );
+  assert_eq!(
+    driver.peers[0].backoff,
+    viewstamp_driver::REDIAL_BACKOFF_BASE,
+    "arming alone does not consume backoff"
+  );
+
+  // A pass before the deadline still dials nothing.
+  driver.reconcile_peer_links(t0);
+  assert!(
+    driver.coord.poll_transmit().is_none(),
+    "a pass before the deadline must not dial either"
+  );
+
+  // Due: dial, and double the backoff for the next probe.
+  driver.reconcile_peer_links(armed);
+  let dialed = driver
+    .coord
+    .poll_transmit()
+    .expect("the due pass dials the unbound peer");
+  assert_eq!(dialed.0, peer_addr, "the dial goes to the peer's address");
+  assert!(
+    driver.peers[0].backoff > viewstamp_driver::REDIAL_BACKOFF_BASE,
+    "a probe doubles the backoff so a peer that stays down is retried at a bounded rate"
+  );
+  let after_first = driver.peers[0].backoff;
+  let next = driver.peers[0]
+    .next_dial
+    .expect("the probe re-arms for the next one");
+  assert!(next > armed, "and the next probe is scheduled later");
+
+  // Repeated probes keep doubling, and never past the configured cap.
+  let mut at = next;
+  for _ in 0..8 {
+    driver.reconcile_peer_links(at);
+    while driver.coord.poll_transmit().is_some() {}
+    at = driver.peers[0].next_dial.expect("still armed");
+  }
+  assert!(
+    driver.peers[0].backoff >= after_first,
+    "the backoff only grows while the peer stays unbound"
+  );
+  assert!(
+    driver.peers[0].backoff <= driver.cfg.redial_backoff_cap(),
+    "and is capped: {:?} exceeds the configured cap {:?}",
+    driver.peers[0].backoff,
+    driver.cfg.redial_backoff_cap()
+  );
+}
+
+/// A four-token text tripwire for the loss seam that was removed here. NOT a guarantee that the
+/// inbound path is unconditional.
+///
+/// A seam gated on this workspace's internal-testkit cfg would compile into every artifact the
+/// workspace builds, because that cfg is a repo-wide rustflag — a datagram-drop branch on the real
+/// driver's inbound hot path. The loss-tolerance test injects its loss from a relay socket it owns
+/// instead, and this makes the specific regression loud.
+///
+/// It reads the driver's source and checks two things, both text:
+///
+/// - between `fn handle_inbound_datagram(` and the first textual `.handle_udp(`, none of the four
+///   tokens `if `, `match `, `return`, `?` appears;
+/// - the file contains none of the five identifiers the removed seam used.
+///
+/// **What it does NOT catch**, and must not be read as covering: a `#[cfg]` attribute on the feed or
+/// on an early-return statement; a `while`, `for`, `let ... else`, `.then(...)`, `.filter(...)` or
+/// any other conditional spelling; a macro that expands to a branch; a drop performed inside a
+/// helper the feed calls, or after the `.handle_udp(` line; a differently-named or differently-typed
+/// seam; token text appearing in a comment. It is a heuristic on source text, not an analysis of
+/// what the function does.
+#[test]
+fn a_text_tripwire_for_the_removed_inbound_loss_seam() {
+  const DRIVER_SRC: &str = include_str!("mod.rs");
+
+  // Heuristic 1: the four tokens, between the helper's signature and the first textual feed call.
+  let body = DRIVER_SRC
+    .split_once("fn handle_inbound_datagram(")
+    .expect("the inbound helper exists")
+    .1;
+  let (before_feed, _) = body
+    .split_once(".handle_udp(")
+    .expect("the inbound helper feeds the coordinator");
+  for branch in ["if ", "match ", "return", "?"] {
+    assert!(
+      !before_feed.contains(branch),
+      "found `{branch}` between the inbound helper and its feed — one of the four shapes a \
+       datagram-drop seam took here"
+    );
+  }
+
+  // Heuristic 2: the identifiers the removed seam used.
+  for needle in [
+    "InboundLoss",
+    "inbound_loss",
+    "arm_inbound_loss",
+    "drop_one_in",
+    "drop_next",
+  ] {
+    assert!(
+      !DRIVER_SRC.contains(needle),
+      "the driver must carry no loss-injection seam, found `{needle}`: inject loss from a relay in \
+       the test instead"
+    );
+  }
+}
+
 #[test]
 fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
   // The referenceable defaults exist so an embedder can compute RELATIVE overrides (e.g. a
@@ -870,6 +1020,12 @@ fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
     viewstamp_proto::DEFAULT_STREAM_RECEIVE_WINDOW,
     viewstamp_proto::QuicTuning::new().stream_receive_window()
   );
+  // The per-stream ceiling an embedder computes a relative override against, and the typed refusal
+  // a larger request returns — both have to be nameable from out here.
+  let err: viewstamp_proto::StreamWindowTooLarge = viewstamp_proto::QuicTuning::new()
+    .try_with_stream_receive_window(viewstamp_proto::MAX_STREAM_RECEIVE_WINDOW + 1)
+    .expect_err("over the ceiling is refused");
+  assert_eq!(err.max(), viewstamp_proto::MAX_STREAM_RECEIVE_WINDOW);
   assert_eq!(
     viewstamp_driver::DriverConfig::new().max_conns(),
     viewstamp_driver::MAX_CONNS

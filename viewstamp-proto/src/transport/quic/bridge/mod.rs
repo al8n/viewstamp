@@ -43,6 +43,82 @@
 //! no post-free replay). Dropping `Drained` entirely (the original behaviour) leaked
 //! that endpoint-owned state under reconnect / failed-handshake churn.
 //!
+//! **Inbound memory: an ESTIMATE, not an upper bound.** The figures below are derived from this
+//! implementation and from the internals of `quinn-proto` 0.11.17, the version this was verified
+//! against; they are the right order of magnitude for sizing, and they are NOT a proof. What is
+//! enumerated: allocations this crate makes, plus the ones quinn's reassembler makes that its own
+//! constants bound. What is not: allocator overhead and fragmentation, transient copies inside quinn
+//! beyond the one called out, and anything a future quinn changes — which is why the sizing is held
+//! by regressions rather than by a version, so a release that moves the bound fails a named test.
+//!
+//! Per recv stream, inbound only:
+//!
+//! | | |
+//! |---|---|
+//! | quinn reassembler, payload | `stream_receive_window` = 1 MiB |
+//! | quinn reassembler, allocation ahead of payload — it compacts only once over-allocation passes `max(32 KiB, 1.5 x buffered)` | ~2.5 MiB |
+//! | quinn span bookkeeping — up to `2 x MAX_CHUNKS` = 2048 spans held before a compaction, heap capacity rounding up, `Buffer` at ~56 B | ~4096 x 56 B = 224 KiB |
+//! | quinn compaction, transient — the old heap, its replacement, and the `BytesMut` copy are live together | up to another ~2.5 MiB while it runs |
+//! | read scratch, one pass | [`STAGE_CHUNK`] = 64 KiB |
+//! | decoder, frame being assembled — reserved to its own size, not doubled past it | `LEN_PREFIX + MAX_FRAME_LEN` = 16 MiB |
+//! | decoder, frames one pass completed — the one that was already assembling, plus what one budget can complete | 16 MiB + 64 KiB |
+//! | decoder, ready-queue slots — one budget of minimal frames is `STAGE_CHUNK / LEN_PREFIX` = 16384 of them | 16384 x 24 B = 384 KiB |
+//!
+//! The recv half of a stream this side OPENED adds nothing to the table. A class's stream is bidi but
+//! only its send half is ours — the peer's frames arrive on the streams IT opened — so a frame on
+//! that half is something no conforming peer produces, and it is answered as a protocol violation
+//! rather than buffered. On a `Readable` for one of our own send ids a one-byte peek runs, and the
+//! connection is closed with [`CloseCause::UnsolicitedStream`] when a STREAM frame is CURRENTLY
+//! OBSERVABLE there. Nothing is read into a decoder and nothing is retained.
+//!
+//! That close is not the whole bound, and the summary must not be read as an unconditional one. A
+//! `RESET_STREAM` processed in the same batch as the data it releases erases the evidence: quinn's
+//! `received_reset` clears the assembler before the bridge drains the event, the peek then sees
+//! `Reset`, and the connection stays OPEN — while those bytes are already freed. So what bounds this
+//! half is quinn's release on reset PLUS the close on observable data, not the close alone. The two
+//! halves are pinned by
+//! `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
+//! `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open`.
+//!
+//! Left alone it would NOT have been window-bounded: sub-packet writes reach the reassembler's span
+//! ceiling well below a window's worth of bytes, so the connection would close anyway, on a path that
+//! first pays a per-datagram cost and hands the peer a churn lever. (`STOP_SENDING` on that half
+//! would be the tidier refusal, but sending it for a bidi stream the peer has not yet allocated
+//! underflows `allocated_remote_count` in `stream_freed` — in quinn-proto 0.11.17, the version this
+//! was verified against — and would corrupt the peer's `MAX_STREAMS` accounting.)
+//!
+//! That is roughly 40 MiB per recv stream at the extreme, and a connection carries at most two
+//! (Control + Bulk). Reaching it needs a peer actually sending a maximum-sized frame; [`decoder_max`]
+//! holds the frame cap down to the hello size until the connection validates. The two frame-sized
+//! decoder rows are what ONE pass can leave: `drain_bridge` pops the ready queue after every
+//! `ingest_recv`, and the decoder never holds two frame-sized buffers itself — a completed frame IS
+//! the buffer that assembled it, handed over rather than copied out of a retained one.
+//!
+//! Retained between frames — what a long-lived idle connection costs — is bounded by code rather
+//! than by estimate: the partial buffer is released above its retained bound as each frame
+//! completes, and the ready queue releases its slots after a quiet stretch (kept through bursts, so
+//! a busy peer cannot drive a grow/shrink pair per pass). quinn's reassembler keeps its heap
+//! allocation for the stream's life.
+//!
+//! **Outbound memory is separate** and separately capped: per class, the staged `outbound` buffer up
+//! to `PER_CLASS_OUTBOUND_CAP` (64 MiB, past which the class resets or the connection is reaped),
+//! one framed message as the encode temporary (at most `MAX_FRAME_LEN`), and quinn's own send buffer
+//! for the connection, bounded by its `send_window`.
+//!
+//! Reading a budget is also what frees flow-control credit, so the peer's next window opens as the
+//! decoder fills: a frame LARGER than the window still arrives, across as many window grants as it
+//! takes. The deliverable frame ceiling is the decoder cap alone — [`MAX_FRAME_LEN`], unchanged by
+//! the window it crosses.
+//!
+//! The window bounds the backlog's BYTES, not the number of spans quinn buffers them as; a peer
+//! whose segmentation drives the span count past what quinn's reassembler will hold gets the
+//! connection closed. The predicate for that, and what it takes to reach it, is stated once — at
+//! [`MAX_STREAM_RECEIVE_WINDOW`](super::crypto::MAX_STREAM_RECEIVE_WINDOW), which also scopes which
+//! senders the window's sizing covers and what the recovery claim rests on. The table above sizes
+//! the memory, not the reachability, and does not restate the predicate. The close itself arrives
+//! here as `Event::ConnectionLost`: [`Bridge::on_app_event`] classifies it, unbinds the peer's
+//! routing and queues the connection on [`Bridge::lost`] for the coordinator to reap.
+//!
 //! The `Bridge` works natively in [`std::time::Instant`] — quinn's time
 //! currency. The viewstamp-time adapter lives one layer up (the coordinator).
 
@@ -73,7 +149,7 @@ use crate::{
 /// Per-class outbound staging cap. When a class's `outbound` would exceed this, the bridge RESETs
 /// just that class's send stream (clearing its buffer + reopening on the next write) rather than
 /// growing without bound or tearing down the connection — consensus retransmission re-drives the
-/// dropped (bulk) message. Pinned at 64 MiB: well above the 16 MiB max frame and 8 MiB stream
+/// dropped (bulk) message. Pinned at 64 MiB: well above the 16 MiB max frame and 1 MiB stream
 /// window, so a single legitimate bulk frame never false-trips it, yet bounded against a wedged
 /// peer that stops reading.
 const PER_CLASS_OUTBOUND_CAP: usize = 64 * 1024 * 1024;
@@ -790,7 +866,61 @@ impl Bridge {
         // (`accept`) and reads the preface deterministically, rather than waiting on a retransmit.
         self.stream_ready.push_back(h);
       }
-      Event::Stream(StreamEvent::Readable { .. }) => {
+      Event::Stream(StreamEvent::Readable { id }) => {
+        // A class opens its stream BIDI (that is the only shape carrying the per-stream flow control
+        // the classes need) but uses only the SEND half: the peer's frames ride the streams IT
+        // opens. Data on the reverse direction of one of ours is therefore something no conforming
+        // peer produces — and left alone it is a hole, since nothing ever reads it: quinn would
+        // buffer for a read that never comes, and sub-packet writes into it reach the reassembler's
+        // span ceiling well before a window's worth of bytes, closing the connection anyway on a
+        // path that costs a per-datagram check first.
+        //
+        // So it is treated as a protocol violation: when data is OBSERVABLE on that half, a one-byte
+        // peek is what sees it and the connection is closed. Nothing is read into a decoder and
+        // nothing is retained. It is not free of work — quinn has already parsed the datagram by the
+        // time the event is drained — and it is not unconditional: a `RESET_STREAM` processed in the
+        // same batch releases the data before the peek runs, and that connection stays open.
+        //
+        // A classification is needed because this transport's OWN retire protocol resets the unused
+        // half ([`retire_local_send`]), and a peer's `RESET_STREAM` surfaces as a `Readable` too. So
+        // peek at the half once, and read the outcome as:
+        //
+        // - `Ok(Some)` — bytes at the read offset. A frame is observable; close.
+        // - `Err(Blocked)` — a frame arrived (that is what raised the `Readable`) but is not at the
+        //   read offset: ahead of a gap, or zero-length. Still a frame on a half no conforming peer
+        //   writes to; close. This says nothing about how many bytes are buffered.
+        // - `Ok(None)` — the half was FINISHED with nothing on it. Not a frame to refuse; ignored.
+        // - `Err(Reset)` — the half was RESET, which is what our own retirement does. Ignored.
+        //
+        // CONTRACT, and its limit: this closes when a STREAM frame is CURRENTLY OBSERVABLE on a half
+        // this side never reads. It does not claim to see data a `RESET_STREAM` already released —
+        // quinn processes frames before the bridge drains application events, and (in quinn-proto
+        // 0.11.17, the version this was verified against) `received_reset` clears the assembler, so
+        // data followed by a reset in one batch reads as
+        // `Reset` and the connection stays open. That is an enforcement and observability gap, not a
+        // memory exposure: the reset is what frees those bytes.
+        //
+        // The peek runs only for an id that is one of OUR send streams, so it is off the conforming
+        // hot path.
+        let unsolicited = self.table.entry(h).is_some_and(|e| {
+          e.classes.iter().any(|c| c.send == Some(id))
+            && e
+              .conn
+              .recv_stream(id)
+              .read(/*ordered=*/ true)
+              .is_ok_and(|mut chunks| {
+                let got = matches!(
+                  chunks.next(1),
+                  Ok(Some(_)) | Err(quinn_proto::ReadError::Blocked)
+                );
+                let _ = chunks.finalize();
+                got
+              })
+        });
+        if unsolicited {
+          self.close_local(now, h, CloseCause::UnsolicitedStream);
+          return;
+        }
         self.stream_ready.push_back(h);
       }
       Event::Stream(StreamEvent::Writable { .. }) => {
@@ -1031,6 +1161,66 @@ impl Bridge {
   /// double-count). Forwarded to the driver through the coordinator's
   /// [`QuicCoordinator::conn_close_count`](super::QuicCoordinator::conn_close_count), mirroring the
   /// stream drivers' per-cause close observability.
+  /// STREAM frames this connection has RECEIVED — quinn's own frame counter, which is one tick per
+  /// span the reassembler was handed. The direct observable for the sender-side segmentation
+  /// contract: a datagram can carry several STREAM frames (retransmit recovery packs disjoint ranges
+  /// into one), so counting datagrams would under-report exactly where it matters.
+  /// Feed one datagram into quinn WITHOUT running the service pump, so SEVERAL datagrams can be
+  /// processed before a single application-event drain.
+  ///
+  /// Test-only, and it exists for one reason: the unsolicited-half classifier's contract turns on
+  /// frame-processing order — a `RESET_STREAM` handled in the same batch as the data it releases
+  /// leaves nothing for the peek to observe. `handle_datagram` services after every datagram, so
+  /// that batch cannot be built through it. Established connections only; the accept and refuse
+  /// paths are deliberately not reachable here.
+  #[cfg(test)]
+  pub(crate) fn test_feed_datagram_unserviced(
+    &mut self,
+    now: Instant,
+    remote: SocketAddr,
+    data: &[u8],
+  ) {
+    let mut scratch = Vec::new();
+    let ev = self.endpoint.handle(
+      now,
+      remote,
+      /*local_ip=*/ None,
+      /*ecn=*/ None,
+      bytes::BytesMut::from(data),
+      &mut scratch,
+    );
+    if let Some(DatagramEvent::ConnectionEvent(h, conn_ev)) = ev
+      && let Some(e) = self.table.entry(h)
+    {
+      e.conn.handle_event(conn_ev);
+    }
+  }
+
+  /// Bytes currently staged for `class` on `h` at the moment of the call — the length of that
+  /// class's `outbound` buffer, or 0 when `h` has no entry.
+  ///
+  /// That is the whole contract. A non-zero value says bytes are staged, not WHY: the peer's
+  /// flow-control window refusing more is one cause, so is stream-slot exhaustion leaving
+  /// [`Self::flush_outbound`] with no stream to open. A zero says nothing is staged now, which a
+  /// drain produces and so do a class reset, a connection close, and the entry being reaped. Any
+  /// test that needs one of those specifically has to establish it some other way.
+  #[cfg(test)]
+  pub(crate) fn staged_outbound_len(&mut self, h: ConnectionHandle, class: StreamClass) -> usize {
+    self
+      .table
+      .entry(h)
+      .map_or(0, |e| e.class_mut(class).outbound.len())
+  }
+
+  #[cfg(test)]
+  pub(crate) fn rx_stream_frames_total(&mut self) -> u64 {
+    self
+      .table
+      .iter_mut()
+      .map(|(_, e)| e.conn.stats().frame_rx.stream)
+      .sum()
+  }
+
   pub(crate) fn conn_close_count(&self, cause: CloseCause) -> u64 {
     self.close_counts[cause.index()]
   }
@@ -2031,8 +2221,8 @@ impl Bridge {
       // `ReadError::Reset` mid-drain means the peer reset this class.
       //
       // Read at most `STAGE_CHUNK` bytes per pass rather than the whole stream window: a single pass
-      // over a multi-megabyte `stream_receive_window` packed with tiny frames would otherwise push
-      // millions of complete frames onto the decoder's ready queue before `drain_bridge` (which only
+      // over a full `stream_receive_window` packed with tiny frames would otherwise push a window's
+      // worth of complete frames onto the decoder's ready queue before `drain_bridge` (which only
       // pops AFTER this returns) drains any. Bounding the read bounds the queue to one budget's worth
       // of frames; `leftover` then reschedules the rest so the stream still fully drains across passes.
       let mut scratch: Vec<u8> = Vec::new();

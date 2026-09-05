@@ -7,7 +7,10 @@ use crate::{
     CloseCause,
     frame::LEN_PREFIX,
     quic::{
-      crypto::MAX_BIDI_STREAMS,
+      crypto::{
+        MAX_BIDI_STREAMS, MAX_STREAM_RECEIVE_WINDOW, MIN_FILLED_STREAM_FRAME_PAYLOAD,
+        QUINN_REASSEMBLY_MAX_SPANS,
+      },
       testutil::{PacketPipe, addr},
     },
   },
@@ -257,6 +260,36 @@ impl Bridge {
   fn test_stage_outbound(&mut self, h: ConnectionHandle, class: StreamClass, bytes: &[u8]) {
     let e = self.table.entry(h).expect("entry for staged outbound");
     e.class_mut(class).outbound.extend(bytes.iter().copied());
+  }
+
+  /// Write raw bytes onto `sid`'s send half from THIS bridge, bypassing the class staging — the
+  /// test-only way to play a peer that writes into the recv half of a stream the other side opened.
+  fn test_write_raw(
+    &mut self,
+    h: ConnectionHandle,
+    sid: StreamId,
+    bytes: &[u8],
+  ) -> Result<usize, WriteError> {
+    let e = self.table.entry(h).expect("entry for a raw write");
+    e.conn.send_stream(sid).write(bytes)
+  }
+
+  /// RESET `sid`'s send half from THIS bridge — the peer-side action our own retirement performs on
+  /// the reverse direction of a stream the other side opened.
+  fn test_reset_raw(&mut self, h: ConnectionHandle, sid: StreamId) {
+    let e = self.table.entry(h).expect("entry for a raw reset");
+    let _ = e.conn.send_stream(sid).reset(VarInt::from_u32(7));
+  }
+
+  /// FINISH `sid`'s send half from THIS bridge, with nothing written on it.
+  fn test_finish_raw(&mut self, h: ConnectionHandle, sid: StreamId) {
+    let e = self.table.entry(h).expect("entry for a raw finish");
+    let _ = e.conn.send_stream(sid).finish();
+  }
+
+  /// The Control/Bulk send stream id this bridge opened for `h`, if any.
+  fn test_send_id(&mut self, h: ConnectionHandle, class: StreamClass) -> Option<StreamId> {
+    self.table.entry(h)?.class_mut(class).send
   }
 
   /// Accept the first peer-opened bidi stream on the first handshook
@@ -827,7 +860,7 @@ fn a_tiny_frame_burst_in_one_window_is_drained_in_bounded_passes() {
 
   // Many zero-body frames (4 bytes each: just the length prefix) — the smallest possible frame, so
   // the queue-depth blowup an unbounded read would cause is maximal. BURST spans several STAGE_CHUNK
-  // passes and fits well inside the 8 MiB stream_receive_window, so B can buffer the whole burst
+  // passes and fits inside the 1 MiB stream_receive_window, so B can buffer the whole burst
   // before it reads a byte (the realistic exhaustion setup).
   const BURST: usize = 8 * STAGE_CHUNK / LEN_PREFIX; // = 8 budgets' worth of minimal frames
   let mut blob = Vec::new();
@@ -844,7 +877,7 @@ fn a_tiny_frame_burst_in_one_window_is_drained_in_bounded_passes() {
   let mut pipe_to_b = PacketPipe::default();
 
   // Phase 1: push the whole burst to B WITHOUT B reading, so its recv buffer fills past one budget.
-  // B's stream window (8 MiB) exceeds the burst, so A drains all of it even though B never reads.
+  // B's stream window (1 MiB) exceeds the burst, so A drains all of it even though B never reads.
   // Ferry until A has emptied its staged outbound, then a few extra ticks to land the last in-flight
   // datagrams in B's recv buffer (A pacing means the tail arrives a tick or two after the last write).
   let mut settle = 0u64;
@@ -929,9 +962,9 @@ fn a_tiny_frame_burst_in_one_window_is_drained_in_bounded_passes() {
 /// dropped-`ShouldTransmit` fix.
 ///
 /// quinn only queues `MAX_STREAM_DATA` once the application has consumed at least
-/// `stream_receive_window / 8` (1 MiB of the 8 MiB window) past the last advertised limit, so a
+/// `stream_receive_window / 8` (128 KiB of the 1 MiB window) past the last advertised limit, so a
 /// single 64 KiB budget read does not cross it; the receiver must read several budgets first. The
-/// test fills B's whole stream window with one large frame (between the 8 MiB window and the 16 MiB
+/// test fills B's whole stream window with one large frame (between the 1 MiB window and the 16 MiB
 /// frame cap), so the sender A blocks behind flow control, then reads budgets on B with NO inbound
 /// datagram and NO `handle_timeout` between reads — the ONLY thing that can push a datagram onto B's
 /// outbound is `ingest_recv` servicing the connection after a read that freed the window. It asserts
@@ -960,8 +993,8 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
   a.bind_validated(now, ha, peer_b);
   b.bind_validated(now, hb, peer_a);
 
-  // One frame larger than B's 8 MiB stream_receive_window but under the 16 MiB frame cap. A can only
-  // push 8 MiB onto the wire before B's window blocks it; the rest stays staged in A's outbound.
+  // One frame larger than B's 1 MiB stream_receive_window but under the 16 MiB frame cap. A can only
+  // push a window's worth onto the wire before B blocks it; the rest stays staged in A's outbound.
   const FRAME_BODY: usize = 12 * 1024 * 1024;
   let mut framed = Vec::new();
   encode_frame(&vec![0xC3u8; FRAME_BODY], &mut framed);
@@ -1008,7 +1041,7 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
   };
   assert!(
     a_blocked > 0,
-    "A must be flow-control blocked with a staged tail (frame {total_len} B exceeds B's 8 MiB \
+    "A must be flow-control blocked with a staged tail (frame {total_len} B exceeds B's 1 MiB \
      stream window), so the transfer depends on B's credit"
   );
 
@@ -1042,7 +1075,7 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
      traffic servicing the connection"
   );
 
-  // End-to-end: with credit flowing, the WHOLE >8 MiB frame is delivered. Resume the ferry (B now
+  // End-to-end: with credit flowing, the WHOLE over-window frame is delivered. Resume the ferry (B now
   // emits credit each time it frees window, so A drains its staged tail) until B decodes the frame.
   let mut got: Option<Vec<u8>> = None;
   for k in 0..8000u64 {
@@ -1066,7 +1099,826 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
   assert_eq!(
     got.map(|f| f.len()),
     Some(FRAME_BODY),
-    "the full >8 MiB frame must be delivered once flow-control credit flows after each budget read"
+    "the full over-window frame must be delivered once flow-control credit flows after each budget \
+     read"
+  );
+}
+
+/// The unread backlog a full stream receive window admits must stay inside the span count quinn's
+/// stream reassembler will hold — the derivation
+/// [`MAX_STREAM_RECEIVE_WINDOW`](crate::transport::quic::crypto::MAX_STREAM_RECEIVE_WINDOW) states,
+/// measured against real packetization rather than assumed.
+///
+/// quinn buffers each received STREAM frame as its own span and rejects an insert once the count
+/// passes `QUINN_REASSEMBLY_MAX_SPANS` — closing the whole CONNECTION, not throttling the peer. The
+/// compaction it tries first merges only poorly utilized spans, so full packets from a sender with a
+/// backlog stay separate and a deep backlog cannot be compacted back under the ceiling. The window
+/// is what bounds that backlog, so it has to be small enough that a window's worth of full packets
+/// is fewer spans than the ceiling.
+///
+/// This test drives the worst case directly: a frame several windows long, ferried to B with B
+/// reading NOTHING, so B's reassembler holds a whole window unread. The spans are COUNTED AT THE
+/// RECEIVER, from quinn's own STREAM-frame counter, and pinned against the ceiling directly; the
+/// datagrams B absorbed are kept alongside as a coarser bound on what the wire carried. Then B
+/// drains and the frame must arrive in FULL — a stream quinn had errored would deliver nothing.
+///
+/// It fails both ways the end-to-end tests only fail indirectly: raising the window (or shrinking
+/// the packets a window holds) drives the receiver's span count over the ceiling, and a quinn
+/// release that lowers its own bound errors this stream while the count assertions still pass.
+///
+/// Scope: this is the FILLED-PACKET case the sizing covers — the shape a bulk transfer produces.
+/// A sender whose segmentation is not packet-filling reaches the ceiling on far fewer bytes, and no
+/// window prevents that;
+/// `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` covers that
+/// shape, and `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
+/// the recovery it gets.
+#[test]
+fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+
+  // Several windows' worth on the Bulk class, so A fills B's whole window and stays blocked behind
+  // it with a staged tail — the deepest unread backlog flow control permits.
+  const BODY: usize = 4 * MAX_STREAM_RECEIVE_WINDOW as usize;
+  let mut framed = Vec::new();
+  encode_frame(&vec![0x2Bu8; BODY], &mut framed);
+  let total = framed.len();
+  a.test_stage_outbound(ha, StreamClass::Bulk, &framed);
+
+  // Ferry with NO `ingest_recv` on B, counting every datagram B absorbs, until A can push nothing
+  // more onto the wire (B's window is full and A still holds a staged tail).
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let spans_before = b.rx_stream_frames_total();
+  let mut unread_datagrams = 0usize;
+  let mut unread_bytes = 0usize;
+  let mut idle = 0u64;
+  let mut tick = now;
+  for k in 1..4000u64 {
+    tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    while let Some((dst, bytes)) = a.poll_transmit() {
+      assert_eq!(dst, b_addr);
+      pipe_to_b.push(a_addr, bytes);
+    }
+    while let Some((dst, bytes)) = b.poll_transmit() {
+      assert_eq!(dst, a_addr);
+      pipe_to_a.push(b_addr, bytes);
+    }
+    let before = unread_datagrams;
+    while let Some((from, bytes)) = pipe_to_b.pop() {
+      unread_datagrams += 1;
+      unread_bytes += bytes.len();
+      b.handle_datagram(tick, from, None, &bytes);
+    }
+    while let Some((from, bytes)) = pipe_to_a.pop() {
+      a.handle_datagram(tick, from, None, &bytes);
+    }
+    a.handle_timeout(tick);
+    b.handle_timeout(tick);
+    // A is done filling once nothing more reaches B for a stretch of ticks while a staged tail
+    // remains: only B's window can be holding it back, since B never reads.
+    let a_left = {
+      let e = a.table.entry(ha).expect("A entry");
+      e.class_mut(StreamClass::Bulk).outbound.len()
+    };
+    if unread_datagrams == before && a_left > 0 {
+      idle += 1;
+      if idle >= 64 {
+        break;
+      }
+    } else {
+      idle = 0;
+    }
+  }
+  let a_left = {
+    let e = a.table.entry(ha).expect("A entry");
+    e.class_mut(StreamClass::Bulk).outbound.len()
+  };
+  assert!(
+    a_left > 0,
+    "A must still hold a staged tail: the frame ({total} B) is several windows long, so B's window \
+     is the only thing that can have stopped it"
+  );
+  // The pin, counted at the RECEIVER from quinn's own STREAM-frame counter: a full window's worth of
+  // real packets is fewer SPANS than the reassembler will hold.
+  let unread_spans = b.rx_stream_frames_total() - spans_before;
+  assert!(
+    unread_spans <= QUINN_REASSEMBLY_MAX_SPANS,
+    "a window's worth of unread data must stay within the {QUINN_REASSEMBLY_MAX_SPANS}-span \
+     reassembly ceiling — B's quinn counted {unread_spans} STREAM frames (over {unread_datagrams} \
+     datagrams); the window is sized as {MAX_STREAM_RECEIVE_WINDOW} B / \
+     {MIN_FILLED_STREAM_FRAME_PAYLOAD} B per full packet"
+  );
+  // The datagram count is kept as the coarser companion: it also covers B's control-stream and
+  // pure-ACK traffic, so it bounds what the wire carried rather than what the reassembler held.
+  assert!(
+    unread_datagrams as u64 <= QUINN_REASSEMBLY_MAX_SPANS,
+    "and the datagrams that carried it ({unread_datagrams}) must stay within it too"
+  );
+
+  // ...and the count is a full window's worth rather than an early-ended fill: a stream quinn has
+  // already errored stops ACKing, which ends the fill too, so this is checked after the pin.
+  assert!(
+    unread_bytes >= MAX_STREAM_RECEIVE_WINDOW as usize,
+    "a full window ({MAX_STREAM_RECEIVE_WINDOW} B) must have reached B unread before flow control \
+     stopped A, got {unread_bytes} B"
+  );
+
+  // B now drains. The frame arrives in full only if quinn kept every span it buffered: a stream it
+  // had errored delivers nothing, however much credit B goes on to grant.
+  let mut got: Option<Vec<u8>> = None;
+  for k in 0..8000u64 {
+    let t = tick + Duration::from_millis(k + 1);
+    a.flush_stream(t, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      t,
+    );
+    assert!(
+      !b.ingest_recv(t, hb),
+      "a legitimate over-window transfer must never reap the connection"
+    );
+    if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
+      got = Some(f);
+      break;
+    }
+  }
+  assert_eq!(
+    got.map(|f| f.len()),
+    Some(BODY),
+    "the whole {BODY}-byte frame must arrive after a full window sat unread in the reassembler"
+  );
+}
+
+/// UNIT PIN, sender side: a sub-packet write flood makes the bridge emit the LOST event for the
+/// stream quinn refused, classified and unbound.
+///
+/// Scope is deliberately this one step. The receive window bounds an unread backlog's BYTES, not the
+/// number of spans quinn buffers them as, and quinn refuses a stream more spans than its reassembler
+/// holds. A sender that hands quinn a few hundred bytes per pump gives it less than a packet's worth
+/// each time, so every packet carries a sub-packet span well-utilized enough that compaction will not
+/// merge it — no loss and no reordering needed, and roughly [`QUINN_REASSEMBLY_MAX_SPANS`] * 2 such
+/// writes cross the ceiling on well under a megabyte, which is the point: the bytes never approach
+/// the window, so no window setting prevents this.
+///
+/// What the bridge owes at that moment is asserted here and nothing more: the loss is queued for the
+/// coordinator to reap, classified as the QUIC layer rejecting the connection, and the peer's routing
+/// is unbound so nothing is written into a dead connection. Whether the cluster then RECOVERS — both
+/// ends reaping, the link re-established, the in-flight operation completing — belongs to the
+/// coordinator, the consensus layer and the driver's link reconcile, and the evidence for it is
+/// COMPONENT-level, not end to end:
+/// `quic::loopback::a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_its_operation`
+/// drives it over real mTLS with three seams MODELLED — the stall, the redial schedule and the
+/// client's stale-request rebroadcast — and `viewstamp-compio`'s
+/// `the_link_reconcile_arms_then_redials_an_unbound_peer_on_a_doubling_backoff` proves the schedule
+/// on the real reconcile. [`MAX_STREAM_RECEIVE_WINDOW`] carries the canonical statement of that
+/// claim. Asserting any of it here would mean building the state by hand instead of reaching it.
+///
+/// The flood stages already-framed bytes and flushes them through the production `flush_outbound`
+/// write path, which is where the coalescing that shapes the spans lives.
+#[test]
+fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  assert_eq!(
+    b.handle_for(peer_a),
+    Some(hb),
+    "B routes to A before the flood"
+  );
+
+  // One small frame per pump: too little for quinn to fill a packet with, so each pump puts one
+  // sub-packet STREAM frame on the wire. B never reads, so they all stay buffered as separate spans.
+  const TRICKLE_BODY: usize = 396;
+  let mut framed = Vec::new();
+  encode_frame(&vec![0x77u8; TRICKLE_BODY], &mut framed);
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let spans_before = b.rx_stream_frames_total();
+  let mut writes = 0u64;
+  let mut lost = None;
+  for k in 1..(QUINN_REASSEMBLY_MAX_SPANS * 6) {
+    // Micro-second ticks keep the whole flood inside one PTO and far inside the idle timeout, so the
+    // loss under test is the reassembler's refusal and not a timer.
+    let tick = now + Duration::from_micros(k * 20);
+    if a.table.entry(ha).is_none() {
+      // A's own side of the connection drained away first: stop feeding it and let the assertions
+      // below report what B did — or failed to do — with the loss.
+      break;
+    }
+    a.test_stage_outbound(ha, StreamClass::Bulk, &framed);
+    writes += 1;
+    a.flush_stream(tick, ha);
+    while let Some((dst, bytes)) = a.poll_transmit() {
+      assert_eq!(dst, b_addr);
+      pipe_to_b.push(a_addr, bytes);
+    }
+    while let Some((dst, bytes)) = b.poll_transmit() {
+      assert_eq!(dst, a_addr);
+      pipe_to_a.push(b_addr, bytes);
+    }
+    while let Some((from, bytes)) = pipe_to_b.pop() {
+      b.handle_datagram(tick, from, None, &bytes);
+    }
+    while let Some((from, bytes)) = pipe_to_a.pop() {
+      a.handle_datagram(tick, from, None, &bytes);
+    }
+    a.handle_timeout(tick);
+    b.handle_timeout(tick);
+    if let Some(h) = b.take_lost() {
+      lost = Some(h);
+      break;
+    }
+  }
+
+  // The promised classification and teardown, in the order the recovery depends on.
+  assert_eq!(
+    lost,
+    Some(hb),
+    "the reassembler's refusal must surface as a LOST connection queued for reaping, not a silent \
+     stall — after {writes} sub-packet writes"
+  );
+  assert_eq!(
+    b.conn_close_count(CloseCause::RecordRejected),
+    1,
+    "and be classified as the QUIC layer rejecting the connection, not an idle-out or a peer close"
+  );
+  assert_eq!(
+    b.handle_for(peer_a),
+    None,
+    "routing to the peer must be unbound the instant the connection is lost, so nothing is sent \
+     into a dead connection"
+  );
+  // Non-vacuity, and the finding this pins: it was the SPAN count that closed it, not the window.
+  // The flood crossed the span ceiling while the bytes stayed far under a window's worth. Counted at
+  // the RECEIVER, from quinn's own STREAM-frame counter, so this is spans that actually reached the
+  // reassembler rather than writes that were staged: each is its own non-mergeable span (a
+  // sub-packet frame quinn packetized alone), and the count has to pass the compaction threshold of
+  // `2 x QUINN_REASSEMBLY_MAX_SPANS` for compaction to have run and still left too many.
+  // Deterministic in this harness: one write per pump, each packetized alone, so one non-mergeable
+  // span per write, and the refusal lands on the first insert past the compaction threshold.
+  let spans = b.rx_stream_frames_total() - spans_before;
+  let expected = 2 * QUINN_REASSEMBLY_MAX_SPANS + 1;
+  assert_eq!(
+    spans, expected,
+    "the refusal must land on the first span past the compaction threshold: {spans} STREAM frames \
+     reached the receiver's reassembler, expected {expected}"
+  );
+  assert_eq!(
+    writes, expected,
+    "and every write must have produced exactly one of them: {writes} writes for {spans} spans"
+  );
+  let flooded = writes * framed.len() as u64;
+  assert!(
+    flooded < MAX_STREAM_RECEIVE_WINDOW,
+    "and it must do so on less than a window ({MAX_STREAM_RECEIVE_WINDOW} B) of stream bytes — \
+     {flooded} B — since a window that admitted this would have to be smaller than any usable one"
+  );
+}
+
+/// Data on the reverse direction of a stream WE opened closes the connection, deterministically.
+///
+/// Each class opens a BIDI stream and uses only its send half — the peer's frames ride the streams IT
+/// opens — so the reverse direction is never read. Leaving it alone is not a bound: quinn buffers for
+/// a read that never comes, and SUB-PACKET writes into it reach the reassembler's span ceiling long
+/// before a window's worth of bytes, so the connection dies anyway, on a path that pays a
+/// per-datagram cost first and gives the peer a churn lever.
+///
+/// So it is treated as what it is — a protocol violation no conforming peer produces — and answered
+/// once: when a STREAM frame is OBSERVABLE on that half at the peek, the connection closes with
+/// [`CloseCause::UnsolicitedStream`], nothing is read into a decoder, and nothing is retained. The
+/// classification is what the peek can see, not a claim about everything the peer sent: this
+/// transport's own retire protocol resets that half and a `RESET_STREAM` surfaces as readable too,
+/// and a reset processed in the same batch as data releases it before the peek runs (see
+/// `data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open`).
+///
+/// The writes here are deliberately sub-packet, the shape that would otherwise reach the span
+/// ceiling rather than the window.
+#[test]
+fn sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "nothing is unsolicited before the peer misbehaves"
+  );
+
+  // B writes into the OTHER direction of that same bidi stream, a few hundred bytes at a time — the
+  // sub-packet shape, one write per pump.
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let payload = std::vec![0x5Cu8; 396];
+  let mut closed = false;
+  for k in 1..400u64 {
+    let tick = now + Duration::from_millis(k);
+    let _ = b.test_write_raw(hb, victim, &payload);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+    if a.conn_close_count(CloseCause::UnsolicitedStream) > 0 {
+      closed = true;
+      break;
+    }
+  }
+  assert!(
+    closed,
+    "reverse-direction data on a stream we opened must close the connection under its own cause, \
+     not accumulate for a read that never comes"
+  );
+  assert!(
+    !a.is_validated(ha),
+    "and the connection must actually be down, not merely counted"
+  );
+  // Nothing of it was read into the class: no partial, no frame.
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "the unsolicited half's bytes must not reach the class decoder"
+  );
+  assert!(
+    a.next_frame(ha, StreamClass::Control).is_none(),
+    "and must not surface as a frame"
+  );
+}
+
+/// A frame that arrives AHEAD OF A GAP closes the connection too.
+///
+/// The half is never read, so an ordered peek at it returns `Blocked` whenever the peer's
+/// offset-zero packet is lost or reordered — a frame arrived (that is what raised the `Readable`)
+/// but not at the read offset. Treating that as "nothing arrived" would leave the half unrefused in
+/// exactly the case that matters, so `Blocked` on one of our own send ids is a violation like bytes
+/// at the offset are.
+///
+/// The first datagram carrying the peer's writes is withheld here and later ones delivered, so the
+/// classifier sees a frame it cannot read at the offset. The close must land while the gap is still
+/// open, before the peer's own retransmission could fill it.
+#[test]
+fn gapped_writes_into_our_opened_streams_recv_half_close_the_connection() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  let payload = std::vec![0x3Bu8; 396];
+
+  // Tick 1's write is HELD, not lost: its datagrams are captured and delivered only at the end. So
+  // when tick 2's write arrives, the bridge holds bytes at a non-zero offset with nothing at the
+  // read offset — the gap — and no retransmission has had a chance to fill it.
+  let tick1 = now + Duration::from_millis(1);
+  b.test_write_raw(hb, victim, &payload)
+    .expect("the first write is accepted");
+  while let Some((dst, bytes)) = a.poll_transmit() {
+    assert_eq!(dst, b_addr);
+    b.handle_datagram(tick1, a_addr, None, &bytes);
+  }
+  b.handle_timeout(tick1);
+  let mut held: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    held.push(bytes);
+  }
+  assert!(
+    !held.is_empty(),
+    "the first write must have produced datagrams to hold back"
+  );
+
+  let tick2 = now + Duration::from_millis(2);
+  b.test_write_raw(hb, victim, &payload)
+    .expect("the second write is accepted");
+  while let Some((dst, bytes)) = a.poll_transmit() {
+    assert_eq!(dst, b_addr);
+    b.handle_datagram(tick2, a_addr, None, &bytes);
+  }
+  b.handle_timeout(tick2);
+  let mut delivered = 0usize;
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    delivered += 1;
+    a.handle_datagram(tick2, b_addr, None, &bytes);
+  }
+  assert!(delivered > 0, "the second write must have reached A");
+
+  assert!(
+    a.conn_close_count(CloseCause::UnsolicitedStream) > 0,
+    "a frame that arrived AHEAD OF A GAP on a stream we opened must close the connection while the \
+     gap is open — an ordered peek reporting Blocked still saw a frame arrive"
+  );
+  assert!(
+    !a.is_validated(ha),
+    "and the connection must actually be down"
+  );
+  let _ = held;
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "with nothing of it read into the class decoder"
+  );
+}
+
+/// CONTROL: a peer RESET of the reverse half must not close the connection.
+///
+/// This transport's own retirement resets exactly that half ([`retire_local_send`]), and a
+/// `RESET_STREAM` surfaces as readable like data does. A policy that closed on the event alone would
+/// tear down every connection that retired a stream normally.
+#[test]
+fn a_peer_reset_of_our_opened_streams_recv_half_does_not_close() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B must have ADOPTED the stream before it retires its side of it — that is the order the real
+  // retirement runs in, and acting on a stream quinn has not allocated is what trips its own
+  // accounting (see the unsolicited-half policy's note).
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut framed = Vec::new();
+  encode_frame(b"hello", &mut framed);
+  a.test_stage_outbound(ha, StreamClass::Control, &framed);
+  for k in 1..40u64 {
+    let tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+    if b.next_frame(hb, StreamClass::Control).is_some() {
+      break;
+    }
+  }
+  b.test_reset_raw(hb, victim);
+  for k in 40..120u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "a RESET of the unused half is the retirement this transport performs itself, not a violation"
+  );
+  assert!(a.is_validated(ha), "and the connection stays up");
+}
+
+/// CONTROL: a peer FIN of the reverse half, with nothing written on it, must not close the
+/// connection either — a finished empty half carries no data, so there is nothing to refuse.
+#[test]
+fn a_peer_fin_of_our_opened_streams_recv_half_does_not_close() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B must have ADOPTED the stream before it retires its side of it — that is the order the real
+  // retirement runs in, and acting on a stream quinn has not allocated is what trips its own
+  // accounting (see the unsolicited-half policy's note).
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut framed = Vec::new();
+  encode_frame(b"hello", &mut framed);
+  a.test_stage_outbound(ha, StreamClass::Control, &framed);
+  for k in 1..40u64 {
+    let tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+    if b.next_frame(hb, StreamClass::Control).is_some() {
+      break;
+    }
+  }
+  b.test_finish_raw(hb, victim);
+  for k in 40..120u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "an empty FIN on the unused half carries no data, so there is nothing to refuse"
+  );
+  assert!(a.is_validated(ha), "and the connection stays up");
+}
+
+/// DOCUMENTED GAP: data whose RESET is processed in the same batch is not classified as data.
+///
+/// quinn processes a datagram batch's frames before the bridge drains application events, and — in
+/// quinn-proto 0.11.17, the version this was verified against — `received_reset` clears the stream's
+/// assembler. So when the peer's write and its reset reach the
+/// receiver before one drain, the peek that follows sees `Reset` — the write is no longer among the
+/// classifier's inputs — and the connection stays open.
+///
+/// Building that batch takes care, because it is easy to write a test that proves nothing. A reset
+/// issued before packetization moves the send stream to `ResetSent` and quinn then emits no STREAM
+/// frame at all, which is just the reset-only control wearing a different name. Here the data is
+/// PACKETIZED FIRST, the reset queued after, and both datagrams are fed through
+/// [`Bridge::test_feed_datagram_unserviced`] so no drain runs between them. The receiver's own
+/// STREAM-frame counter is asserted to have advanced, which is what makes the case non-vacuous: the
+/// bytes really did arrive before the reset released them.
+///
+/// The gap is an enforcement and observability one, not a memory exposure — the reset is precisely
+/// what frees those bytes — and pinning it keeps it from being mistaken for a classifier that saw
+/// the data and chose to allow it.
+#[test]
+fn data_whose_reset_lands_in_the_same_batch_leaves_the_connection_open() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  // B adopts the stream first, the order the real retirement runs in.
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  let mut framed = Vec::new();
+  encode_frame(b"hello", &mut framed);
+  a.test_stage_outbound(ha, StreamClass::Control, &framed);
+  for k in 1..40u64 {
+    let tick = now + Duration::from_millis(k);
+    a.flush_stream(tick, ha);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+    if b.next_frame(hb, StreamClass::Control).is_some() {
+      break;
+    }
+  }
+  while a.poll_transmit().is_some() {}
+  while b.poll_transmit().is_some() {}
+  let frames_before = a.rx_stream_frames_total();
+
+  // 1. Write into the reverse half and PACKETIZE it — this is the datagram carrying the STREAM frame.
+  let t_data = now + Duration::from_millis(40);
+  b.test_write_raw(hb, victim, &std::vec![0x6Du8; 396])
+    .expect("the write is accepted");
+  b.handle_timeout(t_data);
+  let mut with_data: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    with_data.push(bytes);
+  }
+  assert!(
+    !with_data.is_empty(),
+    "the write must be packetized BEFORE the reset, or quinn emits no STREAM frame at all and the \
+     case collapses into the reset-only control"
+  );
+
+  // 2. Now reset, and packetize that.
+  let t_reset = now + Duration::from_millis(41);
+  b.test_reset_raw(hb, victim);
+  b.handle_timeout(t_reset);
+  let mut with_reset: Vec<Vec<u8>> = Vec::new();
+  while let Some((dst, bytes)) = b.poll_transmit() {
+    assert_eq!(dst, a_addr);
+    with_reset.push(bytes);
+  }
+  assert!(!with_reset.is_empty(), "the reset must reach the wire too");
+
+  // 3. Both into the receiver's quinn with NO drain in between, then exactly one drain.
+  for bytes in with_data.iter().chain(with_reset.iter()) {
+    a.test_feed_datagram_unserviced(t_reset, b_addr, bytes);
+  }
+  let drained = now + Duration::from_millis(42);
+  a.handle_timeout(drained);
+  a.ingest_recv(drained, ha);
+
+  assert!(
+    a.rx_stream_frames_total() > frames_before,
+    "the data must actually have reached the receiver — without that this proves nothing about a \
+     reset erasing it"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::UnsolicitedStream),
+    0,
+    "with the reset processed in the same batch the classifier sees `Reset`, not the write it \
+     released — the documented gap"
+  );
+  assert!(
+    a.is_validated(ha),
+    "so the connection stays up; the reset already freed what the write had buffered"
+  );
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "and nothing of it is retained by the bridge either way"
+  );
+}
+
+/// A zero-length, non-FIN frame on the reverse half closes the connection too.
+///
+/// The classifier's `Blocked` arm is "a frame arrived that is not at the read offset", and a
+/// zero-length non-FIN STREAM frame is exactly that: the `Readable` says a frame arrived, the peek
+/// finds nothing at the offset. It carries no bytes, so it is no memory exposure — it is refused
+/// because a frame on a half no conforming peer writes to is the violation, whatever its length.
+///
+/// This pins the outcome rather than assuming it: an empty write through quinn's own API does put a
+/// frame on the wire, so the case is reachable and its result is the close.
+#[test]
+fn a_zero_length_write_into_our_opened_streams_recv_half_closes_the_connection() {
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+  let victim = a
+    .test_send_id(ha, StreamClass::Control)
+    .expect("A opened its Control stream");
+
+  let written = b
+    .test_write_raw(hb, victim, &[])
+    .expect("an empty write is accepted");
+  assert_eq!(written, 0, "and writes nothing");
+
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  for k in 1..80u64 {
+    let tick = now + Duration::from_millis(k);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    a.ingest_recv(tick, ha);
+  }
+  assert!(
+    a.conn_close_count(CloseCause::UnsolicitedStream) > 0,
+    "a zero-length non-FIN frame is still a frame on a half no conforming peer writes to, and the \
+     classifier refuses it like any other"
+  );
+  assert!(!a.is_validated(ha), "so the connection is down");
+  assert_eq!(
+    a.test_partial_len(ha, StreamClass::Control),
+    0,
+    "with nothing retained — the frame carried no bytes to begin with"
   );
 }
 
@@ -3904,13 +4756,13 @@ fn a_send_path_close_unbinds_routing_atomically_so_later_frames_do_not_grow_the_
 /// unconditional `flush_stream` and NO second `write_framed`. If the tail were dropped, or the flush
 /// path stopped retrying, the frame would never fully arrive.
 ///
-/// The frame is sized OVER the 8 MiB `stream_receive_window`, so its first write is necessarily
+/// The frame is sized OVER the 1 MiB `stream_receive_window`, so its first write is necessarily
 /// partial (the peer's per-stream flow-control budget caps it) and the remainder must be pushed only
 /// as the peer reads and reopens its window. Draining the staged tail therefore depends entirely on
 /// the connection making progress under flow control between pumps, with no application traffic to
 /// piggyback on.
 ///
-/// NOTE on scope: under this transport's flow-control parameters the per-stream window (8 MiB) is the
+/// NOTE on scope: under this transport's flow-control parameters the per-stream window (1 MiB) is the
 /// binding limit on every partial write, never the connection-level send window (~9.5 MiB) — so the
 /// `Writable` that retries the tail always originates from the peer freeing its STREAM window
 /// (`MAX_STREAM_DATA`) as it reads, a signal independent of whether `flush_outbound` writes once or
@@ -3938,7 +4790,7 @@ fn a_large_frame_partial_write_drains_its_tail_across_pumps_without_a_follow_on_
   a.bind_validated(now, ha, peer_b);
   b.bind_validated(now, hb, peer_a);
 
-  // A Bulk frame larger than B's 8 MiB stream_receive_window: the first write can only be partial,
+  // A Bulk frame larger than B's 1 MiB stream_receive_window: the first write can only be partial,
   // so the tail MUST be carried out across later pumps as B reads and reopens its window.
   const BODY: usize = 12 * 1024 * 1024;
   let mut framed = Vec::new();

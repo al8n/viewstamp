@@ -44,8 +44,8 @@ pub use passthrough::Passthrough;
 pub use quic::{
   AttestedId, CertOid, ClusterTls, DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_IDLE_TIMEOUT_MILLIS,
   DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, DialError, Hello, Identified,
-  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, ProvidedIdentity, QuicCoordinator,
-  QuicOptions, QuicTuning, StreamLayout,
+  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, MAX_STREAM_RECEIVE_WINDOW,
+  ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning, StreamLayout, StreamWindowTooLarge,
 };
 pub use router::{ConnId, PeerRouter};
 pub use stream::{Intake, StreamTransport};
@@ -86,11 +86,17 @@ pub enum CloseCause {
   /// A live conn was retired by newer state — a fresher validated conn for the same peer won the
   /// duplicate race, or a membership change removed/re-slotted the member it was bound to.
   Superseded,
+  /// A STREAM frame was observable on the reverse direction of a stream THIS side opened. Each class
+  /// uses only the send half of the stream it opens — the peer's frames ride the streams it opens
+  /// itself — so a frame arriving on that half is a protocol violation no conforming peer produces.
+  /// Recorded for what the transport OBSERVED: a peer whose reset releases the data first is not
+  /// counted here, and its connection stays open.
+  UnsolicitedStream,
 }
 
 impl CloseCause {
   /// The number of causes — sizes a per-cause counter array (`[u64; CloseCause::COUNT]`).
-  pub const COUNT: usize = Self::Superseded as usize + 1;
+  pub const COUNT: usize = Self::UnsolicitedStream as usize + 1;
 
   /// The dense counter-array slot of this cause (`0..COUNT`).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -113,6 +119,7 @@ impl CloseCause {
       Self::AcceptCapacity => "accept_capacity",
       Self::IdleTimeout => "idle_timeout",
       Self::Superseded => "superseded",
+      Self::UnsolicitedStream => "unsolicited_stream",
     }
   }
 }

@@ -83,8 +83,8 @@ pub use time::Instant;
 pub use transport::{
   AttestedId, CertOid, ClusterTls, DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_IDLE_TIMEOUT_MILLIS,
   DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, DialError, Hello, Identified,
-  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, ProvidedIdentity, QuicCoordinator,
-  QuicOptions, QuicTuning, StreamLayout,
+  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, MAX_STREAM_RECEIVE_WINDOW,
+  ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning, StreamLayout, StreamWindowTooLarge,
 };
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]

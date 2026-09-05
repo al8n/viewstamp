@@ -13,6 +13,7 @@ fn close_cause_as_str_names_every_variant() {
   assert_eq!(CloseCause::AcceptCapacity.as_str(), "accept_capacity");
   assert_eq!(CloseCause::IdleTimeout.as_str(), "idle_timeout");
   assert_eq!(CloseCause::Superseded.as_str(), "superseded");
+  assert_eq!(CloseCause::UnsolicitedStream.as_str(), "unsolicited_stream");
   // The derived Display forwards to as_str.
   assert_eq!(
     std::format!("{}", CloseCause::Superseded),

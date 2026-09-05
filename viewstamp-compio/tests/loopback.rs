@@ -703,3 +703,153 @@ async fn a_parked_checkpoint_materialize_does_not_stop_the_node_committing() {
     let _ = h.shutdown().await;
   }
 }
+
+/// A test-side UDP relay between two nodes: one socket, forwarding by source address, dropping one
+/// datagram in `drop_one_in` on the way toward `b`.
+///
+/// The loss lives entirely in the test — no seam, no branch, nothing in the driver. Both nodes are
+/// configured with the relay's address as the other's, so each sees a stable peer address and the
+/// relay can tell the two directions apart by source alone. `drop_one_in` is read per datagram so a
+/// test can arm and disarm the loss while the cluster runs; `0` forwards everything.
+async fn lossy_relay(
+  bind: SocketAddr,
+  a: SocketAddr,
+  b: SocketAddr,
+  drop_one_in: std::sync::Arc<std::sync::atomic::AtomicU64>,
+  dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+  use std::sync::atomic::Ordering::Relaxed;
+  let sock = compio::net::UdpSocket::bind(bind)
+    .await
+    .expect("the relay binds its socket");
+  let mut buf = std::vec![0u8; 2048];
+  let mut toward_b = 0u64;
+  loop {
+    let compio::buf::BufResult(res, returned) = sock.recv_from(buf).await;
+    buf = returned;
+    let Ok((n, from)) = res else {
+      continue;
+    };
+    let dst = if from == a { b } else { a };
+    if dst == b {
+      let every = drop_one_in.load(Relaxed);
+      toward_b = toward_b.wrapping_add(1);
+      if every > 0 && toward_b.is_multiple_of(every) {
+        dropped.fetch_add(1, Relaxed);
+        continue;
+      }
+    }
+    let payload = buf[..n].to_vec();
+    let _ = sock.send_to(payload, dst).await;
+  }
+}
+
+/// REAL inbound datagram loss on REAL drivers, injected by the network and not by the driver.
+///
+/// The loss is injected where the network injects it: a relay socket owned by this test sits between
+/// node 2 and each of its peers and drops one INBOUND datagram in two — the outbound direction is
+/// untouched. No driver code participates; there is no loss seam in the shipped driver to arm.
+///
+/// What it pins, and this is the whole list: inbound datagrams to node 2 are dropped (the relay's
+/// own counter is asserted non-zero), the cluster keeps committing while that is happening, and node
+/// 2 is caught up and serving again once the loss stops — shown by a submit relayed through it.
+///
+/// What it establishes NOTHING about: what a dropped datagram carried, whether any STREAM gap
+/// formed, whether retransmission closed one, how many spans a reassembler held, or whether a
+/// refusal was approached. The relay counts opaque datagrams; nothing here inspects their contents
+/// or the receiver's reassembly state. It is loss-tolerance evidence and nothing more.
+#[compio::test]
+async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+  let ca = TestCa::new();
+  let base_port = 41100u16;
+  // Nodes 0..2 at base..base+2; the two relays for node 2's links at base+3 and base+4.
+  let node: Vec<SocketAddr> = (0..3)
+    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+    .collect();
+  let relay02: SocketAddr = format!("127.0.0.1:{}", base_port + 3).parse().unwrap();
+  let relay12: SocketAddr = format!("127.0.0.1:{}", base_port + 4).parse().unwrap();
+  let rid = |i: u8| viewstamp_proto::ReplicaId::new(i as u16);
+
+  let drop_one_in = Arc::new(AtomicU64::new(0));
+  let dropped = Arc::new(AtomicU64::new(0));
+  compio::runtime::spawn(lossy_relay(
+    relay02,
+    node[0],
+    node[2],
+    drop_one_in.clone(),
+    dropped.clone(),
+  ))
+  .detach();
+  compio::runtime::spawn(lossy_relay(
+    relay12,
+    node[1],
+    node[2],
+    drop_one_in.clone(),
+    dropped.clone(),
+  ))
+  .detach();
+
+  // Every path to or from node 2 goes through its relay; nodes 0 and 1 talk directly.
+  let peers_of = |id: u8| -> Vec<(viewstamp_proto::ReplicaId, SocketAddr)> {
+    match id {
+      0 => std::vec![(rid(1), node[1]), (rid(2), relay02)],
+      1 => std::vec![(rid(0), node[0]), (rid(2), relay12)],
+      _ => std::vec![(rid(0), relay02), (rid(1), relay12)],
+    }
+  };
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let (driver, handle) = build_driver(&ca, id, node[id as usize], peers_of(id)).await;
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+
+  // Converge cleanly first, so the fault lands on a working cluster.
+  let reply = compio::time::timeout(
+    std::time::Duration::from_secs(10),
+    handles[0].submit(Bytes::from_static(b"warm")),
+  )
+  .await
+  .expect("initial commit within 10s")
+  .expect("a reply");
+  assert_eq!(&reply[..], &1u64.to_be_bytes());
+
+  // Half of everything arriving at node 2 is now dropped, for the rest of the run.
+  drop_one_in.store(2, Relaxed);
+
+  // A stream of small requests while the drops continue. The cluster must keep committing — quorum
+  // is 2 of 3.
+  for i in 0..40u64 {
+    let reply = compio::time::timeout(
+      std::time::Duration::from_secs(10),
+      handles[0].submit(Bytes::from_static(b"x")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("commit {i} under 50% loss within 10s"))
+    .expect("a reply");
+    assert_eq!(&reply[..], &(i + 2).to_be_bytes());
+  }
+  assert!(
+    dropped.load(Relaxed) > 0,
+    "the relay must actually have dropped datagrams"
+  );
+
+  // Loss stops: node 2 has to be caught up and serving again, which a submit relayed through it
+  // shows — for that path, not for anything the refusal's recovery claim rests on.
+  drop_one_in.store(0, Relaxed);
+  let reply = compio::time::timeout(
+    std::time::Duration::from_secs(15),
+    handles[2].submit(Bytes::from_static(b"healed")),
+  )
+  .await
+  .expect("the healed node relays and commits within 15s")
+  .expect("a reply");
+  assert_eq!(&reply[..], &42u64.to_be_bytes());
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}

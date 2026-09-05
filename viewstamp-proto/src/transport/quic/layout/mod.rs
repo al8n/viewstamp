@@ -54,7 +54,7 @@ impl StreamClass {
 
 /// `Prepare` body bytes above this threshold route to the Bulk stream so a
 /// large operation body cannot head-of-line block a heartbeat on the Control
-/// stream.  Sized well under the bulk stream_receive_window (8 MiB).
+/// stream.  Sized well under the bulk stream_receive_window (1 MiB).
 pub(crate) const PREPARE_BULK_THRESHOLD: usize = 64 * 1024;
 
 /// Pure: which stream class carries `msg` under `layout`.
