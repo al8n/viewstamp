@@ -1317,6 +1317,7 @@ fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_strea
   encode_frame(&vec![0x77u8; TRICKLE_BODY], &mut framed);
   let mut pipe_to_a = PacketPipe::default();
   let mut pipe_to_b = PacketPipe::default();
+  let spans_before = b.rx_stream_frames_total();
   let mut writes = 0u64;
   let mut lost = None;
   for k in 1..(QUINN_REASSEMBLY_MAX_SPANS * 6) {
@@ -1372,7 +1373,18 @@ fn a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_strea
      into a dead connection"
   );
   // Non-vacuity, and the finding this pins: it was the SPAN count that closed it, not the window.
-  // The flood crossed the span ceiling while the bytes stayed far under a window's worth.
+  // The flood crossed the span ceiling while the bytes stayed far under a window's worth. Counted at
+  // the RECEIVER, from quinn's own STREAM-frame counter, so this is spans that actually reached the
+  // reassembler rather than writes that were staged: each is its own non-mergeable span (a
+  // sub-packet frame quinn packetized alone), and the count has to pass the compaction threshold of
+  // `2 x QUINN_REASSEMBLY_MAX_SPANS` for compaction to have run and still left too many.
+  let spans = b.rx_stream_frames_total() - spans_before;
+  assert!(
+    spans > 2 * QUINN_REASSEMBLY_MAX_SPANS,
+    "the flood must drive more than {} spans into the receiver's reassembler — past the compaction \
+     threshold — before the refusal; its quinn counted {spans} STREAM frames over {writes} writes",
+    2 * QUINN_REASSEMBLY_MAX_SPANS
+  );
   assert!(
     writes > QUINN_REASSEMBLY_MAX_SPANS,
     "the flood must actually cross the span ceiling ({QUINN_REASSEMBLY_MAX_SPANS}), took {writes} \

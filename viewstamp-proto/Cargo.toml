@@ -39,7 +39,7 @@ rustls = { version = "0.23", default-features = false, features = ["std"], optio
 # `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` and
 # `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` pin the sizing,
 # `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` pins compaction and
-# refusal, and the three unsolicited-half tests (`sub_packet_writes_...`, `gapped_writes_...`,
+# refusal (receiver-side span count, past the compaction threshold), and the three unsolicited-half tests (`sub_packet_writes_...`, `gapped_writes_...`,
 # `data_whose_reset_lands_in_the_same_batch_...`) pin the classifier that rests on the same private
 # behaviour. This crate's CI resolves fresh and runs the whole QUIC suite against each new 0.11.x; an
 # embedder who pins or upgrades quinn-proto themselves should run that suite as the compatibility

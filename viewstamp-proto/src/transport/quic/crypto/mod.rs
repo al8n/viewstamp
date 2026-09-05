@@ -270,8 +270,9 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
 ///   assumes, counted from the receiver's own STREAM-frame counter;
 /// - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and
-///   refusal: it drives more than 2048 resident spans through compaction and requires the refusal to
-///   surface as a classified, unbound loss;
+///   refusal: it drives non-mergeable sub-packet frames past the compaction threshold, counted at the
+///   RECEIVER from quinn's own STREAM-frame counter (2049 spans over 2049 writes, one past `2 x` the
+///   span ceiling), and requires the refusal to surface as a classified, unbound loss;
 /// - `sub_packet_writes_into_our_opened_streams_recv_half_close_the_connection` and
 /// - `gapped_writes_into_our_opened_streams_recv_half_close_the_connection` — `Readable` being raised
 ///   for a frame that arrived, at the read offset and ahead of a gap;

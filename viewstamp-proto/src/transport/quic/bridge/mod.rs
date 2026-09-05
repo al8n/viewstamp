@@ -1196,6 +1196,17 @@ impl Bridge {
     }
   }
 
+  /// Bytes still staged for `class` on `h` — non-zero exactly while a write is blocked behind the
+  /// peer's flow-control window, so a test can prove a blocked stream and its later drain were in
+  /// its sample rather than assuming they were.
+  #[cfg(test)]
+  pub(crate) fn staged_outbound_len(&mut self, h: ConnectionHandle, class: StreamClass) -> usize {
+    self
+      .table
+      .entry(h)
+      .map_or(0, |e| e.class_mut(class).outbound.len())
+  }
+
   #[cfg(test)]
   pub(crate) fn rx_stream_frames_total(&mut self) -> u64 {
     self

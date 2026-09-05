@@ -1750,31 +1750,49 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
   let mut phase_bytes = 0usize;
   let spans_at_phase = r1.0.rx_stream_frames_for_test();
   let mut delivered = false;
+  let bulk_peer = Peer::Replica(ReplicaId::new(1));
+  let mut saw_blocked = false;
+  let mut saw_drain_after_block = false;
   for _ in 0..40_000u64 {
     now = now + Duration::from_millis(1);
-    // Drain after EACH coordinator entry, so `worst` is short datagrams per ENTRY — the quantity the
-    // contract is about — and not per ferry iteration, which would fold two entries together.
+    // Drain and count after EVERY public coordinator entry on r0 — `handle_storage`,
+    // `handle_timeout` and each `handle_udp` — so `worst` is short datagrams per ENTRY, nothing
+    // folds into the next bucket, and nothing the last entry emitted goes unmeasured when the loop
+    // breaks.
     let mut to_r1: Vec<Vec<u8>> = Vec::new();
-    let drain_r0 = |c: &mut QuicCoordinator<CountSm, ProvidedIdentity>,
-                    to_r1: &mut Vec<Vec<u8>>,
-                    worst: &mut usize| {
-      let mut entry_short = 0usize;
-      while let Some((dst, d)) = c.poll_transmit() {
-        if dst == addr1 {
-          if d.len() < SHORT {
-            entry_short += 1;
+    macro_rules! drain_r0 {
+      () => {{
+        let mut entry_short = 0usize;
+        while let Some((dst, d)) = r0.0.poll_transmit() {
+          if dst == addr1 {
+            if d.len() < SHORT {
+              entry_short += 1;
+            }
+            to_r1.push(d);
           }
-          to_r1.push(d);
         }
-      }
-      *worst = (*worst).max(entry_short);
-    };
+        worst = worst.max(entry_short);
+      }};
+    }
     {
       let (c, w, b) = &mut r0;
       c.handle_storage(now, w, b);
-      drain_r0(c, &mut to_r1, &mut worst);
+    }
+    drain_r0!();
+    {
+      let (c, w, _) = &mut r0;
       c.handle_timeout(now, w);
-      drain_r0(c, &mut to_r1, &mut worst);
+    }
+    drain_r0!();
+    // The blocked-write observable: staged bytes remain exactly while the peer's window refuses
+    // more, and their later disappearance is the `Writable`-driven retry draining the tail.
+    let staged = r0
+      .0
+      .staged_outbound_for_test(bulk_peer, super::layout::StreamClass::Bulk);
+    if staged > 0 {
+      saw_blocked = true;
+    } else if saw_blocked {
+      saw_drain_after_block = true;
     }
     {
       let (c, w, b) = &mut r1;
@@ -1792,9 +1810,29 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
         to_r0.push(d);
       }
     }
+    let mut to_r1_late: Vec<Vec<u8>> = Vec::new();
     for d in &to_r0 {
-      let (c, w, _) = &mut r0;
-      c.handle_udp(now, addr1, None, d, w);
+      {
+        let (c, w, _) = &mut r0;
+        c.handle_udp(now, addr1, None, d, w);
+      }
+      // Each `handle_udp` is its own entry: count it, and carry what it emitted to r1 now rather
+      // than letting it fold into the next iteration's bucket.
+      let mut entry_short = 0usize;
+      while let Some((dst, d)) = r0.0.poll_transmit() {
+        if dst == addr1 {
+          if d.len() < SHORT {
+            entry_short += 1;
+          }
+          to_r1_late.push(d);
+        }
+      }
+      worst = worst.max(entry_short);
+    }
+    for d in &to_r1_late {
+      phase_bytes += d.len();
+      let (c, w, _) = &mut r1;
+      c.handle_udp(now, addr0, None, d, w);
     }
     if r1.0.endpoint().state_machine_ref().applied().len() >= 2 {
       delivered = true;
@@ -1805,16 +1843,28 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     delivered,
     "the large op must commit, so the measured sample really did include its blocked-stream retries"
   );
-  // The per-entry bound, asserted rather than merely reported. A packetizing pass emits
-  // packet-filling frames plus at most one short tail, and an entry packetizes a SMALL CONSTANT
-  // number of times — the drain-side flush, the read pass that services to release flow-control
-  // credit, and the pump-end service, across the connections a mutual-dial pair holds. Measured at 3
-  // in this sample, which includes the partial writes and `Writable`-driven retries of a stream
-  // blocked behind a multi-megabyte frame. Servicing per message instead puts this in the tens.
+  assert!(
+    saw_blocked && saw_drain_after_block,
+    "the sample must contain a stream BLOCKED behind the peer's window and its later drain — the \
+     partial writes and `Writable` retries the bound is claimed over (blocked={saw_blocked}, \
+     drained={saw_drain_after_block})"
+  );
+  // The per-entry bound, asserted rather than merely reported. The structural invariant is per
+  // PACKETIZING PASS: one short tail each, however many messages the pass coalesced. An entry can
+  // run up to four such passes — the leading service its own entry performs, the writable-driven
+  // flush, the read pass that services to release flow-control credit, and the pump-end service —
+  // across the connections a mutual-dial pair holds. This sample measures 3, and the bound is
+  // pinned there rather than at the structural four, so a regression that adds a pass fails here.
+  //
+  // What this does NOT detect is coalescing itself: chunking the writes into `flush_outbound`, or
+  // adding a service that emits nothing new, both leave it at 3 — quinn coalesces at packetization
+  // however many write calls fed the send buffer, which is the property the contract states. The
+  // sharp coalescing detector is the batch phase above, where servicing per message turns 64
+  // messages into 64 receiver-side STREAM frames.
   assert!(
     worst <= 3,
-    "a coordinator entry may emit only a small constant of short datagrams for a class — one per \
-     packetizing pass — got {worst}"
+    "a coordinator entry may emit at most one short datagram per packetizing pass for a class, \
+     three in this sample — got {worst}"
   );
   let phase_spans = r1.0.rx_stream_frames_for_test() - spans_at_phase;
   assert!(
@@ -1824,8 +1874,9 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
   );
 
   // Recovery in the sample: every other datagram to r1 is dropped, so the sender is retransmitting
-  // continuously and packing disjoint ranges into single packets. The receiver's span count must
-  // stay proportional to the data it actually took, and the link must survive.
+  // continuously and packing disjoint ranges into single packets. What is asserted below is that
+  // the retransmission EXCESS is present — more spans than the new-data ratio would give — and that
+  // the link survives. No upper bound on that excess is asserted.
   let spans_before = r1.0.rx_stream_frames_for_test();
   let refusals_before = r1
     .0
