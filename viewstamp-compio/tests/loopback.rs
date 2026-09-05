@@ -744,26 +744,20 @@ async fn lossy_relay(
   }
 }
 
-/// REAL loss on REAL drivers, injected by the network and not by the driver.
+/// REAL inbound datagram loss on REAL drivers, injected by the network and not by the driver.
 ///
-/// The transport's stream receive window bounds an unread backlog's bytes, not the number of spans a
-/// peer segments them into, and a receiver that cannot drain past a gap accumulates one unmergeable
-/// span per arriving packet. Whether a real driver can be walked to quinn's span ceiling that way is
-/// the question, because the production receive entrypoint (`handle_udp`) feeds quinn AND drains it
-/// in the same call.
+/// The loss is injected where the network injects it: a relay socket owned by this test sits between
+/// node 2 and each of its peers and drops one INBOUND datagram in two — the outbound direction is
+/// untouched. No driver code participates; there is no loss seam in the shipped driver to arm.
 ///
-/// The loss is therefore injected where the network injects it: a relay socket owned by this test
-/// sits between node 2 and each of its peers and drops one inbound datagram in two, with quinn's own
-/// loss recovery running underneath. No driver code participates — there is no loss seam in the
-/// shipped driver to arm.
+/// What it pins, and this is the whole list: inbound datagrams to node 2 are dropped (the relay's
+/// own counter is asserted non-zero), the cluster keeps committing while that is happening, and node
+/// 2 is caught up and serving again once the loss stops — shown by a submit relayed through it.
 ///
-/// What it pins: the cluster keeps committing through sustained 50% loss on the INBOUND side of one
-/// node's links — the relay drops only on the way in, and the outbound direction is untouched — and
-/// that node is caught up and relaying again once the loss stops. What it does NOT do is reach the
-/// reassembly ceiling — every datagram that arrives is drained in the same call, so the gap a lost
-/// packet leaves is closed by retransmission long before a span backlog can build. It is
-/// loss-tolerance evidence, not recovery-from-refusal evidence; the refusal's own recovery is proved
-/// at component level (see the report and the window contract's reachability note).
+/// What it establishes NOTHING about: what a dropped datagram carried, whether any STREAM gap
+/// formed, whether retransmission closed one, how many spans a reassembler held, or whether a
+/// refusal was approached. The relay counts opaque datagrams; nothing here inspects their contents
+/// or the receiver's reassembly state. It is loss-tolerance evidence and nothing more.
 #[compio::test]
 async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
   use std::sync::Arc;
@@ -826,8 +820,8 @@ async fn a_lossy_real_link_keeps_the_cluster_committing_and_recovers() {
   // Half of everything arriving at node 2 is now dropped, for the rest of the run.
   drop_one_in.store(2, Relaxed);
 
-  // A stream of small requests: each is a sub-packet `Prepare`, and each lost packet leaves a gap
-  // the following ones land behind. The cluster must keep committing — quorum is 2 of 3.
+  // A stream of small requests while the drops continue. The cluster must keep committing — quorum
+  // is 2 of 3.
   for i in 0..40u64 {
     let reply = compio::time::timeout(
       std::time::Duration::from_secs(10),

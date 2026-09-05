@@ -1282,7 +1282,7 @@ fn a_prepare_larger_than_the_stream_window_commits_over_bulk() {
 /// The stall models a node whose event loop is not running while its network stack still accepts
 /// packets: `feed_datagram_for_test` runs the bridge service pass — so the stalled side still ACKs
 /// and the sender's window keeps opening, exactly as a real receiver's kernel and quinn would — but
-/// never runs `drain_bridge`, so no frame is read out and every arriving STREAM frame stays a span.
+/// never runs `drain_bridge`, so no frame is read out.
 /// The traffic itself is the protocol's own: client requests submitted at the primary, and the
 /// `Prepare` retransmissions its timers drive because the stalled backup never acknowledges.
 ///
@@ -1304,9 +1304,10 @@ fn flood_a_stalled_receiver(
       let (c, w, b) = sender;
       c.handle_storage(now, w, b);
       c.handle_timeout(now, w);
-      // One small request per few ticks: each mints a `Prepare` too small to fill a packet, which is
-      // the sub-packet span shape. The rest of the spans come from the retransmissions the stalled
-      // backup's silence provokes.
+      // One small request per few ticks: each mints a `Prepare` too small to fill a packet. The
+      // rest of the traffic is whatever the primary's timers send while the backup stays silent.
+      // What that traffic becomes at the receiver is not counted here — only that the refusal
+      // eventually fires.
       if k % 4 == 0 {
         submits += 1;
         c.submit_client_request(
@@ -1650,7 +1651,8 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 /// counted at the RECEIVER, from quinn's own `frame_rx.stream`, not inferred from datagram lengths:
 /// a datagram-length proxy would score a recovery packet as one span when it is several.
 ///
-/// The alternating-loss phase then puts recovery in the sample deliberately, and what is ASSERTED
+/// The alternating-loss phase then puts one-way datagram loss in the sample deliberately, and what
+/// is ASSERTED
 /// there is narrow and exact: all 20 submitted operations apply on the receiving replica under
 /// ALTERNATING r0→r1 DATAGRAM LOSS WITH A LOSSLESS REVERSE PATH. Nothing establishes that a dropped
 /// datagram carried STREAM data, and the r1→r0 direction is never touched, so this is completion

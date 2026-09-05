@@ -1117,9 +1117,11 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
 /// is fewer spans than the ceiling.
 ///
 /// This test drives the worst case directly: a frame several windows long, ferried to B with B
-/// reading NOTHING, so B's reassembler holds a whole window unread. Each datagram carries at most
-/// one STREAM frame per stream, so the datagrams B absorbs unread bound the spans it holds. Then B
-/// drains and the frame must arrive in FULL — a stream quinn had errored would deliver nothing.
+/// reading NOTHING, so B's reassembler holds a whole window unread. What is COUNTED is datagrams,
+/// not spans: the count is an upper bound on the spans only under the assumption that a datagram
+/// carries at most one STREAM frame per stream, which nothing here checks — the flood test counts
+/// receiver-side spans directly. Then B drains and the frame must arrive in FULL — a stream quinn
+/// had errored would deliver nothing.
 ///
 /// It fails both ways the end-to-end tests only fail indirectly: raising the window (or
 /// shrinking the packets a window holds) drives the span count over the ceiling, and a quinn release
@@ -1212,8 +1214,9 @@ fn a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound() {
     "A must still hold a staged tail: the frame ({total} B) is several windows long, so B's window \
      is the only thing that can have stopped it"
   );
-  // The pin: a full window of real packets is fewer spans than quinn's reassembler will hold. The
-  // count includes B's control-stream and pure-ACK datagrams, so it over-counts the Bulk spans.
+  // The pin: a full window of real packets is fewer DATAGRAMS than the reassembler's span ceiling.
+  // Spans are not counted here; the count also includes B's control-stream and pure-ACK datagrams,
+  // so it is an over-count of anything Bulk.
   assert!(
     unread_datagrams as u64 <= QUINN_REASSEMBLY_MAX_SPANS,
     "a window's worth of unread datagrams ({unread_datagrams}) must stay within the \
