@@ -757,7 +757,8 @@ async fn lossy_relay(
 /// loss recovery running underneath. No driver code participates — there is no loss seam in the
 /// shipped driver to arm.
 ///
-/// What it pins: the cluster keeps committing through sustained 50% loss on one node's links, and
+/// What it pins: the cluster keeps committing through sustained 50% loss on the INBOUND side of one
+/// node's links — the relay drops only on the way in, and the outbound direction is untouched — and
 /// that node is caught up and relaying again once the loss stops. What it does NOT do is reach the
 /// reassembly ceiling — every datagram that arrives is drained in the same call, so the gap a lost
 /// packet leaves is closed by retransmission long before a span backlog can build. It is

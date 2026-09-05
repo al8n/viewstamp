@@ -1121,7 +1121,7 @@ fn a_budget_read_emits_flow_control_credit_this_pump() {
 /// one STREAM frame per stream, so the datagrams B absorbs unread bound the spans it holds. Then B
 /// drains and the frame must arrive in FULL — a stream quinn had errored would deliver nothing.
 ///
-/// It fails in both directions the end-to-end tests only fail indirectly: raising the window (or
+/// It fails both ways the end-to-end tests only fail indirectly: raising the window (or
 /// shrinking the packets a window holds) drives the span count over the ceiling, and a quinn release
 /// that lowers its own bound errors this stream while the count assertion still passes.
 ///

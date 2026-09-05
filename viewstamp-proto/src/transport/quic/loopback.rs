@@ -1651,11 +1651,12 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 /// a datagram-length proxy would score a recovery packet as one span when it is several.
 ///
 /// The alternating-loss phase then puts recovery in the sample deliberately, and what is ASSERTED
-/// there is the recovery itself: with every other datagram to the peer thrown away, the ops
-/// submitted during the phase must still APPLY on the receiving replica — which needs each
-/// `Prepare` in and its `PrepareOk` back, so the gaps the drops left were refilled in both
-/// directions. The span count for that phase is reported alongside it and carries no claim; nothing
-/// here characterises how many disjoint ranges recovery packs into a packet.
+/// there is narrow and exact: all 20 submitted operations apply on the receiving replica under
+/// ALTERNATING r0→r1 DATAGRAM LOSS WITH A LOSSLESS REVERSE PATH. Nothing establishes that a dropped
+/// datagram carried STREAM data, and the r1→r0 direction is never touched, so this is completion
+/// under one-way datagram loss — not a claim about what was recovered, in which direction, or which
+/// frames were decoded. The span count is reported alongside and carries no claim; nothing here
+/// characterises how many disjoint ranges recovery packs into a packet.
 #[test]
 fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
   /// Below the 1200-byte QUIC path minimum: a datagram this small could not have been packet-filling.
@@ -1922,10 +1923,10 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
      {phase_bytes} B"
   );
 
-  // Recovery in the sample: every other datagram to r1 is dropped, so bytes the sender put on the
-  // wire are lost and can only arrive again by retransmission. What is asserted below is the
-  // RECOVERY itself — every frame sent during the phase is decoded and delivered on the receiving
-  // side, which cannot happen unless the dropped gaps were refilled — and that the link survives.
+  // Loss in the sample: every other datagram from r0 to r1 is dropped. The r1→r0 direction is left
+  // alone, and nothing here inspects what a dropped datagram carried. What is asserted below is
+  // therefore exactly one thing — the submitted operations still apply on the receiving replica
+  // under that one-way loss — plus that the link survives.
   /// Client requests the loss phase submits. Bounded well under the iteration budget so the loop has
   /// room to carry every one of them across a link dropping half its datagrams.
   const LOSS_OPS: u64 = 20;
@@ -1944,8 +1945,8 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
       c.handle_storage(now, w, b);
       c.handle_timeout(now, w);
       // Real client requests, not injected heartbeats: an op only APPLIES on the receiver once its
-      // `Prepare` arrived and its `PrepareOk` came back, so counting applications is a witness that
-      // both directions recovered from the drops.
+      // `Prepare` arrived and its `PrepareOk` came back, so counting applications witnesses
+      // completion across the lossy r0→r1 path rather than merely that bytes moved.
       if k % 32 == 0 && submitted < LOSS_OPS {
         submitted += 1;
         c.submit_client_request(
@@ -2003,13 +2004,14 @@ fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
     "the loss phase must actually have carried traffic: {spans} spans, {delivered_bytes} B"
   );
   assert_eq!(submitted, LOSS_OPS, "the phase must submit its whole batch");
-  // The recovery witness: half of what the sender put on the wire was thrown away, so an op that
-  // APPLIES on the receiver is proof the gaps those drops left were refilled — in both directions,
-  // since applying needs the `Prepare` in and its `PrepareOk` back. `spans` is reported for context
-  // and carries no claim.
+  // The witness, stated no wider than it is: half the datagrams on the r0→r1 path were thrown away
+  // and the submitted operations still applied on the receiving replica. The reverse path was
+  // lossless and no datagram's contents were inspected, so nothing is claimed about which frames
+  // were dropped or how they were made good. `spans` is reported for context and carries no claim.
   assert_eq!(
     applied as u64, LOSS_OPS,
-    "every op submitted under 50% loss must still apply on the receiving replica — the dropped gaps \
-     have to be recovered for that: {applied} of {LOSS_OPS} ({spans} spans for {delivered_bytes} B)"
+    "all {LOSS_OPS} submitted operations must apply on the receiving replica under alternating \
+     r0→r1 datagram loss with a lossless reverse path — got {applied} ({spans} spans for \
+     {delivered_bytes} B)"
   );
 }
