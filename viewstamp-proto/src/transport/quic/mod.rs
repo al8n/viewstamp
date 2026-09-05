@@ -15,7 +15,7 @@
 //! that PIN each private behaviour, named so a failure is legible:
 //!
 //! - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
-//! - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
+//! - `a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams` — the segmentation the sizing
 //!   assumes, counted from the receiver's own STREAM-frame counter;
 //! - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and
 //!   refusal: it drives non-mergeable sub-packet frames past the compaction threshold, counted at the
@@ -1172,11 +1172,14 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// boundary test and the membership-range loopback: a rejected candidate must not pin a slot).
   /// STREAM frames the connection bound to `peer` has RECEIVED — the receiver-side span count the
   /// sender-segmentation regression measures (see [`Bridge::rx_stream_frames`]).
-  /// Bytes still staged for `class` on the connection CURRENTLY ROUTED to `peer` (see
-  /// [`Bridge::staged_outbound_len`]). It re-resolves the route on every call and returns 0 when
-  /// there is none, so a transition to zero means "nothing staged on the routed handle now" — which
-  /// a drain produces, but so would a reset, a close, or the mutual-dial sibling being promoted into
-  /// the route. A caller that needs to tell those apart has to pin the handle itself.
+  /// Bytes currently staged for `class` on the connection ROUTED to `peer` at the moment of the
+  /// call, or 0 when no connection is routed (see [`Bridge::staged_outbound_len`], whose contract
+  /// this inherits: staged bytes may equally be flow-control blocked or waiting on stream-slot
+  /// exhaustion, and zero may equally be a drain, a class reset, a close, or a reaped entry).
+  ///
+  /// This wrapper re-resolves the route on EVERY call, so it adds one more way to read zero: the
+  /// mutual-dial sibling being promoted into the route. A caller that needs to tell these apart has
+  /// to pin the handle itself.
   #[cfg(test)]
   pub(crate) fn staged_outbound_for_test(&mut self, peer: Peer, class: StreamClass) -> usize {
     match self.bridge.handle_for(peer) {

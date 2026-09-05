@@ -1196,9 +1196,14 @@ impl Bridge {
     }
   }
 
-  /// Bytes still staged for `class` on `h` — non-zero exactly while a write is blocked behind the
-  /// peer's flow-control window, so a test can prove a blocked stream and its later drain were in
-  /// its sample rather than assuming they were.
+  /// Bytes currently staged for `class` on `h` at the moment of the call — the length of that
+  /// class's `outbound` buffer, or 0 when `h` has no entry.
+  ///
+  /// That is the whole contract. A non-zero value says bytes are staged, not WHY: the peer's
+  /// flow-control window refusing more is one cause, so is stream-slot exhaustion leaving
+  /// [`Self::flush_outbound`] with no stream to open. A zero says nothing is staged now, which a
+  /// drain produces and so do a class reset, a connection close, and the entry being reaped. Any
+  /// test that needs one of those specifically has to establish it some other way.
   #[cfg(test)]
   pub(crate) fn staged_outbound_len(&mut self, h: ConnectionHandle, class: StreamClass) -> usize {
     self

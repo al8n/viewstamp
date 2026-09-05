@@ -198,9 +198,9 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// service pass rather than running one per message — so a batch of messages leaves as
 /// packet-filling frames plus a short tail, not as a short packet apiece. That is a statement about
 /// the code, and the evidence for it is narrower than the statement: what
-/// `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` measures is a batch of 64
+/// `a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams` measures is a batch of 64
 /// messages arriving as a handful of receiver-side STREAM frames rather than 64, and an aggregate
-/// ceiling of three short datagrams from any one coordinator entry. Neither counts packetizing
+/// count of two short datagrams from any one coordinator entry. Neither counts packetizing
 /// passes, and neither attributes a datagram to a class.
 ///
 /// Nothing bounds how many such spans ACCUMULATE at a peer. That is the ratio between the sender's
@@ -269,7 +269,7 @@ pub(crate) const MIN_FILLED_STREAM_FRAME_PAYLOAD: u64 = 1024;
 /// that PIN each private behaviour, named so a failure is legible:
 ///
 /// - `a_full_stream_window_of_unread_packets_stays_within_the_reassembly_bound` — the span ceiling;
-/// - `a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass` — the segmentation the sizing
+/// - `a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams` — the segmentation the sizing
 ///   assumes, counted from the receiver's own STREAM-frame counter;
 /// - `a_sub_packet_flood_makes_the_bridge_emit_the_lost_event_for_the_refused_stream` — compaction and
 ///   refusal: it drives non-mergeable sub-packet frames past the compaction threshold, counted at the

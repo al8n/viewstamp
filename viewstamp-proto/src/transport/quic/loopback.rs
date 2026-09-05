@@ -1639,9 +1639,9 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 ///   by a wide margin;
 /// - across a converged run that includes a multi-megabyte Bulk frame — so partial writes and the
 ///   `Writable`-driven retries of a blocked stream are in the sample — no coordinator entry puts
-///   more than three short datagrams on the wire to the peer. That is an aggregate count by
-///   destination: it does not separate packetizing passes and does not attribute a datagram to a
-///   class.
+///   more than two short datagrams on the wire to the peer, and exactly two is what this sample
+///   measures. That is an aggregate count by destination: it does not separate packetizing passes
+///   and does not attribute a datagram to a class.
 ///
 /// **Scope: newly written contiguous data.** Retransmissions are excluded — loss recovery packs
 /// disjoint ranges of already-sent data into whatever packet is going out, so one datagram can carry
@@ -1656,7 +1656,7 @@ fn a_modelled_receiver_stall_at_the_reassembly_ceiling_recovers_and_completes_it
 /// upper bound on recovery is asserted, and none is claimed: the worst case for how many disjoint
 /// ranges recovery packs into a packet is not characterised here.
 #[test]
-fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
+fn a_class_batch_coalesces_and_no_entry_exceeds_two_short_datagrams() {
   /// Below the 1200-byte QUIC path minimum: a datagram this small could not have been packet-filling.
   const SHORT: usize = 1100;
 
@@ -1704,6 +1704,7 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     c.handle_timeout(now, w);
   }
   let spans_before = r1.0.rx_stream_frames_for_test();
+  let delivered_before = r1.0.consensus_frames_delivered();
   let (mut datagrams, mut short) = (0usize, 0usize);
   let mut batch_out: Vec<Vec<u8>> = Vec::new();
   while let Some((dst, d)) = r0.0.poll_transmit() {
@@ -1720,8 +1721,26 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
     let (c, w, _) = &mut r1;
     c.handle_udp(now, addr0, None, d, w);
   }
-  // The direct count: STREAM frames the receiver's quinn actually parsed out of that batch.
   let spans = r1.0.rx_stream_frames_for_test() - spans_before;
+  let delivered_frames = r1.0.consensus_frames_delivered() - delivered_before;
+
+  // NON-VACUITY FIRST, at both ends. Every bound below is an upper one, so a batch that never left
+  // the sender, or never reached the peer, would satisfy all of them with zeroes.
+  assert!(
+    !batch_out.is_empty(),
+    "the batch must have put at least one datagram on the wire to the peer"
+  );
+  assert!(
+    spans > 0,
+    "and the receiver's quinn must have parsed STREAM frames out of it"
+  );
+  assert_eq!(
+    delivered_frames, BATCH as u64,
+    "and all {BATCH} messages must have been decoded and delivered on the receiving side, not just \
+     carried — got {delivered_frames}"
+  );
+
+  // The direct count: STREAM frames the receiver's quinn actually parsed out of that batch.
   assert!(
     spans <= 2,
     "{BATCH} messages staged for one class must reach the peer as packet-filling frames plus at \
@@ -1875,19 +1894,19 @@ fn a_class_batch_leaves_as_one_sub_packet_span_per_packetizing_pass() {
      drained={saw_drain_after_block}). Promotion of the mutual-dial sibling into the route is not \
      excluded as the cause of the second observation"
   );
-  // An AGGREGATE per-entry ceiling: three short datagrams to the peer from any one public
-  // coordinator entry, measured at three in this sample. It counts datagrams by destination — it
-  // does not separate packetizing passes and does not attribute a datagram to a stream class, so it
-  // says nothing about how many passes ran or how a class's frames were laid out.
+  // An AGGREGATE per-entry count: short datagrams to the peer from any one public coordinator
+  // entry, exactly two here and deterministic. It counts datagrams by destination — it does not
+  // separate packetizing passes and does not attribute a datagram to a stream class, so it says
+  // nothing about how many passes ran or how a class's frames were laid out.
   //
   // It is not a coalescing detector either: chunking the writes into `flush_outbound`, or adding a
-  // service that emits nothing new, both leave it at three — quinn coalesces at packetization
+  // service that emits nothing new, both leave it where it is — quinn coalesces at packetization
   // however many write calls fed the send buffer. The coalescing detector is the batch phase above,
   // where servicing per message turns 64 messages into 64 receiver-side STREAM frames.
-  assert!(
-    worst <= 3,
-    "one coordinator entry may put at most three short datagrams on the wire to the peer — got \
-     {worst}"
+  assert_eq!(
+    worst, 2,
+    "one coordinator entry puts exactly two short datagrams on the wire to the peer in this sample \
+     — got {worst}"
   );
   let phase_spans = r1.0.rx_stream_frames_for_test() - spans_at_phase;
   assert!(
